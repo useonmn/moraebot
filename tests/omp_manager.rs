@@ -204,6 +204,35 @@ async fn error_status_is_failed() {
     manager.shutdown_all().await;
 }
 
+/// Shell stand-in for omp whose error turn carries `error.code: "provider_error"`: it runs
+/// fake-omp (mode `error`) and adds the code to the `prompt_result` frame on its way out.
+/// Written into the test's temp dir.
+fn coded_error_wrapper(root: &Path) -> PathBuf {
+    let script = root.join("omp-coded-error.sh");
+    let fake = env!("CARGO_BIN_EXE_fake-omp");
+    let body = format!(
+        r#"#!/bin/sh
+'{fake}' "$@" | awk '{{ sub(/"message":"fake provider failure"/, "\"code\":\"provider_error\",\"message\":\"fake provider failure\""); print; fflush() }}'
+"#
+    );
+    std::fs::write(&script, body).expect("write wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    script
+}
+
+#[tokio::test]
+async fn coded_non_cost_cap_error_is_prompt_error() {
+    let mut h = Harness::new();
+    h.config.omp_path = coded_error_wrapper(h.dir.path());
+    let manager = h.manager("error");
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+    assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
+    assert!(manager.child_pid().await.is_some(), "a finished turn keeps its child");
+    assert_eq!(h.frames("prompt").len(), 1);
+    manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
     let h = Harness::new();

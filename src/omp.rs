@@ -46,6 +46,11 @@ pub const E_TURN_TIMEOUT: &str = "E_TURN_TIMEOUT";
 /// The child went away (or its transport broke) during the turn.
 pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
 
+/// How the pinned `omp_rpc` client reports a `prompt_result` it could not decode. omp's
+/// typed `error.code` accepts only `cost_cap`, so a turn that ended with any other error
+/// code arrives as this protocol error instead of a `PromptTurn`.
+const PROMPT_RESULT_UNDECODABLE: &str = "Failed to parse prompt_result";
+
 /// Reply text used when a completed turn produced no visible text.
 pub const EMPTY_REPLY: &str = "(empty reply)";
 
@@ -101,6 +106,8 @@ pub fn map_turn(turn: PromptTurn) -> Outcome {
         ),
         PromptStatus::Aborted => Outcome::failed(E_PROMPT_ABORTED, "the turn was aborted"),
         PromptStatus::Error => match result.error {
+            // The typed code decodes only the value `cost_cap`; other codes never get here
+            // (see `PROMPT_RESULT_UNDECODABLE`).
             Some(error) if error.code.is_some() => Outcome::failed(E_COST_CAP, error.message),
             Some(error) => Outcome::failed(E_PROMPT_ERROR, error.message),
             None => Outcome::failed(E_PROMPT_ERROR, "the turn ended with an error"),
@@ -294,6 +301,10 @@ impl OmpManager {
             Err(RpcError::Command { error, .. }) => return Outcome::failed(E_PROMPT_REJECTED, error),
             Err(RpcError::InvalidArgument(error)) => {
                 return Outcome::failed(E_PROMPT_REJECTED, error);
+            }
+            // The turn ended with an error whose code is not `cost_cap`; the child is fine.
+            Err(RpcError::Protocol(error)) if error.starts_with(PROMPT_RESULT_UNDECODABLE) => {
+                return Outcome::failed(E_PROMPT_ERROR, error);
             }
             Err(error) => Outcome::needs_check(E_CHILD_LOST, error),
         };
@@ -490,11 +501,11 @@ mod tests {
         }
     }
 
-    fn prompt_error(cost_cap: bool) -> PromptError {
+    fn prompt_error(code: Option<&str>) -> PromptError {
         serde_json::from_value(serde_json::json!({
             "message": "stopped",
             "retryable": false,
-            "code": if cost_cap { Some("cost_cap") } else { None },
+            "code": code,
         }))
         .expect("valid prompt error")
     }
@@ -522,11 +533,22 @@ mod tests {
     fn error_statuses_map_to_codes() {
         let aborted = map_turn(turn(Some(PromptStatus::Aborted), None, None));
         assert_eq!(aborted.code(), Some(E_PROMPT_ABORTED));
-        let error = map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(false))));
+        let error = map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(None))));
         assert_eq!(error.code(), Some(E_PROMPT_ERROR));
-        let cap = map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(true))));
+        let cap =
+            map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(Some("cost_cap")))));
         assert_eq!(cap.code(), Some(E_COST_CAP));
         assert!(matches!(cap, Outcome::Failed { .. }));
+    }
+
+    #[test]
+    fn only_cost_cap_decodes_as_a_typed_error_code() {
+        let other = serde_json::from_value::<PromptError>(serde_json::json!({
+            "message": "stopped",
+            "retryable": false,
+            "code": "provider_error",
+        }));
+        assert!(other.is_err(), "other codes reach the client as a protocol error");
     }
 
     #[test]
