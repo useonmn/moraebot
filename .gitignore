@@ -1,0 +1,5 @@
+/target/
+*.token
+secrets/
+/.omo/
+.DS_Store

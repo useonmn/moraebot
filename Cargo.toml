@@ -1,0 +1,41 @@
+[package]
+name = "moraebot"
+version = "0.1.0"
+edition = "2024"
+# rusqlite 0.43 needs Rust 1.89 or newer.
+rust-version = "1.89"
+description = "Always-on messenger gateway that runs the omp (oh-my-pi) coding agent on your own machine"
+repository = "https://github.com/useonmn/moraebot"
+publish = false
+
+[[bin]]
+name = "moraebot"
+path = "src/main.rs"
+
+# Scripted stand-in for omp used by the offline tests (no required-features on purpose,
+# so env!("CARGO_BIN_EXE_fake-omp") works under a plain `cargo test`).
+[[bin]]
+name = "fake-omp"
+path = "tests/bin/fake_omp.rs"
+
+[dependencies]
+serenity = "0.12.5"
+rusqlite = { version = "0.43", features = ["bundled"] }
+toml = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+async-trait = "0.1"
+# Reads the bot token without echo during `moraebot init`.
+rpassword = "7"
+# Official omp RPC client, pinned to the oh-my-pi v18.20.2 commit.
+# Do not replace with the crates.io crate named "omp-rpc": it is unrelated.
+omp-rpc = { git = "https://github.com/can1357/oh-my-pi", rev = "7c49c11aa5bbaf3f418406583096168ad5b8c6dc" }
+
+[dev-dependencies]
+tempfile = "3.27"
