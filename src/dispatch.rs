@@ -7,13 +7,14 @@
 //!
 //! One worker serves the global FIFO with one message in flight. A reply is stored
 //! (`reply_pending`) before it is sent and the row becomes `done` only after every chunk
-//! was accepted. Interrupted work (`needs_check`) is never re-prompted; its conversation
-//! gets one notice, also across restarts (`notice_sent`).
+//! was accepted; a failed send is retried after the adapter reconnects and at startup.
+//! Interrupted work (`needs_check`) is never re-prompted; its conversation gets one
+//! notice, also across restarts (`notice_sent`), and its older queued rows are held.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::access::{self, Decision, DropReason, E_ACCESS_NOT_OWNER};
 use crate::adapter::{ConversationKey, InboundEvent, MessengerAdapter, split_reply};
@@ -94,6 +95,16 @@ pub fn reply_target(key: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+/// Resolves at the adapter's next reconnect; never, when it has no reconnect signal.
+async fn next_reconnect(reconnects: &mut Option<watch::Receiver<u64>>) {
+    let Some(rx) = reconnects else {
+        return std::future::pending().await;
+    };
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// What happened to one inbound event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handled {
@@ -148,12 +159,15 @@ impl Dispatcher {
     }
 
     /// Startup recovery: interrupted rows become `needs_check` (never re-prompted), each
-    /// conversation with an unannounced one gets one notice, stored replies are re-sent.
+    /// conversation with an unannounced one gets one notice and its queued rows are held
+    /// under that notice, stored replies are re-sent. A row cut off by a crash and one
+    /// marked by a graceful shutdown are treated the same.
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
+        let unannounced = self.store().needs_check_notices()?;
         {
             let mut held = self.held.lock().expect("held lock");
-            for row in &recovered.needs_check {
+            for row in &unannounced {
                 held.insert(row.conversation_key.clone(), None);
             }
         }
@@ -170,10 +184,11 @@ impl Dispatcher {
         self: Arc<Self>,
         mut inbound: mpsc::Receiver<InboundEvent>,
     ) -> Result<(), StoreError> {
+        let reconnects = self.adapter.reconnects();
         self.startup().await?;
         let worker = tokio::spawn({
             let this = Arc::clone(&self);
-            async move { this.work_loop().await }
+            async move { this.work_loop(reconnects).await }
         });
         while let Some(event) = inbound.recv().await {
             if let Err(err) = self.handle_event(event).await {
@@ -191,16 +206,38 @@ impl Dispatcher {
         self.omp.shutdown_all().await;
     }
 
-    async fn work_loop(&self) {
+    /// Serves the queue and re-sends failed replies after each adapter reconnect. Both run
+    /// on this one task, so a reconnect seen during a turn is handled right after it, once
+    /// the turn's failed send was remembered.
+    async fn work_loop(&self, mut reconnects: Option<watch::Receiver<u64>>) {
         loop {
-            match self.process_next().await {
-                Ok(true) => {}
-                Ok(false) => self.wake.notified().await,
+            if let Some(rx) = reconnects.as_mut()
+                && rx.has_changed().unwrap_or(false)
+            {
+                rx.borrow_and_update();
+                self.resend_after_reconnect().await;
+            }
+            let idle = match self.process_next().await {
+                Ok(more) => !more,
                 Err(err) => {
                     tracing::error!(code = err.code(), error = %err, "worker step failed");
-                    self.wake.notified().await;
+                    true
+                }
+            };
+            if idle {
+                tokio::select! {
+                    biased;
+                    () = next_reconnect(&mut reconnects) => self.resend_after_reconnect().await,
+                    () = self.wake.notified() => {}
                 }
             }
+        }
+    }
+
+    async fn resend_after_reconnect(&self) {
+        match self.resend_pending().await {
+            Ok(delivered) => tracing::info!(delivered, "pending replies re-sent after reconnect"),
+            Err(err) => tracing::error!(code = err.code(), error = %err, "pending replies not re-sent"),
         }
     }
 

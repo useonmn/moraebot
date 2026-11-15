@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 pub const E_ADAPTER_SEND: &str = "E_ADAPTER_SEND";
 pub const E_ADAPTER_THREAD: &str = "E_ADAPTER_THREAD";
@@ -82,6 +82,12 @@ pub trait MessengerAdapter: Send + Sync {
     ) -> Result<String, AdapterError>;
 
     async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError>;
+
+    /// A counter that increases on every (re)connect of the messenger, so the core can
+    /// re-send replies whose send failed. `None`: the adapter never reconnects.
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// Splits `text` into chunks of at most `limit` characters. A cut falls after the last

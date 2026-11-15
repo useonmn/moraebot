@@ -439,6 +439,44 @@ async fn send_failure_keeps_reply_pending_then_delivers_once() {
 }
 
 #[tokio::test]
+async fn reply_pending_is_resent_once_after_adapter_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let inbound = h.adapter.start().await.unwrap();
+    let runner = tokio::spawn(Arc::clone(&h.dispatcher).run(inbound));
+    let mid = "1300000000000000115";
+    h.adapter.fail_next_send();
+    h.adapter.inject(channel_msg(mid, "hello")).await;
+    bounded(h.adapter.wait_for_send(1)).await;
+    // The reply is stored before the (failed) send, so the row is reply_pending now.
+    assert_eq!(h.row(1).state, State::ReplyPending);
+
+    h.adapter.reconnect();
+    bounded(h.adapter.wait_for_send(2)).await;
+    // A later message in the same thread is served after the resend finished, so the
+    // first row is settled and the same omp child (no restart) is still in use.
+    h.adapter.inject(event("1300000000000000116", OWNER, Some(mid), "second")).await;
+    bounded(h.adapter.wait_for_send(3)).await;
+
+    assert_eq!(h.row(1).state, State::Done);
+    assert_eq!(
+        h.sends(),
+        vec![
+            (mid.to_owned(), "echo: hello".to_owned()),
+            (mid.to_owned(), "echo: hello".to_owned()),
+            (mid.to_owned(), "echo: second".to_owned()),
+        ],
+        "one failed attempt, exactly one delivery after the reconnect"
+    );
+    let hello_prompts = h.prompts().iter().filter(|p| p["message"] == "hello").count();
+    assert_eq!(hello_prompts, 1);
+    assert_eq!(h.starts(), 1);
+    runner.abort();
+    let _ = runner.await;
+    h.close().await;
+}
+
+#[tokio::test]
 async fn reply_pending_is_resent_once_on_startup() {
     let dir = tempfile::tempdir().unwrap();
     let mid = "1300000000000000110";

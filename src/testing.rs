@@ -26,6 +26,7 @@ pub struct FakeAdapter {
     calls: Mutex<Vec<Call>>,
     sent_count: watch::Sender<usize>,
     fail_next_send: AtomicBool,
+    reconnects: watch::Sender<u64>,
     inbound_tx: mpsc::Sender<InboundEvent>,
     inbound_rx: Mutex<Option<mpsc::Receiver<InboundEvent>>>,
 }
@@ -43,6 +44,7 @@ impl FakeAdapter {
             calls: Mutex::new(Vec::new()),
             sent_count: watch::channel(0).0,
             fail_next_send: AtomicBool::new(false),
+            reconnects: watch::channel(0).0,
             inbound_tx,
             inbound_rx: Mutex::new(Some(inbound_rx)),
         }
@@ -54,6 +56,11 @@ impl FakeAdapter {
 
     pub fn fail_next_send(&self) {
         self.fail_next_send.store(true, Ordering::SeqCst);
+    }
+
+    /// Simulates the messenger connection coming back (a ready or resume event).
+    pub fn reconnect(&self) {
+        self.reconnects.send_modify(|count| *count += 1);
     }
 
     pub async fn inject(&self, event: InboundEvent) {
@@ -138,5 +145,9 @@ impl MessengerAdapter for FakeAdapter {
                 channel: channel.to_owned(),
             });
         Ok(TypingHandle::new(|| {}))
+    }
+
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.reconnects.subscribe())
     }
 }

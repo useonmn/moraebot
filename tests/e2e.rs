@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, E_TOKEN_MODE, OmpConfig};
+use moraebot::dispatch::{E_DISPATCH_HELD, N_INTERRUPTED, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::store::{E_ALREADY_RUNNING, State, Store};
 use moraebot::testing::{Call, FakeAdapter};
@@ -163,7 +164,11 @@ impl Rig {
     }
 
     fn gateway(&self, mode: &str) -> Result<Gateway, GatewayError> {
-        let adapter: Arc<dyn MessengerAdapter> = self.adapter.clone();
+        self.gateway_with(self.adapter.clone(), mode)
+    }
+
+    fn gateway_with(&self, adapter: Arc<FakeAdapter>, mode: &str) -> Result<Gateway, GatewayError> {
+        let adapter: Arc<dyn MessengerAdapter> = adapter;
         let vars = [
             ("FAKE_OMP_MODE", mode.to_owned()),
             ("FAKE_OMP_LOG", self.log().to_string_lossy().into_owned()),
@@ -172,7 +177,12 @@ impl Rig {
     }
 
     fn start(&self, mode: &str) -> Running {
-        let gateway = self.gateway(mode).expect("open gateway");
+        self.start_with(self.adapter.clone(), mode)
+    }
+
+    /// Starts a gateway on a fresh adapter (a restarted process gets a new connection).
+    fn start_with(&self, adapter: Arc<FakeAdapter>, mode: &str) -> Running {
+        let gateway = self.gateway_with(adapter, mode).expect("open gateway");
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(gateway.run(async {
             let _ = stopped.await;
@@ -251,6 +261,67 @@ async fn shutdown_during_a_hanging_turn_leaves_needs_check_and_no_child() {
     let pids = tap.pids();
     assert_eq!(pids.len(), 1);
     for pid in pids {
+        assert!(!process_exists(pid), "fake-omp {pid} is still alive");
+    }
+}
+
+#[tokio::test]
+async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one() {
+    let rig = Rig::new();
+    let mut tap = LogTap::create(&rig.log());
+    let running = rig.start("hang");
+
+    rig.adapter.inject(owner_message(MESSAGE_ID, "first")).await;
+    let mut second = owner_message("1300000000000000002", "second");
+    second.thread_id = Some(MESSAGE_ID.into());
+    rig.adapter.inject(second).await;
+    // Events are handled in order, so this notice proves "second" was stored.
+    rig.adapter.inject(owner_message("1300000000000000003", "/marker")).await;
+    bounded(BOUND, rig.adapter.wait_for_send(1)).await;
+    tap.wait_for_prompt().await;
+    running.stop().await.expect("clean stop");
+
+    let adapter = Arc::new(FakeAdapter::new());
+    let running = rig.start_with(adapter.clone(), "ok");
+    // A message in another conversation, admitted after the held row, is served after it.
+    adapter.inject(owner_message("1300000000000000005", "third")).await;
+    bounded(BOUND, adapter.wait_for_send(2)).await;
+    tap.wait_for(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|frame| frame["message"] == "third")
+    })
+    .await;
+    running.stop().await.expect("clean stop");
+
+    let messages: Vec<Value> = tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "prompt")
+        .map(|frame| frame["message"].clone())
+        .collect();
+    assert_eq!(messages, ["first", "third"], "the held message never reaches omp");
+    let sends: Vec<(String, String)> = adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Send { channel, text } => Some((channel, text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sends,
+        vec![
+            (MESSAGE_ID.to_owned(), notice_text(N_INTERRUPTED).to_owned()),
+            ("1300000000000000005".to_owned(), "echo: third".to_owned()),
+        ],
+        "exactly one interrupted notice for the conversation"
+    );
+    let store = Store::open(&rig.config.home.join(STORE_FILE)).expect("reopen store");
+    let held = store.get(2).expect("read row").expect("row exists");
+    assert_eq!(held.state, State::NeedsCheck);
+    assert_eq!(held.error.as_deref(), Some(E_DISPATCH_HELD));
+    assert!(held.notice_sent);
+    for pid in tap.pids() {
         assert!(!process_exists(pid), "fake-omp {pid} is still alive");
     }
 }

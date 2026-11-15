@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serenity::all::{
     Channel, ChannelId, ChannelType, Client, Context, CreateThread, EventHandler, GatewayIntents,
-    Http, Message, MessageId, MessageType, Ready, ShardManager,
+    Http, Message, MessageId, MessageType, Ready, ResumedEvent, ShardManager,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -180,6 +180,8 @@ fn read_token(path: &Path) -> Result<Token, AdapterError> {
 struct Handler {
     scope: Scope,
     tx: mpsc::Sender<InboundEvent>,
+    /// Bumped on every ready and resume, so the core re-sends failed replies.
+    reconnects: Arc<watch::Sender<u64>>,
     /// Channel locations already looked up; a channel never changes type or parent.
     locations: Mutex<HashMap<u64, Location>>,
 }
@@ -247,6 +249,12 @@ impl EventHandler for Handler {
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
         tracing::info!(bot_id = ready.user.id.get(), "discord gateway connected");
+        self.reconnects.send_modify(|count| *count += 1);
+    }
+
+    async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
+        tracing::info!("discord gateway resumed");
+        self.reconnects.send_modify(|count| *count += 1);
     }
 }
 
@@ -263,6 +271,7 @@ pub struct DiscordAdapter {
     scope: Scope,
     runtime: Arc<Mutex<Runtime>>,
     shutdown: watch::Sender<bool>,
+    reconnects: Arc<watch::Sender<u64>>,
 }
 
 impl DiscordAdapter {
@@ -276,6 +285,7 @@ impl DiscordAdapter {
             scope,
             runtime: Arc::new(Mutex::new(Runtime::default())),
             shutdown: watch::channel(false).0,
+            reconnects: Arc::new(watch::channel(0).0),
         })
     }
 
@@ -372,6 +382,7 @@ impl MessengerAdapter for DiscordAdapter {
         let handler = Arc::new(Handler {
             scope: self.scope,
             tx,
+            reconnects: self.reconnects.clone(),
             locations: Mutex::new(HashMap::new()),
         });
         runtime.task = Some(tokio::spawn(gateway_loop(
@@ -424,6 +435,10 @@ impl MessengerAdapter for DiscordAdapter {
         Ok(TypingHandle::new(move || {
             typing.stop();
         }))
+    }
+
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.reconnects.subscribe())
     }
 }
 
