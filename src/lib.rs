@@ -11,3 +11,4 @@ pub mod dispatch;
 pub mod logging;
 pub mod launchd;
 pub mod discord;
+pub mod gateway;

@@ -1,10 +1,22 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
+use moraebot::adapter::MessengerAdapter;
 use moraebot::config::{report_checks, Config, ConfigError, Env};
+use moraebot::discord::DiscordAdapter;
+use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
+use moraebot::logging;
+use tokio::signal::unix::{signal, SignalKind};
+
+/// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(20);
+/// Extra time for closing the Discord connection after the gateway stopped.
+const DISCORD_SHUTDOWN_BOUND: Duration = Duration::from_secs(4);
 
 const USAGE: &str = "\
 Usage: moraebot <command>
@@ -12,6 +24,7 @@ Usage: moraebot <command>
 Commands:
   init                          Ask a few questions and write the config
   check-config [--config PATH]  Check the config and the things it points at
+  run [--config PATH]           Run the gateway until SIGTERM or SIGINT
   install-launchd [--config PATH] [--label LABEL] [--dry-run]
                                 Install the launchd agent (macOS)
   uninstall-launchd [--label LABEL]
@@ -24,6 +37,9 @@ enum Command {
         config: Option<PathBuf>,
     },
     Init,
+    Run {
+        config: Option<PathBuf>,
+    },
     InstallLaunchd {
         config: Option<PathBuf>,
         label: String,
@@ -39,7 +55,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         return Err("missing command".to_string());
     };
     match name.as_str() {
-        "check-config" => parse_check_config(rest),
+        "check-config" => parse_config_flag(rest).map(|config| Command::CheckConfig { config }),
+        "run" => parse_config_flag(rest).map(|config| Command::Run { config }),
         "init" if rest.is_empty() => Ok(Command::Init),
         "init" => Err("init takes no arguments".to_string()),
         "install-launchd" => parse_install_launchd(rest),
@@ -48,12 +65,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 }
 
-fn parse_check_config(args: &[String]) -> Result<Command, String> {
+fn parse_config_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
     match args {
-        [] => Ok(Command::CheckConfig { config: None }),
-        [flag, path] if flag == "--config" => Ok(Command::CheckConfig {
-            config: Some(PathBuf::from(path)),
-        }),
+        [] => Ok(None),
+        [flag, path] if flag == "--config" => Ok(Some(PathBuf::from(path))),
         [flag] if flag == "--config" => Err("--config needs a path".to_string()),
         [other, ..] => Err(format!("unexpected argument '{other}'")),
     }
@@ -149,6 +164,65 @@ fn uninstall_launchd(env: &Env, label: &str) -> Result<ExitCode, ConfigError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Loads and validates the config, starts logging, then serves until a signal.
+fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    config.validate()?;
+    let _log_guard = logging::init(&config.home)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = runtime.block_on(serve(config));
+    // A stuck blocking task must not delay the exit.
+    runtime.shutdown_background();
+    if let Err(err) = &result {
+        tracing::error!(code = err.code(), error = %err, "gateway failed");
+    }
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn serve(config: Config) -> Result<(), GatewayError> {
+    let discord = Arc::new(DiscordAdapter::from_config(&config)?);
+    let adapter: Arc<dyn MessengerAdapter> = discord.clone();
+    let gateway = Gateway::open(&config, adapter)?;
+
+    let mut terminate = signal(SignalKind::terminate()).map_err(GatewayError::Signal)?;
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(GatewayError::Signal)?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let run = gateway.run(async {
+        let _ = stopped.await;
+    });
+    tokio::pin!(run);
+
+    let result = tokio::select! {
+        result = &mut run => result,
+        _ = terminate.recv() => stop_gateway(stop, run).await,
+        _ = interrupt.recv() => stop_gateway(stop, run).await,
+    };
+    if tokio::time::timeout(DISCORD_SHUTDOWN_BOUND, discord.shutdown()).await.is_err() {
+        tracing::warn!("discord shutdown did not finish in time");
+    }
+    result
+}
+
+async fn stop_gateway(
+    stop: tokio::sync::oneshot::Sender<()>,
+    run: impl std::future::Future<Output = Result<(), GatewayError>>,
+) -> Result<(), GatewayError> {
+    tracing::info!("shutdown signal received");
+    let _ = stop.send(());
+    match tokio::time::timeout(SHUTDOWN_BOUND, run).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(code = E_SHUTDOWN_TIMEOUT, "gateway did not stop in time");
+            Err(GatewayError::ShutdownTimeout)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
@@ -162,6 +236,12 @@ fn main() -> ExitCode {
     let result = match command {
         Command::CheckConfig { config } => check_config(&env, config),
         Command::Init => run_init(&env),
+        Command::Run { config } => {
+            return run_gateway(&env, config).unwrap_or_else(|err| {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            });
+        }
         Command::InstallLaunchd {
             config,
             label,
@@ -210,6 +290,13 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_args(&args(&["run", "--config", "x.toml"])),
+            Ok(Command::Run {
+                config: Some(PathBuf::from("x.toml"))
+            })
+        );
+        assert_eq!(parse_args(&args(&["run"])), Ok(Command::Run { config: None }));
+        assert_eq!(
             parse_args(&args(&["check-config"])),
             Ok(Command::CheckConfig { config: None })
         );
@@ -226,7 +313,8 @@ mod tests {
         for bad in [
             &[][..],
             &["bogus"],
-            &["run"],
+            &["run", "--config"],
+            &["run", "extra"],
             &["init", "extra"],
             &["check-config", "--config"],
             &["check-config", "--nope"],
