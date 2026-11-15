@@ -50,6 +50,10 @@ pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
 pub const EMPTY_REPLY: &str = "(empty reply)";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Absolute path, so a `kill` shim earlier in PATH cannot intercept the group kill.
+const KILL_BIN: &str = "/bin/kill";
+/// How long shutdown waits for a killed child's worker thread to finish.
+const ABORT_JOIN_BOUND: Duration = Duration::from_secs(10);
 /// "No limit": `prompt_and_wait` needs a deadline, so use one that never matters.
 const UNLIMITED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
@@ -157,10 +161,34 @@ struct PromptRequest {
     done: oneshot::Sender<Result<PromptTurn, RpcError>>,
 }
 
+/// SIGKILLs the child's process group (the RPC client starts the child as its own
+/// group leader). Best effort: the group may already be gone.
+fn kill_group(pid: u32) {
+    let _ = Command::new(KILL_BIN)
+        .args(["-s", "KILL", "--"])
+        .arg(format!("-{pid}"))
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills the child's group when the `Live` is dropped without being closed (a panic or a
+/// cancelled caller), so a worker blocked in `prompt_and_wait` is released and the
+/// client reaps the child. `close` and `abort` disarm it once the worker is joined,
+/// because the pid may be reused after the child is reaped.
+struct GroupKill(Option<u32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            kill_group(pid);
+        }
+    }
+}
+
 /// The one live child and the thread that owns its client.
 struct Live {
     key: String,
-    pid: Option<u32>,
+    pid: GroupKill,
     requests: mpsc::Sender<PromptRequest>,
     worker: JoinHandle<()>,
 }
@@ -168,11 +196,29 @@ struct Live {
 impl Live {
     /// Closes the client (on its own thread) and waits until the process is reaped.
     async fn close(self) {
-        let Live { key, requests, worker, .. } = self;
+        let Live { key, mut pid, requests, worker } = self;
         drop(requests);
         match tokio::task::spawn_blocking(move || worker.join()).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => pid.0 = None,
             _ => tracing::error!(conversation = %key, "omp worker thread panicked"),
+        }
+    }
+}
+
+impl Live {
+    /// Kills the child's process group first so a worker blocked in `prompt_and_wait`
+    /// sees the closed pipe and returns, then joins the worker within `ABORT_JOIN_BOUND`.
+    async fn abort(self) {
+        let Live { key, mut pid, requests, worker } = self;
+        if let Some(pid) = pid.0 {
+            kill_group(pid);
+        }
+        drop(requests);
+        let joined = tokio::task::spawn_blocking(move || worker.join());
+        match tokio::time::timeout(ABORT_JOIN_BOUND, joined).await {
+            Ok(Ok(Ok(()))) => pid.0 = None,
+            Ok(_) => tracing::error!(conversation = %key, "omp worker thread panicked"),
+            Err(_) => tracing::error!(conversation = %key, "omp worker did not stop in time"),
         }
     }
 }
@@ -212,7 +258,7 @@ impl OmpManager {
     }
 
     pub async fn child_pid(&self) -> Option<u32> {
-        self.live.lock().await.as_ref().and_then(|live| live.pid)
+        self.live.lock().await.as_ref().and_then(|live| live.pid.0)
     }
 
     /// Sends `text` to the conversation's omp session and waits for the turn.
@@ -259,9 +305,11 @@ impl OmpManager {
         outcome
     }
 
+    /// Stops the omp child even in the middle of a turn; the turn's row is left for
+    /// the caller to mark `needs_check`.
     pub async fn shutdown_all(&self) {
         if let Some(live) = self.live.lock().await.take() {
-            live.close().await;
+            live.abort().await;
         }
     }
 
@@ -308,7 +356,7 @@ impl OmpManager {
             tracing::warn!(conversation = %key, code = e.code(), "could not store omp session id");
         }
         tracing::info!(conversation = %key, pid = started.pid, "omp child ready");
-        Ok(Live { key: key.to_owned(), pid: started.pid, requests, worker })
+        Ok(Live { key: key.to_owned(), pid: GroupKill(started.pid), requests, worker })
     }
 
     fn command(&self, key: &str, session_dir: &Path) -> std::io::Result<Command> {
