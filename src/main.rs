@@ -224,6 +224,8 @@ async fn stop_gateway(
 }
 
 fn main() -> ExitCode {
+    // Files this process creates (logs, launchd output) are owner-only.
+    unsafe { libc::umask(0o077) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
         Ok(command) => command,

@@ -51,6 +51,8 @@ pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String,
   <integer>10</integer>
   <key>ExitTimeOut</key>
   <integer>30</integer>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>{logs}/moraebot.out.log</string>
   <key>StandardErrorPath</key>
@@ -221,6 +223,8 @@ mod tests {
   <integer>10</integer>
   <key>ExitTimeOut</key>
   <integer>30</integer>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>/tmp/moraebot test home/logs/moraebot.out.log</string>
   <key>StandardErrorPath</key>

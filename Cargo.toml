@@ -34,6 +34,8 @@ tracing-appender = "0.2"
 async-trait = "0.1"
 # Reads the bot token without echo during `moraebot init`.
 rpassword = "7"
+# umask(2): keeps log files created by the gateway owner-only (0600).
+libc = "0.2"
 # Official omp RPC client, pinned to the oh-my-pi v18.20.2 commit.
 # Do not replace with the crates.io crate named "omp-rpc": it is unrelated.
 omp-rpc = { git = "https://github.com/can1357/oh-my-pi", rev = "7c49c11aa5bbaf3f418406583096168ad5b8c6dc" }
