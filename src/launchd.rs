@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,6 +76,28 @@ pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String,
     ))
 }
 
+/// launchd creates StandardOutPath/StandardErrorPath itself with 0644 and ignores
+/// the plist Umask for them, so the log folder and files are prepared here first.
+fn prepare_log_files(home: &Path) -> Result<(), ConfigError> {
+    let logs = home.join("logs");
+    fs::create_dir_all(&logs)
+        .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", logs.display()), &e))?;
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700))
+        .map_err(|e| ConfigError::io(E_IO, &format!("cannot chmod {}", logs.display()), &e))?;
+    for name in ["moraebot.out.log", "moraebot.err.log"] {
+        let file = logs.join(name);
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&file)
+            .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", file.display()), &e))?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+            .map_err(|e| ConfigError::io(E_IO, &format!("cannot chmod {}", file.display()), &e))?;
+    }
+    Ok(())
+}
+
 pub fn install(
     config: &Config,
     env: &Env,
@@ -108,6 +130,7 @@ pub fn install(
         .map_err(|e| ConfigError::io(E_IO, "cannot make the binary executable", &e))?;
     fs::create_dir_all(launch_agents_dir(env)?)
         .map_err(|e| ConfigError::io(E_IO, "cannot create the LaunchAgents folder", &e))?;
+    prepare_log_files(&config.home)?;
     fs::write(&plist_file, &plist)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot write {plist_text}"), &e))?;
 
@@ -311,6 +334,39 @@ mod tests {
             !dir.path().join("Library").exists(),
             "dry run must not write"
         );
+        let logs = config.home.join("logs");
+        assert!(
+            !logs.join("moraebot.out.log").exists() && !logs.join("moraebot.err.log").exists(),
+            "dry run must not create log files"
+        );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn prepare_log_files_creates_owner_only_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        prepare_log_files(&home).expect("prepares");
+        assert_eq!(mode_of(&home.join("logs")), 0o700);
+        assert_eq!(mode_of(&home.join("logs").join("moraebot.out.log")), 0o600);
+        assert_eq!(mode_of(&home.join("logs").join("moraebot.err.log")), 0o600);
+    }
+
+    #[test]
+    fn prepare_log_files_tightens_existing_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        fs::create_dir(&logs).expect("mkdir logs");
+        let out = logs.join("moraebot.out.log");
+        fs::write(&out, "kept\n").expect("write out log");
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o644)).expect("chmod out log");
+        prepare_log_files(dir.path()).expect("prepares");
+        assert_eq!(mode_of(&out), 0o600);
+        assert_eq!(fs::read_to_string(&out).expect("read out log"), "kept\n");
+        assert_eq!(mode_of(&logs.join("moraebot.err.log")), 0o600);
     }
 
     #[test]
