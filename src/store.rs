@@ -9,11 +9,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior, params,
+    params, Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior,
 };
 use serde_json::Value;
 
 use crate::files::E_FILE_INCOMPLETE;
+use crate::lane::{E_LANE_INTERRUPTED, LANE_PLATFORM};
 
 pub const E_ALREADY_RUNNING: &str = "E_ALREADY_RUNNING";
 pub const E_STORE_WAL: &str = "E_STORE_WAL";
@@ -111,6 +112,10 @@ pub struct InboxRow {
     pub out_files: Option<String>,
     /// The reply text was fully delivered.
     pub text_sent: bool,
+    /// `owner` for a messenger message, `lane` for a lane result.
+    pub origin: String,
+    /// The main row whose lead turn this row was steered into.
+    pub steered_into: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +133,69 @@ pub struct Recovered {
     pub reply_pending: Vec<InboxRow>,
     /// `reply_pending` rows with an outbound file whose upload was cut; the file is now skipped.
     pub interrupted_uploads: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    Running,
+    Idle,
+    Failed,
+    NeedsCheck,
+}
+
+impl LaneState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Idle => "idle",
+            Self::Failed => "failed",
+            Self::NeedsCheck => "needs_check",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => Self::Running,
+            "idle" => Self::Idle,
+            "failed" => Self::Failed,
+            "needs_check" => Self::NeedsCheck,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneRow {
+    pub id: i64,
+    pub conversation_key: String,
+    pub task: String,
+    pub state: LaneState,
+    pub error: Option<String>,
+    /// Prompts sent to the lane so far; the newest one's sequence number.
+    pub prompts: i64,
+    pub omp_session_id: Option<String>,
+    pub notice_sent: bool,
+}
+
+/// Result of [`Store::start_lane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneStart {
+    /// A new running lane with this id.
+    New(i64),
+    /// The tool call already started this lane.
+    Existing(i64),
+    /// The running-lane cap is reached; nothing was stored.
+    Limit,
+}
+
+/// Result of [`Store::message_lane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneMessage {
+    /// The lane runs again; the new prompt's sequence number.
+    Seq(i64),
+    Unknown,
+    Busy,
+    Limit,
 }
 
 pub struct Store {
@@ -152,6 +220,8 @@ CREATE TABLE IF NOT EXISTS inbox(
     files_ready INTEGER NOT NULL DEFAULT 1,
     out_files TEXT,
     text_sent INTEGER NOT NULL DEFAULT 0,
+    origin TEXT NOT NULL DEFAULT 'owner',
+    steered_into INTEGER,
     UNIQUE(platform, message_id)
 );
 CREATE TABLE IF NOT EXISTS conversations(
@@ -167,14 +237,34 @@ CREATE TABLE IF NOT EXISTS known_threads(
     thread_id TEXT,
     PRIMARY KEY(platform, thread_id)
 );
+CREATE TABLE IF NOT EXISTS sessions(
+    name TEXT PRIMARY KEY,
+    omp_session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lanes(
+    id INTEGER PRIMARY KEY,
+    tool_call_id TEXT NOT NULL UNIQUE,
+    conversation_key TEXT NOT NULL,
+    task TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('running','idle','failed','needs_check')),
+    error TEXT,
+    prompts INTEGER NOT NULL DEFAULT 1,
+    omp_session_id TEXT,
+    notice_sent INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 ";
 
 /// Columns added after slice 2; `Store::open` adds the missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str); 4] = [
+const ADDED_COLUMNS: [(&str, &str); 6] = [
     ("attachments", "TEXT"),
     ("files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("out_files", "TEXT"),
     ("text_sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("origin", "TEXT NOT NULL DEFAULT 'owner'"),
+    ("steered_into", "INTEGER"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -229,15 +319,46 @@ fn skip_interrupted(out_files: &str) -> Option<String> {
     changed.then(|| files.to_string())
 }
 
-/// Holds the queued rows of the conversations selected by the appended subquery: they
-/// become `needs_check` / [`E_DISPATCH_HELD`] with their notice still to be posted.
+/// Holds the queued owner rows of the conversations selected by the appended subquery:
+/// they become `needs_check` / [`E_DISPATCH_HELD`] with their notice still to be posted.
+/// Lane-result rows are never held: they answer no owner message.
 fn hold_queued_sql(conversations: &str) -> String {
     format!(
         "UPDATE inbox SET state = 'needs_check', error = '{E_DISPATCH_HELD}', updated_at = {NOW}
-         WHERE state = 'queued' AND conversation_key IN ({conversations})"
+         WHERE state = 'queued' AND origin = 'owner' AND conversation_key IN ({conversations})"
     )
 }
-const COLS: &str = "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error, attachments, files_ready, out_files, text_sent";
+const COLS: &str = "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error, attachments, files_ready, out_files, text_sent, origin, steered_into";
+
+const LANE_COLS: &str =
+    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent";
+
+fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
+    let state: String = r.get(3)?;
+    Ok(LaneRow {
+        id: r.get(0)?,
+        conversation_key: r.get(1)?,
+        task: r.get(2)?,
+        state: LaneState::parse(&state).ok_or(rusqlite::Error::InvalidColumnType(
+            3,
+            "state".into(),
+            rusqlite::types::Type::Text,
+        ))?,
+        error: r.get(4)?,
+        prompts: r.get(5)?,
+        omp_session_id: r.get(6)?,
+        notice_sent: r.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn running_lanes(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM lanes WHERE state = 'running'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n as usize)
+}
 
 fn map_row(r: &SqlRow<'_>) -> rusqlite::Result<InboxRow> {
     let state: String = r.get(6)?;
@@ -260,6 +381,8 @@ fn map_row(r: &SqlRow<'_>) -> rusqlite::Result<InboxRow> {
         files_ready: r.get::<_, i64>(11)? != 0,
         out_files: r.get(12)?,
         text_sent: r.get::<_, i64>(13)? != 0,
+        origin: r.get(14)?,
+        steered_into: r.get(15)?,
     })
 }
 
@@ -525,23 +648,118 @@ impl Store {
         update_out_file(&self.conn, id, index, "$e || '.attempting', json('false')")
     }
 
-    /// Marks an interrupted row `needs_check` with `code` and, in the same transaction,
-    /// holds every queued row of its conversation, so the hold survives a restart.
+    /// Marks an interrupted row `needs_check` with `code` and holds every queued owner row
+    /// of its conversation (see [`Store::interrupt_group`]).
     pub fn mark_interrupted(&mut self, id: i64, code: &str) -> Result<(), StoreError> {
+        self.interrupt_group(&[id], code)
+    }
+
+    /// Marks every row of an interrupted group `needs_check` with `code` and, in the same
+    /// transaction, holds the queued owner rows of their conversations, so the hold survives
+    /// a restart.
+    pub fn interrupt_group(&mut self, ids: &[i64], code: &str) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for &id in ids {
+            let changed = tx.execute(
+                &format!("UPDATE inbox SET state = 'needs_check', error = ?2, updated_at = {NOW} WHERE id = ?1"),
+                params![id, code],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Invalid("no such inbox row"));
+            }
+        }
+        for &id in ids {
+            tx.execute(
+                &hold_queued_sql("SELECT conversation_key FROM inbox WHERE id = ?1"),
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Claims a queued row for one lead turn. Returns false (and changes nothing) when the
+    /// row is no longer `queued`, so one row is run by one path only.
+    pub fn claim(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE inbox SET state = 'processing', updated_at = {NOW}
+                 WHERE id = ?1 AND state = 'queued'"
+            ),
+            [id],
+        )? != 0)
+    }
+
+    /// Claims a queued row as the steer of `main_id`'s running turn. Refused (false, nothing
+    /// changed) unless the row is still `queued`, newer than `main_id`, and no older row of
+    /// its conversation is still `queued`.
+    pub fn steer_into(&self, id: i64, main_id: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE inbox SET state = 'processing', steered_into = ?2, updated_at = {NOW}
+                 WHERE id = ?1 AND state = 'queued' AND ?1 > ?2
+                   AND NOT EXISTS (SELECT 1 FROM inbox o
+                                   WHERE o.conversation_key = inbox.conversation_key
+                                     AND o.state = 'queued' AND o.id < ?1)"
+            ),
+            params![id, main_id],
+        )? != 0)
+    }
+
+    /// Stores a turn group's reply on its main row (`reply_pending`, as
+    /// [`Store::save_reply`]) and marks the steered row, if any, `done`, in one transaction.
+    pub fn finish_group(
+        &mut self,
+        main_id: i64,
+        reply: &str,
+        out_files: Option<&str>,
+        steered: Option<i64>,
+    ) -> Result<(), StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
-            &format!("UPDATE inbox SET state = 'needs_check', error = ?2, updated_at = {NOW} WHERE id = ?1"),
-            params![id, code],
+            &format!(
+                "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, updated_at = {NOW} WHERE id = ?1"
+            ),
+            params![main_id, reply, out_files],
         )?;
         if changed == 0 {
             return Err(StoreError::Invalid("no such inbox row"));
         }
-        tx.execute(
-            &hold_queued_sql("SELECT conversation_key FROM inbox WHERE id = ?1"),
-            [id],
-        )?;
+        if let Some(id) = steered {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE inbox SET state = 'done', error = NULL, updated_at = {NOW} WHERE id = ?1"
+                ),
+                [id],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Invalid("no such inbox row"));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks every row of a turn group `failed` with `code`, in one transaction.
+    pub fn fail_group(&mut self, ids: &[i64], code: &str) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for &id in ids {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE inbox SET state = 'failed', error = ?2, updated_at = {NOW} WHERE id = ?1"
+                ),
+                params![id, code],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Invalid("no such inbox row"));
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -584,6 +802,14 @@ impl Store {
             &format!(
                 "UPDATE inbox SET state = 'needs_check', error = 'interrupted', updated_at = {NOW}
                  WHERE state = 'processing'"
+            ),
+            [],
+        )?;
+        // Lanes are never restarted: a running one is marked for one restart notice.
+        tx.execute(
+            &format!(
+                "UPDATE lanes SET state = 'needs_check', error = '{E_LANE_INTERRUPTED}', notice_sent = 0, updated_at = {NOW}
+                 WHERE state = 'running'"
             ),
             [],
         )?;
@@ -682,6 +908,190 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// The omp session id stored under `name` (for example the lead's).
+    pub fn session_id(&self, name: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT omp_session_id FROM sessions WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Stores (or replaces) the omp session id under `name`.
+    pub fn set_session_id(&self, name: &str, session_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO sessions(name, omp_session_id, updated_at) VALUES (?1, ?2, {NOW})
+                 ON CONFLICT(name) DO UPDATE SET omp_session_id = excluded.omp_session_id,
+                                                 updated_at = excluded.updated_at"
+            ),
+            params![name, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stores a new running lane for a `lane_start` tool call, in one transaction. A
+    /// repeated `tool_call_id` returns the lane it already started; at `max_running`
+    /// running lanes nothing is stored.
+    pub fn start_lane(
+        &mut self,
+        tool_call_id: &str,
+        conversation_key: &str,
+        task: &str,
+        max_running: usize,
+    ) -> Result<LaneStart, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM lanes WHERE tool_call_id = ?1",
+                [tool_call_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(LaneStart::Existing(id));
+        }
+        if running_lanes(&tx)? >= max_running {
+            return Ok(LaneStart::Limit);
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO lanes(tool_call_id, conversation_key, task, state, prompts, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'running', 1, {NOW}, {NOW})"
+            ),
+            params![tool_call_id, conversation_key, task],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(LaneStart::New(id))
+    }
+
+    /// Moves a lane that is not running back to `running` for one more prompt, in one
+    /// transaction, and returns that prompt's sequence number.
+    pub fn message_lane(&mut self, id: i64, max_running: usize) -> Result<LaneMessage, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: Option<String> = tx
+            .query_row("SELECT state FROM lanes WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        match state.as_deref() {
+            None => return Ok(LaneMessage::Unknown),
+            Some("running") => return Ok(LaneMessage::Busy),
+            Some(_) => {}
+        }
+        if running_lanes(&tx)? >= max_running {
+            return Ok(LaneMessage::Limit);
+        }
+        let seq: i64 = tx.query_row(
+            &format!(
+                "UPDATE lanes SET state = 'running', error = NULL, prompts = prompts + 1, updated_at = {NOW}
+                 WHERE id = ?1 RETURNING prompts"
+            ),
+            [id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(LaneMessage::Seq(seq))
+    }
+
+    pub fn lane(&self, id: i64) -> Result<Option<LaneRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {LANE_COLS} FROM lanes WHERE id = ?1"),
+                [id],
+                map_lane,
+            )
+            .optional()?)
+    }
+
+    /// Every lane, oldest first.
+    pub fn lanes(&self) -> Result<Vec<LaneRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {LANE_COLS} FROM lanes ORDER BY id"))?;
+        Ok(stmt.query_map([], map_lane)?.collect::<Result<_, _>>()?)
+    }
+
+    pub fn set_lane_session_id(&self, id: i64, session_id: &str) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            &format!("UPDATE lanes SET omp_session_id = ?2, updated_at = {NOW} WHERE id = ?1"),
+            params![id, session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Invalid("no such lane"));
+        }
+        Ok(())
+    }
+
+    /// Stores lane prompt `seq`'s result as a queued inbox row of the lane's conversation
+    /// and sets the lane's state, in one transaction. A second call for the same `seq`
+    /// changes nothing and returns false.
+    pub fn finish_lane(
+        &mut self,
+        id: i64,
+        seq: i64,
+        text: &str,
+        state: LaneState,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key: String = tx
+            .query_row(
+                "SELECT conversation_key FROM lanes WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::Invalid("no such lane"))?;
+        let inserted = tx.execute(
+            &format!(
+                "INSERT INTO inbox(platform, message_id, conversation_key, author_id, text, state, received_at, updated_at, files_ready, origin)
+                 VALUES (?1, ?2, ?3, 'lane', ?4, 'queued', {NOW}, {NOW}, 1, 'lane')
+                 ON CONFLICT(platform, message_id) DO NOTHING"
+            ),
+            params![LANE_PLATFORM, format!("{id}:{seq}"), key, text],
+        )?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            &format!("UPDATE lanes SET state = ?2, error = ?3, updated_at = {NOW} WHERE id = ?1"),
+            params![id, state.as_str(), error],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Lanes a restart interrupted whose notice has not been posted yet.
+    pub fn lane_notices(&self) -> Result<Vec<LaneRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LANE_COLS} FROM lanes
+             WHERE state = 'needs_check' AND error = '{E_LANE_INTERRUPTED}' AND notice_sent = 0
+             ORDER BY id"
+        ))?;
+        Ok(stmt.query_map([], map_lane)?.collect::<Result<_, _>>()?)
+    }
+
+    pub fn mark_lane_notice_sent(&self, id: i64) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            &format!("UPDATE lanes SET notice_sent = 1, updated_at = {NOW} WHERE id = ?1"),
+            [id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Invalid("no such lane"));
+        }
+        Ok(())
     }
 
     pub fn remember_thread(&self, platform: &str, thread_id: &str) -> Result<(), StoreError> {
@@ -787,10 +1197,9 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'forced'); END;",
             )
             .unwrap();
-        assert!(
-            s.admit("test", "m1", "k1", "chan1", "111", "hello")
-                .is_err()
-        );
+        assert!(s
+            .admit("test", "m1", "k1", "chan1", "111", "hello")
+            .is_err());
         assert_eq!(s.count().unwrap(), 0);
     }
 
@@ -1331,5 +1740,398 @@ mod tests {
         let (_d, path, _s) = open_tmp();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0);
+    }
+
+    /// The slice-3 tables, written by hand so the slice-4 migration is tested against them.
+    const SLICE3_SCHEMA: &str = "
+        CREATE TABLE inbox(
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            conversation_key TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('queued','processing','reply_pending','done','failed','needs_check')),
+            reply TEXT,
+            notice_sent INTEGER NOT NULL DEFAULT 0,
+            received_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            error TEXT,
+            attachments TEXT,
+            files_ready INTEGER NOT NULL DEFAULT 1,
+            out_files TEXT,
+            text_sent INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(platform, message_id)
+        );
+        CREATE TABLE conversations(
+            conversation_key TEXT PRIMARY KEY,
+            platform TEXT,
+            channel_id TEXT NOT NULL,
+            omp_session_id TEXT,
+            created_at TEXT,
+            last_activity_at TEXT
+        );
+        CREATE TABLE known_threads(
+            platform TEXT,
+            thread_id TEXT,
+            PRIMARY KEY(platform, thread_id)
+        );
+    ";
+
+    const K1: &str = "p:th:111";
+    const K2: &str = "p:th:222";
+
+    fn tables(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn state_of(s: &Store, id: i64) -> (State, Option<String>) {
+        let row = s.get(id).unwrap().unwrap();
+        (row.state, row.error)
+    }
+
+    fn claimed(s: &mut Store, mid: &str, key: &str) -> i64 {
+        let id = new_id(admit(s, mid, key));
+        assert!(s.claim(id).unwrap());
+        id
+    }
+
+    fn new_lane(s: &mut Store, call: &str, key: &str) -> i64 {
+        match s.start_lane(call, key, "task", 3).unwrap() {
+            LaneStart::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice3_database_gains_lead_tables_and_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE3_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO inbox(platform, message_id, conversation_key, author_id, text, state, reply, received_at, updated_at)
+             VALUES ('test', 'm1', ?1, '111', 'hello', 'done', 'r', 't', 't')",
+            [K1],
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            let cols = columns(&s.conn);
+            for c in ["origin", "steered_into"] {
+                assert!(cols.iter().any(|x| x == c), "missing column {c}");
+            }
+            let names = tables(&s.conn);
+            for t in ["sessions", "lanes"] {
+                assert!(names.iter().any(|x| x == t), "missing table {t}");
+            }
+            let row = s.get(1).unwrap().unwrap();
+            assert_eq!(row.origin, "owner");
+            assert_eq!(row.steered_into, None);
+            assert_eq!(row.state, State::Done);
+            assert_eq!(s.count().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn session_id_roundtrip() {
+        let (_d, path, s) = open_tmp();
+        assert_eq!(s.session_id("lead").unwrap(), None);
+        s.set_session_id("lead", "sess-1").unwrap();
+        assert_eq!(s.session_id("lead").unwrap().as_deref(), Some("sess-1"));
+        s.set_session_id("lead", "sess-2").unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.session_id("lead").unwrap().as_deref(), Some("sess-2"));
+        assert_eq!(s.session_id("other").unwrap(), None);
+    }
+
+    #[test]
+    fn claim_and_steer_are_exclusive() {
+        let (_d, _p, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        assert!(!s.claim(st).unwrap());
+        let row = s.get(st).unwrap().unwrap();
+        assert_eq!(row.state, State::Processing);
+        assert_eq!(row.steered_into, Some(m));
+        let t = new_id(admit(&mut s, "m3", K2));
+        assert!(s.claim(t).unwrap());
+        assert!(!s.steer_into(t, m).unwrap());
+        assert_eq!(s.get(t).unwrap().unwrap().steered_into, None);
+    }
+
+    #[test]
+    fn steer_refused_while_older_row_of_conversation_queued() {
+        let (_d, _p, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let o = new_id(admit(&mut s, "m2", K1));
+        let n = new_id(admit(&mut s, "m3", K1));
+        let x = new_id(admit(&mut s, "m4", K2));
+        assert!(!s.steer_into(n, m).unwrap());
+        assert_eq!(state_of(&s, n).0, State::Queued);
+        assert!(s.steer_into(x, m).unwrap());
+        assert!(s.claim(o).unwrap());
+        assert!(s.steer_into(n, m).unwrap());
+        assert_eq!(state_of(&s, n).0, State::Processing);
+    }
+
+    #[test]
+    fn steer_never_older_than_main() {
+        let (_d, _p, mut s) = open_tmp();
+        let e = new_id(admit(&mut s, "m1", K1));
+        let m = new_id(admit(&mut s, "m2", K1));
+        assert!(s.claim(m).unwrap());
+        assert!(!s.steer_into(e, m).unwrap());
+        let row = s.get(e).unwrap().unwrap();
+        assert_eq!(row.state, State::Queued);
+        assert_eq!(row.steered_into, None);
+        assert!(s.claim(e).unwrap());
+        let n = new_id(admit(&mut s, "m3", K1));
+        assert!(s.steer_into(n, m).unwrap());
+    }
+
+    #[test]
+    fn finish_group_marks_main_reply_pending_and_steered_done() {
+        let (_d, _p, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        s.finish_group(m, "both", Some("[]"), Some(st)).unwrap();
+        let main = s.get(m).unwrap().unwrap();
+        assert_eq!(main.state, State::ReplyPending);
+        assert_eq!(main.reply.as_deref(), Some("both"));
+        assert_eq!(main.out_files.as_deref(), Some("[]"));
+        let steered = s.get(st).unwrap().unwrap();
+        assert_eq!(steered.state, State::Done);
+        assert_eq!(steered.reply, None);
+        // Without a steer only the main row changes.
+        let solo = claimed(&mut s, "m3", K2);
+        s.finish_group(solo, "one", None, None).unwrap();
+        assert_eq!(state_of(&s, solo).0, State::ReplyPending);
+    }
+
+    #[test]
+    fn fail_group_marks_all_failed() {
+        let (_d, _p, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        let other = new_id(admit(&mut s, "m3", K2));
+        s.fail_group(&[m, st], "E_TEST").unwrap();
+        for id in [m, st] {
+            assert_eq!(
+                state_of(&s, id),
+                (State::Failed, Some("E_TEST".to_string()))
+            );
+        }
+        assert_eq!(state_of(&s, other), (State::Queued, None));
+    }
+
+    #[test]
+    fn interrupt_group_holds_queued_rows_of_each_conversation() {
+        let (_d, _p, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        let same = new_id(admit(&mut s, "m3", K1));
+        let other = new_id(admit(&mut s, "m4", K2));
+        s.interrupt_group(&[m, st], "E_CHILD_LOST").unwrap();
+        for id in [m, st] {
+            assert_eq!(
+                state_of(&s, id),
+                (State::NeedsCheck, Some("E_CHILD_LOST".to_string()))
+            );
+        }
+        assert_eq!(
+            state_of(&s, same),
+            (State::NeedsCheck, Some(E_DISPATCH_HELD.to_string()))
+        );
+        assert_eq!(state_of(&s, other), (State::Queued, None));
+    }
+
+    #[test]
+    fn hold_skips_lane_result_rows() {
+        for restart in [false, true] {
+            let (_d, _p, mut s) = open_tmp();
+            let m = claimed(&mut s, "m1", K1);
+            let lane = new_lane(&mut s, "call-1", K1);
+            assert!(s.finish_lane(lane, 1, "r", LaneState::Idle, None).unwrap());
+            let l = s.next_queued().unwrap().unwrap().id;
+            let q = new_id(admit(&mut s, "m2", K1));
+            let main_error = if restart {
+                s.recover_on_start().unwrap();
+                "interrupted"
+            } else {
+                s.interrupt_group(&[m], "E_CHILD_LOST").unwrap();
+                "E_CHILD_LOST"
+            };
+            assert_eq!(
+                state_of(&s, m),
+                (State::NeedsCheck, Some(main_error.to_string()))
+            );
+            assert_eq!(
+                state_of(&s, q),
+                (State::NeedsCheck, Some(E_DISPATCH_HELD.to_string()))
+            );
+            assert_eq!(state_of(&s, l), (State::Queued, None));
+            assert_eq!(s.next_queued().unwrap().unwrap().id, l);
+        }
+    }
+
+    #[test]
+    fn start_lane_dedups_tool_call_and_caps_running() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert_eq!(
+            s.start_lane("call-a", K1, "task", 3).unwrap(),
+            LaneStart::Existing(a)
+        );
+        new_lane(&mut s, "call-b", K1);
+        new_lane(&mut s, "call-c", K2);
+        assert_eq!(
+            s.start_lane("call-d", K1, "task", 3).unwrap(),
+            LaneStart::Limit
+        );
+        assert_eq!(s.lanes().unwrap().len(), 3);
+        assert!(s.finish_lane(a, 1, "done", LaneState::Idle, None).unwrap());
+        assert!(matches!(
+            s.start_lane("call-d", K1, "task", 3).unwrap(),
+            LaneStart::New(_)
+        ));
+        let row = s.lane(a).unwrap().unwrap();
+        assert_eq!(row.state, LaneState::Idle);
+        assert_eq!(row.prompts, 1);
+        assert_eq!(row.conversation_key, K1);
+    }
+
+    #[test]
+    fn message_lane_refuses_busy_and_unknown_and_counts_seq() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert_eq!(s.message_lane(a, 3).unwrap(), LaneMessage::Busy);
+        assert_eq!(s.message_lane(a + 100, 3).unwrap(), LaneMessage::Unknown);
+        assert!(s.finish_lane(a, 1, "done", LaneState::Idle, None).unwrap());
+        // At the cap an idle lane may not run again.
+        new_lane(&mut s, "call-b", K1);
+        assert_eq!(s.message_lane(a, 1).unwrap(), LaneMessage::Limit);
+        assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Idle);
+        assert_eq!(s.message_lane(a, 3).unwrap(), LaneMessage::Seq(2));
+        let row = s.lane(a).unwrap().unwrap();
+        assert_eq!(row.state, LaneState::Running);
+        assert_eq!(row.prompts, 2);
+    }
+
+    #[test]
+    fn finish_lane_inserts_one_result_row_once() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert!(s
+            .finish_lane(a, 1, "result", LaneState::Idle, None)
+            .unwrap());
+        assert_eq!(s.count().unwrap(), 1);
+        let row = s.next_queued().unwrap().unwrap();
+        assert_eq!(row.platform, "lane");
+        assert_eq!(row.message_id, format!("{a}:1"));
+        assert_eq!(row.origin, "lane");
+        assert_eq!(row.author_id, "lane");
+        assert_eq!(row.conversation_key, K1);
+        assert_eq!(row.text, "result");
+        assert!(row.files_ready);
+        assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Idle);
+        // A forced duplicate changes neither the inbox nor the lane.
+        assert!(!s
+            .finish_lane(a, 1, "again", LaneState::Failed, Some("E_TEST"))
+            .unwrap());
+        assert_eq!(s.count().unwrap(), 1);
+        let lane = s.lane(a).unwrap().unwrap();
+        assert_eq!(lane.state, LaneState::Idle);
+        assert_eq!(lane.error, None);
+    }
+
+    #[test]
+    fn finish_lane_does_not_touch_conversations() {
+        let (_d, _p, mut s) = open_tmp();
+        admit(&mut s, "m1", K1);
+        let count = |s: &Store| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = count(&s);
+        let a = new_lane(&mut s, "call-a", K2);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        assert_eq!(count(&s), before);
+        assert_eq!(s.channel_of(K2).unwrap(), None);
+    }
+
+    #[test]
+    fn restart_marks_running_lanes_needs_check_once() {
+        let (_d, path, mut s) = open_tmp();
+        let r = new_lane(&mut s, "call-r", K1);
+        let t = new_lane(&mut s, "call-t", K1);
+        let i = new_lane(&mut s, "call-i", K2);
+        assert!(s
+            .finish_lane(t, 1, "cut", LaneState::NeedsCheck, Some("E_TURN_TIMEOUT"))
+            .unwrap());
+        assert!(s.finish_lane(i, 1, "ok", LaneState::Idle, None).unwrap());
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        s.recover_on_start().unwrap();
+        let row = s.lane(r).unwrap().unwrap();
+        assert_eq!(row.state, LaneState::NeedsCheck);
+        assert_eq!(row.error.as_deref(), Some(E_LANE_INTERRUPTED));
+        assert!(!row.notice_sent);
+        let notices: Vec<i64> = s.lane_notices().unwrap().iter().map(|l| l.id).collect();
+        assert_eq!(notices, vec![r]);
+        s.mark_lane_notice_sent(r).unwrap();
+        assert!(s.lane_notices().unwrap().is_empty());
+        s.recover_on_start().unwrap();
+        assert!(s.lane_notices().unwrap().is_empty());
+        let timed_out = s.lane(t).unwrap().unwrap();
+        assert_eq!(timed_out.state, LaneState::NeedsCheck);
+        assert_eq!(timed_out.error.as_deref(), Some("E_TURN_TIMEOUT"));
+        let idle = s.lane(i).unwrap().unwrap();
+        assert_eq!(idle.state, LaneState::Idle);
+        assert_eq!(idle.error, None);
+    }
+
+    #[test]
+    fn restart_marks_steered_rows_needs_check() {
+        let (_d, path, mut s) = open_tmp();
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        let rec = s.recover_on_start().unwrap();
+        let ids: Vec<i64> = rec.needs_check.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![m, st]);
+        assert_eq!(state_of(&s, m).0, State::NeedsCheck);
+        assert_eq!(state_of(&s, st).0, State::NeedsCheck);
+    }
+
+    #[test]
+    fn lane_session_id_is_stored() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert_eq!(s.lane(a).unwrap().unwrap().omp_session_id, None);
+        s.set_lane_session_id(a, "lane-sess").unwrap();
+        assert_eq!(
+            s.lane(a).unwrap().unwrap().omp_session_id.as_deref(),
+            Some("lane-sess")
+        );
+        assert_eq!(
+            s.set_lane_session_id(a + 100, "x").unwrap_err().code(),
+            E_STORE_INVALID
+        );
     }
 }
