@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig};
+use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::Store;
 use serde_json::Value;
@@ -31,13 +31,13 @@ impl Harness {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&work_dir).expect("work dir");
         let config = Config {
-            owner_id: 111,
-            token_file: home.join("secrets").join("discord.token"),
+            messenger: Platform::Discord,
             work_dir,
             omp_path: PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             home: home.clone(),
             access_mode: AccessMode::OwnerOnly,
-            discord: DiscordConfig { channel_id: 222 },
+            discord: Some(DiscordConfig { owner_id: 111, channel_id: 222, token_file: home.join("secrets").join("discord.token") }),
+            slack: None,
             omp,
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");

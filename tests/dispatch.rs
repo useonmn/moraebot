@@ -9,7 +9,7 @@ use moraebot::access::DropReason;
 use moraebot::adapter::{
     AdapterError, E_ADAPTER_THREAD, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig};
+use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, MESSAGE_LIMIT, N_FAILED, N_INTERRUPTED,
     N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
@@ -58,13 +58,13 @@ impl Harness {
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
             .expect("token mode");
         let config = Config {
-            owner_id: OWNER.parse().unwrap(),
-            token_file,
+            messenger: Platform::Discord,
             work_dir,
             omp_path,
             home: home.clone(),
             access_mode: AccessMode::OwnerOnly,
-            discord: DiscordConfig { channel_id: CHANNEL.parse().unwrap() },
+            discord: Some(DiscordConfig { owner_id: OWNER.parse().unwrap(), channel_id: CHANNEL.parse().unwrap(), token_file }),
+            slack: None,
             omp: OmpConfig::default(),
         };
         let store = Arc::new(Mutex::new(Store::open(&home.join("inbox.sqlite")).expect("store")));

@@ -129,7 +129,6 @@ pub enum Handled {
 }
 
 pub struct Dispatcher {
-    config: Config,
     owner_id: String,
     adapter: Arc<dyn MessengerAdapter>,
     store: Arc<Mutex<Store>>,
@@ -150,8 +149,7 @@ impl Dispatcher {
         omp: OmpManager,
     ) -> Self {
         Self {
-            config: config.clone(),
-            owner_id: config.owner_id.to_string(),
+            owner_id: config.owner_id(),
             adapter,
             store,
             omp,
@@ -249,7 +247,7 @@ impl Dispatcher {
 
     /// Owner check, input filter, conversation key, store-first admission, thread creation.
     pub async fn handle_event(&self, event: InboundEvent) -> Result<Handled, StoreError> {
-        if let Decision::Drop(reason) = access::allow(&event, &self.config) {
+        if let Decision::Drop(reason) = access::allow(&event, &self.owner_id) {
             tracing::info!(
                 message_id = %event.message_id,
                 author_id = %event.author_id,

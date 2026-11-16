@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    report_checks, AccessMode, Config, ConfigError, DiscordConfig, Env, OmpConfig,
+    report_checks, AccessMode, Config, ConfigError, DiscordConfig, Env, OmpConfig, Platform,
     E_CHANNEL_MISSING, E_IO, E_OMP_MISSING, E_OWNER_MISSING,
 };
 
@@ -86,13 +86,17 @@ pub fn build_config(answers: &Answers, env: &Env) -> Result<Config, ConfigError>
     };
     let home = env.default_home()?;
     Ok(Config {
-        owner_id,
-        token_file: home.join("secrets").join(TOKEN_FILE_NAME),
+        messenger: Platform::Discord,
+        discord: Some(DiscordConfig {
+            owner_id,
+            channel_id,
+            token_file: home.join("secrets").join(TOKEN_FILE_NAME),
+        }),
+        slack: None,
         work_dir: env.expand_tilde(Path::new(work_dir))?,
         omp_path: env.expand_tilde(Path::new(omp_path))?,
         home,
         access_mode: AccessMode::OwnerOnly,
-        discord: DiscordConfig { channel_id },
         omp: OmpConfig::default(),
     })
 }
@@ -265,13 +269,18 @@ pub fn run<R: BufRead, W: Write>(
         env,
     )?;
     config.ensure_home_layout()?;
-    write_private_file(&config.token_file, token.as_bytes())?;
+    let token_file = config
+        .discord
+        .as_ref()
+        .map(|d| d.token_file.clone())
+        .expect("build_config sets the discord section");
+    write_private_file(&token_file, token.as_bytes())?;
     write_private_file(&config_path, config.to_toml()?.as_bytes())?;
     writeln!(prompter.out, "Wrote {}", config_path.display())?;
     writeln!(
         prompter.out,
         "Wrote token file {} (mode 600)",
-        config.token_file.display()
+        token_file.display()
     )?;
 
     writeln!(prompter.out, "Checking the new config:")?;
@@ -358,12 +367,13 @@ mod tests {
     fn build_config_maps_answers() {
         let fx = Fixture::new();
         let cfg = build_config(&fx.answers(), &fx.env).expect("builds");
-        assert_eq!(cfg.owner_id, 111);
-        assert_eq!(cfg.discord.channel_id, 222);
+        let discord = cfg.discord.as_ref().expect("discord section");
+        assert_eq!(cfg.owner_id(), "111");
+        assert_eq!(discord.channel_id, 222);
         assert_eq!(cfg.omp_path, fx.omp);
         assert_eq!(cfg.home, fx.dir.path().join("mhome"));
         assert_eq!(
-            cfg.token_file,
+            discord.token_file,
             fx.dir.path().join("mhome/secrets/discord.token")
         );
         assert_eq!(cfg.work_dir, fx.dir.path().join("moraebot-work"));
@@ -413,7 +423,8 @@ mod tests {
         let fx = Fixture::new();
         let cfg = build_config(&fx.answers(), &fx.env).expect("builds");
         cfg.ensure_home_layout().expect("layout");
-        write_private_file(&cfg.token_file, b"x").expect("token");
+        let token_file = cfg.discord.as_ref().expect("discord section").token_file.clone();
+        write_private_file(&token_file, b"x").expect("token");
         cfg.validate().expect("valid");
     }
 
@@ -461,7 +472,7 @@ mod tests {
         assert!(!out.contains("TOKEN_SENTINEL_9f3a"));
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
         loaded.validate().expect("valid");
-        assert_eq!(loaded.owner_id, 111);
+        assert_eq!(loaded.owner_id(), "111");
     }
 
     #[test]
@@ -479,8 +490,8 @@ mod tests {
         assert_eq!(
             Config::load(&fx.config_path(), &fx.env)
                 .expect("loads")
-                .owner_id,
-            111
+                .owner_id(),
+            "111"
         );
     }
 
@@ -499,7 +510,8 @@ mod tests {
             InitOutcome::Written { checks_ok: true }
         );
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
-        assert_eq!((loaded.owner_id, loaded.discord.channel_id), (111, 222));
+        let discord = loaded.discord.as_ref().expect("discord section");
+        assert_eq!((loaded.owner_id(), discord.channel_id), ("111".to_string(), 222));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
-use moraebot::config::{AccessMode, Config, DiscordConfig, E_TOKEN_MODE, OmpConfig};
+use moraebot::config::{AccessMode, Config, DiscordConfig, E_TOKEN_MODE, OmpConfig, Platform};
 use moraebot::dispatch::{E_DISPATCH_HELD, N_INTERRUPTED, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::store::{E_ALREADY_RUNNING, State, Store};
@@ -147,13 +147,13 @@ impl Rig {
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
             .expect("token mode");
         let config = Config {
-            owner_id: OWNER.parse().unwrap(),
-            token_file,
+            messenger: Platform::Discord,
             work_dir,
             omp_path: PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             home,
             access_mode: AccessMode::OwnerOnly,
-            discord: DiscordConfig { channel_id: CHANNEL.parse().unwrap() },
+            discord: Some(DiscordConfig { owner_id: OWNER.parse().unwrap(), channel_id: CHANNEL.parse().unwrap(), token_file }),
+            slack: None,
             omp: OmpConfig::default(),
         };
         Self { _dir: dir, root, config, adapter: Arc::new(FakeAdapter::new()) }

@@ -24,7 +24,7 @@ use crate::adapter::{
     AdapterError, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD, InboundEvent,
     MessengerAdapter, SendResult, TypingHandle, split_reply,
 };
-use crate::config::Config;
+use crate::config::{Config, E_MESSENGER_MISSING};
 
 pub const PLATFORM: &str = "discord";
 /// Discord's message length limit, counted in characters.
@@ -290,11 +290,15 @@ impl DiscordAdapter {
     }
 
     pub fn from_config(config: &Config) -> Result<Self, AdapterError> {
+        let discord = config.discord.as_ref().ok_or_else(|| AdapterError {
+            code: E_MESSENGER_MISSING,
+            message: "the [discord] config section is missing".into(),
+        })?;
         Self::new(
-            &config.token_file,
+            &discord.token_file,
             Scope {
-                owner_id: config.owner_id,
-                channel_id: config.discord.channel_id,
+                owner_id: discord.owner_id,
+                channel_id: discord.channel_id,
             },
         )
     }
