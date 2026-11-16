@@ -17,7 +17,17 @@
 //! at dequeue); if that fails it becomes `failed` with one notice in the channel, and it
 //! never reaches omp.
 //!
-//! One worker serves the global FIFO with one message in flight. A reply is stored
+//! One lead omp session serves every conversation. Each owner row reaches it as
+//! [`lead::owner_input`] (a tag line naming its conversation and row, then the text with
+//! the saved-files block); a lane-result row (`origin = 'lane'`) carries its stored text
+//! and skips the owner check. Every reply goes to `reply_target(row.conversation_key)`.
+//!
+//! A message of the conversation whose lead turn is running is steered into that turn
+//! once its files are saved, when the store accepts the claim ([`Store::steer_into`]);
+//! otherwise it is queued. A turn and its steered row form one group: one reply on the
+//! main row, or one outcome for both (`needs_check` wins over `failed`).
+//!
+//! One worker serves the global FIFO with one lead turn in flight. A reply is stored
 //! (`reply_pending`) before it is sent and the row becomes `done` only after every chunk
 //! was accepted; a failed send is retried after the adapter reconnects and at startup.
 //! Interrupted work (`needs_check`) is never re-prompted; its conversation gets one
@@ -43,7 +53,8 @@ use crate::adapter::{
 };
 use crate::config::Config;
 use crate::files::{self, OutFile, SavedFile};
-use crate::omp::{E_COST_CAP, OmpManager, Outcome, key_slug};
+use crate::lead;
+use crate::omp::{E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
 
@@ -67,6 +78,8 @@ pub const N_FILE_NOT_RECEIVED: &str = "N_FILE_NOT_RECEIVED";
 pub const N_FILE_NOT_ALLOWED: &str = "N_FILE_NOT_ALLOWED";
 /// A file the agent queued was skipped or its upload failed; posted once per reply.
 pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
+/// A lane was running when the gateway stopped; it was not resumed.
+pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -101,6 +114,10 @@ pub fn notice_text(code: &str) -> &'static str {
         N_FILE_NOT_SENT => {
             "A file from the agent could not be sent, or sending it was interrupted. If this \
              keeps happening, check the bot's file permission (README: Upgrading)."
+        }
+        N_LANE_INTERRUPTED => {
+            "A background task was interrupted by a restart and was not resumed. Ask again if it \
+             is still needed."
         }
         _ => "Something went wrong.",
     }
@@ -158,6 +175,50 @@ fn declared_json(attachments: &[InboundAttachment]) -> String {
     serde_json::Value::Array(declared).to_string()
 }
 
+/// The out-file list stored with a reply for the files `send_file` queued; `None` when
+/// there are none.
+fn out_files_json(files: Vec<PathBuf>) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let entries: Vec<OutFile> = files
+        .into_iter()
+        .map(|path| OutFile {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_owned()),
+            path,
+            sent: false,
+            skipped: false,
+            attempting: false,
+            attempts: 0,
+        })
+        .collect();
+    Some(serde_json::to_string(&entries).expect("out-file list serializes to JSON"))
+}
+
+/// The reply text of one group member; `None` when it did not reply.
+fn reply_text(outcome: &Outcome) -> Option<&str> {
+    match outcome {
+        Outcome::Reply(text) => Some(text),
+        Outcome::NoAgent => Some(notice_text(N_NO_AGENT)),
+        Outcome::Failed { .. } | Outcome::NeedsCheck { .. } => None,
+    }
+}
+
+/// The group's one reply: the texts in send order, consecutive equal texts once, joined
+/// by a blank line.
+fn combine_replies<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for text in texts {
+        if kept.last() != Some(&text) {
+            kept.push(text);
+        }
+    }
+    kept.join("\n\n")
+}
+
 /// Resolves at the adapter's next reconnect; never, when it has no reconnect signal.
 async fn next_reconnect(reconnects: &mut Option<watch::Receiver<u64>>) {
     let Some(rx) = reconnects else {
@@ -182,6 +243,9 @@ pub enum Handled {
     /// held under its earlier notice when it was held meanwhile).
     FilesRejected(&'static str),
     Queued(i64),
+    /// Stored and sent into the running lead turn of its conversation; answered in that
+    /// turn's reply.
+    Steered(i64),
 }
 
 pub struct Dispatcher {
@@ -231,10 +295,12 @@ impl Dispatcher {
     /// rows gets one notice, rows that failed for their files get their pending notice, a
     /// reply whose file upload was cut gets one file notice (the file is skipped), stored
     /// replies are re-sent. A row cut off by a crash and one marked by a graceful shutdown
-    /// are treated the same.
+    /// are treated the same. A lane a restart interrupted gets one notice in its
+    /// conversation.
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
         self.post_needs_check_notices().await?;
+        self.post_lane_notices().await?;
         self.post_failed_file_notices().await?;
         for id in recovered.interrupted_uploads {
             let Some(row) = self.store().get(id)? else {
@@ -283,15 +349,21 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Closes the live omp child, if any.
+    /// Stops the lead child, even in the middle of a turn, and every lane child.
     pub async fn shutdown(&self) {
         self.omp.shutdown_all().await;
+    }
+
+    /// `Some(conversation key)` while a lead turn that accepts a steer runs.
+    pub fn running_turn(&self) -> watch::Receiver<Option<String>> {
+        self.omp.running_turn()
     }
 
     /// Serves the queue and re-sends failed replies after each adapter reconnect. Both run
     /// on this one task, so a reconnect seen during a turn is handled right after it, once
     /// the turn's failed send was remembered.
     async fn work_loop(&self, mut reconnects: Option<watch::Receiver<u64>>) {
+        let lane_wake = self.omp.lane_wake();
         loop {
             if let Some(rx) = reconnects.as_mut()
                 && rx.has_changed().unwrap_or(false)
@@ -311,6 +383,7 @@ impl Dispatcher {
                     biased;
                     () = next_reconnect(&mut reconnects) => self.resend_after_reconnect().await,
                     () = self.wake.notified() => {}
+                    () = lane_wake.notified() => {}
                 }
             }
         }
@@ -400,15 +473,17 @@ impl Dispatcher {
             id
         };
 
+        let mut saved: Vec<SavedFile> = Vec::new();
         if !event.attachments.is_empty() {
             let fetched = self.fetch_files(id, &key, &event.attachments).await;
             let _gate = self.admission.lock().await;
             match fetched {
-                Ok(saved) => {
-                    let json = serde_json::to_string(&saved)
+                Ok(files) => {
+                    let json = serde_json::to_string(&files)
                         .expect("saved-file metadata serializes to JSON");
                     self.store().files_saved(id, &json)?;
-                    tracing::info!(row = id, count = saved.len(), "attachments saved");
+                    tracing::info!(row = id, count = files.len(), "attachments saved");
+                    saved = files;
                 }
                 Err(err) => {
                     tracing::warn!(row = id, code = err.code, "attachments not received");
@@ -424,9 +499,28 @@ impl Dispatcher {
                 }
             }
         }
+        // The same body the worker would send for this row.
+        let body = lead::owner_input(
+            key.as_str(),
+            id,
+            &files::prompt_with_files(&event.text, &saved),
+        );
+        let mut claim_error = None;
+        let steered = self.omp.try_steer(key.as_str(), id, &body, |main| {
+            self.store().steer_into(id, main).unwrap_or_else(|err| {
+                claim_error = Some(err);
+                false
+            })
+        });
+        if steered {
+            return Ok(Handled::Steered(id));
+        }
         tracing::info!(row = id, conversation = key.as_str(), "message queued");
         self.wake.notify_one();
-        Ok(Handled::Queued(id))
+        match claim_error {
+            Some(err) => Err(err),
+            None => Ok(Handled::Queued(id)),
+        }
     }
 
     /// Fetches every attachment of row `id` into its own inbox folder, one after another,
@@ -461,18 +555,24 @@ impl Dispatcher {
         Ok(saved)
     }
 
-    /// Serves the oldest queued row. Returns `false` when the queue is empty.
+    /// Serves the oldest queued row: claims it (a row a steer claimed first is skipped),
+    /// runs one lead turn for it and settles the turn's group. Returns `false` when the
+    /// queue is empty.
     pub async fn process_next(&self) -> Result<bool, StoreError> {
         let row = {
             let _gate = self.admission.lock().await;
-            self.store().next_queued()?
-        };
-        let Some(row) = row else {
-            return Ok(false);
+            let Some(row) = self.store().next_queued()? else {
+                return Ok(false);
+            };
+            if !self.store().claim(row.id)? {
+                return Ok(true);
+            }
+            row
         };
         let key = row.conversation_key.as_str();
+        let from_owner = row.origin == "owner";
 
-        if row.author_id != self.owner_id {
+        if from_owner && row.author_id != self.owner_id {
             tracing::warn!(
                 row = row.id,
                 code = E_ACCESS_NOT_OWNER,
@@ -496,26 +596,30 @@ impl Dispatcher {
             return Ok(true);
         }
 
-        let saved: Vec<SavedFile> = match row.attachments.as_deref().map(serde_json::from_str) {
-            None => Vec::new(),
-            Some(Ok(saved)) => saved,
-            Some(Err(_)) => {
-                tracing::warn!(
-                    row = row.id,
-                    code = files::E_FILE_INCOMPLETE,
-                    "stored file list unreadable"
-                );
-                self.store()
-                    .mark(row.id, State::Failed, Some(files::E_FILE_INCOMPLETE))?;
-                if self.notify(target, N_FILE_NOT_RECEIVED).await {
-                    self.store().mark_notice_sent(row.id)?;
+        let prompt = if from_owner {
+            let saved: Vec<SavedFile> = match row.attachments.as_deref().map(serde_json::from_str) {
+                None => Vec::new(),
+                Some(Ok(saved)) => saved,
+                Some(Err(_)) => {
+                    tracing::warn!(
+                        row = row.id,
+                        code = files::E_FILE_INCOMPLETE,
+                        "stored file list unreadable"
+                    );
+                    self.store()
+                        .mark(row.id, State::Failed, Some(files::E_FILE_INCOMPLETE))?;
+                    if self.notify(target, N_FILE_NOT_RECEIVED).await {
+                        self.store().mark_notice_sent(row.id)?;
+                    }
+                    return Ok(true);
                 }
-                return Ok(true);
-            }
+            };
+            lead::owner_input(key, row.id, &files::prompt_with_files(&row.text, &saved))
+        } else {
+            // A lane result row stores the lead input `finish_lane` built.
+            row.text.clone()
         };
-        let prompt = files::prompt_with_files(&row.text, &saved);
 
-        self.store().mark(row.id, State::Processing, None)?;
         let typing = match self.adapter.start_typing(target).await {
             Ok(handle) => Some(handle),
             Err(err) => {
@@ -523,55 +627,59 @@ impl Dispatcher {
                 None
             }
         };
-        let report = self.omp.prompt(key, row.id, &prompt).await.main;
+        let group = self.omp.prompt(key, row.id, &prompt).await;
         drop(typing);
-
-        match report.outcome {
-            Outcome::Reply(reply) => {
-                let out_files = (!report.files.is_empty()).then(|| {
-                    let entries: Vec<OutFile> = report
-                        .files
-                        .into_iter()
-                        .map(|path| OutFile {
-                            name: path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "file".to_owned()),
-                            path,
-                            sent: false,
-                            skipped: false,
-                            attempting: false,
-                            attempts: 0,
-                        })
-                        .collect();
-                    serde_json::to_string(&entries).expect("out-file list serializes to JSON")
-                });
-                self.store()
-                    .save_reply(row.id, &reply, out_files.as_deref())?;
-                self.send_reply(row.id).await?;
-            }
-            Outcome::NoAgent => {
-                let reply = notice_text(N_NO_AGENT);
-                self.store().save_reply(row.id, reply, None)?;
-                self.send_reply(row.id).await?;
-            }
-            Outcome::Failed { code, .. } => {
-                tracing::warn!(row = row.id, code, "turn failed");
-                self.store().mark(row.id, State::Failed, Some(code))?;
-                let notice = if code == E_COST_CAP {
-                    N_COST_CAP
-                } else {
-                    N_FAILED
-                };
-                self.notify(target, notice).await;
-            }
-            Outcome::NeedsCheck { code, .. } => {
-                tracing::warn!(row = row.id, code, "turn interrupted");
-                self.store().mark_interrupted(row.id, code)?;
-                self.post_needs_check_notices().await?;
-            }
-        }
+        self.settle_group(row.id, target, group).await?;
         Ok(true)
+    }
+
+    /// Stores the outcome of a lead turn and its steered row, if any: one reply on the
+    /// main row (the steered row `done`), else every member `needs_check` with the
+    /// conversation's notice, else every member `failed` with one notice.
+    async fn settle_group(
+        &self,
+        main_id: i64,
+        target: &str,
+        group: GroupReport,
+    ) -> Result<(), StoreError> {
+        let GroupReport { main, steered } = group;
+        let steered_id = steered.as_ref().map(|(id, _)| *id);
+        let mut ids = vec![main_id];
+        ids.extend(steered_id);
+        let outcomes: Vec<&Outcome> = std::iter::once(&main.outcome)
+            .chain(steered.as_ref().map(|(_, outcome)| outcome))
+            .collect();
+
+        if let Some(code) = outcomes.iter().find_map(|outcome| match outcome {
+            Outcome::NeedsCheck { code, .. } => Some(*code),
+            _ => None,
+        }) {
+            tracing::warn!(row = main_id, steered = ?steered_id, code, "turn interrupted");
+            self.store().interrupt_group(&ids, code)?;
+            self.post_needs_check_notices().await?;
+            return Ok(());
+        }
+        if let Some(code) = outcomes.iter().find_map(|outcome| match outcome {
+            Outcome::Failed { code, .. } => Some(*code),
+            _ => None,
+        }) {
+            tracing::warn!(row = main_id, steered = ?steered_id, code, "turn failed");
+            self.store().fail_group(&ids, code)?;
+            let notice = if code == E_COST_CAP {
+                N_COST_CAP
+            } else {
+                N_FAILED
+            };
+            self.notify(target, notice).await;
+            return Ok(());
+        }
+
+        let reply = combine_replies(outcomes.iter().filter_map(|outcome| reply_text(outcome)));
+        let out_files = out_files_json(main.files);
+        self.store()
+            .finish_group(main_id, &reply, out_files.as_deref(), steered_id)?;
+        self.send_reply(main_id).await?;
+        Ok(())
     }
 
     /// Opens the thread of a queued thread-starter row whose creation never completed.
@@ -785,6 +893,26 @@ impl Dispatcher {
                 for id in ids {
                     store.mark_notice_sent(id)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Posts one [`N_LANE_INTERRUPTED`] per lane a restart interrupted, in the
+    /// conversation that started it; `notice_sent` records the delivery.
+    async fn post_lane_notices(&self) -> Result<(), StoreError> {
+        let lanes = self.store().lane_notices()?;
+        for lane in lanes {
+            let Some(target) = reply_target(&lane.conversation_key) else {
+                continue;
+            };
+            tracing::warn!(
+                lane = lane.id,
+                code = N_LANE_INTERRUPTED,
+                "lane was interrupted by a restart"
+            );
+            if self.notify(target, N_LANE_INTERRUPTED).await {
+                self.store().mark_lane_notice_sent(lane.id)?;
             }
         }
         Ok(())

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use moraebot::access::DropReason;
+use moraebot::access::{DropReason, E_ACCESS_NOT_OWNER};
 use moraebot::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_THREAD, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
     InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
@@ -13,15 +13,20 @@ use moraebot::adapter::{
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
-    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_REPLY_TRUNCATED, N_THREAD_FAILED,
-    N_UNSUPPORTED_INPUT, notice_text, reply_messages,
+    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_REPLY_TRUNCATED,
+    N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
-use moraebot::files::{self, OutFile};
+use moraebot::files::{self, OutFile, SavedFile};
+use moraebot::gateway::Gateway;
+use moraebot::hints;
+use moraebot::lane::MAX_RUNNING_LANES;
+use moraebot::lead::{self, LaneResult};
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
-use moraebot::store::{State, Store};
+use moraebot::store::{Admitted, LaneStart, LaneState, State, Store};
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 const LIMIT: usize = 2000;
 const OWNER: &str = "111";
@@ -29,6 +34,32 @@ const STRANGER: &str = "222";
 const CHANNEL: &str = "333";
 const BOUND: Duration = Duration::from_secs(30);
 const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
+
+/// The config of a test home under `root` (created, with its token file).
+fn test_config(root: &Path, omp_path: PathBuf) -> Config {
+    let home = root.join("home");
+    let work_dir = root.join("work");
+    std::fs::create_dir_all(home.join("secrets")).expect("home");
+    std::fs::create_dir_all(&work_dir).expect("work dir");
+    let token_file = home.join("secrets").join("discord.token");
+    std::fs::write(&token_file, TOKEN_SENTINEL).expect("token file");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+        .expect("token mode");
+    Config {
+        messenger: Platform::Discord,
+        work_dir,
+        omp_path,
+        home,
+        access_mode: AccessMode::OwnerOnly,
+        discord: Some(DiscordConfig {
+            owner_id: OWNER.parse().unwrap(),
+            channel_id: CHANNEL.parse().unwrap(),
+            token_file,
+        }),
+        slack: None,
+        omp: OmpConfig::default(),
+    }
+}
 
 struct Harness {
     root: PathBuf,
@@ -82,28 +113,8 @@ impl Harness {
         fail_threads: bool,
         extra_env: Vec<(&'static str, String)>,
     ) -> Self {
-        let home = root.join("home");
-        let work_dir = root.join("work");
-        std::fs::create_dir_all(home.join("secrets")).expect("home");
-        std::fs::create_dir_all(&work_dir).expect("work dir");
-        let token_file = home.join("secrets").join("discord.token");
-        std::fs::write(&token_file, TOKEN_SENTINEL).expect("token file");
-        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
-            .expect("token mode");
-        let config = Config {
-            messenger: Platform::Discord,
-            work_dir,
-            omp_path,
-            home: home.clone(),
-            access_mode: AccessMode::OwnerOnly,
-            discord: Some(DiscordConfig {
-                owner_id: OWNER.parse().unwrap(),
-                channel_id: CHANNEL.parse().unwrap(),
-                token_file,
-            }),
-            slack: None,
-            omp: OmpConfig::default(),
-        };
+        let config = test_config(root, omp_path);
+        let home = config.home.clone();
         let store = Arc::new(Mutex::new(
             Store::open(&home.join("inbox.sqlite")).expect("store"),
         ));
@@ -169,11 +180,23 @@ impl Harness {
             .collect()
     }
 
+    /// Every prompt frame, its `message` turned into the body: the frame must start with a
+    /// moraebot tag line, which is dropped.
     fn prompts(&self) -> Vec<Value> {
         self.log_lines()
             .iter()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .filter(|f| f["type"] == "prompt")
+            .map(|mut frame| {
+                let message = frame["message"].as_str().expect("prompt message");
+                assert!(
+                    lead::parse_tag(message).is_some(),
+                    "prompt starts with a moraebot tag"
+                );
+                let body = message.split_once('\n').map_or("", |(_, body)| body);
+                frame["message"] = Value::String(body.to_owned());
+                frame
+            })
             .collect()
     }
 
@@ -1730,4 +1753,560 @@ async fn next_message_waits_while_file_downloads() {
     runner.abort();
     let _ = runner.await;
     h.close().await;
+}
+
+// --- One lead for every conversation, lane rows and steer (todo 7) ---
+
+const THREAD_A: &str = "111";
+const THREAD_B: &str = "222";
+const DM_CHANNEL: &str = "D333";
+const LANE_KEY: &str = "discord:th:222";
+
+fn in_thread(message_id: &str, thread: &str, text: &str) -> InboundEvent {
+    event(message_id, OWNER, Some(thread), text)
+}
+
+fn dm(message_id: &str, channel: &str, text: &str) -> InboundEvent {
+    let mut ev = event(message_id, OWNER, None, text);
+    ev.channel_id = channel.into();
+    ev.is_dm = true;
+    ev
+}
+
+fn steered(handled: Handled) -> i64 {
+    match handled {
+        Handled::Steered(id) => id,
+        other => panic!("expected Steered, got {other:?}"),
+    }
+}
+
+impl Harness {
+    /// fake-omp in mode `steer`: the first prompt starts a run and waits for a steer,
+    /// answered per `case` (`merged`, `separate`, `hold`).
+    fn open_steer(root: &Path, case: &str) -> Self {
+        Self::build(
+            root,
+            "steer",
+            PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+            false,
+            vec![("FAKE_OMP_STEER_CASE", case.to_owned())],
+        )
+    }
+
+    /// Runs one worker step on its own task: it returns once the turn's group is settled.
+    fn spawn_step(&self) -> JoinHandle<bool> {
+        let dispatcher = Arc::clone(&self.dispatcher);
+        tokio::spawn(async move { dispatcher.process_next().await.expect("worker step") })
+    }
+
+    /// Waits until the lead reported the start of a turn for conversation `key`.
+    async fn wait_turn(&self, key: &str) {
+        let mut turn = self.dispatcher.running_turn();
+        bounded(turn.wait_for(|running| running.as_deref() == Some(key)))
+            .await
+            .map(|_| ())
+            .expect("omp manager alive");
+    }
+
+    /// Handles an event on its own task (for an event whose fetch is held).
+    fn spawn_handle(&self, ev: InboundEvent) -> JoinHandle<Handled> {
+        let dispatcher = Arc::clone(&self.dispatcher);
+        tokio::spawn(async move { dispatcher.handle_event(ev).await.expect("handle event") })
+    }
+
+    async fn wait_for_fetch(&self) {
+        bounded(
+            self.adapter
+                .wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+        )
+        .await;
+    }
+
+    /// The raw prompt frames, tag line included.
+    fn raw_prompts(&self) -> Vec<Value> {
+        self.log_lines()
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|f| f["type"] == "prompt")
+            .collect()
+    }
+}
+
+fn behavior(frame: &Value) -> &str {
+    frame["streamingBehavior"].as_str().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn prompt_carries_conversation_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(
+        h.handle(dm("1300000000000000900", DM_CHANNEL, "hello"))
+            .await,
+    );
+    h.drain().await;
+
+    let frames = h.raw_prompts();
+    assert_eq!(frames.len(), 1);
+    let message = frames[0]["message"].as_str().unwrap();
+    assert!(message.starts_with("[moraebot conversation="));
+    let tag = lead::parse_tag(message).expect("tag line");
+    assert_eq!(tag.conversation, h.row(id).conversation_key);
+    assert_eq!(tag.message, Some(id));
+    assert_eq!(tag.lane, None);
+    assert_eq!(
+        h.sends(),
+        [(DM_CHANNEL.to_owned(), "echo: hello".to_owned())]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn replies_go_to_each_message_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    queued(
+        h.handle(in_thread("1300000000000000901", THREAD_B, "in thread"))
+            .await,
+    );
+    queued(
+        h.handle(dm("1300000000000000902", DM_CHANNEL, "in dm"))
+            .await,
+    );
+    h.drain().await;
+
+    assert_eq!(
+        h.sends(),
+        [
+            (THREAD_B.to_owned(), "echo: in thread".to_owned()),
+            (DM_CHANNEL.to_owned(), "echo: in dm".to_owned()),
+        ]
+    );
+    assert_eq!(h.starts(), 1, "one lead child serves both conversations");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn lane_row_runs_without_owner_check_and_replies_to_lane_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane("toolu_1", LANE_KEY, "t", MAX_RUNNING_LANES)
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected a new lane, got {other:?}"),
+    };
+    let input = lead::lane_result(LANE_KEY, lane, &LaneResult::Text("lane done"));
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, &input, LaneState::Idle, None)
+            .unwrap()
+    );
+    h.drain().await;
+
+    let row = h.row(1);
+    assert_eq!(row.origin, "lane");
+    assert_eq!(row.state, State::Done);
+    assert_eq!(
+        h.sends(),
+        [(THREAD_B.to_owned(), "echo: lane done".to_owned())]
+    );
+    let frames = h.raw_prompts();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0]["message"],
+        input.as_str(),
+        "the stored input is sent as is"
+    );
+
+    // An owner-origin row with a foreign author is still refused.
+    let foreign = match h
+        .store
+        .lock()
+        .unwrap()
+        .admit(
+            "fake",
+            "1300000000000000903",
+            LANE_KEY,
+            CHANNEL,
+            STRANGER,
+            "x",
+        )
+        .unwrap()
+    {
+        Admitted::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    };
+    h.drain().await;
+    let row = h.row(foreign);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(E_ACCESS_NOT_OWNER));
+    assert_eq!(
+        h.raw_prompts().len(),
+        1,
+        "the foreign row never reaches omp"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn same_conversation_message_is_steered_into_running_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000910", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    let b = steered(
+        h.handle(in_thread("1300000000000000911", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+
+    assert_eq!(h.sends(), [(THREAD_A.to_owned(), "echo: A + B".to_owned())]);
+    assert_eq!(h.row(a).state, State::Done);
+    let row_b = h.row(b);
+    assert_eq!(row_b.state, State::Done);
+    assert_eq!(row_b.reply, None);
+    assert_eq!(row_b.steered_into, Some(a));
+    let prompts = h.prompts();
+    assert_eq!(prompts.len(), 2, "no second prompt for B");
+    assert_eq!(behavior(&prompts[0]), "followUp");
+    assert_eq!(behavior(&prompts[1]), "steer");
+    assert_eq!(prompts[1]["message"], "B");
+    assert!(!h.step().await, "nothing left to run");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn separate_steer_answers_are_posted_once_each_in_one_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "separate");
+    let a = queued(
+        h.handle(in_thread("1300000000000000920", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    let b = steered(
+        h.handle(in_thread("1300000000000000921", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+
+    assert_eq!(
+        h.sends(),
+        [(THREAD_A.to_owned(), "echo: A\n\necho: B".to_owned())]
+    );
+    assert_eq!(h.row(a).state, State::Done);
+    assert_eq!(h.row(b).state, State::Done);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn other_conversation_message_waits_for_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000930", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    let c = queued(
+        h.handle(in_thread("1300000000000000931", THREAD_B, "C"))
+            .await,
+    );
+    // The steer releases A's turn; without it the turn would never end.
+    steered(
+        h.handle(in_thread("1300000000000000932", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    h.drain().await;
+    bounded(h.adapter.wait_for_send(2)).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0].0, THREAD_A);
+    assert!(sends[0].1.contains("echo: A + B"));
+    assert_eq!(sends[1], (THREAD_B.to_owned(), "echo: C".to_owned()));
+    assert_eq!(h.row(c).state, State::Done);
+    let prompts = h.prompts();
+    let steer = prompts
+        .iter()
+        .position(|f| behavior(f) == "steer")
+        .expect("steer frame");
+    let c_frame = prompts
+        .iter()
+        .position(|f| f["message"] == "C")
+        .expect("C's prompt frame");
+    assert!(c_frame > steer, "C runs as a later turn");
+    assert_eq!(behavior(&prompts[c_frame]), "followUp");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn older_queued_message_of_conversation_blocks_steer() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000940", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+
+    h.adapter.set_attachment_bytes("ref-b", b"bbb".to_vec());
+    let gate = h.adapter.hold_next_fetch();
+    let b_task = h.spawn_handle(with_files(
+        in_thread("1300000000000000941", THREAD_A, "B"),
+        vec![attachment("b.txt", "ref-b", 3)],
+    ));
+    h.wait_for_fetch().await;
+    let waiting = h.row(2);
+    assert_eq!(waiting.state, State::Queued);
+    assert!(!waiting.files_ready);
+    let c = queued(
+        h.handle(in_thread("1300000000000000942", THREAD_A, "C"))
+            .await,
+    );
+    gate.notify_one();
+    let b = steered(bounded(b_task).await.unwrap());
+    assert_eq!(b, 2);
+    assert!(bounded(step).await.unwrap());
+    h.drain().await;
+    bounded(h.adapter.wait_for_send(2)).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0].0, THREAD_A);
+    assert!(
+        sends[0]
+            .1
+            .starts_with("echo: A + B\n\n[Attached files, saved on disk]\n"),
+        "A's and B's texts, A first"
+    );
+    assert_eq!(sends[1], (THREAD_A.to_owned(), "echo: C".to_owned()));
+    assert_eq!(h.row(c).state, State::Done);
+
+    let prompts = h.prompts();
+    let steer = prompts
+        .iter()
+        .position(|f| behavior(f) == "steer")
+        .expect("steer frame");
+    let body = prompts[steer]["message"].as_str().unwrap();
+    assert!(body.starts_with("B\n\n[Attached files, saved on disk]\n"));
+    let saved: Vec<SavedFile> =
+        serde_json::from_str(h.row(b).attachments.as_deref().expect("saved files")).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(body.contains(saved[0].path.to_string_lossy().as_ref()));
+    let c_frame = prompts
+        .iter()
+        .position(|f| f["message"] == "C")
+        .expect("C's prompt frame");
+    assert!(c_frame > steer, "C runs after the steer");
+    assert_eq!(behavior(&prompts[c_frame]), "followUp");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn group_needs_check_marks_every_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "hold");
+    let a = queued(
+        h.handle(in_thread("1300000000000000950", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    let b = steered(
+        h.handle(in_thread("1300000000000000951", THREAD_A, "B"))
+            .await,
+    );
+
+    let gate = h.adapter.hold_next_fetch();
+    let d_task = h.spawn_handle(with_files(
+        in_thread("1300000000000000952", THREAD_A, "D"),
+        vec![attachment("d.txt", "ref-d", 3)],
+    ));
+    h.wait_for_fetch().await;
+    let d = 3;
+    assert_eq!(h.row(d).text, "D");
+    assert_eq!(h.row(d).state, State::Queued);
+
+    // `hold` never ends the turn: only a shutdown that does not wait on it ends it.
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+    bounded(h.adapter.wait_for_send(1)).await;
+
+    for id in [a, b] {
+        let row = h.row(id);
+        assert_eq!(row.state, State::NeedsCheck);
+        assert_eq!(row.error.as_deref(), Some(E_CHILD_LOST));
+    }
+    let row_d = h.row(d);
+    assert_eq!(row_d.state, State::NeedsCheck);
+    assert_eq!(row_d.error.as_deref(), Some(E_DISPATCH_HELD));
+    assert_eq!(notices(&h, N_INTERRUPTED), 1);
+    assert_eq!(
+        h.sends(),
+        [(THREAD_A.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
+
+    gate.notify_one();
+    bounded(d_task).await.unwrap();
+    assert_eq!(h.row(d).state, State::NeedsCheck);
+    assert_eq!(h.prompts().len(), 2, "A and B's steer only");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn second_same_conversation_message_waits_for_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "hold");
+    let a = queued(
+        h.handle(in_thread("1300000000000000960", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    let b = steered(
+        h.handle(in_thread("1300000000000000961", THREAD_A, "B"))
+            .await,
+    );
+    let c = queued(
+        h.handle(in_thread("1300000000000000962", THREAD_A, "C"))
+            .await,
+    );
+
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+    bounded(h.adapter.wait_for_send(1)).await;
+
+    for id in [a, b] {
+        let row = h.row(id);
+        assert_eq!(row.state, State::NeedsCheck);
+        assert_eq!(row.error.as_deref(), Some(E_CHILD_LOST));
+    }
+    let row_c = h.row(c);
+    assert_eq!(row_c.state, State::NeedsCheck);
+    assert_eq!(row_c.error.as_deref(), Some(E_DISPATCH_HELD));
+    assert_eq!(
+        h.sends(),
+        [(THREAD_A.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
+    assert_eq!(h.prompts().len(), 2, "A and B's steer only");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn startup_posts_lane_interrupted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let lane = {
+        let mut store = h.store.lock().unwrap();
+        let lane = match store
+            .start_lane("toolu_1", LANE_KEY, "t", MAX_RUNNING_LANES)
+            .unwrap()
+        {
+            LaneStart::New(id) => id,
+            other => panic!("expected a new lane, got {other:?}"),
+        };
+        store.recover_on_start().unwrap();
+        lane
+    };
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(
+        h.sends(),
+        [(
+            THREAD_B.to_owned(),
+            notice_text(N_LANE_INTERRUPTED).to_owned()
+        )]
+    );
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .lane(lane)
+            .unwrap()
+            .unwrap()
+            .notice_sent
+    );
+
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(notices(&h, N_LANE_INTERRUPTED), 1, "posted once");
+    assert_eq!(h.raw_prompts().len(), 0, "nothing is re-prompted");
+    h.close().await;
+}
+
+/// Runs a gateway on a fresh home under `root` (with `lead_override` as
+/// `<home>/hints/lead.md`), serves one DM and returns the lead's
+/// `--append-system-prompt=` argv elements.
+async fn lead_system_prompt_flags(root: &Path, lead_override: Option<&str>) -> Vec<String> {
+    let config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    if let Some(text) = lead_override {
+        let path = hints::override_path(&config.home, lead::GUIDANCE_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+    let log = root.join("fake-omp.log");
+    let adapter = Arc::new(FakeAdapter::new());
+    let as_dyn: Arc<dyn MessengerAdapter> = adapter.clone();
+    let vars = [
+        ("FAKE_OMP_MODE", "ok".to_owned()),
+        ("FAKE_OMP_LOG", log.to_string_lossy().into_owned()),
+    ];
+    let gateway = Gateway::open(&config, as_dyn)
+        .expect("open gateway")
+        .with_omp(|omp| omp.with_extra_env(vars));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(gateway.run(async {
+        let _ = stopped.await;
+    }));
+    adapter
+        .inject(dm("1300000000000000970", DM_CHANNEL, "hello"))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    let _ = stop.send(());
+    bounded(task).await.unwrap().expect("clean stop");
+
+    let log = std::fs::read_to_string(&log).expect("fake-omp log");
+    let starts: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.strip_prefix("START pid="))
+        .collect();
+    assert_eq!(starts.len(), 1, "one lead child");
+    let (_, argv) = starts[0].split_once(" argv=").expect("argv field");
+    let argv: Vec<String> = serde_json::from_str(argv).expect("argv JSON");
+    argv.into_iter()
+        .filter(|a| a.starts_with("--append-system-prompt"))
+        .collect()
+}
+
+#[tokio::test]
+async fn gateway_appends_lead_guidance_then_messenger_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let hints_text = FakeAdapter::new().behavior_hints();
+    let flag = "--append-system-prompt=";
+
+    let first_line = lead::DEFAULT_GUIDANCE.lines().next().unwrap();
+    let built_in = lead_system_prompt_flags(&dir.path().join("built-in"), None).await;
+    assert_eq!(built_in.len(), 1);
+    assert!(built_in[0].starts_with(&format!("{flag}{first_line}")));
+    assert!(built_in[0].ends_with(&format!("\n\n{hints_text}")));
+
+    let custom = lead_system_prompt_flags(&dir.path().join("custom"), Some("custom lead\n")).await;
+    assert_eq!(custom, [format!("{flag}custom lead\n\n{hints_text}")]);
+
+    let empty = lead_system_prompt_flags(&dir.path().join("empty"), Some("")).await;
+    assert_eq!(empty, [format!("{flag}{hints_text}")]);
 }

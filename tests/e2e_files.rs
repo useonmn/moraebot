@@ -18,6 +18,7 @@ use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, S
 use moraebot::dispatch::{N_FILE_NOT_SENT, notice_text};
 use moraebot::files::INBOX_DIR;
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
+use moraebot::lead;
 use moraebot::slack::{SlackAdapter, escape_text};
 use moraebot::store::{State, Store};
 use moraebot::testing::{
@@ -85,13 +86,24 @@ impl LogTap {
         .await;
     }
 
-    /// The `message` of every prompt frame fake-omp received, in order.
+    /// The body of every prompt frame fake-omp received, in order: its `message` must
+    /// start with a moraebot tag line, which is dropped.
     fn prompts(&self) -> Vec<String> {
         self.seen
             .iter()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|frame| frame["type"] == "prompt")
-            .map(|frame| frame["message"].as_str().unwrap_or_default().to_owned())
+            .map(|frame| {
+                let message = frame["message"].as_str().unwrap_or_default();
+                assert!(
+                    lead::parse_tag(message).is_some(),
+                    "prompt starts with a moraebot tag"
+                );
+                message
+                    .split_once('\n')
+                    .map_or("", |(_, body)| body)
+                    .to_owned()
+            })
             .collect()
     }
 

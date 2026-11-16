@@ -14,6 +14,7 @@ use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, E_TOKEN_MODE, OmpConfig, Platform};
 use moraebot::dispatch::{E_DISPATCH_HELD, N_INTERRUPTED, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
+use moraebot::lead;
 use moraebot::store::{E_ALREADY_RUNNING, State, Store};
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
@@ -229,6 +230,20 @@ impl Rig {
     }
 }
 
+/// The body of a logged prompt frame: its `message` must start with a moraebot tag line,
+/// which is dropped.
+fn prompt_body(frame: &Value) -> String {
+    let message = frame["message"].as_str().expect("prompt message");
+    assert!(
+        lead::parse_tag(message).is_some(),
+        "prompt starts with a moraebot tag"
+    );
+    message
+        .split_once('\n')
+        .map_or("", |(_, body)| body)
+        .to_owned()
+}
+
 fn owner_message(message_id: &str, text: &str) -> InboundEvent {
     InboundEvent {
         message_id: message_id.into(),
@@ -331,17 +346,18 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
         .await;
     bounded(BOUND, adapter.wait_for_send(2)).await;
     tap.wait_for(|line| {
-        serde_json::from_str::<Value>(line).is_ok_and(|frame| frame["message"] == "third")
+        serde_json::from_str::<Value>(line)
+            .is_ok_and(|frame| frame["type"] == "prompt" && prompt_body(&frame) == "third")
     })
     .await;
     running.stop().await.expect("clean stop");
 
-    let messages: Vec<Value> = tap
+    let messages: Vec<String> = tap
         .seen
         .iter()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|frame| frame["type"] == "prompt")
-        .map(|frame| frame["message"].clone())
+        .map(|frame| prompt_body(&frame))
         .collect();
     assert_eq!(
         messages,

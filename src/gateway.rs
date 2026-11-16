@@ -5,19 +5,21 @@
 //! `moraebot run` passes the configured messenger's adapter.
 //!
 //! Shutdown order: stop taking events from the adapter, let the event being handled
-//! finish its store write, drop the in-flight turn, close and reap the omp child, then
-//! mark the interrupted row `needs_check` so it is never re-prompted.
+//! finish its store write, drop the in-flight turn, stop the lanes, kill and reap the
+//! lead and every lane child, then mark the interrupted rows and lanes `needs_check` so
+//! nothing is re-prompted.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinError;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
 use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
+use crate::lead;
 use crate::omp::OmpManager;
 use crate::store::{Store, StoreError};
 
@@ -70,13 +72,16 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// Opens the inbox and builds the omp manager with the adapter's behavior hints (or
-    /// the home's override file, `E_HINTS_FILE` when unusable). A second gateway on the
-    /// same home fails here with `E_ALREADY_RUNNING`. Nothing is started yet.
+    /// Opens the inbox and builds the omp manager with the lead guidance followed by the
+    /// adapter's behavior hints (each replaced by its override file in the home,
+    /// `E_HINTS_FILE` when unusable). A second gateway on the same home fails here with
+    /// `E_ALREADY_RUNNING`. Nothing is started yet.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
+        let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
-        let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_hints(hints);
+        let omp = OmpManager::new(config.clone(), Arc::clone(&store))
+            .with_hints(lead::system_prompt(&guidance, &hints));
         Ok(Self {
             config: config.clone(),
             adapter,
@@ -89,6 +94,12 @@ impl Gateway {
     pub fn with_omp(mut self, adjust: impl FnOnce(OmpManager) -> OmpManager) -> Self {
         self.omp = adjust(self.omp);
         self
+    }
+
+    /// `Some(conversation key)` while a lead turn that accepts a steer runs. Take it
+    /// before [`Self::run`] consumes the gateway.
+    pub fn running_turn(&self) -> watch::Receiver<Option<String>> {
+        self.omp.running_turn()
     }
 
     /// Serves until `shutdown` resolves (or the adapter stops), then shuts down cleanly.
@@ -123,14 +134,15 @@ impl Gateway {
 
         tracing::info!("gateway stopping");
         // Closing the queue ends the dispatcher: it finishes the event it is handling,
-        // drops the in-flight turn and closes the omp child.
+        // drops the in-flight turn and stops the lead and lane children.
         drop(events);
         drop(inbound);
         let finished = match ended_early {
             Some(finished) => finished,
             None => dispatch.await,
         };
-        // A turn that was cut off is still `processing`: make it `needs_check`.
+        // A turn that was cut off is still `processing` and a stopped lane `running`:
+        // make them `needs_check`.
         store
             .lock()
             .expect("store mutex poisoned")
