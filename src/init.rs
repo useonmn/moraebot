@@ -7,38 +7,60 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    report_checks, AccessMode, Config, ConfigError, DiscordConfig, Env, OmpConfig, Platform,
-    E_CHANNEL_MISSING, E_IO, E_OMP_MISSING, E_OWNER_MISSING,
+    AccessMode, Config, ConfigError, DiscordConfig, E_CHANNEL_MISSING, E_IO, E_OMP_MISSING,
+    E_OWNER_MISSING, Env, OmpConfig, Platform, SlackConfig, report_checks,
 };
 
 pub const E_INIT_EOF: &str = "E_INIT_EOF";
+pub const E_SETUP_NO_CONFIG: &str = "E_SETUP_NO_CONFIG";
+pub const E_SLACK_TOKEN_KIND: &str = "E_SLACK_TOKEN_KIND";
 
 const DEFAULT_WORK_DIR: &str = "~/moraebot-work";
 const TOKEN_FILE_NAME: &str = "discord.token";
+const SLACK_BOT_TOKEN_FILE_NAME: &str = "slack-bot.token";
+const SLACK_APP_TOKEN_FILE_NAME: &str = "slack-app.token";
+
+const SLACK_MANIFEST: &str = include_str!("../docs/guides/slack-manifest.json");
+const SLACK_GUIDE: &str = include_str!("../docs/guides/slack.md");
+const DISCORD_GUIDE: &str = include_str!("../docs/guides/discord.md");
+
+const BAD_ID: &str = "Please enter a non-zero number.";
+const BAD_SLACK_OWNER: &str =
+    "Please enter a Slack member id: capital letters and digits, starting with U or W.";
+const BAD_SLACK_CHANNEL: &str =
+    "Please enter a Slack channel id: capital letters and digits, starting with C or G.";
+const BAD_BOT_TOKEN: &str =
+    "E_SLACK_TOKEN_KIND: a Slack bot token starts with xoxb-. Please enter it again.";
+const BAD_APP_TOKEN: &str =
+    "E_SLACK_TOKEN_KIND: a Slack app token starts with xapp-. Please enter it again.";
 
 pub struct Messenger {
     pub name: &'static str,
-    pub available: bool,
+    /// `None` while the messenger is not implemented yet.
+    pub platform: Option<Platform>,
 }
 
 pub const MESSENGERS: [Messenger; 4] = [
     Messenger {
         name: "Discord",
-        available: true,
+        platform: Some(Platform::Discord),
     },
     Messenger {
         name: "Slack",
-        available: false,
+        platform: Some(Platform::Slack),
     },
     Messenger {
         name: "Telegram",
-        available: false,
+        platform: None,
     },
     Messenger {
         name: "WhatsApp",
-        available: false,
+        platform: None,
     },
 ];
+
+/// A token typed by the owner and the file it is saved to once every question is answered.
+type PendingToken = (PathBuf, Option<String>);
 
 /// Raw answers for the Discord messenger. The bot token is deliberately not part of this.
 #[derive(Debug, Clone)]
@@ -73,32 +95,91 @@ pub fn build_config(answers: &Answers, env: &Env) -> Result<Config, ConfigError>
             "the channel id must be a non-zero number",
         )
     })?;
-    let omp_path = answers.omp_path.trim();
+    let discord = DiscordConfig {
+        owner_id,
+        channel_id,
+        token_file: env.default_home()?.join("secrets").join(TOKEN_FILE_NAME),
+    };
+    assemble(
+        env,
+        Platform::Discord,
+        Some(discord),
+        None,
+        &answers.omp_path,
+        &answers.work_dir,
+    )
+}
+
+/// Builds a fresh config around one messenger section.
+fn assemble(
+    env: &Env,
+    messenger: Platform,
+    discord: Option<DiscordConfig>,
+    slack: Option<SlackConfig>,
+    omp_path: &str,
+    work_dir: &str,
+) -> Result<Config, ConfigError> {
+    let omp_path = omp_path.trim();
     if omp_path.is_empty() {
         return Err(ConfigError::new(
             E_OMP_MISSING,
             "the path to omp is required",
         ));
     }
-    let work_dir = match answers.work_dir.trim() {
+    let work_dir = match work_dir.trim() {
         "" => DEFAULT_WORK_DIR,
         typed => typed,
     };
-    let home = env.default_home()?;
     Ok(Config {
-        messenger: Platform::Discord,
-        discord: Some(DiscordConfig {
-            owner_id,
-            channel_id,
-            token_file: home.join("secrets").join(TOKEN_FILE_NAME),
-        }),
-        slack: None,
+        messenger,
+        discord,
+        slack,
         work_dir: env.expand_tilde(Path::new(work_dir))?,
         omp_path: env.expand_tilde(Path::new(omp_path))?,
-        home,
+        home: env.default_home()?,
         access_mode: AccessMode::OwnerOnly,
         omp: OmpConfig::default(),
     })
+}
+
+/// `moraebot guide <messenger>`: the same text as `docs/guides/<messenger>.md`.
+pub fn guide(messenger: Platform) -> &'static str {
+    match messenger {
+        Platform::Discord => DISCORD_GUIDE,
+        Platform::Slack => SLACK_GUIDE,
+    }
+}
+
+/// Link that opens Slack's app creation page with the manifest already filled in.
+pub fn slack_manifest_link() -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_str(SLACK_MANIFEST).expect("the embedded manifest is valid JSON");
+    format!(
+        "https://api.slack.com/apps?new_app=1&manifest_json={}",
+        percent_encode(&manifest.to_string())
+    )
+}
+
+/// Keeps `A-Z a-z 0-9 - _ . ~` and writes every other UTF-8 byte as `%XX`.
+fn percent_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len() * 2);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Slack ids are capital letters and digits; the first letter tells the kind.
+fn valid_slack_id(id: &str, first: &[char]) -> bool {
+    id.len() >= 2
+        && id.starts_with(first)
+        && id
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 pub fn is_executable_file(path: &Path) -> bool {
@@ -171,10 +252,172 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         }
     }
 
-    fn choose_messenger(&mut self) -> Result<(), ConfigError> {
+    /// Asks for an id. Enter keeps `existing` when there is one.
+    fn ask_id(
+        &mut self,
+        label: &str,
+        existing: Option<String>,
+        valid: impl Fn(&str) -> bool,
+        bad: &'static str,
+    ) -> Result<String, ConfigError> {
+        let prompt = match &existing {
+            Some(current) => format!("{label} [{current}]: "),
+            None => format!("{label}: "),
+        };
+        self.ask_until(&prompt, false, existing.is_some(), |line| {
+            let line = line.trim();
+            if line.is_empty() {
+                existing.clone().ok_or(bad)
+            } else if valid(line) {
+                Ok(line.to_string())
+            } else {
+                Err(bad)
+            }
+        })
+    }
+
+    /// Asks for a token without echo. Enter keeps the token already saved in `file`.
+    /// `kind` is the required prefix and the message shown when it does not match.
+    fn ask_token(
+        &mut self,
+        label: &str,
+        file: &Path,
+        kind: Option<(&'static str, &'static str)>,
+    ) -> Result<PendingToken, ConfigError> {
+        let saved = file.is_file();
+        let prompt = if saved {
+            format!("{label} (hidden) [Enter keeps the saved token]: ")
+        } else {
+            format!("{label} (hidden): ")
+        };
+        let token = self.ask_until(&prompt, true, saved, |line| {
+            let token = line.trim();
+            let token = token.strip_suffix(',').unwrap_or(token).trim();
+            if token.is_empty() {
+                return if saved {
+                    Ok(None)
+                } else {
+                    Err("The token cannot be empty.")
+                };
+            }
+            match kind {
+                Some((prefix, message)) if !token.starts_with(prefix) => Err(message),
+                _ => Ok(Some(token.to_string())),
+            }
+        })?;
+        Ok((file.to_path_buf(), token))
+    }
+
+    fn ask_discord(
+        &mut self,
+        existing: Option<&DiscordConfig>,
+        home: &Path,
+    ) -> Result<(DiscordConfig, Vec<PendingToken>), ConfigError> {
+        let owner_id = self.ask_id(
+            "Discord owner user id",
+            existing.map(|d| d.owner_id.to_string()),
+            |id| parse_id(id).is_some(),
+            BAD_ID,
+        )?;
+        let channel_id = self.ask_id(
+            "Discord channel id",
+            existing.map(|d| d.channel_id.to_string()),
+            |id| parse_id(id).is_some(),
+            BAD_ID,
+        )?;
+        let token_file = existing.map_or_else(
+            || home.join("secrets").join(TOKEN_FILE_NAME),
+            |d| d.token_file.clone(),
+        );
+        let token = self.ask_token("Discord bot token", &token_file, None)?;
+        let section = DiscordConfig {
+            owner_id: parse_id(&owner_id).expect("validated by ask_id"),
+            channel_id: parse_id(&channel_id).expect("validated by ask_id"),
+            token_file,
+        };
+        Ok((section, vec![token]))
+    }
+
+    fn ask_slack(
+        &mut self,
+        existing: Option<&SlackConfig>,
+        home: &Path,
+    ) -> Result<(SlackConfig, Vec<PendingToken>), ConfigError> {
+        let owner_id = self.ask_id(
+            "Slack owner member id (starts with U)",
+            existing.map(|s| s.owner_id.clone()),
+            |id| valid_slack_id(id, &['U', 'W']),
+            BAD_SLACK_OWNER,
+        )?;
+        let channel_id = self.ask_id(
+            "Slack channel id (starts with C or G)",
+            existing.map(|s| s.channel_id.clone()),
+            |id| valid_slack_id(id, &['C', 'G']),
+            BAD_SLACK_CHANNEL,
+        )?;
+        let bot_token_file = existing.map_or_else(
+            || home.join("secrets").join(SLACK_BOT_TOKEN_FILE_NAME),
+            |s| s.bot_token_file.clone(),
+        );
+        let app_token_file = existing.map_or_else(
+            || home.join("secrets").join(SLACK_APP_TOKEN_FILE_NAME),
+            |s| s.app_token_file.clone(),
+        );
+        let bot = self.ask_token(
+            "Slack bot token, xoxb-...",
+            &bot_token_file,
+            Some(("xoxb-", BAD_BOT_TOKEN)),
+        )?;
+        let app = self.ask_token(
+            "Slack app token, xapp-...",
+            &app_token_file,
+            Some(("xapp-", BAD_APP_TOKEN)),
+        )?;
+        let section = SlackConfig {
+            owner_id,
+            channel_id,
+            bot_token_file,
+            app_token_file,
+        };
+        Ok((section, vec![bot, app]))
+    }
+
+    fn print_slack_link(&mut self) -> Result<(), ConfigError> {
+        writeln!(
+            self.out,
+            "Create the Slack app with this link (the manifest is filled in):\n{}",
+            slack_manifest_link()
+        )?;
+        Ok(())
+    }
+
+    /// Writes the config and the typed tokens, then runs the checks on what was written.
+    fn finish(
+        &mut self,
+        config: &Config,
+        config_path: &Path,
+        env: &Env,
+        tokens: Vec<PendingToken>,
+    ) -> Result<InitOutcome, ConfigError> {
+        config.ensure_home_layout()?;
+        write_private_file(config_path, config.to_toml()?.as_bytes())?;
+        writeln!(self.out, "Wrote {}", config_path.display())?;
+        for (file, token) in tokens {
+            if let Some(token) = token {
+                write_private_file(&file, token.as_bytes())?;
+                writeln!(self.out, "Wrote token file {} (mode 600)", file.display())?;
+            }
+        }
+        writeln!(self.out, "Checking the new config:")?;
+        let loaded = Config::load(config_path, env)?;
+        let checks_ok = report_checks(&loaded.checks(), &mut self.out)?;
+        Ok(InitOutcome::Written { checks_ok })
+    }
+
+    fn choose_messenger(&mut self) -> Result<Platform, ConfigError> {
         writeln!(self.out, "Choose a messenger:")?;
         for (index, messenger) in MESSENGERS.iter().enumerate() {
-            let suffix = if messenger.available {
+            let suffix = if messenger.platform.is_some() {
                 ""
             } else {
                 " (coming later)"
@@ -189,7 +432,10 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
                 line.parse::<usize>().ok()
             };
             match choice.and_then(|n| MESSENGERS.get(n.wrapping_sub(1))) {
-                Some(messenger) if messenger.available => Ok(()),
+                Some(Messenger {
+                    platform: Some(platform),
+                    ..
+                }) => Ok(*platform),
                 Some(_) => Err("That messenger is coming later. Please choose an available one."),
                 None => Err("Please enter one of the listed numbers."),
             }
@@ -218,25 +464,19 @@ pub fn run<R: BufRead, W: Write>(
         }
     }
 
-    prompter.choose_messenger()?;
-    let owner_id = prompter.ask_until("Discord owner user id: ", false, false, |line| {
-        parse_id(line)
-            .map(|_| line.trim().to_string())
-            .ok_or("Please enter a non-zero number.")
-    })?;
-    let channel_id = prompter.ask_until("Discord channel id: ", false, false, |line| {
-        parse_id(line)
-            .map(|_| line.trim().to_string())
-            .ok_or("Please enter a non-zero number.")
-    })?;
-    let token = prompter.ask_until("Discord bot token (hidden): ", true, false, |line| {
-        let token = line.trim();
-        if token.is_empty() {
-            Err("The token cannot be empty.")
-        } else {
-            Ok(token.to_string())
+    let messenger = prompter.choose_messenger()?;
+    let home = env.default_home()?;
+    let (discord, slack, tokens) = match messenger {
+        Platform::Discord => {
+            let (section, tokens) = prompter.ask_discord(None, &home)?;
+            (Some(section), None, tokens)
         }
-    })?;
+        Platform::Slack => {
+            prompter.print_slack_link()?;
+            let (section, tokens) = prompter.ask_slack(None, &home)?;
+            (None, Some(section), tokens)
+        }
+    };
 
     let omp_default = find_in_path("omp", env.path.as_ref());
     let omp_prompt = match &omp_default {
@@ -259,34 +499,59 @@ pub fn run<R: BufRead, W: Write>(
     })?;
     let work_dir = prompter.ask_with_default(&format!("Work folder [{DEFAULT_WORK_DIR}]: "))?;
 
-    let config = build_config(
-        &Answers {
-            owner_id,
-            channel_id,
-            omp_path: omp_path.to_string_lossy().into_owned(),
-            work_dir,
-        },
+    let config = assemble(
         env,
+        messenger,
+        discord,
+        slack,
+        &omp_path.to_string_lossy(),
+        &work_dir,
     )?;
-    config.ensure_home_layout()?;
-    let token_file = config
-        .discord
-        .as_ref()
-        .map(|d| d.token_file.clone())
-        .expect("build_config sets the discord section");
-    write_private_file(&token_file, token.as_bytes())?;
-    write_private_file(&config_path, config.to_toml()?.as_bytes())?;
-    writeln!(prompter.out, "Wrote {}", config_path.display())?;
+    prompter.finish(&config, &config_path, env, tokens)
+}
+
+/// `moraebot setup <messenger>`: asks only that messenger's required fields, keeps every
+/// other config value and makes the messenger the active one.
+pub fn setup<R: BufRead, W: Write>(
+    env: &Env,
+    messenger: Platform,
+    input: R,
+    out: W,
+    is_tty: bool,
+) -> Result<InitOutcome, ConfigError> {
+    let mut prompter = Prompter { input, out, is_tty };
+    let config_path = env.default_config_path()?;
+    if !config_path.exists() {
+        return Err(ConfigError::new(
+            E_SETUP_NO_CONFIG,
+            format!(
+                "there is no config at {}; run `moraebot init` first",
+                config_path.display()
+            ),
+        ));
+    }
+    let mut config = Config::load(&config_path, env)?;
+    let tokens = match messenger {
+        Platform::Discord => {
+            let (section, tokens) = prompter.ask_discord(config.discord.as_ref(), &config.home)?;
+            config.discord = Some(section);
+            tokens
+        }
+        Platform::Slack => {
+            prompter.print_slack_link()?;
+            let (section, tokens) = prompter.ask_slack(config.slack.as_ref(), &config.home)?;
+            config.slack = Some(section);
+            tokens
+        }
+    };
+    config.messenger = messenger;
+    let outcome = prompter.finish(&config, &config_path, env, tokens)?;
     writeln!(
         prompter.out,
-        "Wrote token file {} (mode 600)",
-        token_file.display()
+        "{} is now the active messenger. Restart moraebot to use it.",
+        messenger.as_str()
     )?;
-
-    writeln!(prompter.out, "Checking the new config:")?;
-    let loaded = Config::load(&config_path, env)?;
-    let checks_ok = report_checks(&loaded.checks(), &mut prompter.out)?;
-    Ok(InitOutcome::Written { checks_ok })
+    Ok(outcome)
 }
 
 /// Replaces `path` with a new file readable only by the owner.
@@ -423,7 +688,12 @@ mod tests {
         let fx = Fixture::new();
         let cfg = build_config(&fx.answers(), &fx.env).expect("builds");
         cfg.ensure_home_layout().expect("layout");
-        let token_file = cfg.discord.as_ref().expect("discord section").token_file.clone();
+        let token_file = cfg
+            .discord
+            .as_ref()
+            .expect("discord section")
+            .token_file
+            .clone();
         write_private_file(&token_file, b"x").expect("token");
         cfg.validate().expect("valid");
     }
@@ -479,7 +749,7 @@ mod tests {
     fn unavailable_messenger_is_asked_again() {
         let fx = Fixture::new();
         let input = format!(
-            "2\n9\n1\n111\n222\nTOKEN_SENTINEL_9f3a\n{}\n\n",
+            "3\n9\n1\n111\n222\nTOKEN_SENTINEL_9f3a\n{}\n\n",
             fx.omp.display()
         );
         let (result, _) = fx.run(&input);
@@ -511,7 +781,10 @@ mod tests {
         );
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
         let discord = loaded.discord.as_ref().expect("discord section");
-        assert_eq!((loaded.owner_id(), discord.channel_id), ("111".to_string(), 222));
+        assert_eq!(
+            (loaded.owner_id(), discord.channel_id),
+            ("111".to_string(), 222)
+        );
     }
 
     #[test]
@@ -590,5 +863,201 @@ mod tests {
         let (result, _) = fx.run("1\n111\n");
         assert_eq!(code(result), E_INIT_EOF);
         assert!(!fx.config_path().exists());
+    }
+
+    const BOT: &str = "xoxb-test-SENTINEL1";
+    const APP: &str = "xapp-test-SENTINEL2";
+
+    impl Fixture {
+        fn setup(
+            &self,
+            messenger: Platform,
+            input: &str,
+        ) -> (Result<InitOutcome, ConfigError>, String) {
+            let mut out = Vec::new();
+            let result = setup(&self.env, messenger, input.as_bytes(), &mut out, false);
+            (result, String::from_utf8(out).expect("utf-8 output"))
+        }
+
+        fn secret(&self, name: &str) -> PathBuf {
+            self.dir.path().join("mhome/secrets").join(name)
+        }
+
+        fn slack_input(&self) -> String {
+            format!("U111\nC222\n{BOT}\n{APP}\n")
+        }
+    }
+
+    #[test]
+    fn init_slack_writes_slack_section_and_two_private_tokens() {
+        let fx = Fixture::new();
+        let input = format!("2\nU111\nC222\n{BOT}\n{APP}\n{}\n\n", fx.omp.display());
+        let (result, out) = fx.run(&input);
+        assert_eq!(
+            result.expect("init runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        for name in ["slack-bot.token", "slack-app.token"] {
+            let mode = fs::metadata(fx.secret(name))
+                .expect("token")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name}");
+        }
+        assert_eq!(
+            fs::read_to_string(fx.secret("slack-bot.token")).expect("bot"),
+            BOT
+        );
+        assert_eq!(
+            fs::read_to_string(fx.secret("slack-app.token")).expect("app"),
+            APP
+        );
+        let config_text = fs::read_to_string(fx.config_path()).expect("config");
+        assert!(config_text.contains("messenger = \"slack\""));
+        for text in [&config_text, &out] {
+            assert!(!text.contains("SENTINEL"));
+        }
+        let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
+        assert_eq!(loaded.messenger, Platform::Slack);
+        assert!(loaded.discord.is_none());
+    }
+
+    #[test]
+    fn setup_slack_keeps_discord_section_and_work_dir() {
+        let fx = Fixture::new();
+        let typed_work = fx.dir.path().join("typed-work");
+        let input = format!(
+            "1\n111\n222\nTOKEN_SENTINEL_9f3a\n{}\n{}\n",
+            fx.omp.display(),
+            typed_work.display()
+        );
+        assert!(fx.run(&input).0.is_ok());
+        let (result, out) = fx.setup(Platform::Slack, &fx.slack_input());
+        assert_eq!(
+            result.expect("setup runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        assert!(out.contains("slack is now the active messenger"));
+        let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
+        assert_eq!(loaded.messenger, Platform::Slack);
+        assert_eq!(loaded.work_dir, typed_work);
+        let discord = loaded.discord.as_ref().expect("discord kept");
+        assert_eq!((discord.owner_id, discord.channel_id), (111, 222));
+        assert_eq!(loaded.slack.as_ref().expect("slack").owner_id, "U111");
+        assert_eq!(
+            fs::read_to_string(fx.secret("discord.token")).expect("discord token"),
+            "TOKEN_SENTINEL_9f3a"
+        );
+    }
+
+    #[test]
+    fn setup_discord_on_legacy_config_rewrites_new_layout() {
+        let fx = Fixture::new();
+        let secrets = fx.dir.path().join("mhome/secrets");
+        fs::create_dir_all(&secrets).expect("mkdir");
+        let token = secrets.join("discord.token");
+        write_private_file(&token, b"saved").expect("token");
+        let legacy = format!(
+            "owner_id = 111\ntoken_file = {:?}\nomp_path = {:?}\n[discord]\nchannel_id = 222\n",
+            token.display().to_string(),
+            fx.omp.display().to_string()
+        );
+        fs::write(fx.config_path(), legacy).expect("legacy config");
+        let (result, _) = fx.setup(Platform::Discord, "\n\n\n");
+        assert_eq!(
+            result.expect("setup runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        let text = fs::read_to_string(fx.config_path()).expect("config");
+        assert!(
+            !text
+                .split("[discord]")
+                .next()
+                .expect("head")
+                .contains("owner_id")
+        );
+        let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
+        assert_eq!(loaded.discord.as_ref().expect("discord").owner_id, 111);
+        assert_eq!(fs::read_to_string(&token).expect("token"), "saved");
+    }
+
+    #[test]
+    fn setup_keeps_saved_tokens_on_enter() {
+        let fx = Fixture::new();
+        assert!(fx.setup_after_init_slack().is_ok());
+        let (result, out) = fx.setup(Platform::Slack, "U222\n\n\n\n");
+        assert!(result.is_ok());
+        assert!(out.contains("Enter keeps the saved token"));
+        assert_eq!(
+            fs::read_to_string(fx.secret("slack-bot.token")).expect("bot"),
+            BOT
+        );
+        assert_eq!(
+            fs::read_to_string(fx.secret("slack-app.token")).expect("app"),
+            APP
+        );
+        let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
+        let slack = loaded.slack.as_ref().expect("slack");
+        assert_eq!(
+            (slack.owner_id.as_str(), slack.channel_id.as_str()),
+            ("U222", "C222")
+        );
+    }
+
+    impl Fixture {
+        fn setup_after_init_slack(&self) -> Result<InitOutcome, ConfigError> {
+            let input = format!("2\nU111\nC222\n{BOT}\n{APP}\n{}\n\n", self.omp.display());
+            self.run(&input).0
+        }
+    }
+
+    #[test]
+    fn wrong_token_prefix_is_asked_again() {
+        let fx = Fixture::new();
+        assert!(fx.run(&fx.happy_input()).0.is_ok());
+        let input = format!("U111\nC222\n{APP}\n{BOT}\n{APP}\n");
+        let (result, out) = fx.setup(Platform::Slack, &input);
+        assert!(result.is_ok());
+        assert!(out.contains(E_SLACK_TOKEN_KIND));
+        assert_eq!(
+            fs::read_to_string(fx.secret("slack-bot.token")).expect("bot"),
+            BOT
+        );
+    }
+
+    #[test]
+    fn failed_setup_leaves_the_config_untouched() {
+        let fx = Fixture::new();
+        assert!(fx.run(&fx.happy_input()).0.is_ok());
+        let before = fs::read(fx.config_path()).expect("config");
+        let (result, _) = fx.setup(Platform::Slack, &format!("U111\nC222\n{APP}\n"));
+        assert_eq!(code(result), E_INIT_EOF);
+        assert_eq!(fs::read(fx.config_path()).expect("config"), before);
+        assert!(!fx.secret("slack-bot.token").exists());
+    }
+
+    #[test]
+    fn setup_without_config_is_setup_no_config() {
+        let fx = Fixture::new();
+        let (result, _) = fx.setup(Platform::Slack, &fx.slack_input());
+        assert_eq!(code(result), E_SETUP_NO_CONFIG);
+    }
+
+    #[test]
+    fn slack_ids_need_the_right_prefix() {
+        assert!(valid_slack_id("U111", &['U', 'W']));
+        assert!(valid_slack_id("C222", &['C', 'G']));
+        assert!(!valid_slack_id("111", &['U', 'W']));
+        assert!(!valid_slack_id("u111", &['U', 'W']));
+        assert!(!valid_slack_id("C2 2", &['C', 'G']));
+    }
+
+    #[test]
+    fn percent_encode_keeps_unreserved_only() {
+        assert_eq!(
+            percent_encode("a-b_c.d~E9 {\"é"),
+            "a-b_c.d~E9%20%7B%22%C3%A9"
+        );
     }
 }

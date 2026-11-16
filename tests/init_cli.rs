@@ -126,6 +126,172 @@ fn config_carries_its_own_home() {
         .arg(home.join("config.toml"))
         .output()
         .expect("check-config");
-    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stdout));
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
     assert!(!other_home.join(".moraebot").exists());
+}
+
+const BOT: &str = "xoxb-test-SENTINEL1";
+const APP: &str = "xapp-test-SENTINEL2";
+
+fn run_with_input(home: &Path, args: &[&str], input: &str) -> std::process::Output {
+    let mut child = moraebot(home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn moraebot");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write answers");
+    child.wait_with_output().expect("wait")
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex digits");
+            decoded.push(u8::from_str_radix(hex, 16).expect("hex"));
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).expect("utf-8")
+}
+
+#[test]
+fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+
+    let output = run_with_input(
+        &home,
+        &["setup", "slack"],
+        &format!("U111\nC222\n{BOT}\n{APP}\n"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+
+    for name in ["slack-bot.token", "slack-app.token"] {
+        let mode = fs::metadata(home.join("secrets").join(name))
+            .expect("token file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{name}");
+    }
+    let config_text = fs::read_to_string(home.join("config.toml")).expect("config.toml");
+    assert!(config_text.contains("messenger = \"slack\""));
+    assert!(config_text.contains("[discord]") && config_text.contains("[slack]"));
+    for text in [stdout.as_ref(), config_text.as_str()] {
+        assert!(!text.contains("SENTINEL"), "token leaked");
+    }
+
+    let check = moraebot(&home)
+        .arg("check-config")
+        .output()
+        .expect("check-config");
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+}
+
+#[test]
+fn setup_prints_manifest_link_that_decodes_to_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+
+    let output = run_with_input(
+        &home,
+        &["setup", "slack"],
+        &format!("U111\nC222\n{BOT}\n{APP}\n"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let link = stdout
+        .lines()
+        .find(|line| line.starts_with("https://api.slack.com/apps?new_app=1&manifest_json="))
+        .expect("link line");
+    let encoded = link.split("manifest_json=").nth(1).expect("parameter");
+    let printed: serde_json::Value =
+        serde_json::from_str(&percent_decode(encoded)).expect("decoded manifest is JSON");
+    let file: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/guides/slack-manifest.json"
+        ))
+        .expect("manifest file"),
+    )
+    .expect("manifest JSON");
+    assert_eq!(printed, file);
+}
+
+#[test]
+fn failed_setup_leaves_config_byte_identical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+    let before = fs::read(home.join("config.toml")).expect("config");
+
+    let output = run_with_input(&home, &["setup", "slack"], "U111\nC222\nxapp-test-x\n");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("E_SLACK_TOKEN_KIND"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E_INIT_EOF"));
+    assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
+}
+
+#[test]
+fn setup_without_config_fails_with_its_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = run_with_input(&tmp.path().join("home"), &["setup", "discord"], "");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E_SETUP_NO_CONFIG"));
+}
+
+#[test]
+fn guide_prints_embedded_guides() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for name in ["discord", "slack"] {
+        let output = moraebot(tmp.path())
+            .args(["guide", name])
+            .output()
+            .expect("guide");
+        assert!(output.status.success());
+        let file = fs::read_to_string(format!(
+            "{}/docs/guides/{name}.md",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("guide file");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), file);
+    }
+}
+
+#[test]
+fn unknown_messenger_is_usage_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for args in [["setup", "telegram"], ["guide", "telegram"]] {
+        let output = moraebot(tmp.path()).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
 }

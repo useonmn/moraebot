@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
-use moraebot::config::{report_checks, Config, ConfigError, Env};
+use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
 use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 /// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(20);
@@ -23,6 +23,8 @@ Usage: moraebot <command>
 
 Commands:
   init                          Ask a few questions and write the config
+  setup <discord|slack>         Re-run one messenger's questions and make it active
+  guide <discord|slack>         Print the setup guide for a messenger
   check-config [--config PATH]  Check the config and the things it points at
   run [--config PATH]           Run the gateway until SIGTERM or SIGINT
   install-launchd [--config PATH] [--label LABEL] [--dry-run]
@@ -37,6 +39,12 @@ enum Command {
         config: Option<PathBuf>,
     },
     Init,
+    Setup {
+        messenger: Platform,
+    },
+    Guide {
+        messenger: Platform,
+    },
     Run {
         config: Option<PathBuf>,
     },
@@ -59,9 +67,20 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "run" => parse_config_flag(rest).map(|config| Command::Run { config }),
         "init" if rest.is_empty() => Ok(Command::Init),
         "init" => Err("init takes no arguments".to_string()),
+        "setup" => parse_messenger(name, rest).map(|messenger| Command::Setup { messenger }),
+        "guide" => parse_messenger(name, rest).map(|messenger| Command::Guide { messenger }),
         "install-launchd" => parse_install_launchd(rest),
         "uninstall-launchd" => parse_uninstall_launchd(rest),
         other => Err(format!("unknown command '{other}'")),
+    }
+}
+
+fn parse_messenger(command: &str, args: &[String]) -> Result<Platform, String> {
+    match args {
+        [name] if name == "discord" => Ok(Platform::Discord),
+        [name] if name == "slack" => Ok(Platform::Slack),
+        [name] => Err(format!("unknown messenger '{name}'; use discord or slack")),
+        _ => Err(format!("{command} needs one messenger: discord or slack")),
     }
 }
 
@@ -144,6 +163,16 @@ fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
     })
 }
 
+fn run_setup(env: &Env, messenger: Platform) -> Result<ExitCode, ConfigError> {
+    let stdin = io::stdin();
+    let is_tty = stdin.is_terminal();
+    let outcome = init::setup(env, messenger, stdin.lock(), io::stdout().lock(), is_tty)?;
+    Ok(match outcome {
+        InitOutcome::Written { checks_ok: false } => ExitCode::FAILURE,
+        InitOutcome::Written { checks_ok: true } | InitOutcome::Kept => ExitCode::SUCCESS,
+    })
+}
+
 fn install_launchd(
     env: &Env,
     config: Option<PathBuf>,
@@ -173,7 +202,9 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     let config = Config::load(&path, env)?;
     config.validate()?;
     let _log_guard = logging::init(&config.home)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let result = runtime.block_on(serve(config));
     // A stuck blocking task must not delay the exit.
     runtime.shutdown_background();
@@ -201,8 +232,14 @@ async fn serve(config: Config) -> Result<(), GatewayError> {
         _ = terminate.recv() => stop_gateway(stop, run).await,
         _ = interrupt.recv() => stop_gateway(stop, run).await,
     };
-    if tokio::time::timeout(ADAPTER_SHUTDOWN_BOUND, adapter.shutdown()).await.is_err() {
-        tracing::warn!(platform = adapter.platform(), "adapter shutdown did not finish in time");
+    if tokio::time::timeout(ADAPTER_SHUTDOWN_BOUND, adapter.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            platform = adapter.platform(),
+            "adapter shutdown did not finish in time"
+        );
     }
     result
 }
@@ -237,6 +274,11 @@ fn main() -> ExitCode {
     let result = match command {
         Command::CheckConfig { config } => check_config(&env, config),
         Command::Init => run_init(&env),
+        Command::Setup { messenger } => run_setup(&env, messenger),
+        Command::Guide { messenger } => {
+            print!("{}", init::guide(messenger));
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Run { config } => {
             return run_gateway(&env, config).unwrap_or_else(|err| {
                 eprintln!("error: {err}");
@@ -268,6 +310,18 @@ mod tests {
     fn parses_known_commands() {
         assert_eq!(parse_args(&args(&["init"])), Ok(Command::Init));
         assert_eq!(
+            parse_args(&args(&["setup", "slack"])),
+            Ok(Command::Setup {
+                messenger: Platform::Slack
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["guide", "discord"])),
+            Ok(Command::Guide {
+                messenger: Platform::Discord
+            })
+        );
+        assert_eq!(
             parse_args(&args(&[
                 "install-launchd",
                 "--dry-run",
@@ -296,7 +350,10 @@ mod tests {
                 config: Some(PathBuf::from("x.toml"))
             })
         );
-        assert_eq!(parse_args(&args(&["run"])), Ok(Command::Run { config: None }));
+        assert_eq!(
+            parse_args(&args(&["run"])),
+            Ok(Command::Run { config: None })
+        );
         assert_eq!(
             parse_args(&args(&["check-config"])),
             Ok(Command::CheckConfig { config: None })
@@ -317,6 +374,9 @@ mod tests {
             &["run", "--config"],
             &["run", "extra"],
             &["init", "extra"],
+            &["setup"],
+            &["setup", "telegram"],
+            &["guide", "slack", "extra"],
             &["check-config", "--config"],
             &["check-config", "--nope"],
             &["install-launchd", "--label"],
