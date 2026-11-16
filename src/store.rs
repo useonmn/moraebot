@@ -175,6 +175,8 @@ pub struct LaneRow {
     pub prompts: i64,
     pub omp_session_id: Option<String>,
     pub notice_sent: bool,
+    /// The canonical Done line the lane started with; `None` for a lane started before slice 5.
+    pub done: Option<String>,
 }
 
 /// Result of [`Store::start_lane`].
@@ -253,18 +255,21 @@ CREATE TABLE IF NOT EXISTS lanes(
     omp_session_id TEXT,
     notice_sent INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    done TEXT
 );
 ";
 
-/// Columns added after slice 2; `Store::open` adds the missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str); 6] = [
-    ("attachments", "TEXT"),
-    ("files_ready", "INTEGER NOT NULL DEFAULT 1"),
-    ("out_files", "TEXT"),
-    ("text_sent", "INTEGER NOT NULL DEFAULT 0"),
-    ("origin", "TEXT NOT NULL DEFAULT 'owner'"),
-    ("steered_into", "INTEGER"),
+/// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
+/// missing ones to an older database.
+const ADDED_COLUMNS: [(&str, &str, &str); 7] = [
+    ("inbox", "attachments", "TEXT"),
+    ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
+    ("inbox", "out_files", "TEXT"),
+    ("inbox", "text_sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("inbox", "origin", "TEXT NOT NULL DEFAULT 'owner'"),
+    ("inbox", "steered_into", "INTEGER"),
+    ("lanes", "done", "TEXT"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -272,14 +277,14 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 /// Adds every missing column of [`ADDED_COLUMNS`] in one transaction.
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('inbox')")?;
-        stmt.query_map([], |r| r.get(0))?
-            .collect::<Result<_, _>>()?
-    };
-    for (name, decl) in ADDED_COLUMNS {
-        if !existing.iter().any(|c| c == name) {
-            tx.execute_batch(&format!("ALTER TABLE inbox ADD COLUMN {name} {decl}"))?;
+    for (table, name, decl) in ADDED_COLUMNS {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            [table, name],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))?;
         }
     }
     tx.commit()
@@ -331,7 +336,7 @@ fn hold_queued_sql(conversations: &str) -> String {
 const COLS: &str = "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error, attachments, files_ready, out_files, text_sent, origin, steered_into";
 
 const LANE_COLS: &str =
-    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent";
+    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, done";
 
 fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
     let state: String = r.get(3)?;
@@ -348,6 +353,7 @@ fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
         prompts: r.get(5)?,
         omp_session_id: r.get(6)?,
         notice_sent: r.get::<_, i64>(7)? != 0,
+        done: r.get(8)?,
     })
 }
 
@@ -910,6 +916,7 @@ impl Store {
         tool_call_id: &str,
         conversation_key: &str,
         task: &str,
+        done: Option<&str>,
         max_running: usize,
     ) -> Result<LaneStart, StoreError> {
         let tx = self
@@ -930,10 +937,10 @@ impl Store {
         }
         tx.execute(
             &format!(
-                "INSERT INTO lanes(tool_call_id, conversation_key, task, state, prompts, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'running', 1, {NOW}, {NOW})"
+                "INSERT INTO lanes(tool_call_id, conversation_key, task, done, state, prompts, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', 1, {NOW}, {NOW})"
             ),
-            params![tool_call_id, conversation_key, task],
+            params![tool_call_id, conversation_key, task, done],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
@@ -1754,7 +1761,7 @@ mod tests {
     }
 
     fn new_lane(s: &mut Store, call: &str, key: &str) -> i64 {
-        match s.start_lane(call, key, "task", 3).unwrap() {
+        match s.start_lane(call, key, "task", None, 3).unwrap() {
             LaneStart::New(id) => id,
             other => panic!("expected New, got {other:?}"),
         }
@@ -1789,6 +1796,125 @@ mod tests {
             assert_eq!(row.state, State::Done);
             assert_eq!(s.count().unwrap(), 1);
         }
+    }
+
+    /// The slice-4 `lanes` table (and the tables a slice-4 database has besides it), written
+    /// by hand so the slice-5 migration is tested against it: no `done` column.
+    const SLICE4_SCHEMA: &str = "
+        CREATE TABLE inbox(
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            conversation_key TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('queued','processing','reply_pending','done','failed','needs_check')),
+            reply TEXT,
+            notice_sent INTEGER NOT NULL DEFAULT 0,
+            received_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            error TEXT,
+            attachments TEXT,
+            files_ready INTEGER NOT NULL DEFAULT 1,
+            out_files TEXT,
+            text_sent INTEGER NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL DEFAULT 'owner',
+            steered_into INTEGER,
+            UNIQUE(platform, message_id)
+        );
+        CREATE TABLE conversations(
+            conversation_key TEXT PRIMARY KEY,
+            platform TEXT,
+            channel_id TEXT NOT NULL,
+            omp_session_id TEXT,
+            created_at TEXT,
+            last_activity_at TEXT
+        );
+        CREATE TABLE known_threads(
+            platform TEXT,
+            thread_id TEXT,
+            PRIMARY KEY(platform, thread_id)
+        );
+        CREATE TABLE sessions(
+            name TEXT PRIMARY KEY,
+            omp_session_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE lanes(
+            id INTEGER PRIMARY KEY,
+            tool_call_id TEXT NOT NULL UNIQUE,
+            conversation_key TEXT NOT NULL,
+            task TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('running','idle','failed','needs_check')),
+            error TEXT,
+            prompts INTEGER NOT NULL DEFAULT 1,
+            omp_session_id TEXT,
+            notice_sent INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    ";
+
+    #[test]
+    fn slice4_database_gains_lanes_done_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO lanes(tool_call_id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, created_at, updated_at)
+             VALUES ('call-old', ?1, 'old task', 'idle', 'E_X', 2, 'sess-9', 1, 't', 't')",
+            [K1],
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            let cols: Vec<String> = s
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('lanes')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(cols.iter().any(|c| c == "done"), "missing column done");
+            assert_eq!(
+                s.lane(1).unwrap().unwrap(),
+                LaneRow {
+                    id: 1,
+                    conversation_key: K1.to_string(),
+                    task: "old task".to_string(),
+                    state: LaneState::Idle,
+                    error: Some("E_X".to_string()),
+                    prompts: 2,
+                    omp_session_id: Some("sess-9".to_string()),
+                    notice_sent: true,
+                    done: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn start_lane_stores_done_line() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = match s
+            .start_lane("call-a", K1, "task", Some("file a"), 3)
+            .unwrap()
+        {
+            LaneStart::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        };
+        assert_eq!(s.lane(a).unwrap().unwrap().done.as_deref(), Some("file a"));
+        let b = new_lane(&mut s, "call-b", K1);
+        assert_eq!(s.lane(b).unwrap().unwrap().done, None);
+        assert_eq!(
+            s.start_lane("call-a", K1, "task", Some("file other"), 3)
+                .unwrap(),
+            LaneStart::Existing(a)
+        );
+        assert_eq!(s.lane(a).unwrap().unwrap().done.as_deref(), Some("file a"));
     }
 
     #[test]
@@ -1943,19 +2069,19 @@ mod tests {
         let (_d, _p, mut s) = open_tmp();
         let a = new_lane(&mut s, "call-a", K1);
         assert_eq!(
-            s.start_lane("call-a", K1, "task", 3).unwrap(),
+            s.start_lane("call-a", K1, "task", None, 3).unwrap(),
             LaneStart::Existing(a)
         );
         new_lane(&mut s, "call-b", K1);
         new_lane(&mut s, "call-c", K2);
         assert_eq!(
-            s.start_lane("call-d", K1, "task", 3).unwrap(),
+            s.start_lane("call-d", K1, "task", None, 3).unwrap(),
             LaneStart::Limit
         );
         assert_eq!(s.lanes().unwrap().len(), 3);
         assert!(s.finish_lane(a, 1, "done", LaneState::Idle, None).unwrap());
         assert!(matches!(
-            s.start_lane("call-d", K1, "task", 3).unwrap(),
+            s.start_lane("call-d", K1, "task", None, 3).unwrap(),
             LaneStart::New(_)
         ));
         let row = s.lane(a).unwrap().unwrap();

@@ -236,7 +236,7 @@ impl LaneManager {
             return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
         }
         let started = lock(&self.store)
-            .start_lane(tool_call_id, &conversation_key, task, MAX_RUNNING_LANES)
+            .start_lane(tool_call_id, &conversation_key, task, None, MAX_RUNNING_LANES)
             .map_err(|e| refused(e.code(), &e.to_string()))?;
         let id = match started {
             LaneStart::New(id) => {

@@ -1894,7 +1894,7 @@ async fn lane_row_runs_without_owner_check_and_replies_to_lane_conversation() {
         .store
         .lock()
         .unwrap()
-        .start_lane("toolu_1", LANE_KEY, "t", MAX_RUNNING_LANES)
+        .start_lane("toolu_1", LANE_KEY, "t", None, MAX_RUNNING_LANES)
         .unwrap()
     {
         LaneStart::New(id) => id,
@@ -2215,7 +2215,7 @@ async fn startup_posts_lane_interrupted_once() {
     let lane = {
         let mut store = h.store.lock().unwrap();
         let lane = match store
-            .start_lane("toolu_1", LANE_KEY, "t", MAX_RUNNING_LANES)
+            .start_lane("toolu_1", LANE_KEY, "t", None, MAX_RUNNING_LANES)
             .unwrap()
         {
             LaneStart::New(id) => id,
