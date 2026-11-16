@@ -1,38 +1,45 @@
-//! omp child manager: at most one live `omp --mode rpc` child in total.
+//! omp child manager: one lead `omp --mode rpc` child serves every conversation.
 //!
-//! The child belongs to the conversation currently being served. Before another
-//! conversation's child spawns, the previous one is closed and reaped, so two
-//! processes never share a session folder. The official `omp_rpc::Client` is
-//! blocking, so each child is owned by a dedicated OS thread; async callers talk
-//! to it through channels. Message text reaches omp only as a JSON line on the
-//! child's stdin, never as an argument or through a shell.
+//! The lead child is never closed because the next input belongs to another
+//! conversation: each input names its own conversation (see `lead`), and the reply
+//! stays with the row that asked. Its session folder is `<home>/lead/session` and its
+//! omp session id is stored under `lead::LEAD_SESSION`. Lane children are owned by
+//! `lane.rs` and built with the same plumbing (`child_command`, `open_child`).
+//!
+//! The official `omp_rpc::Client` is blocking, so the lead's client is owned by a
+//! dedicated OS thread that serves each prompt on its own short-lived thread over a
+//! shared client; async callers talk to it through channels. While a turn runs, one
+//! newer message of the same conversation can be steered into it (`try_steer`).
+//! Message text reaches omp only as a JSON line on the child's stdin, never as an
+//! argument or through a shell.
 
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use omp_rpc::{
     Client, ClientOptions, Error as RpcError, Event, GetSessionLeaseCommand, HostTool,
-    HostToolError, OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcNotification,
-    ToolLoadMode,
+    HostToolError, OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent,
+    RpcNotification, StreamingBehavior, ToolLoadMode,
 };
 use serde_json::{Map, Value};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::config::Config;
 use crate::files;
+use crate::lead;
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
 pub const E_OMP_SPAWN: &str = "E_OMP_SPAWN";
-/// `get_session_lease` failed before reopening a conversation.
+/// `get_session_lease` failed before reopening a session.
 pub const E_SESSION_LEASE: &str = "E_SESSION_LEASE";
-/// Another process holds the conversation's omp session; no prompt was sent.
+/// Another process holds the omp session; no prompt was sent.
 pub const E_SESSION_BUSY: &str = "E_SESSION_BUSY";
 /// `open_session` failed; no prompt was sent.
 pub const E_OPEN_SESSION: &str = "E_OPEN_SESSION";
@@ -63,11 +70,14 @@ type SentFiles = Arc<Mutex<Vec<PathBuf>>>;
 /// Reply text used when a completed turn produced no visible text.
 pub const EMPTY_REPLY: &str = "(empty reply)";
 
+/// omp reads this variable as its session folder; it must never override `--session-dir`.
+const SESSION_DIR_OVERRIDE: &str = "PI_CODING_AGENT_SESSION_DIR";
+
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Absolute path, so a `kill` shim earlier in PATH cannot intercept the group kill.
 const KILL_BIN: &str = "/bin/kill";
 /// How long shutdown waits for a killed child's worker thread to finish.
-const ABORT_JOIN_BOUND: Duration = Duration::from_secs(10);
+pub const ABORT_JOIN_BOUND: Duration = Duration::from_secs(10);
 /// "No limit": `prompt_and_wait` needs a deadline, so use one that never matters.
 const UNLIMITED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
@@ -126,6 +136,22 @@ impl TurnReport {
     }
 }
 
+/// Result of one lead turn: the main row's report (with every file `send_file` queued
+/// during the turn) and, when a row was steered into it, that row's id and outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupReport {
+    pub main: TurnReport,
+    pub steered: Option<(i64, Outcome)>,
+}
+
+/// The lead turn that is running: its main row and conversation. Host-tool handlers
+/// read it through [`OmpManager::turn_context`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnContext {
+    pub row_id: i64,
+    pub conversation_key: String,
+}
+
 /// The `send_file` host tool. The handler (on the client's own thread) only checks the
 /// path with `files::check_outbound`, refuses the file past `files::MAX_FILES` in this
 /// turn, and queues the canonical path; dispatch uploads queued files after the reply.
@@ -161,9 +187,7 @@ fn send_file_tool(work_dir: PathBuf, home: PathBuf, sent: SentFiles) -> HostTool
                 |code: &str, reason: &str| -> HostToolError { format!("{code}: {reason}").into() };
             let (canonical, _) = files::check_outbound(Path::new(path), &work_dir, &home)
                 .map_err(|e| refused(e.code, &e.message))?;
-            let mut sent = sent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut sent = lock(&sent);
             if sent.len() >= files::MAX_FILES {
                 return Err(refused(
                     files::E_FILE_TOO_MANY,
@@ -202,7 +226,25 @@ pub fn map_turn(turn: PromptTurn) -> Outcome {
     }
 }
 
-/// Exact omp argv (without the program) for one conversation. Non-empty `hints` become one
+/// The one mapping of a prompt's result, for the lead's main and steer prompts and for
+/// lanes. Only a timeout or a lost child is `NeedsCheck`; the caller closes the child then.
+pub(crate) fn map_result(turn: Result<PromptTurn, RpcError>) -> Outcome {
+    match turn {
+        Ok(turn) => map_turn(turn),
+        Err(RpcError::Timeout { .. }) => {
+            Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
+        }
+        Err(RpcError::Command { error, .. }) => Outcome::failed(E_PROMPT_REJECTED, error),
+        Err(RpcError::InvalidArgument(error)) => Outcome::failed(E_PROMPT_REJECTED, error),
+        // The turn ended with an error whose code is not `cost_cap`; the child is fine.
+        Err(RpcError::Protocol(error)) if error.starts_with(PROMPT_RESULT_UNDECODABLE) => {
+            Outcome::failed(E_PROMPT_ERROR, error)
+        }
+        Err(error) => Outcome::needs_check(E_CHILD_LOST, error),
+    }
+}
+
+/// Exact omp argv (without the program) for one child. Non-empty `hints` become one
 /// `--append-system-prompt=<hints>` element; message text never goes into argv.
 pub fn omp_args(config: &Config, session_dir: &Path, hints: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
@@ -237,45 +279,78 @@ pub fn key_slug(key: &str) -> String {
         .collect()
 }
 
-/// `<home>/conversations/<slug>/session`.
-pub fn session_dir(config: &Config, key: &str) -> PathBuf {
+/// `<home>/lead/session`.
+pub fn lead_session_dir(config: &Config) -> PathBuf {
+    config.home.join("lead").join("session")
+}
+
+/// `<home>/lanes/<id>/session`.
+pub fn lane_session_dir(config: &Config, lane_id: i64) -> PathBuf {
     config
         .home
-        .join("conversations")
-        .join(key_slug(key))
+        .join("lanes")
+        .join(lane_id.to_string())
         .join("session")
 }
 
-/// `<home>/logs/omp-<slug>.stderr.log`.
-pub fn stderr_log_path(config: &Config, key: &str) -> PathBuf {
+/// `<home>/logs/omp-<name>.stderr.log`; `name` is `lead::LEAD_SESSION` or `lane-<id>`.
+pub fn stderr_log_path(config: &Config, name: &str) -> PathBuf {
     config
         .home
         .join("logs")
-        .join(format!("omp-{}.stderr.log", key_slug(key)))
+        .join(format!("omp-{}.stderr.log", key_slug(name)))
 }
 
 /// Messenger names: a variable whose name contains one (any case) never reaches omp.
 const MESSENGER_ENV_WORDS: [&str; 2] = ["DISCORD", "SLACK"];
 
-/// Drops every variable whose name contains a messenger name; everything else (PATH,
-/// HOME, model-provider credentials) is kept so omp can authenticate.
+/// Drops every variable whose name contains a messenger name, and omp's session-folder
+/// override; everything else (PATH, HOME, model-provider credentials) is kept so omp
+/// can authenticate.
 fn child_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     vars.filter(|(name, _)| {
         let name = name.to_string_lossy().to_ascii_uppercase();
-        !MESSENGER_ENV_WORDS.iter().any(|word| name.contains(word))
+        name != SESSION_DIR_OVERRIDE && !MESSENGER_ENV_WORDS.iter().any(|word| name.contains(word))
     })
     .collect()
 }
 
-struct Started {
-    pid: Option<u32>,
-    session_id: String,
+/// Creates `path` and its parents, readable by the owner only.
+pub(crate) fn private_dir(path: &Path) -> std::io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
-struct PromptRequest {
-    text: String,
-    timeout: Duration,
-    done: oneshot::Sender<Result<PromptTurn, RpcError>>,
+/// The omp command for one child: `args`, stderr appended to `stderr_path` (mode
+/// `0o600`), and the filtered environment plus `extra_env`. The lead and every lane use
+/// it, so all children get exactly the same environment.
+pub(crate) fn child_command(
+    config: &Config,
+    args: Vec<OsString>,
+    stderr_path: &Path,
+    extra_env: &[(OsString, OsString)],
+) -> std::io::Result<Command> {
+    if let Some(logs) = stderr_path.parent() {
+        private_dir(logs)?;
+    }
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(stderr_path)?;
+    let mut command = Command::new(&config.omp_path);
+    command
+        .args(args)
+        .env_clear()
+        .envs(child_env(
+            std::env::vars_os().chain(extra_env.iter().cloned()),
+        ))
+        .stderr(Stdio::from(stderr));
+    Ok(command)
+}
+
+/// Locks a std mutex, taking the data even when a holder panicked.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// SIGKILLs the child's process group (the RPC client starts the child as its own
@@ -288,24 +363,179 @@ fn kill_group(pid: u32) {
         .status();
 }
 
-/// Kills the child's group when the `Live` is dropped without being closed (a panic or a
-/// cancelled caller), so a worker blocked in `prompt_and_wait` is released and the
-/// client reaps the child. `close` and `abort` disarm it once the worker is joined,
-/// because the pid may be reused after the child is reaped.
-struct GroupKill(Option<u32>);
+/// The process group of a spawned child. It kills the group when dropped while armed
+/// (a panic or a cancelled caller), so a thread blocked on the child is released.
+/// Whoever reaps the child disarms it, because the pid may be reused afterwards.
+pub(crate) struct GroupKill(Option<u32>);
 
-impl Drop for GroupKill {
-    fn drop(&mut self) {
+impl GroupKill {
+    /// Kills the group now; stays armed until the child is reaped.
+    pub(crate) fn kill(&self) {
         if let Some(pid) = self.0 {
             kill_group(pid);
         }
     }
+
+    /// The child was reaped: never signal its pid again.
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
 }
 
-/// The one live child and the thread that owns its client.
-struct Live {
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A child that is ready for prompts: spawned, lease checked, session opened. Its event
+/// drain thread runs until the client is closed.
+pub(crate) struct OpenedChild {
+    pub(crate) client: Client,
+    pub(crate) pid: Option<u32>,
+    pub(crate) session_id: String,
+}
+
+/// Spawns one omp child and opens its session, on the calling (blocking) thread.
+///
+/// `on_spawn` gets the child's process group right after `Client::spawn` returned and
+/// before any command is sent; returning `false` closes (and reaps) the child and fails
+/// with `E_OMP_SPAWN`. `on_event` sees every event before it is logged. With a
+/// `previous_session`, the lease is checked first: held elsewhere is `E_SESSION_BUSY`.
+pub(crate) fn open_child(
+    name: &str,
+    command: Command,
+    tools: Vec<HostTool>,
+    session_dir: String,
+    previous_session: Option<String>,
+    on_spawn: impl FnOnce(GroupKill) -> bool,
+    on_event: impl Fn(&Event) + Send + 'static,
+) -> Result<OpenedChild, Outcome> {
+    let options = ClientOptions {
+        ready_timeout: READY_TIMEOUT,
+        tools,
+        ..ClientOptions::default()
+    };
+    let (client, events) =
+        Client::spawn(command, options).map_err(|e| Outcome::failed(E_OMP_SPAWN, e))?;
+    let pid = client.pid();
+    if !on_spawn(GroupKill(pid)) {
+        close(name, client);
+        return Err(Outcome::failed(
+            E_OMP_SPAWN,
+            "the child was refused at spawn",
+        ));
+    }
+    let drain_name = name.to_owned();
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("omp-events-{}", key_slug(name)))
+        .spawn(move || {
+            for event in events {
+                on_event(&event);
+                log_event(&drain_name, &event);
+            }
+        })
+    {
+        close(name, client);
+        return Err(Outcome::failed(E_OMP_SPAWN, e));
+    }
+
+    if let Some(session_id) = previous_session {
+        let lease = client.call(&GetSessionLeaseCommand {
+            session_ids: vec![session_id.clone()],
+        });
+        let refusal = match lease {
+            Ok(lease) if lease.held.contains(&session_id) => Some(Outcome::needs_check(
+                E_SESSION_BUSY,
+                "another process holds this omp session",
+            )),
+            Ok(_) => None,
+            Err(e) => Some(Outcome::failed(E_SESSION_LEASE, e)),
+        };
+        if let Some(outcome) = refusal {
+            close(name, client);
+            return Err(outcome);
+        }
+    }
+
+    let opened = client.call(&OpenSessionCommand {
+        session_dir,
+        provider: None,
+        model_id: None,
+    });
+    match opened {
+        Ok(opened) => Ok(OpenedChild {
+            client,
+            pid,
+            session_id: opened.session_id,
+        }),
+        Err(e) => {
+            close(name, client);
+            Err(Outcome::failed(E_OPEN_SESSION, e))
+        }
+    }
+}
+
+struct Started {
+    pid: Option<u32>,
+    session_id: String,
+}
+
+struct PromptRequest {
+    text: String,
+    timeout: Duration,
+    behavior: StreamingBehavior,
+    done: oneshot::Sender<Result<PromptTurn, RpcError>>,
+}
+
+/// The lead's process group, shared with `shutdown_all` and the turn's timeout path so
+/// they can kill the child without waiting for the running turn.
+type LeadKill = Arc<Mutex<Option<GroupKill>>>;
+
+/// The child was reaped: drop its group without signalling it.
+fn disarm(kill: &LeadKill) {
+    if let Some(mut group) = lock(kill).take() {
+        group.disarm();
+    }
+}
+
+/// The steer sent into the open turn: its row and the receiver of its result.
+struct Steer {
+    row_id: i64,
+    result: oneshot::Receiver<Result<PromptTurn, RpcError>>,
+}
+
+/// The lead turn that accepts a steer: set by `prompt` before the main frame is sent,
+/// taken when the main prompt's wait returns (no steer joins afterwards).
+struct OpenTurn {
     key: String,
-    pid: GroupKill,
+    main_row_id: i64,
+    /// The lead reported `agent_start` for this turn.
+    started: bool,
+    requests: mpsc::Sender<PromptRequest>,
+    steer: Option<Steer>,
+}
+
+type SteerGate = Arc<Mutex<Option<OpenTurn>>>;
+
+/// Opens the steer gate on the first `agent_start` of the open turn.
+fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, event: &Event) {
+    if !matches!(
+        event,
+        Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
+    ) {
+        return;
+    }
+    if let Some(turn) = lock(gate).as_mut() {
+        if !turn.started {
+            turn.started = true;
+            running.send_replace(Some(turn.key.clone()));
+        }
+    }
+}
+
+/// The lead child and the thread that owns its client.
+struct Live {
     requests: mpsc::Sender<PromptRequest>,
     worker: JoinHandle<()>,
     sent_files: SentFiles,
@@ -313,42 +543,32 @@ struct Live {
 
 impl Live {
     /// Closes the client (on its own thread) and waits until the process is reaped.
-    async fn close(self) {
+    async fn close(self, kill: &LeadKill) {
         let Live {
-            key,
-            mut pid,
-            requests,
-            worker,
-            ..
+            requests, worker, ..
         } = self;
         drop(requests);
         match tokio::task::spawn_blocking(move || worker.join()).await {
-            Ok(Ok(())) => pid.0 = None,
-            _ => tracing::error!(conversation = %key, "omp worker thread panicked"),
+            Ok(Ok(())) => disarm(kill),
+            _ => tracing::error!("omp lead worker thread panicked"),
         }
     }
-}
 
-impl Live {
-    /// Kills the child's process group first so a worker blocked in `prompt_and_wait`
-    /// sees the closed pipe and returns, then joins the worker within `ABORT_JOIN_BOUND`.
-    async fn abort(self) {
+    /// Kills the child's process group first so a prompt blocked on it sees the closed
+    /// pipe and returns, then joins the worker within `ABORT_JOIN_BOUND`.
+    async fn abort(self, kill: &LeadKill) {
         let Live {
-            key,
-            mut pid,
-            requests,
-            worker,
-            ..
+            requests, worker, ..
         } = self;
-        if let Some(pid) = pid.0 {
-            kill_group(pid);
+        if let Some(group) = lock(kill).as_ref() {
+            group.kill();
         }
         drop(requests);
         let joined = tokio::task::spawn_blocking(move || worker.join());
         match tokio::time::timeout(ABORT_JOIN_BOUND, joined).await {
-            Ok(Ok(Ok(()))) => pid.0 = None,
-            Ok(_) => tracing::error!(conversation = %key, "omp worker thread panicked"),
-            Err(_) => tracing::error!(conversation = %key, "omp worker did not stop in time"),
+            Ok(Ok(Ok(()))) => disarm(kill),
+            Ok(_) => tracing::error!("omp lead worker thread panicked"),
+            Err(_) => tracing::error!("omp lead worker did not stop in time"),
         }
     }
 }
@@ -359,7 +579,12 @@ pub struct OmpManager {
     turn_timeout: Duration,
     extra_env: Vec<(OsString, OsString)>,
     hints: String,
+    host_tools: Vec<HostTool>,
     live: tokio::sync::Mutex<Option<Live>>,
+    lead_kill: LeadKill,
+    gate: SteerGate,
+    running: Arc<watch::Sender<Option<String>>>,
+    turn: Arc<Mutex<Option<TurnContext>>>,
 }
 
 impl OmpManager {
@@ -377,7 +602,12 @@ impl OmpManager {
             turn_timeout,
             extra_env: Vec::new(),
             hints: String::new(),
+            host_tools: Vec::new(),
             live: Default::default(),
+            lead_kill: Default::default(),
+            gate: Default::default(),
+            running: Arc::new(watch::channel(None).0),
+            turn: Default::default(),
         }
     }
 
@@ -398,30 +628,51 @@ impl OmpManager {
         self
     }
 
-    /// Behavior hints for the messenger, appended to omp's system prompt; empty = none.
+    /// System prompt text appended to the lead's (guidance and messenger hints); empty = none.
     pub fn with_hints(mut self, hints: String) -> Self {
         self.hints = hints;
         self
     }
 
-    pub async fn child_pid(&self) -> Option<u32> {
-        self.live.lock().await.as_ref().and_then(|live| live.pid.0)
+    /// Host tools for the lead, registered after `send_file`.
+    pub fn with_host_tools(mut self, tools: Vec<HostTool>) -> Self {
+        self.host_tools.extend(tools);
+        self
     }
 
-    /// Sends `text` to the conversation's omp session and waits for the turn, then reports
-    /// the outcome with the files queued by `send_file` during this turn.
-    /// One prompt runs at a time across all conversations.
-    pub async fn prompt(&self, key: &str, text: &str) -> TurnReport {
+    /// The running turn's main row and conversation, for host-tool handlers; `None`
+    /// between turns.
+    pub fn turn_context(&self) -> Arc<Mutex<Option<TurnContext>>> {
+        Arc::clone(&self.turn)
+    }
+
+    /// `Some(conversation key)` from the lead's first `agent_start` of a turn until the
+    /// turn's group ends; a same-conversation message can be steered in meanwhile.
+    pub fn running_turn(&self) -> watch::Receiver<Option<String>> {
+        self.running.subscribe()
+    }
+
+    pub async fn child_pid(&self) -> Option<u32> {
+        let live = self.live.lock().await;
+        live.as_ref()?;
+        lock(&self.lead_kill).as_ref().and_then(|group| group.0)
+    }
+
+    /// Sends `text` (row `row_id` of conversation `key`) to the lead and waits for the
+    /// turn, including a message steered into it, then reports the group with the files
+    /// queued by `send_file` during it. One lead turn runs at a time. The child is closed
+    /// only when an outcome is `NeedsCheck` (timeout or lost child).
+    pub async fn prompt(&self, key: &str, row_id: i64, text: &str) -> GroupReport {
         let mut live = self.live.lock().await;
-        if live.as_ref().is_some_and(|l| l.key != key) {
-            if let Some(previous) = live.take() {
-                previous.close().await;
-            }
-        }
         if live.is_none() {
-            match self.start(key).await {
+            match self.start().await {
                 Ok(started) => *live = Some(started),
-                Err(outcome) => return TurnReport::without_files(outcome),
+                Err(outcome) => {
+                    return GroupReport {
+                        main: TurnReport::without_files(outcome),
+                        steered: None,
+                    };
+                }
             }
         }
         let Some(current) = live.as_ref() else {
@@ -430,240 +681,275 @@ impl OmpManager {
 
         // The live mutex is held for the whole turn, so the bucket belongs to this turn only.
         take_sent(&current.sent_files);
+        *lock(&self.turn) = Some(TurnContext {
+            row_id,
+            conversation_key: key.to_owned(),
+        });
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text: text.to_owned(),
             timeout: self.turn_timeout,
+            behavior: StreamingBehavior::FollowUp,
             done,
         };
-        let turn = match current.requests.send(request) {
-            Ok(()) => result.await.unwrap_or(Err(RpcError::Closed)),
-            Err(_) => Err(RpcError::Closed),
+        let sent = {
+            let mut gate = lock(&self.gate);
+            *gate = Some(OpenTurn {
+                key: key.to_owned(),
+                main_row_id: row_id,
+                started: false,
+                requests: current.requests.clone(),
+                steer: None,
+            });
+            current.requests.send(request).is_ok()
+        };
+        let main = if sent {
+            result.await.unwrap_or(Err(RpcError::Closed))
+        } else {
+            Err(RpcError::Closed)
+        };
+        // Close the gate: no steer joins this turn from here on.
+        let steer = lock(&self.gate).take().and_then(|turn| turn.steer);
+        let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
+        let main = map_result(main);
+
+        let mut killed = false;
+        let steered = match steer {
+            None => None,
+            Some(Steer {
+                row_id: steer_row,
+                mut result,
+            }) => {
+                let outcome = if main_timed_out {
+                    // Never let the child outlive the turn limit by waiting for the steer.
+                    self.kill_lead();
+                    killed = true;
+                    map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                } else {
+                    match tokio::time::timeout(self.turn_timeout, &mut result).await {
+                        Ok(turn) => map_result(turn.unwrap_or(Err(RpcError::Closed))),
+                        Err(_) => {
+                            self.kill_lead();
+                            killed = true;
+                            let _ = result.await;
+                            Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
+                        }
+                    }
+                };
+                Some((steer_row, outcome))
+            }
         };
         let files = take_sent(&current.sent_files);
-        let outcome = match turn {
-            Ok(turn) => {
-                let outcome = map_turn(turn);
-                return report(key, outcome, files);
+
+        let lost = killed
+            || matches!(main, Outcome::NeedsCheck { .. })
+            || matches!(steered, Some((_, Outcome::NeedsCheck { .. })));
+        if lost {
+            if let Some(current) = live.take() {
+                tracing::warn!(
+                    conversation = %key,
+                    row = row_id,
+                    code = main.code(),
+                    "closing omp lead child"
+                );
+                current.close(&self.lead_kill).await;
             }
-            Err(RpcError::Timeout { .. }) => {
-                Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
-            }
-            Err(RpcError::Command { error, .. }) => {
-                return report(key, Outcome::failed(E_PROMPT_REJECTED, error), files);
-            }
-            Err(RpcError::InvalidArgument(error)) => {
-                return report(key, Outcome::failed(E_PROMPT_REJECTED, error), files);
-            }
-            // The turn ended with an error whose code is not `cost_cap`; the child is fine.
-            Err(RpcError::Protocol(error)) if error.starts_with(PROMPT_RESULT_UNDECODABLE) => {
-                return report(key, Outcome::failed(E_PROMPT_ERROR, error), files);
-            }
-            Err(error) => Outcome::needs_check(E_CHILD_LOST, error),
+        }
+        *lock(&self.turn) = None;
+        self.running.send_replace(None);
+        GroupReport {
+            main: report(key, main, files),
+            steered,
+        }
+    }
+
+    /// Sends `text` (row `row_id`) into the running lead turn as a steer. Only when that
+    /// turn is for `key`, the lead reported `agent_start` for it and it holds no steer
+    /// yet; then `claim` gets the turn's main row id and must claim the row in the store
+    /// (false: nothing is sent). Returns whether the row was steered.
+    pub fn try_steer(
+        &self,
+        key: &str,
+        row_id: i64,
+        text: &str,
+        claim: impl FnOnce(i64) -> bool,
+    ) -> bool {
+        let mut gate = lock(&self.gate);
+        let Some(turn) = gate.as_mut() else {
+            return false;
         };
-        // Timeout or lost child: tear the child down before reporting.
-        if let Some(current) = live.take() {
-            tracing::warn!(conversation = %key, code = outcome.code(), "closing omp child");
-            current.close().await;
+        if turn.key != key || !turn.started || turn.steer.is_some() {
+            return false;
         }
-        report(key, outcome, files)
+        if !claim(turn.main_row_id) {
+            return false;
+        }
+        let (done, result) = oneshot::channel();
+        let request = PromptRequest {
+            text: text.to_owned(),
+            // A backstop only: `prompt` always ends the steer wait first.
+            timeout: self.turn_timeout.saturating_mul(2),
+            behavior: StreamingBehavior::Steer,
+            done,
+        };
+        // A failed send drops `done`, so the claimed row is reported as a lost child.
+        let _ = turn.requests.send(request);
+        turn.steer = Some(Steer { row_id, result });
+        tracing::info!(conversation = %key, row = row_id, main = turn.main_row_id, "steered into the running turn");
+        true
     }
 
-    /// Stops the omp child even in the middle of a turn; the turn's row is left for
-    /// the caller to mark `needs_check`.
+    /// Stops the lead child even in the middle of a turn, without waiting for the turn:
+    /// the kill makes a running `prompt` report `NeedsCheck(E_CHILD_LOST)` and release
+    /// the child, and whatever is left is aborted. Rows are left for the caller to mark.
     pub async fn shutdown_all(&self) {
+        self.kill_lead();
         if let Some(live) = self.live.lock().await.take() {
-            live.abort().await;
+            live.abort(&self.lead_kill).await;
         }
     }
 
-    async fn start(&self, key: &str) -> Result<Live, Outcome> {
-        let previous_session = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .omp_session_id(key)
+    fn kill_lead(&self) {
+        if let Some(group) = lock(&self.lead_kill).as_ref() {
+            group.kill();
+        }
+    }
+
+    async fn start(&self) -> Result<Live, Outcome> {
+        let previous_session = lock(&self.store)
+            .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
-        let session_dir = session_dir(&self.config, key);
-        let command = self
-            .command(key, &session_dir)
+        let session_dir = lead_session_dir(&self.config);
+        let command = private_dir(&session_dir)
+            .and_then(|()| {
+                child_command(
+                    &self.config,
+                    omp_args(&self.config, &session_dir, &self.hints),
+                    &stderr_log_path(&self.config, lead::LEAD_SESSION),
+                    &self.extra_env,
+                )
+            })
             .map_err(|e| Outcome::failed(E_OMP_SPAWN, e))?;
         let session_dir = session_dir.to_string_lossy().into_owned();
 
         let (requests, inbox) = mpsc::channel();
         let (started_tx, started) = oneshot::channel();
         let sent_files = SentFiles::default();
-        let tool = send_file_tool(
+        let mut tools = vec![send_file_tool(
             self.config.work_dir.clone(),
             self.config.home.clone(),
             Arc::clone(&sent_files),
-        );
-        let thread_key = key.to_owned();
+        )];
+        tools.extend(self.host_tools.iter().cloned());
+        let lead_kill = Arc::clone(&self.lead_kill);
+        let gate = Arc::clone(&self.gate);
+        let running = Arc::clone(&self.running);
         let worker = std::thread::Builder::new()
-            .name(format!("omp-{}", key_slug(key)))
+            .name("omp-lead".to_owned())
             .spawn(move || {
-                run_child(
-                    thread_key,
+                let opened = open_child(
+                    lead::LEAD_SESSION,
                     command,
+                    tools,
                     session_dir,
                     previous_session,
-                    tool,
-                    started_tx,
-                    inbox,
-                )
+                    move |group| {
+                        *lock(&lead_kill) = Some(group);
+                        true
+                    },
+                    move |event| note_agent_start(&gate, &running, event),
+                );
+                match opened {
+                    Err(outcome) => {
+                        let _ = started_tx.send(Err(outcome));
+                    }
+                    Ok(OpenedChild {
+                        client,
+                        pid,
+                        session_id,
+                    }) => {
+                        if started_tx.send(Ok(Started { pid, session_id })).is_err() {
+                            close(lead::LEAD_SESSION, client);
+                            return;
+                        }
+                        serve_lead(client, inbox);
+                    }
+                }
             })
             .map_err(|e| Outcome::failed(E_OMP_SPAWN, e))?;
 
         let started = match started.await {
             Ok(Ok(started)) => started,
-            Ok(Err(outcome)) => {
+            failed => {
                 let _ = tokio::task::spawn_blocking(move || worker.join()).await;
-                return Err(outcome);
-            }
-            Err(_) => {
-                let _ = tokio::task::spawn_blocking(move || worker.join()).await;
-                return Err(Outcome::failed(
-                    E_OMP_SPAWN,
-                    "omp worker exited during startup",
-                ));
+                // `open_child` reaped the child (if one was spawned).
+                disarm(&self.lead_kill);
+                return Err(match failed {
+                    Ok(Err(outcome)) => outcome,
+                    _ => Outcome::failed(E_OMP_SPAWN, "omp worker exited during startup"),
+                });
             }
         };
-        if let Err(e) = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .set_omp_session_id(key, &started.session_id)
-        {
-            tracing::warn!(conversation = %key, code = e.code(), "could not store omp session id");
+        if let Err(e) = lock(&self.store).set_session_id(lead::LEAD_SESSION, &started.session_id) {
+            tracing::warn!(code = e.code(), "could not store the lead's omp session id");
         }
-        tracing::info!(conversation = %key, pid = started.pid, "omp child ready");
+        tracing::info!(pid = started.pid, "omp lead child ready");
         Ok(Live {
-            key: key.to_owned(),
-            pid: GroupKill(started.pid),
             requests,
             worker,
             sent_files,
         })
     }
-
-    fn command(&self, key: &str, session_dir: &Path) -> std::io::Result<Command> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(session_dir)?;
-        let stderr_path = stderr_log_path(&self.config, key);
-        if let Some(logs) = stderr_path.parent() {
-            DirBuilder::new().recursive(true).mode(0o700).create(logs)?;
-        }
-        let stderr = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&stderr_path)?;
-
-        let mut command = Command::new(&self.config.omp_path);
-        command
-            .args(omp_args(&self.config, session_dir, &self.hints))
-            .env_clear()
-            .envs(child_env(
-                std::env::vars_os().chain(self.extra_env.iter().cloned()),
-            ))
-            .stderr(Stdio::from(stderr));
-        Ok(command)
-    }
 }
 
-/// Body of the thread that owns one client: start, check the lease, open the
-/// session, then serve prompts until the request channel closes.
-fn run_child(
-    key: String,
-    command: Command,
-    session_dir: String,
-    previous_session: Option<String>,
-    send_file: HostTool,
-    started: oneshot::Sender<Result<Started, Outcome>>,
-    requests: mpsc::Receiver<PromptRequest>,
-) {
-    let options = ClientOptions {
-        ready_timeout: READY_TIMEOUT,
-        tools: vec![send_file],
-        ..ClientOptions::default()
-    };
-    let (client, events) = match Client::spawn(command, options) {
-        Ok(spawned) => spawned,
-        Err(e) => {
-            let _ = started.send(Err(Outcome::failed(E_OMP_SPAWN, e)));
-            return;
-        }
-    };
-    let pid = client.pid();
-    let drain_key = key.clone();
-    if let Err(e) = std::thread::Builder::new()
-        .name(format!("omp-events-{}", key_slug(&key)))
-        .spawn(move || drain_events(&drain_key, events))
-    {
-        close(&key, client);
-        let _ = started.send(Err(Outcome::failed(E_OMP_SPAWN, e)));
-        return;
-    }
-
-    if let Some(session_id) = previous_session {
-        let lease = client.call(&GetSessionLeaseCommand {
-            session_ids: vec![session_id.clone()],
-        });
-        let refusal = match lease {
-            Ok(lease) if lease.held.contains(&session_id) => Some(Outcome::needs_check(
-                E_SESSION_BUSY,
-                "another process holds this omp session",
-            )),
-            Ok(_) => None,
-            Err(e) => Some(Outcome::failed(E_SESSION_LEASE, e)),
-        };
-        if let Some(outcome) = refusal {
-            close(&key, client);
-            let _ = started.send(Err(outcome));
-            return;
-        }
-    }
-
-    let opened = client.call(&OpenSessionCommand {
-        session_dir,
-        provider: None,
-        model_id: None,
-    });
-    let session_id = match opened {
-        Ok(opened) => opened.session_id,
-        Err(e) => {
-            close(&key, client);
-            let _ = started.send(Err(Outcome::failed(E_OPEN_SESSION, e)));
-            return;
-        }
-    };
-    if started.send(Ok(Started { pid, session_id })).is_err() {
-        close(&key, client);
-        return;
-    }
-
+/// Serves the lead's prompts until the request channel closes. Each prompt waits on its
+/// own thread (concurrent waits on one client are allowed), so a steer can be sent
+/// while the main prompt waits. The client is closed after every wait has joined.
+fn serve_lead(client: Client, requests: mpsc::Receiver<PromptRequest>) {
+    let client = Arc::new(client);
+    let mut waits: Vec<JoinHandle<()>> = Vec::new();
     for request in requests {
-        let prompt = PromptCommand {
-            message: request.text,
-            images: None,
-            streaming_behavior: None,
-        };
-        let _ = request
-            .done
-            .send(client.prompt_and_wait(&prompt, request.timeout));
+        let (finished, open): (Vec<_>, Vec<_>) =
+            waits.into_iter().partition(JoinHandle::is_finished);
+        for wait in finished {
+            let _ = wait.join();
+        }
+        waits = open;
+        let PromptRequest {
+            text,
+            timeout,
+            behavior,
+            done,
+        } = request;
+        let client = Arc::clone(&client);
+        // A failed spawn drops `done`, which the caller reads as a lost child.
+        match std::thread::Builder::new()
+            .name("omp-lead-prompt".to_owned())
+            .spawn(move || {
+                let prompt = PromptCommand {
+                    message: text,
+                    images: None,
+                    streaming_behavior: Some(behavior),
+                };
+                let _ = done.send(client.prompt_and_wait(&prompt, timeout));
+            }) {
+            Ok(wait) => waits.push(wait),
+            Err(e) => tracing::warn!(error = %e, "could not start an omp prompt thread"),
+        }
     }
-    close(&key, client);
+    for wait in waits {
+        let _ = wait.join();
+    }
+    match Arc::try_unwrap(client) {
+        Ok(client) => close(lead::LEAD_SESSION, client),
+        // Dropping the last handle runs the same teardown.
+        Err(_) => tracing::error!("omp lead client still shared at close"),
+    }
 }
 
 /// Empties the turn's bucket and returns what it held.
 fn take_sent(sent: &SentFiles) -> Vec<PathBuf> {
-    std::mem::take(
-        &mut *sent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    std::mem::take(&mut *lock(sent))
 }
 
 /// Keeps the queued files only for a reply; otherwise they are dropped and only their
@@ -681,24 +967,23 @@ fn report(key: &str, outcome: Outcome, files: Vec<PathBuf>) -> TurnReport {
     TurnReport::without_files(outcome)
 }
 
-fn close(key: &str, client: Client) {
+pub(crate) fn close(name: &str, client: Client) {
     if let Err(e) = client.close() {
-        tracing::warn!(conversation = %key, error = %e, "omp child teardown was not confirmed");
+        tracing::warn!(child = %name, error = %e, "omp child teardown was not confirmed");
     }
 }
 
-/// The client's event channel is unbounded: drain it for the child's lifetime.
-fn drain_events(key: &str, events: mpsc::Receiver<Event>) {
-    for event in events {
-        match event {
-            Event::Notification(RpcNotification::ExtensionError(e)) => {
-                tracing::warn!(conversation = %key, event = %e.event, "omp extension error");
-            }
-            Event::Undecodable { error, .. } => {
-                tracing::warn!(conversation = %key, %error, "undecodable omp frame");
-            }
-            _ => {}
+/// Logs the events worth a line; the client's event channel is drained for the
+/// child's lifetime.
+fn log_event(name: &str, event: &Event) {
+    match event {
+        Event::Notification(RpcNotification::ExtensionError(e)) => {
+            tracing::warn!(child = %name, event = %e.event, "omp extension error");
         }
+        Event::Undecodable { error, .. } => {
+            tracing::warn!(child = %name, %error, "undecodable omp frame");
+        }
+        _ => {}
     }
 }
 
@@ -788,6 +1073,25 @@ mod tests {
     }
 
     #[test]
+    fn map_result_maps_errors() {
+        assert_eq!(map_result(Err(RpcError::Closed)).code(), Some(E_CHILD_LOST));
+        assert!(matches!(
+            map_result(Err(RpcError::Closed)),
+            Outcome::NeedsCheck { .. }
+        ));
+        let rejected = map_result(Err(RpcError::InvalidArgument("bad".into())));
+        assert!(matches!(rejected, Outcome::Failed { .. }));
+        assert_eq!(rejected.code(), Some(E_PROMPT_REJECTED));
+        let undecodable = map_result(Err(RpcError::Protocol(format!(
+            "{PROMPT_RESULT_UNDECODABLE}: unknown code"
+        ))));
+        assert!(matches!(undecodable, Outcome::Failed { .. }));
+        assert_eq!(undecodable.code(), Some(E_PROMPT_ERROR));
+        let ok = turn(Some(PromptStatus::Completed), Some("done"), None);
+        assert_eq!(map_result(Ok(ok.clone())), map_turn(ok));
+    }
+
+    #[test]
     fn key_slug_replaces_separators() {
         assert_eq!(key_slug("discord:th:111"), "discord-th-111");
         assert_eq!(key_slug("a/../b"), "a----b");
@@ -811,5 +1115,21 @@ mod tests {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PATH", "HOME", "PROVIDER_API_KEY"]);
+    }
+
+    #[test]
+    fn child_env_drops_session_dir_override() {
+        let vars = [
+            ("PATH", "p"),
+            (SESSION_DIR_OVERRIDE, "/elsewhere"),
+            ("PI_CODING_AGENT_DIR", "d"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let names: Vec<String> = child_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PATH", "PI_CODING_AGENT_DIR"]);
     }
 }

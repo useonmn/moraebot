@@ -883,33 +883,6 @@ impl Store {
         Ok(stmt.query_map([], map_row)?.collect::<Result<_, _>>()?)
     }
 
-    pub fn set_omp_session_id(
-        &self,
-        conversation_key: &str,
-        session_id: &str,
-    ) -> Result<(), StoreError> {
-        let changed = self.conn.execute(
-            "UPDATE conversations SET omp_session_id = ?2 WHERE conversation_key = ?1",
-            params![conversation_key, session_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::Invalid("no such conversation"));
-        }
-        Ok(())
-    }
-
-    pub fn omp_session_id(&self, conversation_key: &str) -> Result<Option<String>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT omp_session_id FROM conversations WHERE conversation_key = ?1",
-                [conversation_key],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
     /// The omp session id stored under `name` (for example the lead's).
     pub fn session_id(&self, name: &str) -> Result<Option<String>, StoreError> {
         Ok(self
@@ -1288,22 +1261,6 @@ mod tests {
         let err = Store::open(&path).err().expect("second open must fail");
         assert!(matches!(err, StoreError::AlreadyRunning));
         assert_eq!(err.code(), E_ALREADY_RUNNING);
-    }
-
-    #[test]
-    fn omp_session_id_roundtrip() {
-        let (_d, path, mut s) = open_tmp();
-        admit(&mut s, "m1", "k1");
-        assert_eq!(s.omp_session_id("k1").unwrap(), None);
-        assert_eq!(s.omp_session_id("missing").unwrap(), None);
-        s.set_omp_session_id("k1", "sess-1").unwrap();
-        drop(s);
-        let s = Store::open(&path).unwrap();
-        assert_eq!(s.omp_session_id("k1").unwrap().as_deref(), Some("sess-1"));
-        assert_eq!(
-            s.set_omp_session_id("missing", "x").unwrap_err().code(),
-            E_STORE_INVALID
-        );
     }
 
     #[test]

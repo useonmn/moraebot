@@ -523,7 +523,7 @@ impl Dispatcher {
                 None
             }
         };
-        let report = self.omp.prompt(key, &prompt).await;
+        let report = self.omp.prompt(key, row.id, &prompt).await.main;
         drop(typing);
 
         match report.outcome {
