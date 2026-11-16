@@ -363,12 +363,12 @@ impl Dispatcher {
 
         match outcome {
             Outcome::Reply(reply) => {
-                self.store().save_reply(row.id, &reply)?;
+                self.store().save_reply(row.id, &reply, None)?;
                 self.send_reply(row.id, key, &reply).await?;
             }
             Outcome::NoAgent => {
                 let reply = notice_text(N_NO_AGENT);
-                self.store().save_reply(row.id, reply)?;
+                self.store().save_reply(row.id, reply, None)?;
                 self.send_reply(row.id, key, reply).await?;
             }
             Outcome::Failed { code, .. } => {
