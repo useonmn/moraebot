@@ -12,9 +12,9 @@ Click **New Application** and give it a name. On **General Information**, copy t
 
 - **Installation Contexts**: Guild Install only. Uncheck User Install.
 - **Default Install Settings** for Guild Install: scopes `bot` only.
-- Permissions: View Channels, Send Messages, Read Message History, Create Public Threads, Send Messages in Threads. As one number that's `309237713920`.
+- Permissions: View Channels, Send Messages, Read Message History, Attach Files, Create Public Threads, Send Messages in Threads. As one number that's `309237746688`.
 
-Threads don't inherit Send Messages from their channel, so Send Messages in Threads is needed too.
+Threads don't inherit Send Messages from their channel, so Send Messages in Threads is needed too. Attach Files is there so moraebot can post files the agent sends back.
 
 ## 3. Bot page
 
@@ -31,7 +31,7 @@ Threads don't inherit Send Messages from their channel, so Send Messages in Thre
 Use the portal's Install Link, or put your Application ID into this link:
 
 ```text
-https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=309237713920
+https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=309237746688
 ```
 
 Pick your server and confirm. Then create a private channel for the bot, or reuse one only you can see, and give the bot **View Channel** on it. Discord hides channels a bot can't view.
@@ -41,6 +41,13 @@ Pick your server and confirm. Then create a private channel for the bot, or reus
 1. In the Discord app, open **User Settings > Advanced** and turn on **Developer Mode**.
 2. Right-click your own name and choose **Copy User ID**.
 3. Right-click the bot's channel and choose **Copy Channel ID**.
+
+### Upgrading from an earlier version
+
+Earlier versions didn't ask for Attach Files. Without it, files the agent sends back can't be posted. Fix it one of two ways:
+
+- Open the invite link above again with the new number, pick the same server and confirm. Your settings and channel stay as they are.
+- Or, in your server's settings, give the bot's role **Attach Files** by hand.
 
 ## 6. A limit to know about
 
@@ -52,7 +59,7 @@ The agent and the README both check against this list.
 
 - [ ] Installation Contexts: Guild Install only.
 - [ ] Install scopes: `bot` only.
-- [ ] Permissions integer `309237713920`, nothing more.
+- [ ] Permissions integer `309237746688`, nothing more.
 - [ ] Public Bot OFF, Requires OAuth2 Code Grant OFF.
 - [ ] Message Content Intent ON, Presence Intent OFF, Server Members Intent OFF.
 - [ ] Bot has View Channel on one private channel.

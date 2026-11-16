@@ -20,8 +20,10 @@
   "oauth_config": {
     "scopes": {
       "bot": [
-        "chat:write",
         "channels:history",
+        "chat:write",
+        "files:read",
+        "files:write",
         "groups:history",
         "im:history"
       ]

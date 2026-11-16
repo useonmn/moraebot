@@ -16,6 +16,8 @@ Bot scopes:
 | `channels:history` | Read messages in public channels the bot was added to. Needed for `message.channels`. |
 | `groups:history` | Same for private channels. Needed for `message.groups`. |
 | `im:history` | Read your DMs to the bot. Needed for `message.im`. |
+| `files:read` | Download files you attach. |
+| `files:write` | Upload files the agent sends back. |
 
 Events:
 
@@ -28,7 +30,7 @@ Events:
 Left out on purpose:
 
 - `app_mention` and `app_mentions:read`. The bot already gets every message in its channel, so mentions add nothing. Fewer permissions is safer.
-- `im:write`, `chat:write.public`, `files:*`. moraebot only answers inside conversations you start, in channels it was invited to, and doesn't handle files.
+- `im:write` and `chat:write.public`. moraebot only answers inside conversations you start, in channels it was invited to.
 - Interactivity, slash commands and token rotation.
 
 moraebot answers only your member id. Messages from anyone else, from bots, and from other channels are dropped. Slack doesn't enforce this; moraebot does.
@@ -74,13 +76,17 @@ The bot only sees messages in channels it was added to. DMs work without this st
 
 If you change scopes or events in the manifest, reinstall the app to the workspace. Slack applies new scopes to an existing install only after a reinstall.
 
+### Upgrading from an earlier version
+
+Earlier versions didn't ask for `files:read` and `files:write`, so files you attach can't be downloaded and files the agent sends back can't be uploaded. Update your app's manifest to match [`slack-manifest.json`](slack-manifest.json), then reinstall the app as described above. Your tokens and channel stay the same.
+
 ## 8. Fixed settings
 
 The agent and the README both check against this list. Anything else is a mistake.
 
 - [ ] App created from `slack-manifest.json`, unchanged.
 - [ ] Socket Mode on. No request URL anywhere.
-- [ ] Bot scopes are exactly `chat:write`, `channels:history`, `groups:history`, `im:history`.
+- [ ] Bot scopes are exactly `channels:history`, `chat:write`, `files:read`, `files:write`, `groups:history`, `im:history`.
 - [ ] Bot events are exactly `message.channels`, `message.groups`, `message.im`.
 - [ ] Messages tab on, and users can send messages to the app.
 - [ ] Token rotation off.
