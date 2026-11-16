@@ -11,6 +11,7 @@ use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
+use moraebot::slack::SlackAdapter;
 use tokio::signal::unix::{SignalKind, signal};
 
 /// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
@@ -216,7 +217,11 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
 }
 
 async fn serve(config: Config) -> Result<(), GatewayError> {
-    let adapter: Arc<dyn MessengerAdapter> = Arc::new(DiscordAdapter::from_config(&config)?);
+    let adapter: Arc<dyn MessengerAdapter> = match config.messenger {
+        Platform::Discord => Arc::new(DiscordAdapter::from_config(&config)?),
+        Platform::Slack => Arc::new(SlackAdapter::from_config(&config)?),
+    };
+    tracing::info!(platform = adapter.platform(), "starting messenger");
     let gateway = Gateway::open(&config, Arc::clone(&adapter))?;
 
     let mut terminate = signal(SignalKind::terminate()).map_err(GatewayError::Signal)?;
