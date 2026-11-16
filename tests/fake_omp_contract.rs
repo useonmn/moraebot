@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use omp_rpc::{
-    Client, ClientOptions, Error, GetSessionLeaseCommand, OpenSessionCommand, PromptCommand,
-    PromptStatus, DEFAULT_PROMPT_TIMEOUT,
+    Client, ClientOptions, DEFAULT_PROMPT_TIMEOUT, Error, GetSessionLeaseCommand,
+    OpenSessionCommand, PromptCommand, PromptStatus,
 };
 
 fn spawn_fake(mode: &str, log: Option<&Path>) -> Client {

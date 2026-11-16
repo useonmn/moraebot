@@ -36,7 +36,11 @@ impl Harness {
             omp_path: PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             home: home.clone(),
             access_mode: AccessMode::OwnerOnly,
-            discord: Some(DiscordConfig { owner_id: 111, channel_id: 222, token_file: home.join("secrets").join("discord.token") }),
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("secrets").join("discord.token"),
+            }),
             slack: None,
             omp,
         };
@@ -46,7 +50,11 @@ impl Harness {
                 .admit("discord", &format!("m{n}"), key, "222", "111", "seed")
                 .expect("admit seed row");
         }
-        Self { dir, config, store: Arc::new(Mutex::new(store)) }
+        Self {
+            dir,
+            config,
+            store: Arc::new(Mutex::new(store)),
+        }
     }
 
     fn log(&self) -> PathBuf {
@@ -85,12 +93,18 @@ impl Harness {
     }
 
     fn set_session(&self, key: &str, session_id: &str) {
-        self.store.lock().unwrap().set_omp_session_id(key, session_id).unwrap();
+        self.store
+            .lock()
+            .unwrap()
+            .set_omp_session_id(key, session_id)
+            .unwrap();
     }
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(BOUND, future).await.expect("operation finished within bound")
+    tokio::time::timeout(BOUND, future)
+        .await
+        .expect("operation finished within bound")
 }
 
 fn alive(pid: u32) -> bool {
@@ -105,9 +119,19 @@ fn alive(pid: u32) -> bool {
 fn expected_argv(config: &Config, key: &str) -> Vec<String> {
     let session = omp::session_dir(config, key).to_string_lossy().into_owned();
     let work = config.work_dir.to_string_lossy().into_owned();
-    ["--mode", "rpc", "--no-ui", "--session-dir", &session, "--cwd", &work, "--approval-mode", "yolo"]
-        .map(str::to_owned)
-        .to_vec()
+    [
+        "--mode",
+        "rpc",
+        "--no-ui",
+        "--session-dir",
+        &session,
+        "--cwd",
+        &work,
+        "--approval-mode",
+        "yolo",
+    ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 fn start_argv(line: &str) -> Vec<String> {
@@ -118,18 +142,30 @@ fn start_argv(line: &str) -> Vec<String> {
 #[tokio::test]
 async fn argv_is_exact_and_env_drops_only_discord_names() {
     let h = Harness::new();
-    let manager = h
-        .manager("ok")
-        .with_extra_env([("MORAEBOT_DISCORD_PROBE", "x"), ("PROVIDER_PROBE_API_KEY", "y")]);
+    let manager = h.manager("ok").with_extra_env([
+        ("MORAEBOT_DISCORD_PROBE", "x"),
+        ("PROVIDER_PROBE_API_KEY", "y"),
+    ]);
     let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
     assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
 
     let lines = h.log_lines();
-    let start = lines.iter().find(|l| l.starts_with("START pid=")).expect("START line");
+    let start = lines
+        .iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("START line");
     assert_eq!(start_argv(start), expected_argv(&h.config, KEY_A));
-    let env = lines.iter().find(|l| l.starts_with("ENV ")).expect("ENV line");
+    let env = lines
+        .iter()
+        .find(|l| l.starts_with("ENV "))
+        .expect("ENV line");
     let names: Vec<&str> = env["ENV ".len()..].split_whitespace().collect();
-    assert!(names.iter().all(|n| !n.to_ascii_uppercase().contains("DISCORD")), "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.to_ascii_uppercase().contains("DISCORD")),
+        "{names:?}"
+    );
     assert!(names.contains(&"PROVIDER_PROBE_API_KEY"));
     for kept in ["PATH", "HOME"] {
         if std::env::var_os(kept).is_some() {
@@ -138,10 +174,18 @@ async fn argv_is_exact_and_env_drops_only_discord_names() {
     }
 
     let stderr_log = omp::stderr_log_path(&h.config, KEY_A);
-    let mode = std::fs::metadata(&stderr_log).expect("stderr log exists").permissions().mode();
+    let mode = std::fs::metadata(&stderr_log)
+        .expect("stderr log exists")
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
     assert_eq!(
-        h.store.lock().unwrap().omp_session_id(KEY_A).unwrap().as_deref(),
+        h.store
+            .lock()
+            .unwrap()
+            .omp_session_id(KEY_A)
+            .unwrap()
+            .as_deref(),
         Some("fake-session-1")
     );
     manager.shutdown_all().await;
@@ -149,10 +193,17 @@ async fn argv_is_exact_and_env_drops_only_discord_names() {
 
 #[tokio::test]
 async fn max_cost_adds_flag_only_when_set() {
-    let h = Harness::with_omp(OmpConfig { turn_timeout_minutes: None, max_cost_usd: Some(2.5) });
+    let h = Harness::with_omp(OmpConfig {
+        turn_timeout_minutes: None,
+        max_cost_usd: Some(2.5),
+    });
     let manager = h.manager("ok");
     bounded(manager.prompt(KEY_A, "hi")).await;
-    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
     let mut expected = expected_argv(&h.config, KEY_A);
     expected.extend(["--max-cost".to_owned(), "2.5".to_owned()]);
     assert_eq!(start_argv(&start), expected);
@@ -161,10 +212,17 @@ async fn max_cost_adds_flag_only_when_set() {
 
 #[tokio::test]
 async fn flag_present_when_hints_set() {
-    let h = Harness::with_omp(OmpConfig { turn_timeout_minutes: None, max_cost_usd: Some(2.5) });
+    let h = Harness::with_omp(OmpConfig {
+        turn_timeout_minutes: None,
+        max_cost_usd: Some(2.5),
+    });
     let manager = h.manager("ok").with_hints("probe hints".into());
     bounded(manager.prompt(KEY_A, "hi")).await;
-    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
     let mut expected = expected_argv(&h.config, KEY_A);
     expected.extend(["--append-system-prompt=probe hints", "--max-cost", "2.5"].map(str::to_owned));
     assert_eq!(start_argv(&start), expected);
@@ -176,8 +234,16 @@ async fn no_flag_when_hints_empty() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints(String::new());
     bounded(manager.prompt(KEY_A, "hi")).await;
-    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
-    assert!(start_argv(&start).iter().all(|a| !a.starts_with("--append-system-prompt")));
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
+    assert!(
+        start_argv(&start)
+            .iter()
+            .all(|a| !a.starts_with("--append-system-prompt"))
+    );
     manager.shutdown_all().await;
 }
 
@@ -216,8 +282,16 @@ async fn injection_payload_arrives_byte_for_byte_and_never_runs() {
     let prompts = h.frames("prompt");
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0]["message"], payload);
-    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
-    assert!(start_argv(&start).iter().all(|a| !a.contains("moraebot-pwned")));
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
+    assert!(
+        start_argv(&start)
+            .iter()
+            .all(|a| !a.contains("moraebot-pwned"))
+    );
     assert!(!Path::new("/tmp/moraebot-pwned-7f3a").exists());
     assert!(!Path::new("/tmp/moraebot-pwned-7f3a-b").exists());
     manager.shutdown_all().await;
@@ -265,7 +339,10 @@ async fn coded_non_cost_cap_error_is_prompt_error() {
     let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
     assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
-    assert!(manager.child_pid().await.is_some(), "a finished turn keeps its child");
+    assert!(
+        manager.child_pid().await.is_some(),
+        "a finished turn keeps its child"
+    );
     assert_eq!(h.frames("prompt").len(), 1);
     manager.shutdown_all().await;
 }
@@ -306,7 +383,10 @@ async fn held_lease_is_needs_check_without_prompt() {
     assert_eq!(outcome.code(), Some(omp::E_SESSION_BUSY));
     let leases = h.frames("get_session_lease");
     assert_eq!(leases.len(), 1);
-    assert_eq!(leases[0]["sessionIds"], serde_json::json!(["fake-session-1"]));
+    assert_eq!(
+        leases[0]["sessionIds"],
+        serde_json::json!(["fake-session-1"])
+    );
     assert!(h.frames("open_session").is_empty());
     assert!(h.frames("prompt").is_empty());
     assert!(!alive(h.start_pids()[0]));
@@ -317,7 +397,10 @@ async fn reopen_checks_free_lease_then_prompts() {
     let h = Harness::new();
     h.set_session(KEY_A, "fake-session-1");
     let manager = h.manager("ok");
-    assert_eq!(bounded(manager.prompt(KEY_A, "hi")).await, Outcome::Reply("echo: hi".into()));
+    assert_eq!(
+        bounded(manager.prompt(KEY_A, "hi")).await,
+        Outcome::Reply("echo: hi".into())
+    );
     assert_eq!(h.frames("get_session_lease").len(), 1);
     assert_eq!(h.frames("prompt").len(), 1);
     manager.shutdown_all().await;
@@ -340,12 +423,19 @@ async fn one_child_in_total_across_conversations() {
 
     bounded(manager.prompt(KEY_A, "one")).await;
     bounded(manager.prompt(KEY_A, "two")).await;
-    assert_eq!(h.start_pids().len(), 1, "same conversation reuses its child");
+    assert_eq!(
+        h.start_pids().len(),
+        1,
+        "same conversation reuses its child"
+    );
 
     bounded(manager.prompt(KEY_B, "three")).await;
     let pids = h.start_pids();
     assert_eq!(pids.len(), 2);
-    assert!(!alive(pids[0]), "previous child is reaped before the next spawns");
+    assert!(
+        !alive(pids[0]),
+        "previous child is reaped before the next spawns"
+    );
 
     bounded(manager.prompt(KEY_A, "four")).await;
     let pids = h.start_pids();

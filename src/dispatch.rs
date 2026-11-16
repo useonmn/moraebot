@@ -171,13 +171,20 @@ impl Dispatcher {
         self.post_needs_check_notices().await?;
         let starters = self.store().queued_thread_starters()?;
         for row in starters {
-            if !self.store().is_known_thread(&row.platform, &row.message_id)? {
+            if !self
+                .store()
+                .is_known_thread(&row.platform, &row.message_id)?
+            {
                 self.open_missing_thread(&row).await?;
             }
         }
         for row in recovered.reply_pending {
-            self.send_reply(row.id, &row.conversation_key, row.reply.as_deref().unwrap_or_default())
-                .await?;
+            self.send_reply(
+                row.id,
+                &row.conversation_key,
+                row.reply.as_deref().unwrap_or_default(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -240,7 +247,9 @@ impl Dispatcher {
     async fn resend_after_reconnect(&self) {
         match self.resend_pending().await {
             Ok(delivered) => tracing::info!(delivered, "pending replies re-sent after reconnect"),
-            Err(err) => tracing::error!(code = err.code(), error = %err, "pending replies not re-sent"),
+            Err(err) => {
+                tracing::error!(code = err.code(), error = %err, "pending replies not re-sent")
+            }
         }
     }
 
@@ -318,16 +327,24 @@ impl Dispatcher {
         let key = row.conversation_key.as_str();
 
         if row.author_id != self.owner_id {
-            tracing::warn!(row = row.id, code = E_ACCESS_NOT_OWNER, "stored author is not the owner");
-            self.store().mark(row.id, State::Failed, Some(E_ACCESS_NOT_OWNER))?;
+            tracing::warn!(
+                row = row.id,
+                code = E_ACCESS_NOT_OWNER,
+                "stored author is not the owner"
+            );
+            self.store()
+                .mark(row.id, State::Failed, Some(E_ACCESS_NOT_OWNER))?;
             return Ok(true);
         }
         let Some(target) = reply_target(key) else {
-            self.store().mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
+            self.store()
+                .mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
             return Ok(true);
         };
         if is_thread_starter(&row)
-            && !self.store().is_known_thread(&row.platform, &row.message_id)?
+            && !self
+                .store()
+                .is_known_thread(&row.platform, &row.message_id)?
             && !self.open_missing_thread(&row).await?
         {
             return Ok(true);
@@ -357,7 +374,11 @@ impl Dispatcher {
             Outcome::Failed { code, .. } => {
                 tracing::warn!(row = row.id, code, "turn failed");
                 self.store().mark(row.id, State::Failed, Some(code))?;
-                let notice = if code == E_COST_CAP { N_COST_CAP } else { N_FAILED };
+                let notice = if code == E_COST_CAP {
+                    N_COST_CAP
+                } else {
+                    N_FAILED
+                };
                 self.notify(target, notice).await;
             }
             Outcome::NeedsCheck { code, .. } => {
@@ -373,10 +394,15 @@ impl Dispatcher {
     /// Returns whether the row may run; otherwise it is `failed` and announced.
     async fn open_missing_thread(&self, row: &InboxRow) -> Result<bool, StoreError> {
         let Some(channel) = self.store().channel_of(&row.conversation_key)? else {
-            self.store().mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
+            self.store()
+                .mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
             return Ok(false);
         };
-        match self.adapter.create_thread(&channel, &row.message_id, &row.text).await {
+        match self
+            .adapter
+            .create_thread(&channel, &row.message_id, &row.text)
+            .await
+        {
             Ok(thread) => {
                 self.store().remember_thread(&row.platform, &thread)?;
                 tracing::info!(row = row.id, "missing thread opened");
@@ -406,12 +432,17 @@ impl Dispatcher {
         let ids = std::mem::take(&mut *self.pending.lock().expect("pending lock"));
         let mut delivered = 0;
         for id in ids {
-            let Some(row) = self.store().get(id)? else { continue };
+            let Some(row) = self.store().get(id)? else {
+                continue;
+            };
             if row.state != State::ReplyPending {
                 continue;
             }
             let reply = row.reply.unwrap_or_default();
-            if self.send_reply(row.id, &row.conversation_key, &reply).await? {
+            if self
+                .send_reply(row.id, &row.conversation_key, &reply)
+                .await?
+            {
                 delivered += 1;
             }
         }
@@ -427,7 +458,11 @@ impl Dispatcher {
         };
         for chunk in reply_messages(reply, self.adapter.message_limit()) {
             if let Err(err) = self.adapter.send(target, &chunk).await {
-                tracing::warn!(row = id, code = err.code, "reply send failed, kept as reply_pending");
+                tracing::warn!(
+                    row = id,
+                    code = err.code,
+                    "reply send failed, kept as reply_pending"
+                );
                 let mut pending = self.pending.lock().expect("pending lock");
                 if !pending.contains(&id) {
                     pending.push(id);
@@ -444,13 +479,18 @@ impl Dispatcher {
         let rows = self.store().needs_check_notices()?;
         let mut groups: Vec<(String, Vec<i64>)> = Vec::new();
         for row in rows {
-            match groups.iter_mut().find(|(key, _)| *key == row.conversation_key) {
+            match groups
+                .iter_mut()
+                .find(|(key, _)| *key == row.conversation_key)
+            {
                 Some((_, ids)) => ids.push(row.id),
                 None => groups.push((row.conversation_key, vec![row.id])),
             }
         }
         for (key, ids) in groups {
-            let Some(target) = reply_target(&key) else { continue };
+            let Some(target) = reply_target(&key) else {
+                continue;
+            };
             if self.notify(target, N_INTERRUPTED).await {
                 let store = self.store();
                 for id in ids {

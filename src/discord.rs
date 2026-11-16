@@ -163,7 +163,11 @@ impl fmt::Debug for Token {
 fn read_token(path: &Path) -> Result<Token, AdapterError> {
     let text = std::fs::read_to_string(path).map_err(|err| AdapterError {
         code: E_DISCORD_TOKEN,
-        message: format!("cannot read the token file {}: {}", path.display(), err.kind()),
+        message: format!(
+            "cannot read the token file {}: {}",
+            path.display(),
+            err.kind()
+        ),
     })?;
     let token = text.trim();
     if token.is_empty() {
@@ -193,14 +197,21 @@ impl Handler {
         if channel_id == self.scope.channel_id {
             return Some(Location::GuildChannel);
         }
-        if let Some(location) = self.locations.lock().expect("locations lock").get(&channel_id) {
+        if let Some(location) = self
+            .locations
+            .lock()
+            .expect("locations lock")
+            .get(&channel_id)
+        {
             return Some(*location);
         }
         let location = match msg.channel(ctx).await {
             Ok(Channel::Guild(channel)) => guild_location(
                 matches!(
                     channel.kind,
-                    ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+                    ChannelType::PublicThread
+                        | ChannelType::PrivateThread
+                        | ChannelType::NewsThread
                 ),
                 channel.parent_id.map(ChannelId::get),
             ),
@@ -300,7 +311,6 @@ impl DiscordAdapter {
             },
         )
     }
-
 }
 
 /// Keeps a gateway connection up until shutdown. A failed or dropped connection (also a
@@ -416,7 +426,11 @@ impl MessengerAdapter for DiscordAdapter {
         let channel_id = ChannelId::new(parse_id(channel_id)?);
         let message_id = MessageId::new(parse_id(from_message_id)?);
         let thread = channel_id
-            .create_thread_from_message(&self.http, message_id, CreateThread::new(thread_name(name)))
+            .create_thread_from_message(
+                &self.http,
+                message_id,
+                CreateThread::new(thread_name(name)),
+            )
             .await
             .map_err(|err| AdapterError {
                 code: E_ADAPTER_THREAD,
@@ -485,8 +499,11 @@ mod tests {
 
     #[test]
     fn owner_message_in_configured_channel_maps_to_event() {
-        let event = map_message(&raw(Location::GuildChannel, CHANNEL, OWNER, "hello"), &scope())
-            .expect("event");
+        let event = map_message(
+            &raw(Location::GuildChannel, CHANNEL, OWNER, "hello"),
+            &scope(),
+        )
+        .expect("event");
         assert_eq!(
             event,
             InboundEvent {
@@ -512,7 +529,11 @@ mod tests {
     fn bot_flag_is_carried() {
         let mut message = raw(Location::GuildChannel, CHANNEL, OWNER, "hi");
         message.author_is_bot = true;
-        assert!(map_message(&message, &scope()).expect("event").author_is_bot);
+        assert!(
+            map_message(&message, &scope())
+                .expect("event")
+                .author_is_bot
+        );
     }
 
     #[test]
@@ -548,7 +569,10 @@ mod tests {
     fn threads_under_other_or_unknown_parents_are_dropped() {
         for parent_id in [Some(999), None] {
             let location = Location::Thread { parent_id };
-            assert_eq!(map_message(&raw(location, THREAD, OWNER, "x"), &scope()), None);
+            assert_eq!(
+                map_message(&raw(location, THREAD, OWNER, "x"), &scope()),
+                None
+            );
         }
     }
 
@@ -558,7 +582,10 @@ mod tests {
         assert!(event.is_dm);
         assert_eq!(event.channel_id, "555");
         assert_eq!(event.thread_id, None);
-        assert_eq!(map_message(&raw(Location::Dm, 555, OTHER, "dm"), &scope()), None);
+        assert_eq!(
+            map_message(&raw(Location::Dm, 555, OTHER, "dm"), &scope()),
+            None
+        );
     }
 
     #[test]
@@ -589,7 +616,10 @@ mod tests {
 
     #[test]
     fn thread_name_collapses_whitespace() {
-        assert_eq!(thread_name("  fix\nthe   build \t now "), "fix the build now");
+        assert_eq!(
+            thread_name("  fix\nthe   build \t now "),
+            "fix the build now"
+        );
     }
 
     #[test]
@@ -656,7 +686,9 @@ mod tests {
     #[test]
     fn missing_or_empty_token_file_is_refused_with_code() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = DiscordAdapter::new(&dir.path().join("nope"), scope()).err().unwrap();
+        let missing = DiscordAdapter::new(&dir.path().join("nope"), scope())
+            .err()
+            .unwrap();
         assert_eq!(missing.code, E_DISCORD_TOKEN);
         let empty = DiscordAdapter::new(&token_file(dir.path(), " \n"), scope())
             .err()
@@ -678,11 +710,21 @@ mod tests {
         let adapter =
             DiscordAdapter::new(&token_file(dir.path(), "TOKEN_SENTINEL_9f3a"), scope()).unwrap();
         assert_eq!(adapter.platform(), PLATFORM);
-        assert_eq!(adapter.send("thread-1", "hi").await.unwrap_err().code, E_DISCORD_ID);
         assert_eq!(
-            adapter.create_thread("222", "0", "name").await.unwrap_err().code,
+            adapter.send("thread-1", "hi").await.unwrap_err().code,
             E_DISCORD_ID
         );
-        assert_eq!(adapter.start_typing("").await.err().unwrap().code, E_DISCORD_ID);
+        assert_eq!(
+            adapter
+                .create_thread("222", "0", "name")
+                .await
+                .unwrap_err()
+                .code,
+            E_DISCORD_ID
+        );
+        assert_eq!(
+            adapter.start_typing("").await.err().unwrap().code,
+            E_DISCORD_ID
+        );
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{
-    params, Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior,
+    Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior, params,
 };
 
 pub const E_ALREADY_RUNNING: &str = "E_ALREADY_RUNNING";
@@ -551,9 +551,10 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'forced'); END;",
             )
             .unwrap();
-        assert!(s
-            .admit("test", "m1", "k1", "chan1", "111", "hello")
-            .is_err());
+        assert!(
+            s.admit("test", "m1", "k1", "chan1", "111", "hello")
+                .is_err()
+        );
         assert_eq!(s.count().unwrap(), 0);
     }
 

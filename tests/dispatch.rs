@@ -42,7 +42,12 @@ impl Harness {
 
     /// Like [`Self::open`], but every `create_thread` call is recorded and then fails.
     fn open_failing_threads(root: &Path) -> Self {
-        Self::build(root, "ok", PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")), true)
+        Self::build(
+            root,
+            "ok",
+            PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+            true,
+        )
     }
 
     fn open_with(root: &Path, mode: &str, omp_path: PathBuf) -> Self {
@@ -64,14 +69,23 @@ impl Harness {
             omp_path,
             home: home.clone(),
             access_mode: AccessMode::OwnerOnly,
-            discord: Some(DiscordConfig { owner_id: OWNER.parse().unwrap(), channel_id: CHANNEL.parse().unwrap(), token_file }),
+            discord: Some(DiscordConfig {
+                owner_id: OWNER.parse().unwrap(),
+                channel_id: CHANNEL.parse().unwrap(),
+                token_file,
+            }),
             slack: None,
             omp: OmpConfig::default(),
         };
-        let store = Arc::new(Mutex::new(Store::open(&home.join("inbox.sqlite")).expect("store")));
+        let store = Arc::new(Mutex::new(
+            Store::open(&home.join("inbox.sqlite")).expect("store"),
+        ));
         let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env([
             ("FAKE_OMP_MODE", mode.to_owned()),
-            ("FAKE_OMP_LOG", root.join("fake-omp.log").to_string_lossy().into_owned()),
+            (
+                "FAKE_OMP_LOG",
+                root.join("fake-omp.log").to_string_lossy().into_owned(),
+            ),
         ]);
         let adapter = Arc::new(FakeAdapter::new());
         let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
@@ -80,15 +94,25 @@ impl Harness {
             adapter.clone()
         };
         let dispatcher = Arc::new(Dispatcher::new(&config, as_dyn, Arc::clone(&store), omp));
-        Self { root: root.to_owned(), config, store, adapter, dispatcher }
+        Self {
+            root: root.to_owned(),
+            config,
+            store,
+            adapter,
+            dispatcher,
+        }
     }
 
     async fn handle(&self, event: InboundEvent) -> Handled {
-        bounded(self.dispatcher.handle_event(event)).await.expect("handle event")
+        bounded(self.dispatcher.handle_event(event))
+            .await
+            .expect("handle event")
     }
 
     async fn step(&self) -> bool {
-        bounded(self.dispatcher.process_next()).await.expect("worker step")
+        bounded(self.dispatcher.process_next())
+            .await
+            .expect("worker step")
     }
 
     async fn drain(&self) {
@@ -96,7 +120,12 @@ impl Harness {
     }
 
     fn row(&self, id: i64) -> moraebot::store::InboxRow {
-        self.store.lock().unwrap().get(id).unwrap().expect("row exists")
+        self.store
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .expect("row exists")
     }
 
     fn count(&self) -> i64 {
@@ -120,7 +149,10 @@ impl Harness {
     }
 
     fn starts(&self) -> usize {
-        self.log_lines().iter().filter(|l| l.starts_with("START pid=")).count()
+        self.log_lines()
+            .iter()
+            .filter(|l| l.starts_with("START pid="))
+            .count()
     }
 
     fn sends(&self) -> Vec<(String, String)> {
@@ -153,7 +185,14 @@ impl Harness {
             .store
             .lock()
             .unwrap()
-            .admit("fake", message_id, &format!("fake:th:{message_id}"), CHANNEL, OWNER, text)
+            .admit(
+                "fake",
+                message_id,
+                &format!("fake:th:{message_id}"),
+                CHANNEL,
+                OWNER,
+                text,
+            )
             .unwrap();
         match admitted {
             moraebot::store::Admitted::New(id) => id,
@@ -193,8 +232,13 @@ impl MessengerAdapter for ThreadFailAdapter {
         from_message_id: &str,
         name: &str,
     ) -> Result<String, AdapterError> {
-        self.0.create_thread(channel_id, from_message_id, name).await?;
-        Err(AdapterError { code: E_ADAPTER_THREAD, message: "injected thread failure".to_owned() })
+        self.0
+            .create_thread(channel_id, from_message_id, name)
+            .await?;
+        Err(AdapterError {
+            code: E_ADAPTER_THREAD,
+            message: "injected thread failure".to_owned(),
+        })
     }
 
     async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError> {
@@ -207,7 +251,9 @@ impl MessengerAdapter for ThreadFailAdapter {
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(BOUND, future).await.expect("finished within bound")
+    tokio::time::timeout(BOUND, future)
+        .await
+        .expect("finished within bound")
 }
 
 fn event(message_id: &str, author_id: &str, thread_id: Option<&str>, text: &str) -> InboundEvent {
@@ -275,8 +321,13 @@ async fn round_trip_creates_thread_and_replies() {
                 from_message_id: mid.into(),
                 name: "hello".into(),
             },
-            Call::StartTyping { channel: mid.into() },
-            Call::Send { channel: mid.into(), text: "echo: hello".into() },
+            Call::StartTyping {
+                channel: mid.into()
+            },
+            Call::Send {
+                channel: mid.into(),
+                text: "echo: hello".into()
+            },
         ]
     );
     let row = h.row(id);
@@ -312,8 +363,13 @@ async fn crash_before_thread_creation_opens_thread_at_startup_then_runs_once() {
                 from_message_id: mid.into(),
                 name: "hello".into(),
             },
-            Call::StartTyping { channel: mid.into() },
-            Call::Send { channel: mid.into(), text: "echo: hello".into() },
+            Call::StartTyping {
+                channel: mid.into()
+            },
+            Call::Send {
+                channel: mid.into(),
+                text: "echo: hello".into()
+            },
         ]
     );
     assert_eq!(h.prompts().len(), 1);
@@ -340,7 +396,10 @@ async fn crash_before_thread_creation_and_failed_retry_marks_failed_with_one_not
     assert_eq!(row.error.as_deref(), Some(E_ADAPTER_THREAD));
     assert!(row.notice_sent);
     assert_eq!(h.threads_created(), 1);
-    assert_eq!(h.sends(), vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]
+    );
     assert!(h.prompts().is_empty());
     assert_eq!(h.starts(), 0);
     h.close().await;
@@ -348,7 +407,10 @@ async fn crash_before_thread_creation_and_failed_retry_marks_failed_with_one_not
     let h = Harness::open(dir.path(), "ok");
     bounded(h.dispatcher.startup()).await.unwrap();
     assert!(!h.step().await);
-    assert!(h.adapter.calls().is_empty(), "no second thread attempt and no second notice");
+    assert!(
+        h.adapter.calls().is_empty(),
+        "no second thread attempt and no second notice"
+    );
     assert!(h.prompts().is_empty());
     assert_eq!(h.row(id).state, State::Failed);
     h.close().await;
@@ -377,7 +439,10 @@ async fn worker_never_prompts_a_thread_starter_without_its_thread() {
                 from_message_id: mid.into(),
                 name: "hello".into(),
             },
-            Call::Send { channel: CHANNEL.into(), text: notice_text(N_THREAD_FAILED).into() },
+            Call::Send {
+                channel: CHANNEL.into(),
+                text: notice_text(N_THREAD_FAILED).into()
+            },
         ]
     );
     h.close().await;
@@ -388,7 +453,9 @@ async fn thread_creation_failure_on_arrival_marks_failed_with_one_notice() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open_failing_threads(dir.path());
     let handled = h.handle(channel_msg("1300000000000000143", "hello")).await;
-    let Handled::ThreadFailed(id) = handled else { panic!("expected ThreadFailed, got {handled:?}") };
+    let Handled::ThreadFailed(id) = handled else {
+        panic!("expected ThreadFailed, got {handled:?}")
+    };
     assert!(!h.step().await);
 
     let row = h.row(id);
@@ -396,7 +463,10 @@ async fn thread_creation_failure_on_arrival_marks_failed_with_one_notice() {
     assert_eq!(row.error.as_deref(), Some(E_ADAPTER_THREAD));
     assert!(row.notice_sent);
     assert!(h.prompts().is_empty());
-    assert_eq!(h.sends(), vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]
+    );
     h.close().await;
 }
 
@@ -406,8 +476,12 @@ async fn run_loop_serves_injected_events() {
     let h = Harness::open(dir.path(), "ok");
     let inbound = h.adapter.start().await.unwrap();
     let runner = tokio::spawn(Arc::clone(&h.dispatcher).run(inbound));
-    h.adapter.inject(channel_msg("1300000000000000011", "one")).await;
-    h.adapter.inject(channel_msg("1300000000000000012", "two")).await;
+    h.adapter
+        .inject(channel_msg("1300000000000000011", "one"))
+        .await;
+    h.adapter
+        .inject(channel_msg("1300000000000000012", "two"))
+        .await;
     bounded(h.adapter.wait_for_send(2)).await;
     let texts: Vec<String> = h.sends().into_iter().map(|(_, text)| text).collect();
     assert_eq!(texts, ["echo: one", "echo: two"]);
@@ -423,12 +497,18 @@ async fn message_in_thread_reuses_conversation() {
     let thread = "1300000000000000020";
     let first = queued(h.handle(channel_msg(thread, "first")).await);
     h.drain().await;
-    let second = queued(h.handle(event("1300000000000000021", OWNER, Some(thread), "second")).await);
+    let second = queued(
+        h.handle(event("1300000000000000021", OWNER, Some(thread), "second"))
+            .await,
+    );
     h.drain().await;
 
     assert_eq!(h.threads_created(), 1);
     assert_eq!(h.starts(), 1, "same fake-omp child serves both messages");
-    assert_eq!(h.row(first).conversation_key, h.row(second).conversation_key);
+    assert_eq!(
+        h.row(first).conversation_key,
+        h.row(second).conversation_key
+    );
     assert_eq!(h.row(second).state, State::Done);
     assert_eq!(
         h.sends(),
@@ -444,9 +524,13 @@ async fn message_in_thread_reuses_conversation() {
 async fn non_owner_never_stored_or_sent() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    let stranger = h.handle(event("1300000000000000030", STRANGER, None, "hello")).await;
+    let stranger = h
+        .handle(event("1300000000000000030", STRANGER, None, "hello"))
+        .await;
     assert_eq!(stranger, Handled::Dropped(DropReason::NotOwner));
-    let stranger_slash = h.handle(event("1300000000000000031", STRANGER, None, "/model x")).await;
+    let stranger_slash = h
+        .handle(event("1300000000000000031", STRANGER, None, "/model x"))
+        .await;
     assert_eq!(stranger_slash, Handled::Dropped(DropReason::NotOwner));
     let mut bot = event("1300000000000000032", OWNER, None, "hello");
     bot.author_is_bot = true;
@@ -465,9 +549,15 @@ async fn duplicate_message_id_processed_once() {
     let h = Harness::open(dir.path(), "ok");
     let mid = "1300000000000000001";
     queued(h.handle(channel_msg(mid, "hello")).await);
-    assert_eq!(h.handle(channel_msg(mid, "hello")).await, Handled::Duplicate);
+    assert_eq!(
+        h.handle(channel_msg(mid, "hello")).await,
+        Handled::Duplicate
+    );
     h.drain().await;
-    assert_eq!(h.handle(channel_msg(mid, "hello")).await, Handled::Duplicate);
+    assert_eq!(
+        h.handle(channel_msg(mid, "hello")).await,
+        Handled::Duplicate
+    );
     assert!(!h.step().await);
 
     assert_eq!(h.count(), 1);
@@ -490,7 +580,10 @@ async fn omp_exit1_marks_needs_check_and_notifies() {
     assert_eq!(row.error.as_deref(), Some(E_CHILD_LOST));
     assert!(row.notice_sent);
     assert_eq!(h.prompts().len(), 1);
-    assert_eq!(h.sends(), vec![(mid.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
     h.close().await;
 }
 
@@ -500,7 +593,10 @@ async fn queued_behind_interrupted_is_held_under_one_notice() {
     let h = Harness::open_with(dir.path(), "hang", exit1_wrapper(dir.path()));
     let thread = "1300000000000000050";
     let first = queued(h.handle(channel_msg(thread, "first")).await);
-    let second = queued(h.handle(event("1300000000000000051", OWNER, Some(thread), "second")).await);
+    let second = queued(
+        h.handle(event("1300000000000000051", OWNER, Some(thread), "second"))
+            .await,
+    );
     h.drain().await;
 
     assert_eq!(h.row(first).state, State::NeedsCheck);
@@ -508,7 +604,10 @@ async fn queued_behind_interrupted_is_held_under_one_notice() {
     assert_eq!(held.state, State::NeedsCheck);
     assert!(held.notice_sent);
     assert_eq!(h.prompts().len(), 1, "the held message never reaches omp");
-    assert_eq!(h.sends(), vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
     h.close().await;
 }
 
@@ -521,13 +620,22 @@ async fn hold_behind_announced_interruption_survives_restart() {
         let h = Harness::open_with(dir.path(), "hang", exit1_wrapper(dir.path()));
         let first = queued(h.handle(channel_msg(thread, "first")).await);
         let other_id = queued(h.handle(channel_msg(other, "other")).await);
-        let second =
-            queued(h.handle(event("1300000000000000057", OWNER, Some(thread), "second")).await);
+        let second = queued(
+            h.handle(event("1300000000000000057", OWNER, Some(thread), "second"))
+                .await,
+        );
         assert!(h.step().await);
         assert_eq!(h.row(first).state, State::NeedsCheck);
-        assert_eq!(h.sends(), vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+        assert_eq!(
+            h.sends(),
+            vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+        );
         // The process stops while the other conversation's turn is in flight.
-        h.store.lock().unwrap().mark(other_id, State::Processing, None).unwrap();
+        h.store
+            .lock()
+            .unwrap()
+            .mark(other_id, State::Processing, None)
+            .unwrap();
         h.close().await;
         (first, other_id, second)
     };
@@ -559,13 +667,20 @@ async fn restart_with_processing_row_sends_notice_and_no_prompt() {
     let id = {
         let h = Harness::open(dir.path(), "ok");
         let id = queued(h.handle(channel_msg(mid, "hello")).await);
-        h.store.lock().unwrap().mark(id, State::Processing, None).unwrap();
+        h.store
+            .lock()
+            .unwrap()
+            .mark(id, State::Processing, None)
+            .unwrap();
         id
     };
 
     let h = Harness::open(dir.path(), "ok");
     bounded(h.dispatcher.startup()).await.unwrap();
-    assert_eq!(h.sends(), vec![(mid.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
     assert!(!h.step().await);
     let row = h.row(id);
     assert_eq!(row.state, State::NeedsCheck);
@@ -575,7 +690,10 @@ async fn restart_with_processing_row_sends_notice_and_no_prompt() {
     let h = Harness::open(dir.path(), "ok");
     bounded(h.dispatcher.startup()).await.unwrap();
     assert!(!h.step().await);
-    assert!(h.sends().is_empty(), "the notice is posted exactly once across restarts");
+    assert!(
+        h.sends().is_empty(),
+        "the notice is posted exactly once across restarts"
+    );
     assert!(h.prompts().is_empty());
     assert_eq!(h.starts(), 0);
 }
@@ -603,7 +721,12 @@ fn reply_longer_than_ten_messages_is_cut_with_note() {
     let chunks = reply_messages(&text, LIMIT);
     assert_eq!(chunks.len(), MAX_REPLY_MESSAGES);
     assert!(chunks.iter().all(|c| c.chars().count() <= LIMIT));
-    assert!(chunks.last().unwrap().ends_with(notice_text(N_REPLY_TRUNCATED)));
+    assert!(
+        chunks
+            .last()
+            .unwrap()
+            .ends_with(notice_text(N_REPLY_TRUNCATED))
+    );
     assert_eq!(reply_messages("short", LIMIT), ["short"]);
 }
 
@@ -611,14 +734,19 @@ fn reply_longer_than_ten_messages_is_cut_with_note() {
 async fn slash_message_not_forwarded() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    let handled = h.handle(channel_msg("1300000000000000080", "/model x")).await;
+    let handled = h
+        .handle(channel_msg("1300000000000000080", "/model x"))
+        .await;
     assert_eq!(handled, Handled::Notice(N_UNSUPPORTED_INPUT));
     assert!(!h.step().await);
     assert!(h.prompts().is_empty());
     assert_eq!(h.count(), 0);
     assert_eq!(
         h.sends(),
-        vec![(CHANNEL.to_owned(), notice_text(N_UNSUPPORTED_INPUT).to_owned())]
+        vec![(
+            CHANNEL.to_owned(),
+            notice_text(N_UNSUPPORTED_INPUT).to_owned()
+        )]
     );
 
     let empty = h.handle(channel_msg("1300000000000000081", "  ")).await;
@@ -639,7 +767,10 @@ async fn open_session_failure_no_prompt_one_notice() {
     assert_eq!(row.state, State::Failed);
     assert_eq!(row.error.as_deref(), Some(E_OPEN_SESSION));
     assert!(h.prompts().is_empty());
-    assert_eq!(h.sends(), vec![(mid.to_owned(), notice_text(N_FAILED).to_owned())]);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FAILED).to_owned())]
+    );
     h.close().await;
 }
 
@@ -663,7 +794,11 @@ async fn send_failure_keeps_reply_pending_then_delivers_once() {
 
     let sends = h.sends();
     assert_eq!(sends.len(), 2, "one failed attempt, one delivery");
-    assert!(sends.iter().all(|(channel, text)| channel == mid && text == "echo: hello"));
+    assert!(
+        sends
+            .iter()
+            .all(|(channel, text)| channel == mid && text == "echo: hello")
+    );
     assert_eq!(h.prompts().len(), 1);
     h.close().await;
 }
@@ -685,7 +820,9 @@ async fn reply_pending_is_resent_once_after_adapter_reconnect() {
     bounded(h.adapter.wait_for_send(2)).await;
     // A later message in the same thread is served after the resend finished, so the
     // first row is settled and the same omp child (no restart) is still in use.
-    h.adapter.inject(event("1300000000000000116", OWNER, Some(mid), "second")).await;
+    h.adapter
+        .inject(event("1300000000000000116", OWNER, Some(mid), "second"))
+        .await;
     bounded(h.adapter.wait_for_send(3)).await;
 
     assert_eq!(h.row(1).state, State::Done);
@@ -698,7 +835,11 @@ async fn reply_pending_is_resent_once_after_adapter_reconnect() {
         ],
         "one failed attempt, exactly one delivery after the reconnect"
     );
-    let hello_prompts = h.prompts().iter().filter(|p| p["message"] == "hello").count();
+    let hello_prompts = h
+        .prompts()
+        .iter()
+        .filter(|p| p["message"] == "hello")
+        .count();
     assert_eq!(hello_prompts, 1);
     assert_eq!(h.starts(), 1);
     runner.abort();
@@ -744,7 +885,10 @@ async fn injection_payload_reaches_omp_byte_for_byte_and_never_runs() {
     let prompts = h.prompts();
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0]["message"], payload);
-    assert_eq!(h.sends(), vec![(mid.to_owned(), format!("echo: {payload}"))]);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), format!("echo: {payload}"))]
+    );
     assert!(!Path::new("/tmp/moraebot-pwned-7f3a").exists());
     assert!(!Path::new("/tmp/moraebot-pwned-7f3a-b").exists());
     h.close().await;
@@ -774,11 +918,17 @@ async fn token_sentinel_absent_from_logs_db_and_omp_io() {
         }
     }
     checked.push(fake_log);
-    assert!(checked.iter().any(|p| p.to_string_lossy().contains("moraebot.log")));
+    assert!(
+        checked
+            .iter()
+            .any(|p| p.to_string_lossy().contains("moraebot.log"))
+    );
     assert!(checked.iter().any(|p| p.ends_with("inbox.sqlite")));
     for path in checked {
         let bytes = std::fs::read(&path).unwrap();
-        let found = bytes.windows(TOKEN_SENTINEL.len()).any(|w| w == TOKEN_SENTINEL.as_bytes());
+        let found = bytes
+            .windows(TOKEN_SENTINEL.len())
+            .any(|w| w == TOKEN_SENTINEL.as_bytes());
         assert!(!found, "token sentinel leaked into {}", path.display());
     }
 }

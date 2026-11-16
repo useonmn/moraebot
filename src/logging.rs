@@ -5,7 +5,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, fmt};
 
 pub const E_LOG_DIR_NOT_WRITABLE: &str = "E_LOG_DIR_NOT_WRITABLE";
 
@@ -66,9 +66,11 @@ mod tests {
                     .starts_with("moraebot.log")
             })
             .expect("a moraebot.log file");
-        assert!(fs::read_to_string(file)
-            .unwrap()
-            .contains("logging-test-line-7f3a"));
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("logging-test-line-7f3a")
+        );
     }
 
     #[test]

@@ -29,7 +29,9 @@ const SHUTDOWN_BOUND: Duration = Duration::from_secs(25);
 const BOUND: Duration = Duration::from_secs(30);
 
 async fn bounded<T>(bound: Duration, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(bound, future).await.expect("finished within bound")
+    tokio::time::timeout(bound, future)
+        .await
+        .expect("finished within bound")
 }
 
 /// Streams the lines fake-omp appends to `FAKE_OMP_LOG`. The log is a FIFO that the tap
@@ -41,9 +43,16 @@ struct LogTap {
 
 impl LogTap {
     fn create(path: &Path) -> Self {
-        let made = Command::new("mkfifo").arg(path).status().expect("run mkfifo");
+        let made = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
         assert!(made.success(), "mkfifo failed");
-        let fifo = OpenOptions::new().read(true).write(true).open(path).expect("open fifo");
+        let fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open fifo");
         let (tx, lines) = mpsc::unbounded_channel();
         std::thread::spawn(move || {
             for line in BufReader::new(fifo).lines() {
@@ -53,7 +62,10 @@ impl LogTap {
                 }
             }
         });
-        Self { lines, seen: Vec::new() }
+        Self {
+            lines,
+            seen: Vec::new(),
+        }
     }
 
     async fn wait_for(&mut self, matches: impl Fn(&str) -> bool) {
@@ -88,7 +100,13 @@ impl LogTap {
         self.seen
             .iter()
             .filter_map(|line| line.strip_prefix("START pid="))
-            .map(|rest| rest.split_whitespace().next().expect("pid").parse().expect("pid"))
+            .map(|rest| {
+                rest.split_whitespace()
+                    .next()
+                    .expect("pid")
+                    .parse()
+                    .expect("pid")
+            })
             .collect()
     }
 
@@ -112,7 +130,10 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn terminate(pid: u32) {
-    let _ = Command::new("kill").args(["-9", &pid.to_string()]).stderr(Stdio::null()).status();
+    let _ = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
 }
 
 struct Running {
@@ -123,7 +144,9 @@ struct Running {
 impl Running {
     async fn stop(self) -> Result<(), GatewayError> {
         let _ = self.stop.send(());
-        bounded(SHUTDOWN_BOUND, self.task).await.expect("gateway task joined")
+        bounded(SHUTDOWN_BOUND, self.task)
+            .await
+            .expect("gateway task joined")
     }
 }
 
@@ -152,11 +175,20 @@ impl Rig {
             omp_path: PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             home,
             access_mode: AccessMode::OwnerOnly,
-            discord: Some(DiscordConfig { owner_id: OWNER.parse().unwrap(), channel_id: CHANNEL.parse().unwrap(), token_file }),
+            discord: Some(DiscordConfig {
+                owner_id: OWNER.parse().unwrap(),
+                channel_id: CHANNEL.parse().unwrap(),
+                token_file,
+            }),
             slack: None,
             omp: OmpConfig::default(),
         };
-        Self { _dir: dir, root, config, adapter: Arc::new(FakeAdapter::new()) }
+        Self {
+            _dir: dir,
+            root,
+            config,
+            adapter: Arc::new(FakeAdapter::new()),
+        }
     }
 
     fn log(&self) -> PathBuf {
@@ -255,9 +287,16 @@ async fn shutdown_during_a_hanging_turn_leaves_needs_check_and_no_child() {
         }
         panic!("the gateway did not stop within the bound");
     }
-    finished.unwrap().expect("gateway task joined").expect("clean stop");
+    finished
+        .unwrap()
+        .expect("gateway task joined")
+        .expect("clean stop");
     assert_eq!(rig.first_row_state(), State::NeedsCheck);
-    assert_eq!(tap.prompts(), 1, "the interrupted message must not be re-prompted");
+    assert_eq!(
+        tap.prompts(),
+        1,
+        "the interrupted message must not be re-prompted"
+    );
     let pids = tap.pids();
     assert_eq!(pids.len(), 1);
     for pid in pids {
@@ -276,7 +315,9 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
     second.thread_id = Some(MESSAGE_ID.into());
     rig.adapter.inject(second).await;
     // Events are handled in order, so this notice proves "second" was stored.
-    rig.adapter.inject(owner_message("1300000000000000003", "/marker")).await;
+    rig.adapter
+        .inject(owner_message("1300000000000000003", "/marker"))
+        .await;
     bounded(BOUND, rig.adapter.wait_for_send(1)).await;
     tap.wait_for_prompt().await;
     running.stop().await.expect("clean stop");
@@ -284,7 +325,9 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
     let adapter = Arc::new(FakeAdapter::new());
     let running = rig.start_with(adapter.clone(), "ok");
     // A message in another conversation, admitted after the held row, is served after it.
-    adapter.inject(owner_message("1300000000000000005", "third")).await;
+    adapter
+        .inject(owner_message("1300000000000000005", "third"))
+        .await;
     bounded(BOUND, adapter.wait_for_send(2)).await;
     tap.wait_for(|line| {
         serde_json::from_str::<Value>(line).is_ok_and(|frame| frame["message"] == "third")
@@ -299,7 +342,11 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
         .filter(|frame| frame["type"] == "prompt")
         .map(|frame| frame["message"].clone())
         .collect();
-    assert_eq!(messages, ["first", "third"], "the held message never reaches omp");
+    assert_eq!(
+        messages,
+        ["first", "third"],
+        "the held message never reaches omp"
+    );
     let sends: Vec<(String, String)> = adapter
         .calls()
         .into_iter()
@@ -335,7 +382,8 @@ async fn second_gateway_on_the_same_home_is_refused() {
     assert_eq!(refused.code(), E_ALREADY_RUNNING);
 
     running.stop().await.expect("clean stop");
-    rig.gateway("ok").expect("the home is free again after a clean stop");
+    rig.gateway("ok")
+        .expect("the home is free again after a clean stop");
 }
 
 #[test]

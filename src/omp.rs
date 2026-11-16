@@ -12,7 +12,7 @@ use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -86,11 +86,17 @@ impl Outcome {
     }
 
     fn failed(code: &'static str, detail: impl ToString) -> Self {
-        Self::Failed { code, detail: detail.to_string() }
+        Self::Failed {
+            code,
+            detail: detail.to_string(),
+        }
     }
 
     fn needs_check(code: &'static str, detail: impl ToString) -> Self {
-        Self::NeedsCheck { code, detail: detail.to_string() }
+        Self::NeedsCheck {
+            code,
+            detail: detail.to_string(),
+        }
     }
 }
 
@@ -140,18 +146,31 @@ pub fn omp_args(config: &Config, session_dir: &Path, hints: &str) -> Vec<OsStrin
 /// Filesystem-safe form of a conversation key (`discord:th:1` -> `discord-th-1`).
 pub fn key_slug(key: &str) -> String {
     key.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
 /// `<home>/conversations/<slug>/session`.
 pub fn session_dir(config: &Config, key: &str) -> PathBuf {
-    config.home.join("conversations").join(key_slug(key)).join("session")
+    config
+        .home
+        .join("conversations")
+        .join(key_slug(key))
+        .join("session")
 }
 
 /// `<home>/logs/omp-<slug>.stderr.log`.
 pub fn stderr_log_path(config: &Config, key: &str) -> PathBuf {
-    config.home.join("logs").join(format!("omp-{}.stderr.log", key_slug(key)))
+    config
+        .home
+        .join("logs")
+        .join(format!("omp-{}.stderr.log", key_slug(key)))
 }
 
 /// Messenger names: a variable whose name contains one (any case) never reaches omp.
@@ -213,7 +232,12 @@ struct Live {
 impl Live {
     /// Closes the client (on its own thread) and waits until the process is reaped.
     async fn close(self) {
-        let Live { key, mut pid, requests, worker } = self;
+        let Live {
+            key,
+            mut pid,
+            requests,
+            worker,
+        } = self;
         drop(requests);
         match tokio::task::spawn_blocking(move || worker.join()).await {
             Ok(Ok(())) => pid.0 = None,
@@ -226,7 +250,12 @@ impl Live {
     /// Kills the child's process group first so a worker blocked in `prompt_and_wait`
     /// sees the closed pipe and returns, then joins the worker within `ABORT_JOIN_BOUND`.
     async fn abort(self) {
-        let Live { key, mut pid, requests, worker } = self;
+        let Live {
+            key,
+            mut pid,
+            requests,
+            worker,
+        } = self;
         if let Some(pid) = pid.0 {
             kill_group(pid);
         }
@@ -255,7 +284,9 @@ impl OmpManager {
         let turn_timeout = config
             .omp
             .turn_timeout_minutes
-            .map_or(UNLIMITED, |minutes| Duration::from_secs(minutes.saturating_mul(60)));
+            .map_or(UNLIMITED, |minutes| {
+                Duration::from_secs(minutes.saturating_mul(60))
+            });
         Self {
             config,
             store,
@@ -278,7 +309,8 @@ impl OmpManager {
         K: Into<OsString>,
         V: Into<OsString>,
     {
-        self.extra_env.extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self.extra_env
+            .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
 
@@ -312,7 +344,11 @@ impl OmpManager {
         };
 
         let (done, result) = oneshot::channel();
-        let request = PromptRequest { text: text.to_owned(), timeout: self.turn_timeout, done };
+        let request = PromptRequest {
+            text: text.to_owned(),
+            timeout: self.turn_timeout,
+            done,
+        };
         let turn = match current.requests.send(request) {
             Ok(()) => result.await.unwrap_or(Err(RpcError::Closed)),
             Err(_) => Err(RpcError::Closed),
@@ -322,7 +358,9 @@ impl OmpManager {
             Err(RpcError::Timeout { .. }) => {
                 Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
             }
-            Err(RpcError::Command { error, .. }) => return Outcome::failed(E_PROMPT_REJECTED, error),
+            Err(RpcError::Command { error, .. }) => {
+                return Outcome::failed(E_PROMPT_REJECTED, error);
+            }
             Err(RpcError::InvalidArgument(error)) => {
                 return Outcome::failed(E_PROMPT_REJECTED, error);
             }
@@ -367,7 +405,14 @@ impl OmpManager {
         let worker = std::thread::Builder::new()
             .name(format!("omp-{}", key_slug(key)))
             .spawn(move || {
-                run_child(thread_key, command, session_dir, previous_session, started_tx, inbox)
+                run_child(
+                    thread_key,
+                    command,
+                    session_dir,
+                    previous_session,
+                    started_tx,
+                    inbox,
+                )
             })
             .map_err(|e| Outcome::failed(E_OMP_SPAWN, e))?;
 
@@ -379,7 +424,10 @@ impl OmpManager {
             }
             Err(_) => {
                 let _ = tokio::task::spawn_blocking(move || worker.join()).await;
-                return Err(Outcome::failed(E_OMP_SPAWN, "omp worker exited during startup"));
+                return Err(Outcome::failed(
+                    E_OMP_SPAWN,
+                    "omp worker exited during startup",
+                ));
             }
         };
         if let Err(e) = self
@@ -391,11 +439,19 @@ impl OmpManager {
             tracing::warn!(conversation = %key, code = e.code(), "could not store omp session id");
         }
         tracing::info!(conversation = %key, pid = started.pid, "omp child ready");
-        Ok(Live { key: key.to_owned(), pid: GroupKill(started.pid), requests, worker })
+        Ok(Live {
+            key: key.to_owned(),
+            pid: GroupKill(started.pid),
+            requests,
+            worker,
+        })
     }
 
     fn command(&self, key: &str, session_dir: &Path) -> std::io::Result<Command> {
-        DirBuilder::new().recursive(true).mode(0o700).create(session_dir)?;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(session_dir)?;
         let stderr_path = stderr_log_path(&self.config, key);
         if let Some(logs) = stderr_path.parent() {
             DirBuilder::new().recursive(true).mode(0o700).create(logs)?;
@@ -410,7 +466,9 @@ impl OmpManager {
         command
             .args(omp_args(&self.config, session_dir, &self.hints))
             .env_clear()
-            .envs(child_env(std::env::vars_os().chain(self.extra_env.iter().cloned())))
+            .envs(child_env(
+                std::env::vars_os().chain(self.extra_env.iter().cloned()),
+            ))
             .stderr(Stdio::from(stderr));
         Ok(command)
     }
@@ -426,7 +484,10 @@ fn run_child(
     started: oneshot::Sender<Result<Started, Outcome>>,
     requests: mpsc::Receiver<PromptRequest>,
 ) {
-    let options = ClientOptions { ready_timeout: READY_TIMEOUT, ..ClientOptions::default() };
+    let options = ClientOptions {
+        ready_timeout: READY_TIMEOUT,
+        ..ClientOptions::default()
+    };
     let (client, events) = match Client::spawn(command, options) {
         Ok(spawned) => spawned,
         Err(e) => {
@@ -446,7 +507,9 @@ fn run_child(
     }
 
     if let Some(session_id) = previous_session {
-        let lease = client.call(&GetSessionLeaseCommand { session_ids: vec![session_id.clone()] });
+        let lease = client.call(&GetSessionLeaseCommand {
+            session_ids: vec![session_id.clone()],
+        });
         let refusal = match lease {
             Ok(lease) if lease.held.contains(&session_id) => Some(Outcome::needs_check(
                 E_SESSION_BUSY,
@@ -462,7 +525,11 @@ fn run_child(
         }
     }
 
-    let opened = client.call(&OpenSessionCommand { session_dir, provider: None, model_id: None });
+    let opened = client.call(&OpenSessionCommand {
+        session_dir,
+        provider: None,
+        model_id: None,
+    });
     let session_id = match opened {
         Ok(opened) => opened.session_id,
         Err(e) => {
@@ -477,8 +544,14 @@ fn run_child(
     }
 
     for request in requests {
-        let prompt = PromptCommand { message: request.text, images: None, streaming_behavior: None };
-        let _ = request.done.send(client.prompt_and_wait(&prompt, request.timeout));
+        let prompt = PromptCommand {
+            message: request.text,
+            images: None,
+            streaming_behavior: None,
+        };
+        let _ = request
+            .done
+            .send(client.prompt_and_wait(&prompt, request.timeout));
     }
     close(&key, client);
 }
@@ -509,7 +582,11 @@ mod tests {
     use super::*;
     use omp_rpc::{PromptError, PromptResultEvent};
 
-    fn turn(status: Option<PromptStatus>, text: Option<&str>, error: Option<PromptError>) -> PromptTurn {
+    fn turn(
+        status: Option<PromptStatus>,
+        text: Option<&str>,
+        error: Option<PromptError>,
+    ) -> PromptTurn {
         PromptTurn {
             events: Vec::new(),
             messages: Vec::new(),
@@ -557,10 +634,17 @@ mod tests {
     fn error_statuses_map_to_codes() {
         let aborted = map_turn(turn(Some(PromptStatus::Aborted), None, None));
         assert_eq!(aborted.code(), Some(E_PROMPT_ABORTED));
-        let error = map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(None))));
+        let error = map_turn(turn(
+            Some(PromptStatus::Error),
+            None,
+            Some(prompt_error(None)),
+        ));
         assert_eq!(error.code(), Some(E_PROMPT_ERROR));
-        let cap =
-            map_turn(turn(Some(PromptStatus::Error), None, Some(prompt_error(Some("cost_cap")))));
+        let cap = map_turn(turn(
+            Some(PromptStatus::Error),
+            None,
+            Some(prompt_error(Some("cost_cap"))),
+        ));
         assert_eq!(cap.code(), Some(E_COST_CAP));
         assert!(matches!(cap, Outcome::Failed { .. }));
     }
@@ -572,7 +656,10 @@ mod tests {
             "retryable": false,
             "code": "provider_error",
         }));
-        assert!(other.is_err(), "other codes reach the client as a protocol error");
+        assert!(
+            other.is_err(),
+            "other codes reach the client as a protocol error"
+        );
     }
 
     #[test]
@@ -592,10 +679,12 @@ mod tests {
             ("my_slack_y", "4"),
             ("PROVIDER_API_KEY", "k"),
         ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let names: Vec<String> = child_env(vars)
             .into_iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
-        let names: Vec<String> =
-            child_env(vars).into_iter().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(names, ["PATH", "HOME", "PROVIDER_API_KEY"]);
     }
 }

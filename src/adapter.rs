@@ -176,7 +176,10 @@ mod tests {
     #[tokio::test]
     async fn fake_records_calls_in_order_and_threads_use_message_id() {
         let fake = FakeAdapter::new();
-        let thread = fake.create_thread("111", "1300000000000000001", "task").await.unwrap();
+        let thread = fake
+            .create_thread("111", "1300000000000000001", "task")
+            .await
+            .unwrap();
         assert_eq!(thread, "1300000000000000001");
         fake.send(&thread, "hi").await.unwrap();
         let _typing = fake.start_typing(&thread).await.unwrap();

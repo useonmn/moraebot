@@ -4,7 +4,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{Config, ConfigError, Env, E_HOME_UNKNOWN, E_IO, E_OMP_MISSING};
+use crate::config::{Config, ConfigError, E_HOME_UNKNOWN, E_IO, E_OMP_MISSING, Env};
 
 pub const DEFAULT_LABEL: &str = "dev.moraebot.gateway";
 

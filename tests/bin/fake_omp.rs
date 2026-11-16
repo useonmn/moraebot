@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SESSION_ID: &str = "fake-session-1";
 

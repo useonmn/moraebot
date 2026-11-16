@@ -1,16 +1,16 @@
 //! moraebot core: a messenger-agnostic gateway in front of omp.
 
-pub mod config;
-pub mod init;
-pub mod adapter;
-pub mod testing;
-pub mod store;
-pub mod omp;
 pub mod access;
-pub mod dispatch;
-pub mod logging;
-pub mod launchd;
+pub mod adapter;
+pub mod config;
 pub mod discord;
+pub mod dispatch;
 pub mod gateway;
 pub mod hints;
+pub mod init;
+pub mod launchd;
+pub mod logging;
+pub mod omp;
 pub mod slack;
+pub mod store;
+pub mod testing;

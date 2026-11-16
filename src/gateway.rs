@@ -77,7 +77,12 @@ impl Gateway {
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
         let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_hints(hints);
-        Ok(Self { config: config.clone(), adapter, store, omp })
+        Ok(Self {
+            config: config.clone(),
+            adapter,
+            store,
+            omp,
+        })
     }
 
     /// Adjusts the omp manager (tests add child environment variables or a turn limit).
@@ -88,7 +93,12 @@ impl Gateway {
 
     /// Serves until `shutdown` resolves (or the adapter stops), then shuts down cleanly.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), GatewayError> {
-        let Self { config, adapter, store, omp } = self;
+        let Self {
+            config,
+            adapter,
+            store,
+            omp,
+        } = self;
         let mut inbound = adapter.start().await?;
         let dispatcher = Arc::new(Dispatcher::new(&config, adapter, Arc::clone(&store), omp));
         let (events, queue) = mpsc::channel(EVENT_QUEUE);
@@ -121,7 +131,10 @@ impl Gateway {
             None => dispatch.await,
         };
         // A turn that was cut off is still `processing`: make it `needs_check`.
-        store.lock().expect("store mutex poisoned").recover_on_start()?;
+        store
+            .lock()
+            .expect("store mutex poisoned")
+            .recover_on_start()?;
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())
