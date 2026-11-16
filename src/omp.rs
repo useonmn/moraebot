@@ -17,12 +17,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use omp_rpc::{
-    Client, ClientOptions, Error as RpcError, Event, GetSessionLeaseCommand, OpenSessionCommand,
-    PromptCommand, PromptStatus, PromptTurn, RpcNotification,
+    Client, ClientOptions, Error as RpcError, Event, GetSessionLeaseCommand, HostTool,
+    HostToolError, OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcNotification,
+    ToolLoadMode,
 };
+use serde_json::{Map, Value};
 use tokio::sync::oneshot;
 
 use crate::config::Config;
+use crate::files;
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -50,6 +53,12 @@ pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
 /// typed `error.code` accepts only `cost_cap`, so a turn that ended with any other error
 /// code arrives as this protocol error instead of a `PromptTurn`.
 const PROMPT_RESULT_UNDECODABLE: &str = "Failed to parse prompt_result";
+
+/// Name of the host tool omp calls to hand a file back to the owner.
+pub const SEND_FILE_TOOL: &str = "send_file";
+
+/// Files the agent queued with `send_file` during the current turn (canonical paths).
+type SentFiles = Arc<Mutex<Vec<PathBuf>>>;
 
 /// Reply text used when a completed turn produced no visible text.
 pub const EMPTY_REPLY: &str = "(empty reply)";
@@ -98,6 +107,78 @@ impl Outcome {
             detail: detail.to_string(),
         }
     }
+}
+
+/// Result of one prompt plus the files the agent queued with `send_file` during it.
+/// `files` is non-empty only when `outcome` is `Outcome::Reply`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnReport {
+    pub outcome: Outcome,
+    pub files: Vec<PathBuf>,
+}
+
+impl TurnReport {
+    fn without_files(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// The `send_file` host tool. The handler (on the client's own thread) only checks the
+/// path with `files::check_outbound`, refuses the file past `files::MAX_FILES` in this
+/// turn, and queues the canonical path; dispatch uploads queued files after the reply.
+fn send_file_tool(work_dir: PathBuf, home: PathBuf, sent: SentFiles) -> HostTool {
+    let parameters: Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File to send: an absolute path, or a path relative to the work folder."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    }))
+    .expect("send_file schema is a JSON object");
+    let description = format!(
+        "Send a file from the work folder to the owner. It is posted in this conversation \
+         after your reply. `path` is absolute or relative to the work folder. At most {} files \
+         per reply.",
+        files::MAX_FILES
+    );
+    HostTool::new(
+        SEND_FILE_TOOL,
+        description,
+        parameters,
+        move |arguments, _| {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let refused =
+                |code: &str, reason: &str| -> HostToolError { format!("{code}: {reason}").into() };
+            let (canonical, _) = files::check_outbound(Path::new(path), &work_dir, &home)
+                .map_err(|e| refused(e.code, &e.message))?;
+            let mut sent = sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sent.len() >= files::MAX_FILES {
+                return Err(refused(
+                    files::E_FILE_TOO_MANY,
+                    &format!("at most {} files per reply", files::MAX_FILES),
+                ));
+            }
+            let name = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            sent.push(canonical);
+            Ok(format!("Queued {name}; it is sent after your reply.").into())
+        },
+    )
+    .load_mode(ToolLoadMode::Essential)
 }
 
 pub fn map_turn(turn: PromptTurn) -> Outcome {
@@ -227,6 +308,7 @@ struct Live {
     pid: GroupKill,
     requests: mpsc::Sender<PromptRequest>,
     worker: JoinHandle<()>,
+    sent_files: SentFiles,
 }
 
 impl Live {
@@ -237,6 +319,7 @@ impl Live {
             mut pid,
             requests,
             worker,
+            ..
         } = self;
         drop(requests);
         match tokio::task::spawn_blocking(move || worker.join()).await {
@@ -255,6 +338,7 @@ impl Live {
             mut pid,
             requests,
             worker,
+            ..
         } = self;
         if let Some(pid) = pid.0 {
             kill_group(pid);
@@ -324,9 +408,10 @@ impl OmpManager {
         self.live.lock().await.as_ref().and_then(|live| live.pid.0)
     }
 
-    /// Sends `text` to the conversation's omp session and waits for the turn.
+    /// Sends `text` to the conversation's omp session and waits for the turn, then reports
+    /// the outcome with the files queued by `send_file` during this turn.
     /// One prompt runs at a time across all conversations.
-    pub async fn prompt(&self, key: &str, text: &str) -> Outcome {
+    pub async fn prompt(&self, key: &str, text: &str) -> TurnReport {
         let mut live = self.live.lock().await;
         if live.as_ref().is_some_and(|l| l.key != key) {
             if let Some(previous) = live.take() {
@@ -336,13 +421,15 @@ impl OmpManager {
         if live.is_none() {
             match self.start(key).await {
                 Ok(started) => *live = Some(started),
-                Err(outcome) => return outcome,
+                Err(outcome) => return TurnReport::without_files(outcome),
             }
         }
         let Some(current) = live.as_ref() else {
             unreachable!("a child was started above")
         };
 
+        // The live mutex is held for the whole turn, so the bucket belongs to this turn only.
+        take_sent(&current.sent_files);
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text: text.to_owned(),
@@ -353,20 +440,24 @@ impl OmpManager {
             Ok(()) => result.await.unwrap_or(Err(RpcError::Closed)),
             Err(_) => Err(RpcError::Closed),
         };
+        let files = take_sent(&current.sent_files);
         let outcome = match turn {
-            Ok(turn) => return map_turn(turn),
+            Ok(turn) => {
+                let outcome = map_turn(turn);
+                return report(key, outcome, files);
+            }
             Err(RpcError::Timeout { .. }) => {
                 Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
             }
             Err(RpcError::Command { error, .. }) => {
-                return Outcome::failed(E_PROMPT_REJECTED, error);
+                return report(key, Outcome::failed(E_PROMPT_REJECTED, error), files);
             }
             Err(RpcError::InvalidArgument(error)) => {
-                return Outcome::failed(E_PROMPT_REJECTED, error);
+                return report(key, Outcome::failed(E_PROMPT_REJECTED, error), files);
             }
             // The turn ended with an error whose code is not `cost_cap`; the child is fine.
             Err(RpcError::Protocol(error)) if error.starts_with(PROMPT_RESULT_UNDECODABLE) => {
-                return Outcome::failed(E_PROMPT_ERROR, error);
+                return report(key, Outcome::failed(E_PROMPT_ERROR, error), files);
             }
             Err(error) => Outcome::needs_check(E_CHILD_LOST, error),
         };
@@ -375,7 +466,7 @@ impl OmpManager {
             tracing::warn!(conversation = %key, code = outcome.code(), "closing omp child");
             current.close().await;
         }
-        outcome
+        report(key, outcome, files)
     }
 
     /// Stops the omp child even in the middle of a turn; the turn's row is left for
@@ -401,6 +492,12 @@ impl OmpManager {
 
         let (requests, inbox) = mpsc::channel();
         let (started_tx, started) = oneshot::channel();
+        let sent_files = SentFiles::default();
+        let tool = send_file_tool(
+            self.config.work_dir.clone(),
+            self.config.home.clone(),
+            Arc::clone(&sent_files),
+        );
         let thread_key = key.to_owned();
         let worker = std::thread::Builder::new()
             .name(format!("omp-{}", key_slug(key)))
@@ -410,6 +507,7 @@ impl OmpManager {
                     command,
                     session_dir,
                     previous_session,
+                    tool,
                     started_tx,
                     inbox,
                 )
@@ -444,6 +542,7 @@ impl OmpManager {
             pid: GroupKill(started.pid),
             requests,
             worker,
+            sent_files,
         })
     }
 
@@ -481,11 +580,13 @@ fn run_child(
     command: Command,
     session_dir: String,
     previous_session: Option<String>,
+    send_file: HostTool,
     started: oneshot::Sender<Result<Started, Outcome>>,
     requests: mpsc::Receiver<PromptRequest>,
 ) {
     let options = ClientOptions {
         ready_timeout: READY_TIMEOUT,
+        tools: vec![send_file],
         ..ClientOptions::default()
     };
     let (client, events) = match Client::spawn(command, options) {
@@ -554,6 +655,30 @@ fn run_child(
             .send(client.prompt_and_wait(&prompt, request.timeout));
     }
     close(&key, client);
+}
+
+/// Empties the turn's bucket and returns what it held.
+fn take_sent(sent: &SentFiles) -> Vec<PathBuf> {
+    std::mem::take(
+        &mut *sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Keeps the queued files only for a reply; otherwise they are dropped and only their
+/// count is logged.
+fn report(key: &str, outcome: Outcome, files: Vec<PathBuf>) -> TurnReport {
+    if matches!(outcome, Outcome::Reply(_)) || files.is_empty() {
+        return TurnReport { outcome, files };
+    }
+    tracing::warn!(
+        conversation = %key,
+        code = outcome.code(),
+        dropped = files.len(),
+        "turn did not reply; queued files dropped"
+    );
+    TurnReport::without_files(outcome)
 }
 
 fn close(key: &str, client: Client) {

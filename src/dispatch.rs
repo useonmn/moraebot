@@ -358,7 +358,7 @@ impl Dispatcher {
                 None
             }
         };
-        let outcome = self.omp.prompt(key, &row.text).await;
+        let outcome = self.omp.prompt(key, &row.text).await.outcome;
         drop(typing);
 
         match outcome {

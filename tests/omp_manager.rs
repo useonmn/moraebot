@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::files;
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::Store;
 use serde_json::Value;
@@ -146,7 +147,7 @@ async fn argv_is_exact_and_env_drops_only_discord_names() {
         ("MORAEBOT_DISCORD_PROBE", "x"),
         ("PROVIDER_PROBE_API_KEY", "y"),
     ]);
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
 
     let lines = h.log_lines();
@@ -198,7 +199,7 @@ async fn max_cost_adds_flag_only_when_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, "hi")).await;
+    bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     let start = h
         .log_lines()
         .into_iter()
@@ -217,7 +218,7 @@ async fn flag_present_when_hints_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok").with_hints("probe hints".into());
-    bounded(manager.prompt(KEY_A, "hi")).await;
+    bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     let start = h
         .log_lines()
         .into_iter()
@@ -233,7 +234,7 @@ async fn flag_present_when_hints_set() {
 async fn no_flag_when_hints_empty() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints(String::new());
-    bounded(manager.prompt(KEY_A, "hi")).await;
+    bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     let start = h
         .log_lines()
         .into_iter()
@@ -252,7 +253,7 @@ async fn injection_payload_arrives_byte_for_byte_with_hints_set() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints("probe hints".into());
     let payload = "$(touch /tmp/moraebot-pwned-7f3a); touch /tmp/moraebot-pwned-7f3a-b";
-    let outcome = bounded(manager.prompt(KEY_A, payload)).await;
+    let outcome = bounded(manager.prompt(KEY_A, payload)).await.outcome;
     assert_eq!(outcome, Outcome::Reply(format!("echo: {payload}")));
     let prompts = h.frames("prompt");
     assert_eq!(prompts.len(), 1);
@@ -267,7 +268,7 @@ async fn multibyte_text_round_trips() {
     let h = Harness::new();
     let manager = h.manager("ok");
     let text = "안녕하세요, 모래봇 🌊";
-    let outcome = bounded(manager.prompt(KEY_A, text)).await;
+    let outcome = bounded(manager.prompt(KEY_A, text)).await.outcome;
     assert_eq!(outcome, Outcome::Reply(format!("echo: {text}")));
     manager.shutdown_all().await;
 }
@@ -277,7 +278,7 @@ async fn injection_payload_arrives_byte_for_byte_and_never_runs() {
     let h = Harness::new();
     let manager = h.manager("ok");
     let payload = "$(touch /tmp/moraebot-pwned-7f3a); touch /tmp/moraebot-pwned-7f3a-b";
-    let outcome = bounded(manager.prompt(KEY_A, payload)).await;
+    let outcome = bounded(manager.prompt(KEY_A, payload)).await.outcome;
     assert_eq!(outcome, Outcome::Reply(format!("echo: {payload}")));
     let prompts = h.frames("prompt");
     assert_eq!(prompts.len(), 1);
@@ -301,7 +302,10 @@ async fn injection_payload_arrives_byte_for_byte_and_never_runs() {
 async fn not_invoked_is_no_agent() {
     let h = Harness::new();
     let manager = h.manager("not_invoked");
-    assert_eq!(bounded(manager.prompt(KEY_A, "hi")).await, Outcome::NoAgent);
+    assert_eq!(
+        bounded(manager.prompt(KEY_A, "hi")).await.outcome,
+        Outcome::NoAgent
+    );
     manager.shutdown_all().await;
 }
 
@@ -309,7 +313,7 @@ async fn not_invoked_is_no_agent() {
 async fn error_status_is_failed() {
     let h = Harness::new();
     let manager = h.manager("error");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }));
     assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
     manager.shutdown_all().await;
@@ -336,7 +340,7 @@ async fn coded_non_cost_cap_error_is_prompt_error() {
     let mut h = Harness::new();
     h.config.omp_path = coded_error_wrapper(h.dir.path());
     let manager = h.manager("error");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
     assert!(
@@ -351,7 +355,7 @@ async fn coded_non_cost_cap_error_is_prompt_error() {
 async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
     let h = Harness::new();
     let manager = h.manager("hang").with_turn_timeout(Duration::from_secs(1));
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }));
     assert_eq!(outcome.code(), Some(omp::E_TURN_TIMEOUT));
     let pids = h.start_pids();
@@ -365,7 +369,7 @@ async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
 async fn open_session_failure_is_failed_without_prompt() {
     let h = Harness::new();
     let manager = h.manager("open_session_fail");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }));
     assert_eq!(outcome.code(), Some(omp::E_OPEN_SESSION));
     assert!(h.frames("prompt").is_empty());
@@ -378,7 +382,7 @@ async fn held_lease_is_needs_check_without_prompt() {
     let h = Harness::new();
     h.set_session(KEY_A, "fake-session-1");
     let manager = h.manager("lease_held");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }));
     assert_eq!(outcome.code(), Some(omp::E_SESSION_BUSY));
     let leases = h.frames("get_session_lease");
@@ -398,7 +402,7 @@ async fn reopen_checks_free_lease_then_prompts() {
     h.set_session(KEY_A, "fake-session-1");
     let manager = h.manager("ok");
     assert_eq!(
-        bounded(manager.prompt(KEY_A, "hi")).await,
+        bounded(manager.prompt(KEY_A, "hi")).await.outcome,
         Outcome::Reply("echo: hi".into())
     );
     assert_eq!(h.frames("get_session_lease").len(), 1);
@@ -410,7 +414,7 @@ async fn reopen_checks_free_lease_then_prompts() {
 async fn fresh_conversation_skips_lease_check() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, "hi")).await;
+    bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(h.frames("get_session_lease").is_empty());
     assert_eq!(h.frames("open_session").len(), 1);
     manager.shutdown_all().await;
@@ -421,15 +425,15 @@ async fn one_child_in_total_across_conversations() {
     let h = Harness::new();
     let manager = h.manager("ok");
 
-    bounded(manager.prompt(KEY_A, "one")).await;
-    bounded(manager.prompt(KEY_A, "two")).await;
+    bounded(manager.prompt(KEY_A, "one")).await.outcome;
+    bounded(manager.prompt(KEY_A, "two")).await.outcome;
     assert_eq!(
         h.start_pids().len(),
         1,
         "same conversation reuses its child"
     );
 
-    bounded(manager.prompt(KEY_B, "three")).await;
+    bounded(manager.prompt(KEY_B, "three")).await.outcome;
     let pids = h.start_pids();
     assert_eq!(pids.len(), 2);
     assert!(
@@ -437,7 +441,7 @@ async fn one_child_in_total_across_conversations() {
         "previous child is reaped before the next spawns"
     );
 
-    bounded(manager.prompt(KEY_A, "four")).await;
+    bounded(manager.prompt(KEY_A, "four")).await.outcome;
     let pids = h.start_pids();
     assert_eq!(pids.len(), 3);
     assert!(!alive(pids[1]));
@@ -461,7 +465,7 @@ async fn one_child_in_total_across_conversations() {
 async fn killed_child_is_lost_then_respawned() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, "first")).await;
+    bounded(manager.prompt(KEY_A, "first")).await.outcome;
     let pid = manager.child_pid().await.expect("live child");
     let killed = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
@@ -469,13 +473,13 @@ async fn killed_child_is_lost_then_respawned() {
         .expect("run kill");
     assert!(killed.success());
 
-    let outcome = bounded(manager.prompt(KEY_A, "second")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "second")).await.outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }));
     assert_eq!(outcome.code(), Some(omp::E_CHILD_LOST));
     assert_eq!(manager.child_pid().await, None);
     assert!(!alive(pid));
 
-    let outcome = bounded(manager.prompt(KEY_A, "third")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "third")).await.outcome;
     assert_eq!(outcome, Outcome::Reply("echo: third".into()));
     assert_eq!(h.start_pids().len(), 2);
     manager.shutdown_all().await;
@@ -485,7 +489,7 @@ async fn killed_child_is_lost_then_respawned() {
 async fn exit1_is_lost() {
     let h = Harness::new();
     let manager = h.manager("exit1");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_CHILD_LOST));
     assert_eq!(manager.child_pid().await, None);
@@ -500,6 +504,236 @@ async fn missing_omp_binary_is_spawn_failure() {
     let mut h = Harness::new();
     h.config.omp_path = h.dir.path().join("no-such-omp");
     let manager = h.manager("ok");
-    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await.outcome;
     assert_eq!(outcome.code(), Some(omp::E_OMP_SPAWN));
+}
+
+// --- send_file host tool -------------------------------------------------------------
+
+impl Harness {
+    /// A `send_file` manager whose fake omp calls the tool once per line of `lines`.
+    fn send_file_manager(&self, lines: &[String]) -> OmpManager {
+        self.manager("send_file")
+            .with_extra_env([("FAKE_OMP_SEND_FILE", lines.join("\n"))])
+    }
+
+    /// Creates `rel` (and its parents) under the work dir and returns its canonical path.
+    fn work_file(&self, rel: &str) -> PathBuf {
+        let path = self.config.work_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("parent dir");
+        std::fs::write(&path, b"report").expect("write work file");
+        path.canonicalize().expect("canonical work file")
+    }
+
+    /// `(isError, text)` of every `host_tool_result` frame, in order.
+    fn tool_results(&self) -> Vec<(bool, String)> {
+        self.frames("host_tool_result")
+            .iter()
+            .map(|f| {
+                let text = f["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                (f["isError"] == true, text)
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn send_file_tool_records_inside_path() {
+    let h = Harness::new();
+    let file = h.work_file("s3-report.txt");
+    let manager = h.send_file_manager(&[file.to_string_lossy().into_owned()]);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert_eq!(report.outcome, Outcome::Reply("echo: hi".into()));
+    assert_eq!(report.files, [file]);
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].0, "{results:?}");
+    let tools = h.frames("set_host_tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["tools"][0]["name"], omp::SEND_FILE_TOOL);
+    assert_eq!(tools[0]["tools"][0]["loadMode"], "essential");
+    // QA evidence (shown with --nocapture): the host tool frames fake omp received.
+    for frame in tools.iter().chain(h.frames("host_tool_result").iter()) {
+        println!("FRAME {frame}");
+    }
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn send_file_tool_accepts_relative_path() {
+    let h = Harness::new();
+    assert!(
+        !Path::new("out/s3-rel-report.txt").exists(),
+        "the test's own current folder must not hold the file"
+    );
+    let file = h.work_file("out/s3-rel-report.txt");
+    std::fs::write(h.dir.path().join("s3-outside.txt"), b"outside").expect("outside file");
+    let manager = h.send_file_manager(&[
+        "out/s3-rel-report.txt".to_owned(),
+        "../s3-outside.txt".to_owned(),
+    ]);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert_eq!(report.outcome, Outcome::Reply("echo: hi".into()));
+    assert_eq!(report.files, [file]);
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].0, "{results:?}");
+    assert!(results[1].0, "{results:?}");
+    assert!(results[1].1.starts_with(files::E_FILE_PATH), "{results:?}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn send_file_tool_rejects_outside_path() {
+    let h = Harness::new();
+    let other = tempfile::tempdir().expect("other tempdir");
+    let outside = other.path().join("s3-elsewhere.txt");
+    std::fs::write(&outside, b"elsewhere").expect("outside file");
+    let manager = h.send_file_manager(&[outside.to_string_lossy().into_owned()]);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert_eq!(report.outcome, Outcome::Reply("echo: hi".into()));
+    assert!(report.files.is_empty());
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0, "{results:?}");
+    assert!(results[0].1.starts_with(files::E_FILE_PATH), "{results:?}");
+    assert!(
+        !results[0].1.contains("s3-elsewhere"),
+        "the refusal never names the path"
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn send_file_tool_rejects_home() {
+    let mut h = Harness::new();
+    // A moraebot home inside the work folder: the location rule alone must refuse it.
+    h.config.home = h.config.work_dir.join("mb-home");
+    let secret = h.work_file("mb-home/secrets/s3-token.txt");
+    let manager = h.send_file_manager(&[secret.to_string_lossy().into_owned()]);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert_eq!(report.outcome, Outcome::Reply("echo: hi".into()));
+    assert!(report.files.is_empty());
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0, "{results:?}");
+    assert!(results[0].1.starts_with(files::E_FILE_PATH), "{results:?}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn send_file_tool_caps_files_per_turn() {
+    let h = Harness::new();
+    let paths: Vec<PathBuf> = (0..=files::MAX_FILES)
+        .map(|n| h.work_file(&format!("s3-file-{n}.txt")))
+        .collect();
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let manager = h.send_file_manager(&lines);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert_eq!(report.outcome, Outcome::Reply("echo: hi".into()));
+    assert_eq!(report.files, paths[..files::MAX_FILES]);
+    let results = h.tool_results();
+    assert_eq!(results.len(), files::MAX_FILES + 1);
+    assert!(results[..files::MAX_FILES].iter().all(|(err, _)| !err));
+    let (last_err, last_text) = &results[files::MAX_FILES];
+    assert!(*last_err);
+    assert!(last_text.starts_with(files::E_FILE_TOO_MANY), "{last_text}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn send_file_bucket_is_per_turn() {
+    let h = Harness::new();
+    let a = h.work_file("s3-a.txt");
+    let b = h.work_file("s3-b.txt");
+    let manager = h.send_file_manager(&[
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    ]);
+    let first = bounded(manager.prompt(KEY_A, "one")).await;
+    assert_eq!(first.files, [a.clone(), b.clone()]);
+    let second = bounded(manager.prompt(KEY_A, "two")).await;
+    assert_eq!(second.outcome, Outcome::Reply("echo: two".into()));
+    assert_eq!(second.files, [a, b], "only the second turn's own files");
+    assert_eq!(h.start_pids().len(), 1, "both turns ran on one child");
+    manager.shutdown_all().await;
+}
+
+/// Shell stand-in for omp that runs fake-omp and drops its `prompt_result` frame, so a
+/// turn never ends on its own. Written into the test's temp dir.
+fn no_result_wrapper(root: &Path) -> PathBuf {
+    let script = root.join("omp-no-result.sh");
+    let fake = env!("CARGO_BIN_EXE_fake-omp");
+    let body = format!(
+        r#"#!/bin/sh
+'{fake}' "$@" | awk '!/"type":"prompt_result"/ {{ print; fflush() }}'
+"#
+    );
+    std::fs::write(&script, body).expect("write wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    script
+}
+
+#[tokio::test]
+async fn files_dropped_when_turn_fails() {
+    let mut h = Harness::new();
+    h.config.omp_path = no_result_wrapper(h.dir.path());
+    let file = h.work_file("s3-dropped.txt");
+    let manager = h
+        .send_file_manager(&[file.to_string_lossy().into_owned()])
+        .with_turn_timeout(Duration::from_secs(5));
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert!(
+        matches!(report.outcome, Outcome::NeedsCheck { .. }),
+        "{report:?}"
+    );
+    assert_eq!(report.outcome.code(), Some(omp::E_TURN_TIMEOUT));
+    // The tool accepted the file during the turn (the fake logged the success result,
+    // which the handler writes only after queueing), yet the report carries none.
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    assert!(report.files.is_empty());
+    assert_eq!(manager.child_pid().await, None);
+}
+
+#[tokio::test]
+async fn send_file_tool_never_runs_shell_payload() {
+    let h = Harness::new();
+    let manager = h.send_file_manager(&["$(touch /tmp/moraebot-pwned-3c1d)".to_owned()]);
+    let report = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert!(report.files.is_empty());
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0);
+    assert!(results[0].1.starts_with(files::E_FILE_PATH), "{results:?}");
+    assert!(!Path::new("/tmp/moraebot-pwned-3c1d").exists());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn argv_unchanged_by_host_tools() {
+    let h = Harness::new();
+    let manager = h.manager("ok");
+    bounded(manager.prompt(KEY_A, "hi")).await;
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("START line");
+    assert_eq!(start_argv(&start), expected_argv(&h.config, KEY_A));
+    let tools = h.frames("set_host_tools");
+    assert_eq!(
+        tools.len(),
+        1,
+        "the tool is registered once, right after startup"
+    );
+    assert_eq!(tools[0]["tools"][0]["name"], omp::SEND_FILE_TOOL);
+    manager.shutdown_all().await;
 }
