@@ -3,12 +3,20 @@
 //! where time is the behavior (backoff, silence, Retry-After).
 
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use moraebot::adapter::{E_ADAPTER_SEND, E_ADAPTER_START, MessengerAdapter};
-use moraebot::slack::{E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, SlackAdapter};
-use moraebot::testing::FakeSlackTransport;
+use moraebot::adapter::{
+    AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED, InboundAttachment,
+    MessengerAdapter,
+};
+use moraebot::files::{E_FILE_HOST, E_FILE_REMOTE, E_FILE_WRITE, Progress};
+use moraebot::slack::{
+    E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, SlackAdapter, SlackTransport,
+};
+use moraebot::testing::{FAKE_FILE_ID, FakeSlackTransport, SlackFileCall, UploadStep};
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
 
@@ -265,6 +273,282 @@ async fn create_thread_returns_message_id_without_api_call() {
         .unwrap();
     assert_eq!(thread, "C222:1.1");
     assert_eq!(fake.record(), Default::default());
+}
+
+const DOWNLOAD_URL: &str = "https://files.slack.com/files-pri/T111-F111/download/notes.txt";
+const THREAD_TS: &str = "1700000000.000100";
+
+fn slack_file(reference: &str, mime: Option<&str>) -> InboundAttachment {
+    InboundAttachment {
+        name: "notes.txt".into(),
+        size: 5,
+        mime: mime.map(str::to_string),
+        reference: AttachmentRef(reference.into()),
+    }
+}
+
+fn temp_file(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn file_calls(fake: &FakeSlackTransport) -> Vec<SlackFileCall> {
+    fake.record().file_calls
+}
+
+#[tokio::test]
+async fn fetch_uses_download_and_writes_file() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("0-notes.txt");
+    fake.set_download_bytes(DOWNLOAD_URL, b"hello".to_vec());
+    let progress = Progress::new();
+    let n = adapter
+        .fetch_attachment(
+            &slack_file(DOWNLOAD_URL, Some("text/plain")),
+            &dest,
+            &progress,
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(progress.bytes(), 5);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        file_calls(&fake),
+        vec![SlackFileCall::Download {
+            url_host: "files.slack.com".into(),
+            dest,
+            reject_html: true,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn fetch_remote_is_file_remote() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapter
+        .fetch_attachment(
+            &slack_file("", None),
+            &dir.path().join("x"),
+            &Progress::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, E_FILE_REMOTE);
+    assert!(file_calls(&fake).is_empty());
+}
+
+#[tokio::test]
+async fn slack_download_html_for_pdf_is_denied() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, mime) in [("a.pdf", "application/pdf"), ("b.html", "text/html")] {
+        adapter
+            .fetch_attachment(
+                &slack_file(DOWNLOAD_URL, Some(mime)),
+                &dir.path().join(name),
+                &Progress::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let flags: Vec<bool> = file_calls(&fake)
+        .into_iter()
+        .map(|call| match call {
+            SlackFileCall::Download { reject_html, .. } => reject_html,
+            other => panic!("unexpected call {other:?}"),
+        })
+        .collect();
+    assert_eq!(flags, vec![true, false]);
+}
+
+#[tokio::test]
+async fn fake_download_without_parent_dir_is_write_error() {
+    let fake = FakeSlackTransport::new();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-dir");
+    let err = fake
+        .download(DOWNLOAD_URL, &missing.join("f.txt"), true, &Progress::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, E_FILE_WRITE);
+    assert!(!missing.exists(), "the fake never creates directories");
+}
+
+#[tokio::test]
+async fn send_file_thread_target_completes_with_parent_ts() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "report.txt", b"0123456789");
+    let sent = adapter
+        .send_file(&format!("C222:{THREAD_TS}"), &path, "report.txt")
+        .await
+        .unwrap();
+    assert_eq!(sent.message_id, FAKE_FILE_ID);
+    assert_eq!(
+        file_calls(&fake),
+        vec![
+            SlackFileCall::UploadUrl {
+                filename: "report.txt".into(),
+                length: 10,
+            },
+            SlackFileCall::UploadBytes {
+                host: "files.slack.com".into(),
+                len: 10,
+            },
+            SlackFileCall::CompleteUpload {
+                file_id: FAKE_FILE_ID.into(),
+                channel_id: "C222".into(),
+                thread_ts: Some(THREAD_TS.into()),
+            },
+        ]
+    );
+    assert!(fake.record().posts.is_empty(), "no chat.postMessage");
+}
+
+#[tokio::test]
+async fn send_file_dm_target_has_no_thread_ts() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "a.txt", b"abc");
+    adapter.send_file("D333", &path, "a.txt").await.unwrap();
+    assert_eq!(
+        file_calls(&fake).last(),
+        Some(&SlackFileCall::CompleteUpload {
+            file_id: FAKE_FILE_ID.into(),
+            channel_id: "D333".into(),
+            thread_ts: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn send_file_reads_file_and_uploads_once() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let size = 200 * 1024;
+    let path = temp_file(dir.path(), "big.bin", &vec![7u8; size]);
+    adapter
+        .send_file("C222:1.1", &path, "big.bin")
+        .await
+        .unwrap();
+    let calls = file_calls(&fake);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[0],
+        SlackFileCall::UploadUrl {
+            filename: "big.bin".into(),
+            length: size as u64,
+        }
+    );
+    assert_eq!(
+        calls[1],
+        SlackFileCall::UploadBytes {
+            host: "files.slack.com".into(),
+            len: size as u64,
+        }
+    );
+    assert!(matches!(calls[2], SlackFileCall::CompleteUpload { .. }));
+}
+
+#[tokio::test]
+async fn upload_url_on_other_host_is_refused_before_bytes() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "a.txt", b"abc");
+    for url in [
+        "https://files.slack.com.evil.test/upload/v1/x",
+        "http://files.slack.com/upload/v1/x",
+        "https://u@files.slack.com/upload/v1/x",
+    ] {
+        fake.set_upload_url(url);
+        let err = adapter.send_file("C222", &path, "a.txt").await.unwrap_err();
+        assert!(
+            err.code == E_SLACK_UPLOAD || err.code == E_FILE_HOST,
+            "{url}: {}",
+            err.code
+        );
+    }
+    assert!(
+        file_calls(&fake)
+            .iter()
+            .all(|call| matches!(call, SlackFileCall::UploadUrl { .. })),
+        "no bytes and no complete after a bad upload URL"
+    );
+}
+
+#[tokio::test]
+async fn complete_failure_is_upload_error() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "a.txt", b"abc");
+    fake.fail_next_upload_step(UploadStep::CompleteUpload, "internal_error");
+    let err = adapter.send_file("C222", &path, "a.txt").await.unwrap_err();
+    assert_eq!(err.code, E_SLACK_UPLOAD);
+    fake.fail_next_upload_step(UploadStep::CompleteUpload, "not_in_channel");
+    let err = adapter.send_file("C222", &path, "a.txt").await.unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+    assert_eq!(file_calls(&fake).len(), 6, "all three steps ran twice");
+}
+
+#[tokio::test]
+async fn missing_scope_upload_is_denied() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "a.txt", b"abc");
+    fake.fail_next_upload_step(UploadStep::UploadUrl, "missing_scope");
+    let err = adapter.send_file("C222", &path, "a.txt").await.unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+    assert_eq!(
+        file_calls(&fake),
+        vec![SlackFileCall::UploadUrl {
+            filename: "a.txt".into(),
+            length: 3,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn upload_bytes_413_is_denied() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "a.txt", b"abc");
+    fake.fail_next_upload_bytes_status(413);
+    let err = adapter.send_file("C222", &path, "a.txt").await.unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+    let calls = file_calls(&fake);
+    assert_eq!(calls.len(), 2);
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, SlackFileCall::CompleteUpload { .. }))
+    );
+}
+
+#[tokio::test]
+async fn send_file_unreadable_file_is_denied() {
+    let (fake, adapter) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_file(dir.path(), "secret.txt", b"abc");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err = adapter
+        .send_file("C222", &path, "secret.txt")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+    let missing = adapter
+        .send_file("C222", &dir.path().join("missing.txt"), "missing.txt")
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code, E_ADAPTER_UPLOAD_DENIED);
+    assert!(file_calls(&fake).is_empty(), "no UploadUrl recorded");
 }
 
 #[tokio::test]

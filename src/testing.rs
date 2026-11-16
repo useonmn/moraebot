@@ -5,6 +5,7 @@ use crate::adapter::{
 use crate::files::{E_FILE_WRITE, Progress};
 use crate::slack::{
     E_SLACK_API, E_SLACK_AUTH, PostOutcome, SlackSocket, SlackTransport, SocketMessage,
+    upload_error_code, upload_status_code,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -401,7 +402,43 @@ pub struct SlackRecord {
     pub socket_texts: Vec<String>,
     pub pings: usize,
     pub closed_sockets: usize,
+    /// Every file call (downloads and the three upload steps), failed ones included.
+    pub file_calls: Vec<SlackFileCall>,
 }
+
+/// One file call seen by `FakeSlackTransport`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackFileCall {
+    Download {
+        url_host: String,
+        dest: PathBuf,
+        reject_html: bool,
+    },
+    UploadUrl {
+        filename: String,
+        length: u64,
+    },
+    UploadBytes {
+        host: String,
+        len: u64,
+    },
+    CompleteUpload {
+        file_id: String,
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
+}
+
+/// A Web API step of the upload flow that `fail_next_upload_step` can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadStep {
+    UploadUrl,
+    CompleteUpload,
+}
+
+/// The upload URL and file id the fake hands out unless `set_upload_url` changes the URL.
+pub const FAKE_UPLOAD_URL: &str = "https://files.slack.com/upload/v1/fake-111";
+pub const FAKE_FILE_ID: &str = "F111";
 
 type SocketItem = Result<SocketMessage, AdapterError>;
 
@@ -412,6 +449,31 @@ struct FakeSlackState {
     rate_limits: VecDeque<Duration>,
     fail_next_post: bool,
     sessions: Vec<mpsc::UnboundedSender<SocketItem>>,
+    download_bytes: HashMap<String, Vec<u8>>,
+    step_failures: VecDeque<(UploadStep, String)>,
+    bytes_status_failures: VecDeque<u16>,
+    upload_url: Option<String>,
+}
+
+impl FakeSlackState {
+    /// Pops a scripted Slack error for `step`, classified like the real transport does.
+    fn step_failure(&mut self, step: UploadStep) -> Result<(), AdapterError> {
+        let Some(index) = self.step_failures.iter().position(|(s, _)| *s == step) else {
+            return Ok(());
+        };
+        let (_, slack_error) = self.step_failures.remove(index).expect("index exists");
+        Err(AdapterError {
+            code: upload_error_code(&slack_error),
+            message: slack_error,
+        })
+    }
+}
+
+fn url_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 struct FakeSlackShared {
@@ -463,6 +525,35 @@ impl FakeSlackTransport {
     /// The next `post_message` fails with a Slack API error.
     pub fn fail_next_post(&self) {
         self.shared.update(|state| state.fail_next_post = true);
+    }
+
+    /// The bytes `download` writes for this URL (empty when unset).
+    pub fn set_download_bytes(&self, url: &str, bytes: Vec<u8>) {
+        self.shared.update(|state| {
+            state.download_bytes.insert(url.to_owned(), bytes);
+        });
+    }
+
+    /// The next call of `step` records itself, then answers `ok:false` with `slack_error`.
+    pub fn fail_next_upload_step(&self, step: UploadStep, slack_error: &str) {
+        self.shared.update(|state| {
+            state
+                .step_failures
+                .push_back((step, slack_error.to_owned()))
+        });
+    }
+
+    /// The next `upload_bytes` records itself, then fails as the real transport does for
+    /// this HTTP status.
+    pub fn fail_next_upload_bytes_status(&self, status: u16) {
+        self.shared
+            .update(|state| state.bytes_status_failures.push_back(status));
+    }
+
+    /// The upload URL later `upload_url` calls return (default `FAKE_UPLOAD_URL`).
+    pub fn set_upload_url(&self, url: &str) {
+        self.shared
+            .update(|state| state.upload_url = Some(url.to_owned()));
     }
 
     pub fn record(&self) -> SlackRecord {
@@ -620,6 +711,80 @@ impl SlackTransport for FakeSlackTransport {
                 "{}.0001",
                 state.record.posts.len()
             )))
+        })
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        reject_html: bool,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        let bytes = self.shared.update(|state| {
+            state.record.file_calls.push(SlackFileCall::Download {
+                url_host: url_host(url),
+                dest: dest.to_owned(),
+                reject_html,
+            });
+            state.download_bytes.get(url).cloned().unwrap_or_default()
+        });
+        create_private_file(dest)?
+            .write_all(&bytes)
+            .map_err(|e| write_failure(&e))?;
+        progress.record(bytes.len() as u64);
+        Ok(bytes.len() as u64)
+    }
+
+    async fn upload_url(
+        &self,
+        filename: &str,
+        length: u64,
+    ) -> Result<(String, String), AdapterError> {
+        self.shared.update(|state| {
+            state.record.file_calls.push(SlackFileCall::UploadUrl {
+                filename: filename.to_owned(),
+                length,
+            });
+            state.step_failure(UploadStep::UploadUrl)?;
+            let url = state
+                .upload_url
+                .clone()
+                .unwrap_or_else(|| FAKE_UPLOAD_URL.to_owned());
+            Ok((url, FAKE_FILE_ID.to_owned()))
+        })
+    }
+
+    async fn upload_bytes(&self, url: reqwest::Url, bytes: Vec<u8>) -> Result<(), AdapterError> {
+        self.shared.update(|state| {
+            state.record.file_calls.push(SlackFileCall::UploadBytes {
+                host: url.host_str().unwrap_or_default().to_owned(),
+                len: bytes.len() as u64,
+            });
+            match state.bytes_status_failures.pop_front() {
+                Some(status) => Err(AdapterError {
+                    code: upload_status_code(status),
+                    message: format!("the file upload answered HTTP {status}"),
+                }),
+                None => Ok(()),
+            }
+        })
+    }
+
+    async fn complete_upload(
+        &self,
+        file_id: &str,
+        _title: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        self.shared.update(|state| {
+            state.record.file_calls.push(SlackFileCall::CompleteUpload {
+                file_id: file_id.to_owned(),
+                channel_id: channel_id.to_owned(),
+                thread_ts: thread_ts.map(str::to_owned),
+            });
+            state.step_failure(UploadStep::CompleteUpload)
         })
     }
 }

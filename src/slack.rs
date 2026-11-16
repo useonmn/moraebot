@@ -23,10 +23,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::adapter::{
-    AdapterError, E_ADAPTER_SEND, E_ADAPTER_START, InboundEvent, MessengerAdapter, SendResult,
-    TypingHandle, next_backoff,
+    AdapterError, AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED,
+    InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle, next_backoff,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
+use crate::files::{self, E_FILE_REMOTE, Progress};
 
 pub const PLATFORM: &str = "slack";
 /// Slack advises keeping `text` under 4,000 characters.
@@ -38,8 +39,23 @@ pub const E_SLACK_API: &str = "E_SLACK_API";
 pub const E_SLACK_RATE: &str = "E_SLACK_RATE";
 pub const E_SLACK_ID: &str = "E_SLACK_ID";
 pub const E_SLACK_PROTOCOL: &str = "E_SLACK_PROTOCOL";
+/// A file upload step failed in a way that may work next time (network, 5xx, 429, or a
+/// transient Slack error).
+pub const E_SLACK_UPLOAD: &str = "E_SLACK_UPLOAD";
 
-pub const DEFAULT_HINTS: &str = "Your replies are posted to Slack. Use Slack mrkdwn, not Markdown: *bold*, _italic_, ~strike~, `code`, fenced code blocks, > quotes, - lists. Double-asterisk bold, # headings and tables do not render. Write links as plain URLs. One message holds about 3900 characters; longer replies are split.";
+/// The only host Slack serves file downloads and upload URLs from.
+pub const FILE_HOST: &str = "files.slack.com";
+
+pub const DEFAULT_HINTS: &str = "Your replies are posted to Slack. Use Slack mrkdwn, not Markdown: *bold*, _italic_, ~strike~, `code`, fenced code blocks, > quotes, - lists. Double-asterisk bold, # headings and tables do not render. Write links as plain URLs. One message holds about 3900 characters; longer replies are split. Files the owner shares in Slack are saved on disk; their paths are listed at the end of the message. To send a file back into the Slack thread or DM, call the send_file tool with a path inside the work folder (at most 10 files per reply).";
+
+/// Slack `error` strings on a file call that may succeed when retried.
+const TRANSIENT_UPLOAD_ERRORS: [&str; 5] = [
+    "ratelimited",
+    "internal_error",
+    "fatal_error",
+    "service_unavailable",
+    "request_timeout",
+];
 
 /// One Socket Mode message received from Slack.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,9 +117,35 @@ pub fn ack_frame(envelope_id: &str) -> String {
     json!({ "envelope_id": envelope_id }).to_string()
 }
 
+/// Maps one `files[]` entry. Never fails: a missing field gets a neutral value, and a file
+/// Slack cannot serve (external, remote, access stub, hidden, deleted, no download URL)
+/// gets an empty reference, which the adapter's fetch refuses with `E_FILE_REMOTE`.
+fn map_file(entry: &Value) -> InboundAttachment {
+    let str_field = |key: &str| entry.get(key).and_then(Value::as_str);
+    let unservable = matches!(
+        str_field("mode"),
+        Some("external" | "file_access" | "hidden_by_limit" | "tombstone")
+    ) || entry.get("is_external").and_then(Value::as_bool) == Some(true)
+        || str_field("filetype") == Some("remote");
+    let reference = if unservable {
+        String::new()
+    } else {
+        str_field("url_private_download")
+            .unwrap_or_default()
+            .to_string()
+    };
+    InboundAttachment {
+        name: str_field("name").unwrap_or("file").to_string(),
+        size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
+        mime: str_field("mimetype").map(str::to_string),
+        reference: AttachmentRef(reference),
+    }
+}
+
 /// Maps an `events_api` payload to an inbound event, or `None` when the message must be
-/// dropped: wrong type, bot or own messages, edits and other subtypes, other users in a
-/// DM, other channels. Every field is optional on the wire; a missing one drops the event.
+/// dropped: wrong type, bot or own messages, edits and subtypes other than `file_share`
+/// and `thread_broadcast`, other users in a DM, other channels. Every field is optional on
+/// the wire; a missing one drops the event (an odd `files[]` entry never does).
 pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     if payload.get("type")?.as_str()? != "event_callback" {
         return None;
@@ -113,7 +155,7 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         return None;
     }
     if let Some(subtype) = event.get("subtype") {
-        if subtype.as_str() != Some("thread_broadcast") {
+        if !matches!(subtype.as_str(), Some("thread_broadcast" | "file_share")) {
             return None;
         }
     }
@@ -151,6 +193,11 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         Some(rest) => rest.trim_start(),
         None => raw_text,
     };
+    let attachments = event
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().map(map_file).collect())
+        .unwrap_or_default();
     Some(InboundEvent {
         message_id: format!("{channel}:{ts}"),
         author_id: user.to_string(),
@@ -159,7 +206,7 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         thread_id,
         is_dm,
         text: text.to_string(),
-        attachments: Vec::new(),
+        attachments,
     })
 }
 
@@ -229,9 +276,77 @@ pub fn parse_post_response(json: &Value) -> Result<String, AdapterError> {
     ok_field(json, "ts", E_SLACK_API)
 }
 
+/// Classifies Slack's `error` string from a file call: the transient ones may work next
+/// time (`E_SLACK_UPLOAD`); every other one, `missing_scope` and size refusals included,
+/// is permanent (`E_ADAPTER_UPLOAD_DENIED`).
+pub fn upload_error_code(slack_error: &str) -> &'static str {
+    if TRANSIENT_UPLOAD_ERRORS.contains(&slack_error) {
+        E_SLACK_UPLOAD
+    } else {
+        E_ADAPTER_UPLOAD_DENIED
+    }
+}
+
+/// Classifies a non-200 HTTP status of the upload POST: 4xx other than 429 (413 too large
+/// included) is permanent, anything else may work next time.
+pub fn upload_status_code(status: u16) -> &'static str {
+    if (400..500).contains(&status) && status != 429 {
+        E_ADAPTER_UPLOAD_DENIED
+    } else {
+        E_SLACK_UPLOAD
+    }
+}
+
+/// `ok: false` on a file call -> its error, classified by `upload_error_code`.
+fn upload_ok(json: &Value) -> Result<(), AdapterError> {
+    if json.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let reason = json
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Err(AdapterError {
+        code: upload_error_code(reason),
+        message: reason.to_string(),
+    })
+}
+
+/// `files.getUploadURLExternal` response -> `(upload_url, file_id)`.
+pub fn parse_upload_url_response(json: &Value) -> Result<(String, String), AdapterError> {
+    upload_ok(json)?;
+    let field = |key: &str| {
+        json.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| protocol_error(format!("response without {key}")))
+    };
+    Ok((field("upload_url")?, field("file_id")?))
+}
+
+/// The `files.completeUploadExternal` body: shares the uploaded file into the channel, or
+/// into the thread when `thread_ts` is given.
+pub fn complete_upload_body(
+    file_id: &str,
+    title: &str,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+) -> Value {
+    let mut body = json!({
+        "files": [{ "id": file_id, "title": title }],
+        "channel_id": channel_id,
+    });
+    if let Some(thread_ts) = thread_ts {
+        body["thread_ts"] = json!(thread_ts);
+    }
+    body
+}
+
 const AUTH_TEST_URL: &str = "https://slack.com/api/auth.test";
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+const UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
+const COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
 
 const INBOUND_BUFFER: usize = 64;
 const BACKOFF_START: Duration = Duration::from_secs(5);
@@ -277,6 +392,33 @@ pub trait SlackTransport: Send + Sync {
     async fn connect(&self, url: &str) -> Result<Box<dyn SlackSocket>, AdapterError>;
     /// `chat.postMessage` with the bot token.
     async fn post_message(&self, body: Value) -> Result<PostOutcome, AdapterError>;
+    /// Streams a `url_private_download` file into the new file `dest` with the bot token;
+    /// only `FILE_HOST` is allowed and redirects are not followed. `reject_html` refuses a
+    /// 2xx `text/html` answer (Slack's login page) with `E_FILE_DENIED`.
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        reject_html: bool,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError>;
+    /// `files.getUploadURLExternal` -> `(upload_url, file_id)`.
+    async fn upload_url(
+        &self,
+        filename: &str,
+        length: u64,
+    ) -> Result<(String, String), AdapterError>;
+    /// One POST of the whole file to an upload URL the caller has host-checked; no
+    /// `Authorization` header.
+    async fn upload_bytes(&self, url: reqwest::Url, bytes: Vec<u8>) -> Result<(), AdapterError>;
+    /// `files.completeUploadExternal`: shares the uploaded file into the channel or thread.
+    async fn complete_upload(
+        &self,
+        file_id: &str,
+        title: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<(), AdapterError>;
 }
 
 /// An open Socket Mode connection.
@@ -325,9 +467,18 @@ fn api_error(code: &'static str, err: impl fmt::Display) -> AdapterError {
     }
 }
 
+/// A Web API request body.
+enum ApiBody<'a> {
+    Empty,
+    Json(&'a Value),
+    Form(&'a [(&'a str, String)]),
+}
+
 /// The real transport: HTTPS Web API calls and an outbound WebSocket.
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// `files::file_client()`: downloads and the upload POST only.
+    file_client: reqwest::Client,
     bot_token: Secret,
     app_token: Secret,
 }
@@ -353,6 +504,7 @@ impl HttpTransport {
     fn from_secrets(bot_token: Secret, app_token: Secret) -> Self {
         Self {
             client: reqwest::Client::new(),
+            file_client: files::file_client(),
             bot_token,
             app_token,
         }
@@ -363,18 +515,19 @@ impl HttpTransport {
         &self,
         url: &str,
         token: &Secret,
-        body: Option<&Value>,
+        body: ApiBody<'_>,
         code: &'static str,
     ) -> Result<Result<Value, Duration>, AdapterError> {
         let request = self.client.post(url).bearer_auth(&token.0);
         let request = match body {
-            Some(body) => request
+            ApiBody::Json(body) => request
                 .header(
                     reqwest::header::CONTENT_TYPE,
                     "application/json; charset=utf-8",
                 )
                 .body(body.to_string()),
-            None => request.header(
+            ApiBody::Form(fields) => request.form(fields),
+            ApiBody::Empty => request.header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             ),
@@ -408,7 +561,7 @@ fn rate_limited(method: &str) -> AdapterError {
 impl SlackTransport for HttpTransport {
     async fn auth_test(&self) -> Result<String, AdapterError> {
         match self
-            .call(AUTH_TEST_URL, &self.bot_token, None, E_SLACK_AUTH)
+            .call(AUTH_TEST_URL, &self.bot_token, ApiBody::Empty, E_SLACK_AUTH)
             .await?
         {
             Ok(json) => parse_auth_response(&json),
@@ -418,7 +571,12 @@ impl SlackTransport for HttpTransport {
 
     async fn open_connection(&self) -> Result<String, AdapterError> {
         match self
-            .call(CONNECTIONS_OPEN_URL, &self.app_token, None, E_SLACK_API)
+            .call(
+                CONNECTIONS_OPEN_URL,
+                &self.app_token,
+                ApiBody::Empty,
+                E_SLACK_API,
+            )
             .await?
         {
             Ok(json) => parse_open_response(&json),
@@ -436,12 +594,102 @@ impl SlackTransport for HttpTransport {
 
     async fn post_message(&self, body: Value) -> Result<PostOutcome, AdapterError> {
         match self
-            .call(POST_MESSAGE_URL, &self.bot_token, Some(&body), E_SLACK_API)
+            .call(
+                POST_MESSAGE_URL,
+                &self.bot_token,
+                ApiBody::Json(&body),
+                E_SLACK_API,
+            )
             .await?
         {
             Ok(json) => parse_post_response(&json).map(PostOutcome::Posted),
             Err(wait) => Ok(PostOutcome::RateLimited(wait)),
         }
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        reject_html: bool,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        let url = files::check_url(url, &[FILE_HOST])?;
+        files::fetch_to_file(
+            &self.file_client,
+            url,
+            Some(&self.bot_token.0),
+            dest,
+            reject_html,
+            progress,
+        )
+        .await
+    }
+
+    async fn upload_url(
+        &self,
+        filename: &str,
+        length: u64,
+    ) -> Result<(String, String), AdapterError> {
+        let fields = [
+            ("filename", filename.to_string()),
+            ("length", length.to_string()),
+        ];
+        match self
+            .call(
+                UPLOAD_URL_URL,
+                &self.bot_token,
+                ApiBody::Form(&fields),
+                E_SLACK_UPLOAD,
+            )
+            .await?
+        {
+            Ok(json) => parse_upload_url_response(&json),
+            Err(_) => Err(upload_rate_limited("files.getUploadURLExternal")),
+        }
+    }
+
+    async fn upload_bytes(&self, url: reqwest::Url, bytes: Vec<u8>) -> Result<(), AdapterError> {
+        match files::post_bytes(&self.file_client, url, bytes).await {
+            Some(200) => Ok(()),
+            Some(status) => Err(AdapterError {
+                code: upload_status_code(status),
+                message: format!("the file upload answered HTTP {status}"),
+            }),
+            None => Err(AdapterError {
+                code: E_SLACK_UPLOAD,
+                message: "the file upload failed on the network".to_string(),
+            }),
+        }
+    }
+
+    async fn complete_upload(
+        &self,
+        file_id: &str,
+        title: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        let body = complete_upload_body(file_id, title, channel_id, thread_ts);
+        match self
+            .call(
+                COMPLETE_UPLOAD_URL,
+                &self.bot_token,
+                ApiBody::Json(&body),
+                E_SLACK_UPLOAD,
+            )
+            .await?
+        {
+            Ok(json) => upload_ok(&json),
+            Err(_) => Err(upload_rate_limited("files.completeUploadExternal")),
+        }
+    }
+}
+
+fn upload_rate_limited(method: &str) -> AdapterError {
+    AdapterError {
+        code: E_SLACK_UPLOAD,
+        message: format!("{method} is rate limited"),
     }
 }
 
@@ -801,6 +1049,55 @@ impl MessengerAdapter for SlackAdapter {
         Ok(TypingHandle::new(|| {}))
     }
 
+    async fn fetch_attachment(
+        &self,
+        attachment: &InboundAttachment,
+        dest: &Path,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        if attachment.reference.0.is_empty() {
+            return Err(AdapterError {
+                code: E_FILE_REMOTE,
+                message: "slack cannot serve this file for download".to_string(),
+            });
+        }
+        // Without `files:read` Slack answers 200 with its HTML login page.
+        let reject_html = !attachment
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("text/html"));
+        self.transport
+            .download(&attachment.reference.0, dest, reject_html, progress)
+            .await
+    }
+
+    /// Reads the file whole, then gets an upload URL, POSTs the bytes and shares the file
+    /// into the target channel or thread. Returns the Slack file id.
+    async fn send_file(
+        &self,
+        target: &str,
+        path: &Path,
+        name: &str,
+    ) -> Result<SendResult, AdapterError> {
+        let (channel, thread_ts) = parse_target(target)?;
+        let data = tokio::fs::read(path).await.map_err(|err| AdapterError {
+            code: E_ADAPTER_UPLOAD_DENIED,
+            message: format!("the file could not be read: {:?}", err.kind()),
+        })?;
+        let (upload_url, file_id) = self.transport.upload_url(name, data.len() as u64).await?;
+        let url = files::check_url(&upload_url, &[FILE_HOST]).map_err(|_| AdapterError {
+            code: E_SLACK_UPLOAD,
+            message: "slack returned an upload URL on an unexpected host".to_string(),
+        })?;
+        self.transport.upload_bytes(url, data).await?;
+        self.transport
+            .complete_upload(&file_id, name, &channel, thread_ts.as_deref())
+            .await?;
+        Ok(SendResult {
+            message_id: file_id,
+        })
+    }
+
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         Some(self.reconnects.subscribe())
     }
@@ -1045,6 +1342,210 @@ mod tests {
         let err =
             parse_post_response(&json!({ "ok": false, "error": "channel_not_found" })).unwrap_err();
         assert_eq!(err.code, E_SLACK_API);
+    }
+
+    const DOWNLOAD_URL: &str = "https://files.slack.com/files-pri/T111-F111/download/report.pdf";
+
+    fn pdf_file() -> Value {
+        json!({ "id": "F111", "name": "report.pdf", "size": 1234, "mimetype": "application/pdf",
+                "filetype": "pdf", "mode": "hosted", "url_private_download": DOWNLOAD_URL })
+    }
+
+    fn with_files(mut m: Value, files: Vec<Value>) -> Value {
+        m["files"] = json!(files);
+        m
+    }
+
+    fn file_share(user: &str, channel: &str, files: Vec<Value>) -> Value {
+        let mut m = with_files(msg(user, channel, "1.1"), files);
+        m["subtype"] = json!("file_share");
+        m
+    }
+
+    fn only_attachment(m: Value) -> InboundAttachment {
+        let event = map_event(&payload(m), &scope()).expect("event kept");
+        assert_eq!(event.attachments.len(), 1);
+        event.attachments.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn file_share_maps_attachments() {
+        let m = file_share("U111", "C222", vec![pdf_file()]);
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(event.text, "hi");
+        assert_eq!(
+            event.attachments,
+            vec![InboundAttachment {
+                name: "report.pdf".into(),
+                size: 1234,
+                mime: Some("application/pdf".into()),
+                reference: AttachmentRef(DOWNLOAD_URL.into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn file_share_without_text_maps() {
+        let mut m = file_share("U111", "C222", vec![pdf_file(), pdf_file()]);
+        m.as_object_mut().unwrap().remove("text");
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(event.text, "");
+        assert_eq!(event.attachments.len(), 2);
+    }
+
+    #[test]
+    fn plain_message_with_files_maps_attachments() {
+        let m = with_files(msg("U111", "C222", "1.1"), vec![pdf_file()]);
+        assert_eq!(only_attachment(m).reference.0, DOWNLOAD_URL);
+        let mut broadcast = with_files(msg("U111", "C222", "2.2"), vec![pdf_file()]);
+        broadcast["subtype"] = json!("thread_broadcast");
+        broadcast["thread_ts"] = json!("1.1");
+        assert_eq!(only_attachment(broadcast).reference.0, DOWNLOAD_URL);
+    }
+
+    #[test]
+    fn remote_file_has_empty_reference() {
+        let variants = [
+            ("mode", json!("external")),
+            ("is_external", json!(true)),
+            ("filetype", json!("remote")),
+        ];
+        for (key, value) in variants {
+            let mut file = pdf_file();
+            file[key] = value;
+            let attachment = only_attachment(file_share("U111", "C222", vec![file]));
+            assert_eq!(attachment.reference.0, "", "{key}");
+            assert_eq!(attachment.name, "report.pdf");
+        }
+    }
+
+    #[test]
+    fn file_access_stub_has_empty_reference() {
+        let stub = json!({ "id": "F111", "mode": "file_access", "file_access": "check_file_info",
+                           "url_private_download": DOWNLOAD_URL });
+        let attachment = only_attachment(file_share("U111", "C222", vec![stub]));
+        assert_eq!(attachment.reference.0, "");
+        assert_eq!(attachment.name, "file");
+    }
+
+    #[test]
+    fn hidden_by_limit_file_has_empty_reference() {
+        for mode in ["hidden_by_limit", "tombstone"] {
+            let mut file = pdf_file();
+            file["mode"] = json!(mode);
+            let attachment = only_attachment(file_share("U111", "C222", vec![file]));
+            assert_eq!(attachment.reference.0, "", "{mode}");
+        }
+    }
+
+    #[test]
+    fn file_without_download_url_has_empty_reference() {
+        let mut missing = pdf_file();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("url_private_download");
+        let mut not_string = pdf_file();
+        not_string["url_private_download"] = json!(42);
+        let m = file_share("U111", "C222", vec![missing, not_string]);
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert!(event.attachments.iter().all(|a| a.reference.0.is_empty()));
+        assert_eq!(event.attachments.len(), 2);
+    }
+
+    #[test]
+    fn file_entry_missing_name_and_size_still_maps() {
+        let m = file_share("U111", "C222", vec![json!({ "id": "F111" }), json!("odd")]);
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(event.text, "hi");
+        assert_eq!(event.attachments.len(), 2);
+        for attachment in &event.attachments {
+            assert_eq!(attachment.name, "file");
+            assert_eq!(attachment.size, 0);
+            assert_eq!(attachment.mime, None);
+            assert_eq!(attachment.reference.0, "");
+        }
+    }
+
+    #[test]
+    fn message_changed_still_dropped() {
+        let mut m = with_files(msg("U111", "C222", "1.1"), vec![pdf_file()]);
+        m["subtype"] = json!("message_changed");
+        assert!(map_event(&payload(m), &scope()).is_none());
+        let mut deleted = msg("U111", "C222", "1.1");
+        deleted["subtype"] = json!("message_deleted");
+        assert!(map_event(&payload(deleted), &scope()).is_none());
+    }
+
+    #[test]
+    fn other_user_file_share_dropped() {
+        let mut dm = file_share("U999", "D333", vec![pdf_file()]);
+        dm["channel_type"] = json!("im");
+        assert!(map_event(&payload(dm), &scope()).is_none());
+        let other_channel = file_share("U111", "C777", vec![pdf_file()]);
+        assert!(map_event(&payload(other_channel), &scope()).is_none());
+        let mut bot = file_share("U111", "C222", vec![pdf_file()]);
+        bot["bot_id"] = json!("B1");
+        assert!(map_event(&payload(bot), &scope()).is_none());
+    }
+
+    #[test]
+    fn default_hints_mention_send_file() {
+        assert!(DEFAULT_HINTS.contains("send_file"));
+    }
+
+    #[test]
+    fn upload_error_classification() {
+        for error in [
+            "missing_scope",
+            "file_too_large",
+            "not_in_channel",
+            "invalid_auth",
+        ] {
+            assert_eq!(upload_error_code(error), E_ADAPTER_UPLOAD_DENIED, "{error}");
+        }
+        for error in TRANSIENT_UPLOAD_ERRORS {
+            assert_eq!(upload_error_code(error), E_SLACK_UPLOAD, "{error}");
+        }
+        for status in [400, 403, 404, 413] {
+            assert_eq!(
+                upload_status_code(status),
+                E_ADAPTER_UPLOAD_DENIED,
+                "{status}"
+            );
+        }
+        for status in [429, 500, 503] {
+            assert_eq!(upload_status_code(status), E_SLACK_UPLOAD, "{status}");
+        }
+    }
+
+    #[test]
+    fn upload_url_response_parses_and_classifies() {
+        assert_eq!(
+            parse_upload_url_response(&json!({ "ok": true, "upload_url": "https://files.slack.com/upload/v1/x", "file_id": "F111" }))
+                .unwrap(),
+            ("https://files.slack.com/upload/v1/x".to_string(), "F111".to_string())
+        );
+        let err = parse_upload_url_response(&json!({ "ok": false, "error": "missing_scope" }))
+            .unwrap_err();
+        assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+        let err =
+            parse_upload_url_response(&json!({ "ok": false, "error": "ratelimited" })).unwrap_err();
+        assert_eq!(err.code, E_SLACK_UPLOAD);
+        let err = parse_upload_url_response(&json!({ "ok": true, "file_id": "F111" })).unwrap_err();
+        assert_eq!(err.code, E_SLACK_PROTOCOL);
+    }
+
+    #[test]
+    fn complete_upload_body_has_thread_ts_only_when_given() {
+        assert_eq!(
+            complete_upload_body("F111", "a.txt", "C222", Some("1.1")),
+            json!({ "files": [{ "id": "F111", "title": "a.txt" }], "channel_id": "C222", "thread_ts": "1.1" })
+        );
+        assert_eq!(
+            complete_upload_body("F111", "a.txt", "D333", None),
+            json!({ "files": [{ "id": "F111", "title": "a.txt" }], "channel_id": "D333" })
+        );
     }
 
     #[test]
