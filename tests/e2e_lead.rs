@@ -177,7 +177,7 @@ impl LogTap {
                         .to_owned(),
                 )
             })
-            .filter(|(_, text)| text.starts_with("accepted:") || text.starts_with("E_"))
+            .filter(|(_, text)| text.starts_with(done::ACCEPTED) || text.starts_with("E_"))
             .collect()
     }
 

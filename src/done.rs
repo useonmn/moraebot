@@ -20,6 +20,8 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DETAIL_CHARS: usize = 120;
 /// The host tool a lane calls to claim its work is done.
 pub const LANE_DONE_TOOL: &str = "lane_done";
+/// The first word of an accepted `lane_done` answer (a refusal starts with its code).
+pub const ACCEPTED: &str = "ACCEPTED";
 
 /// The Done line cannot be checked.
 pub const E_DONE_SYNTAX: &str = "E_DONE_SYNTAX";
@@ -301,9 +303,9 @@ fn check_command(
     started: &mut impl FnMut(u32) -> bool,
     ended: &mut impl FnMut(u32),
 ) -> Result<(Option<&'static str>, String), Stopped> {
-    let Some((program, args)) = argv.split_first() else {
-        return Ok((Some(E_CHECK_SPAWN), "empty command".to_owned()));
-    };
+    let (program, args) = argv
+        .split_first()
+        .expect("DoneLine::parse rejects an empty argv");
     let output = |name: &str| {
         OpenOptions::new()
             .write(true)

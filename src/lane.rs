@@ -607,11 +607,12 @@ impl LaneManager {
                 "lane done claim accepted"
             );
             *claim = Claim::Accepted { receipt };
-            return Ok(
-                "accepted: every Done check passed. End your turn now with a short \
-                       summary of what you did."
-                    .into(),
-            );
+            return Ok(format!(
+                "{}: every Done check passed. End your turn now with a short summary of \
+                 what you did.",
+                done::ACCEPTED
+            )
+            .into());
         }
         let failing: Vec<&str> = checks.iter().filter_map(|check| check.code).collect();
         tracing::info!(
