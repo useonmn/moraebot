@@ -287,8 +287,9 @@ omp 저장소에는 공식 Rust 클라이언트 `sdk/rust/omp-rpc`가 있습니�
 
 ```
 [moraebot conversation=<key> message=<row id>]           주인 메시지 (본문 + 첨부 파일 목록)
-[moraebot conversation=<key> lane=<id> result]           lane이 낸 결과 (본문 = lane의 마지막 글)
-[moraebot conversation=<key> lane=<id> failed code=<CODE>]  lane 실패 (본문 없음)
+[moraebot conversation=<key> lane=<id> result]           lane이 낸 결과 (본문 = lane의 마지막 글, 완료 주장 없음)
+[moraebot conversation=<key> lane=<id> done]             완료 확인을 통과한 lane 결과 (본문 = lane의 마지막 글 + 확인 기록)
+[moraebot conversation=<key> lane=<id> failed code=<CODE>]  lane 실패 (본문 없음, 단 E_DONE_UNMET은 lane의 마지막 글 + 확인 기록)
 ```
 
 lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation_key)`로 보냅니다. lane 결과에 대한 답은 lane을 시작한 대화로 갑니다. "마지막으로 말한 대화" 같은 상태는 어디에도 없습니다.
@@ -299,11 +300,11 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 | 도구 | 하는 일 |
 |---|---|
-| `lane_start {task}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
+| `lane_start {task, done}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
 | `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
 | `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다 |
 
-거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 lead와 같은 작업 폴더에서 돌고, 세션 폴더는 `<홈>/lanes/<id>/session`, 호스트 도구는 없으며 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 lead와 같은 작업 폴더에서 돌고, 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
 
 **결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
 
@@ -323,6 +324,31 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 - 끄는 순서는 디스패처 종료, `omp.shutdown_all()`(lead와 lane 모두 끄기), `recover_on_start`입니다. 꺼지는 중에 스스로 끝난 lane의 결과는 저장해 두었다가 다음에 켜질 때 lead에게 보냅니다.
 
 **업그레이드.** slice 3의 `inbox.sqlite`는 그 자리에서 바뀝니다(새 표 `sessions`, `lanes`, 새 열 `origin`, `steered_into`). `<홈>/conversations/*/session` 폴더는 읽지도, 옮기지도, 지우지도 않습니다. lead는 빈 기록으로 시작합니다.
+
+### 3.8 완료 확인 (slice 5)
+
+**done 줄.** `lane_start`는 `done` 문자열을 꼭 받습니다(Dori mode 문법). 확인 방법은 두 가지입니다. `command ["program","arg"]`는 그 프로그램이 종료 코드 0으로 끝나면 통과하고, `file <경로>`는 그 경로가 있으면 통과합니다. 여러 개는 `;`로 잇습니다. `done`이 없거나 비면 `E_LANE_ARGS`, 확인할 수 없는 줄이면 잘못된 부분을 밝혀 `E_DONE_SYNTAX`로 거절합니다. 거절된 호출은 lane을 저장하지도, 자식을 띄우지도 않습니다. 받아들인 줄은 정리된 모양(canonical)으로 `lanes.done` 열에 저장하고 `lane_status`에도 보여 줍니다. 이 열이 없던 slice 4 저장소는 열 때 열이 더해지고, 예전 lane은 done 줄이 없는 lane으로 남습니다(도구도, 안내 꼬리말도 없고 결과는 `result` 표시).
+
+**`lane_done` 도구.** done 줄이 있는 lane은 호스트 도구 `lane_done {evidence}` 하나를 받고, 보내는 프롬프트마다 끝에 done 줄과 완료를 주장하는 방법을 적은 꼬리말이 붙습니다. lane이 일이 끝났다고 보면 증거(한 일과 확인한 방법)를 담아 `lane_done`을 부릅니다. 그러면 moraebot이 그 도구 호출 안에서 모든 확인을 차례로 돌립니다. 확인은 이 호출 안에서만 돕니다.
+
+- `command`는 셸 없이 argv 그대로, 작업 폴더에서, 자기 프로세스 그룹으로 돕니다. 환경은 omp 자식과 같고 메신저 변수만 뺍니다(`omp::check_env`). 입력은 닫고, 출력은 파이프가 아니라 `<홈>/lanes/<id>/check/<순번>/stdout`, `stderr` 파일(권한 0600)로 보냅니다. `CHECK_TIMEOUT`(120초)이 지나면 그룹째 죽입니다. 끝나면 그룹에 남은 프로세스도 죽입니다. `setsid`로 새 세션에 빠져나간 프로세스는 닿지 않습니다.
+- `file`은 경로가 있는지 봅니다. 상대 경로는 작업 폴더 기준이고, `~/`는 `HOME`으로 풉니다.
+
+확인 하나의 결과 코드는 통과(코드 없음), `E_CHECK_EXIT`, `E_CHECK_MISSING`, `E_CHECK_TIMEOUT`, `E_CHECK_SPAWN` 중 하나입니다. 로그에는 lane id, 확인 개수, 실패 코드만 남기고 증거나 확인 출력은 남기지 않습니다.
+
+**주장 상태(claim).** 작업(job)마다 `None`, `Failed`, `Accepted` 중 하나를 가지며 `None`에서 시작합니다. 모두 통과하면 `Accepted`가 되고 도구는 받아들였다고 답합니다. 하나라도 실패하면 `Failed`가 되고, 도구는 `E_DONE_UNMET`과 실패한 확인마다 한 줄(확인, 코드, 자세한 내용)로 거절합니다. lane은 같은 턴에서 계속 일하고 `lane_done`을 몇 번이든 다시 부를 수 있습니다. 턴의 마지막 호출이 결과를 정합니다. moraebot은 lane에 스스로 프롬프트를 보내지 않습니다. 한 lane의 `lane_done` 호출은 하나씩 차례로 돌고, 잠금 순서는 claim, `inner`, 저장소입니다.
+
+**결과 표시.** 턴이 답으로 끝나면 주장 상태에 따라 결과 줄을 씁니다.
+
+| 마지막 주장 | lead가 받는 표시 | lane 상태 |
+|---|---|---|
+| 통과 | `done` (답 + 증거와 모든 확인을 담은 기록) | `idle` |
+| 실패 | `failed code=E_DONE_UNMET` (답 + 기록) | `failed` / `E_DONE_UNMET`, 다시 `lane_message` 가능 |
+| 없음 | `result` (답, 확인하지 않음) | `idle` |
+
+`Failed`나 `NeedsCheck`로 끝난 턴은 주장과 상관없이 slice 4처럼 알립니다. `lane_message`로 다시 일을 주면 저장된 done 줄로 같은 도구와 꼬리말을 붙입니다.
+
+**끄기와 재시작.** 꺼지기 시작한 뒤의 `lane_done`은 확인을 시작하지 않고 `E_LANE_STOPPING`으로 거절합니다. `shutdown_all`은 lane 자식을 모두 먼저 죽이고, 그다음 돌고 있는 확인을 죽입니다. 그래서 확인의 거절이 살아 있는 lane에 닿는 일이 없고, 확인 도중 끊긴 턴은 늘 잘린 턴이 됩니다(결과 줄 없음, 다음 시작 때 `E_LANE_INTERRUPTED` 안내 한 번). `shutdown_all`은 죽인 확인이 모두 거둬진 뒤에(`ABORT_JOIN_BOUND`까지) 돌아옵니다. 시간 초과나 자식을 잃어 작업이 먼저 끝나면, 그 작업의 워커가 자기 확인을 죽입니다. 보통 종료에서는 확인 프로세스도, 확인의 프로세스 그룹에 남은 프로세스도 확인이나 게이트웨이보다 오래 살지 않습니다. SIGKILL로 죽은 게이트웨이는 정리하지 못합니다.
 
 ## 4. 상태, 설정, 운영
 
