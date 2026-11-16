@@ -12,3 +12,5 @@ pub mod logging;
 pub mod launchd;
 pub mod discord;
 pub mod gateway;
+pub mod hints;
+pub mod slack;
