@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod config;
 pub mod discord;
 pub mod dispatch;
+pub mod files;
 pub mod gateway;
 pub mod hints;
 pub mod init;
