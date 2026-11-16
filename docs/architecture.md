@@ -20,9 +20,10 @@ moraebot은 Discord로 받은 메시지를 이 컴퓨터의 코딩 에이전트 
      v
  SQLite (inbox.sqlite)
      |
-     |  대화마다 줄 하나 (큐)
+     |  전체 대기열 하나 (먼저 온 순서)
      v
- omp --mode rpc --session-dir <대화 폴더>/session   (대화 하나에 omp 하나)
+ omp --mode rpc --session-dir <홈>/lead/session   (모든 대화에 lead omp 하나)
+     |  긴 일은 lane_start로 lane omp에게 (최대 3개)
      |
      |  prompt_result 도착
      v
@@ -66,7 +67,7 @@ moraebot은 Discord로 받은 메시지를 이 컴퓨터의 코딩 에이전트 
 | D4 | 게이트웨이는 Rust로 만든 별도 프로그램 | 항상 켜져 있는 프로그램 하나입니다. |
 | D5 | 접근 제어는 바꿀 수 있는 설정 | `owner_only`, `allowlist`, `pairing`, `open` 중 하나를 고릅니다. 기본값은 `owner_only`입니다. (`allowlist`는 적어 둔 사용자만, `pairing`은 모르는 사람이 코드를 받고 주인이 승인하는 방식, 2.6절) |
 | D6 | 먼저 저장하고, 그다음 처리 | 받은 메시지를 SQLite에 먼저 저장하고 처리합니다. dinobot의 원칙만 참고하고 코드는 새로 씁니다. |
-| D7 | 대화마다 omp 하나 | `omp --mode rpc --session-dir <대화 폴더>/session`을 대화마다 하나 띄웁니다. 그 메시지의 `prompt_result`가 오면 답장합니다. |
+| D7 | 모든 대화에 lead omp 하나 (slice 4) | `omp --mode rpc --session-dir <홈>/lead/session` 하나가 모든 대화를 맡습니다. 그 메시지의 `prompt_result`가 오면 메시지가 온 대화로 답장합니다. 처음 설계(대화마다 omp 하나)는 slice 4에서 바뀌었습니다(3.7절). |
 | D8 | 작게 시작해 하나씩 | 한 번에 기능 하나만 만듭니다. 지금은 문서만 씁니다. |
 | D9 | 쉬운 한국어 | 주인은 개발자가 아닐 수 있습니다. 어려운 말은 처음 나올 때 풀어 씁니다. |
 
@@ -78,7 +79,7 @@ moraebot은 세 부분으로 이루어집니다.
 
 1. **게이트웨이**: Rust로 만든 프로그램 하나입니다. Discord와 계속 연결되어 메시지를 받고, 저장하고, omp에 넘기고, 답장을 보냅니다.
 2. **SQLite**: 파일 하나로 된 작은 데이터베이스입니다. 별도 서버가 필요 없습니다. 받은 메시지, 대화 목록, 허용 사용자 같은 상태를 저장합니다.
-3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 대화 하나에 omp 하나가 돕니다.
+3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 모든 대화를 맡는 lead omp 하나와, lead가 긴 일을 맡기는 lane omp가 최대 3개 돕니다(3.7절).
 
 > **slice 2 메모.** 이제 Slack도 붙습니다. Slack은 Socket Mode(WebSocket)로 연결하고, 코드는 `src/slack.rs`에 있습니다. 메신저는 한 번에 하나만 켜집니다(`config.toml`의 `messenger`). 앱 설정 방법은 `docs/guides/`의 메신저별 안내서에 있습니다. 아래 그림의 Discord 자리에 Slack이 들어가도 흐름은 같습니다.
 
@@ -141,7 +142,7 @@ dinobot은 Discord를 interactions 웹훅으로만 받습니다. 이 방식은 �
 
 ### 2.2 무엇을 "대화 하나"로 볼까
 
-대화 하나는 omp 하나, 세션 폴더 하나와 짝을 이룹니다. 그래서 메시지마다 **대화 키**를 정합니다. 대화 키는 이 메시지가 어느 대화에 속하는지 나타내는 문자열입니다.
+slice 4부터 모든 대화는 lead omp 하나가 맡습니다. 그래도 답장을 메시지가 온 대화로 보내야 하므로 메시지마다 **대화 키**를 정합니다. 대화 키는 이 메시지가 어느 대화에 속하는지 나타내는 문자열입니다.
 
 | 메시지가 온 곳 | 대화 키 | 비고 |
 |---|---|---|
@@ -208,14 +209,14 @@ hermes의 pairing은 8자리 코드, 1시간 만료, 플랫폼당 대기 요청 
 
 - **RPC 모드**: omp를 화면 없이 실행하고, 명령과 결과를 글자 줄로 주고받는 방식입니다. 한 줄에 JSON 객체 하나가 들어갑니다(JSONL).
 - **stdin / stdout**: 자식 프로세스의 입력 통로와 출력 통로입니다. 게이트웨이는 stdin에 명령을 쓰고 stdout에서 결과를 읽습니다.
-- **세션 폴더**: 대화 기록 파일이 저장되는 폴더입니다. 대화 하나에 폴더 하나를 쓰고, 위치는 늘 `<대화 폴더>/session`입니다.
+- **세션 폴더**: 대화 기록 파일이 저장되는 폴더입니다. lead는 `<홈>/lead/session`, lane은 `<홈>/lanes/<id>/session`을 씁니다.
 
-### 3.2 한 대화에 omp 하나
+### 3.2 실행 명령
 
-대화마다 omp를 하나씩 띄웁니다.
+lead omp는 하나만 띄웁니다(3.7절). lane도 같은 모양의 명령으로 띄우고, 세션 폴더만 `<홈>/lanes/<id>/session`으로 다릅니다.
 
 ```
-omp --mode rpc --session-dir <대화 폴더>/session --cwd <작업 폴더> --approval-mode yolo
+omp --mode rpc --session-dir <홈>/lead/session --cwd <작업 폴더> --approval-mode yolo
 ```
 
 `--cwd`는 omp가 일하는 폴더입니다. yolo에도 예외가 하나 있습니다. omp 설정의 "제한 폴더" 안에서 하는 작업은 yolo여도 승인을 요청하고, 화면이 없으면 거부됩니다.
@@ -223,7 +224,7 @@ omp --mode rpc --session-dir <대화 폴더>/session --cwd <작업 폴더> --app
 ### 3.3 흐름
 
 ```
- 대화별 큐에서 메시지 하나 꺼냄
+ 전체 대기열에서 메시지 하나 꺼냄
           |
           v
  [자식 없음] omp 실행 --> stdout에 ready
@@ -240,7 +241,7 @@ omp --mode rpc --session-dir <대화 폴더>/session --cwd <작업 폴더> --app
 ```
 
 1. **시작.** omp는 켜지자마자 stdout에 `ready` 한 줄을 씁니다. 지원하는 통신 규칙(프로토콜) 버전(1과 2)이 들어 있습니다. 게이트웨이는 곧바로 버전 2를 요청합니다(`negotiate_protocol`). 버전 2에서는 1 MiB(약 100만 바이트)가 넘는 큰 결과도 조각으로 나뉘어 잃지 않고 도착합니다.
-2. **대화 열기.** `open_session`으로 세션 폴더를 엽니다. 이때 넘기는 `sessionDir`는 실행할 때 `--session-dir`로 준 `<대화 폴더>/session`과 같은 폴더입니다. 기록이 있으면 이어 가고, 없으면 새로 시작합니다. 응답의 `resumed` 값으로 어느 쪽인지 알 수 있습니다. `--continue` 옵션과 같은 일을 실행 중에 하는 것입니다.
+2. **대화 열기.** `open_session`으로 세션 폴더를 엽니다. 이때 넘기는 `sessionDir`는 실행할 때 `--session-dir`로 준 `<홈>/lead/session`과 같은 폴더입니다. 기록이 있으면 이어 가고, 없으면 새로 시작합니다. 응답의 `resumed` 값으로 어느 쪽인지 알 수 있습니다. `--continue` 옵션과 같은 일을 실행 중에 하는 것입니다.
 3. **메시지 보내기.** `prompt` 명령의 `id`에 Discord 메시지 id를 넣습니다. 응답은 순서대로 오지 않을 수 있으니, 순서가 아니라 `id`로 맞춥니다.
 4. **진행 중.** omp는 일하는 동안 이벤트를 계속 보냅니다. 게이트웨이는 이걸 보고 Discord에 "입력 중" 표시를 유지합니다. Discord "입력 중" API의 유지 시간은 **미검증**입니다(열린 질문 8).
 5. **끝.** 같은 `id`의 `prompt_result`가 오면 omp가 그 메시지에 대한 한 턴을 마친 것입니다. `status`는 `completed`, `aborted`, `error` 중 하나입니다. 모델 쪽에서 실패해도 명령 응답은 성공으로 오고, 실패는 `status: error`로만 나타납니다. 그래서 보통은 명령 응답이 아니라 `prompt_result`를 기다립니다.
@@ -278,6 +279,51 @@ omp 저장소에는 공식 Rust 클라이언트 `sdk/rust/omp-rpc`가 있습니�
 - **crates.io의 `omp-rpc`가 아닙니다.** crates.io는 Rust 라이브러리를 내려받는 공개 저장소입니다. 저장소의 크레이트(Rust 라이브러리 단위)는 `publish = false`라서 crates.io에 없습니다. crates.io에 있는 같은 이름은 다른 것이거나 출처가 확인되지 않았습니다. 그래서 git 주소와 특정 커밋으로 고정해서 씁니다.
 - **기다리는 방식입니다.** 이 클라이언트는 결과가 올 때까지 호출한 쪽을 멈춰 세웁니다. 게이트웨이는 tokio(여러 일을 동시에 처리하는 Rust 실행 환경)로 돌기 때문에, 이 클라이언트는 별도 작업 흐름(스레드)이나 `spawn_blocking`(오래 기다리는 일을 따로 돌리는 tokio 기능)에서 불러야 합니다.
 
+### 3.7 lead와 lane (slice 4)
+
+**lead 자식 하나.** omp RPC 자식 하나(lead)가 지금 켜진 메신저의 모든 스레드와 DM을 맡습니다. 세션 폴더는 `<홈>/lead/session`, stderr 기록은 `<홈>/logs/omp-lead.stderr.log`입니다. omp 세션 id는 `sessions` 표의 `name='lead'` 줄에 저장하고, 재시작하면 그 세션을 다시 엽니다. 다른 프로세스가 세션을 쥐고 있으면 `E_SESSION_BUSY`로 그 메시지를 "확인 필요"(`needs_check`)로 둡니다. 대화가 바뀌어도 lead를 끄지 않습니다. 메시지는 전체 대기열 하나에서 먼저 온 순서로 꺼냅니다.
+
+**봉투(envelope) 줄.** lead에 넘기는 입력은 모두 어느 대화에서 왔는지 알리는 영어 한 줄로 시작하고, 줄바꿈 뒤에 본문이 옵니다.
+
+```
+[moraebot conversation=<key> message=<row id>]           주인 메시지 (본문 + 첨부 파일 목록)
+[moraebot conversation=<key> lane=<id> result]           lane이 낸 결과 (본문 = lane의 마지막 글)
+[moraebot conversation=<key> lane=<id> failed code=<CODE>]  lane 실패 (본문 없음)
+```
+
+lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation_key)`로 보냅니다. lane 결과에 대한 답은 lane을 시작한 대화로 갑니다. "마지막으로 말한 대화" 같은 상태는 어디에도 없습니다.
+
+**역할 안내문.** 기본 안내문 `lead::DEFAULT_GUIDANCE`(영어)를 메신저 안내문과 함께 `--append-system-prompt=` 하나로 넘깁니다. 모양은 `<안내문>\n\n<메신저 안내문>`이고, 둘 다 비면 그 인자를 넣지 않습니다. `<홈>/hints/lead.md`가 있으면 기본 안내문을 바꿉니다. 규칙은 메신저 안내문과 같습니다(8192바이트까지, 빈 파일은 끄기, 너무 크면 `E_HINTS_FILE`).
+
+**lane 도구 세 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
+
+| 도구 | 하는 일 |
+|---|---|
+| `lane_start {task}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
+| `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
+| `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다 |
+
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 lead와 같은 작업 폴더에서 돌고, 세션 폴더는 `<홈>/lanes/<id>/session`, 호스트 도구는 없으며 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+
+**결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
+
+**steer 묶음 규칙.** lead가 어떤 대화의 턴을 처리하는 중에 **같은 대화**에서 새 메시지가 오면, 그 메시지를 `prompt{streamingBehavior:"steer"}`로 지금 턴에 끼워 넣습니다. 조건은 모두 지켜야 합니다.
+
+- 파일 저장이 끝났고, lead가 그 턴의 `agent_start`를 보낸 뒤입니다.
+- 그 줄이 턴의 주 메시지보다 새것이고, 같은 대화에 더 오래된 `queued` 줄이 없습니다(`steer_into`의 조건부 UPDATE). 그래서 끼워 넣은 메시지가 먼저 보낸 메시지를 앞지르지 않습니다.
+- 한 턴에 하나까지입니다. 그 뒤에 온 같은 대화 메시지는 다음 턴에 갑니다.
+
+다른 대화의 메시지와 lane 결과는 끼워 넣지 않고 다음 턴을 기다립니다. 워커와 steer 경로는 모두 `claim`/`steer_into`로 줄을 차지하므로 한 줄은 한 경로에서만 돕니다. 묶음의 답은 하나로 합쳐 주 메시지 줄에 저장하고(`finish_group`, 끼워 넣은 줄은 `done`), 한 번 보냅니다. 묶음 중 하나라도 실패하거나 끊기면 묶음 전체가 `failed`(`fail_group`) 또는 `needs_check`(`interrupt_group`)가 됩니다.
+
+**재시작 규칙.** 무엇도 두 번 돌리지 않습니다.
+
+- 시작할 때 `processing`으로 남은 줄(끼워 넣은 줄 포함)은 `needs_check`가 되고, 같은 대화의 대기 중인 주인 줄(`origin = 'owner'`)을 붙잡아 둡니다. 대기 중인 lane 결과 줄은 붙잡지 않습니다.
+- 시작할 때 `running`인 lane은 `needs_check` / `E_LANE_INTERRUPTED`가 되고, lane을 시작한 대화에 `N_LANE_INTERRUPTED` 안내를 한 번 보냅니다(`lanes.notice_sent`). 시간 초과처럼 스스로 멈춘 lane은 이미 `failed code=` 결과 줄로 알렸으므로 이 안내를 받지 않습니다.
+- lane을 다시 돌리지 않고, lead 입력을 다시 보내지도 않습니다.
+- 끄는 순서는 디스패처 종료, `omp.shutdown_all()`(lead와 lane 모두 끄기), `recover_on_start`입니다. 꺼지는 중에 스스로 끝난 lane의 결과는 저장해 두었다가 다음에 켜질 때 lead에게 보냅니다.
+
+**업그레이드.** slice 3의 `inbox.sqlite`는 그 자리에서 바뀝니다(새 표 `sessions`, `lanes`, 새 열 `origin`, `steered_into`). `<홈>/conversations/*/session` 폴더는 읽지도, 옮기지도, 지우지도 않습니다. lead는 빈 기록으로 시작합니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -290,15 +336,16 @@ omp 저장소에는 공식 Rust 클라이언트 `sdk/rust/omp-rpc`가 있습니�
   secrets/discord.token    Discord 봇 토큰 (주인만 읽기, 권한 600)
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록, 허용 사용자, pairing 대기
-  conversations/
-    <대화 폴더 이름>/
-      session/             omp 세션 기록 (--session-dir로 넘김)
+  lead/session/            lead omp 세션 기록 (--session-dir로 넘김)
+  lanes/<id>/session/      lane마다 omp 세션 기록
+  hints/lead.md            lead 역할 안내문 바꾸기 (선택)
+  conversations/           slice 3까지 쓰던 대화별 세션 기록. 더 쓰지 않고 지우지도 않음
   logs/
     gateway.log            게이트웨이 동작 기록
     launchd.out / .err     launchd가 받아 주는 출력과 오류
 ```
 
-받은 메시지 보관함(`inbox.sqlite`)을 따로 둡니다. dinobot도 보관함을 본 DB와 다른 파일로 두고, 배타 잠금(한 프로그램만 쓰게 막는 잠금)과 `synchronous=FULL`(디스크에 기록된 것을 확인한 뒤 진행)을 씁니다. omp는 원래 대화 기록을 `~/.omp/agent/sessions/`에 저장하지만, `--session-dir`로 위치를 대화 폴더로 바꿉니다.
+받은 메시지 보관함(`inbox.sqlite`)을 따로 둡니다. dinobot도 보관함을 본 DB와 다른 파일로 두고, 배타 잠금(한 프로그램만 쓰게 막는 잠금)과 `synchronous=FULL`(디스크에 기록된 것을 확인한 뒤 진행)을 씁니다. omp는 원래 대화 기록을 `~/.omp/agent/sessions/`에 저장하지만, `--session-dir`로 위치를 moraebot 홈 안으로 바꿉니다.
 
 ### 4.2 설정
 
@@ -331,7 +378,7 @@ launchd는 macOS가 프로그램을 자동으로 켜고, 죽으면 다시 켜 �
    2. processing으로 남은 메시지 처리 (아래 설명)
    3. 남아 있는 옛 omp 자식 프로세스 종료하고 거두기
    4. Discord Gateway 다시 연결
-   5. 대화가 오면 omp를 다시 띄우고 open_session으로 이전 대화 이어 받기
+   5. 메시지가 오면 lead omp를 다시 띄우고 open_session으로 lead 대화 이어 받기
    6. 대기(queued) 메시지를 순서대로 처리 (같은 메시지 id는 한 번만)
 ```
 

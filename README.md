@@ -179,6 +179,17 @@ moraebot run
 
 Stop it with Ctrl+C.
 
+## Lead and lanes
+
+One omp, the lead, answers every thread and DM of the active messenger. It knows which conversation each message came from, and its reply always goes back to that conversation. Because it's one omp, it remembers what was said in all of them.
+
+- **Lanes for long work.** When a task is long, the lead hands it to a lane: a separate omp that works in the background while the lead keeps answering you. At most 3 lanes run at once. Lanes work in the same work folder as the lead, so two lanes could touch the same files; the lead is told not to give them the same files at the same time.
+- **Lane results.** When a lane finishes, its result goes to the lead, not straight to you. The lead checks it and answers in the conversation that started the lane. A lane that finished can be given more work later; it picks up its own history.
+- **Follow-ups while it works.** If you send another message in the same conversation while the lead is working on it, that message is folded into the answer it's writing, and you get one reply. Only one follow-up is folded in per answer; anything after that waits for the next turn. Messages from other conversations, and lane results, also wait their turn.
+- **Restarts.** A lane that was running when moraebot stopped isn't resumed. You get one notice in the conversation that started it. Ask the lead to try again if you still need it.
+
+The lead controls lanes only through three tools moraebot gives it: `lane_start`, `lane_message` and `lane_status`. Each lane runs a full omp, so three busy lanes cost about as much as four omp sessions.
+
 ## Behavior hints
 
 moraebot gives omp a short built-in note about the messenger it's answering in, for example how long a reply may be and which formatting renders. To replace it, write your own text to:
@@ -194,6 +205,8 @@ moraebot gives omp a short built-in note about the messenger it's answering in, 
 - Restart moraebot to apply a change.
 
 The built-in hints also tell omp how files work here: where received files are saved and how to send one back. An override file replaces all of that text, so keep those file sentences in your own file if you write one.
+
+The lead also gets a built-in role note: how to read the tag line at the start of each input, when to answer directly and when to start a lane, and how to use the lane tools. To replace it, write your own text to `~/.moraebot/hints/lead.md`. The same rules apply (8 KiB at most, empty turns it off, restart to apply). If you write one, keep the lane tool names (`lane_start`, `lane_message`, `lane_status`) and the description of the tag line, or the lead won't know how to use lanes or where a message came from. The messenger hints file still applies on top of it.
 
 ## Logs
 
@@ -215,6 +228,8 @@ After installing, check these by hand once:
 - [ ] **Restart notice.** Send something long, then restart moraebot mid-task (`launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway`). After it comes back you get one notice saying the task was interrupted.
 - [ ] **Send a file.** Attach a small file to a message. omp's answer shows it read the file.
 - [ ] **Get a file back.** Ask omp to send you a file from the work folder. It shows up in the same thread, after the reply text.
+- [ ] **Lane result in the same thread.** In a thread, ask for something long, such as a task with several steps. The lead says it started a lane, and later the lane's result is answered in that same thread.
+- [ ] **Follow-up while it works.** While the lead is still answering in a thread, send a second message in that thread. You get one reply that covers both.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -268,6 +283,12 @@ Files need one more permission than earlier versions asked for. If you set up th
 - Slack: update the app from the manifest in [docs/guides/slack.md](docs/guides/slack.md), then reinstall it to your workspace.
 
 The guides hold the exact settings. Restart moraebot afterwards.
+
+This version replaces the separate omp per thread or DM with one lead (see Lead and lanes). After the upgrade:
+
+- The lead starts with an empty history. It doesn't pick up what earlier per-thread sessions remembered.
+- The old `~/.moraebot/conversations/*/session` folders are kept as they were and are no longer used. Delete them by hand if you don't need them.
+- Your stored messages and settings keep working without any change.
 
 ## Stop and uninstall
 
