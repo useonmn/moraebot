@@ -573,6 +573,121 @@ fn tools_mode_without_trigger_answers_plain() {
 }
 
 #[test]
+fn lane_fake_runs_the_lane_tool_script() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lane_script = r#"{"tool":"lane_done","arguments":{"evidence":"built it"}}"#;
+    let lead_script = r#"{"tool":"other_tool","arguments":{}}"#;
+    let lane_dir = dir.path().join("lanes/1/session");
+    let lane_dir = lane_dir.to_str().expect("utf-8 path");
+    let (tools, calls) = recording_tools(&["lane_done", "other_tool"]);
+    let (lane, _events) = spawn_env(
+        &["--session-dir", lane_dir],
+        &[
+            ("FAKE_OMP_LANE_MODE", "tools"),
+            ("FAKE_OMP_LANE_TOOL_CALLS", lane_script),
+            ("FAKE_OMP_TOOL_CALLS", lead_script),
+        ],
+        tools,
+    );
+    let turn = lane
+        .prompt_and_wait(&prompt("run-lane-tools x"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("lane prompt");
+    assert_eq!(
+        turn.assistant_text.as_deref(),
+        Some("echo: run-lane-tools x")
+    );
+    let call = calls.recv_timeout(WAIT).expect("lane_done call");
+    assert_eq!(call.tool, "lane_done");
+    assert_eq!(call.arguments, json!({"evidence": "built it"}));
+    assert!(calls.try_recv().is_err(), "exactly one call");
+
+    // The lead trigger does nothing in a lane; the fake writes every call
+    // before its final reply, so an empty channel after the reply is conclusive.
+    let turn = lane
+        .prompt_and_wait(&prompt("run-tools y"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("lane prompt");
+    assert_eq!(turn.assistant_text.as_deref(), Some("echo: run-tools y"));
+    assert!(calls.try_recv().is_err(), "no call on the lead trigger");
+
+    // A fake without `/lanes/` keeps the lead script.
+    let (tools, calls) = recording_tools(&["lane_done", "other_tool"]);
+    let (lead, _events) = spawn_env(
+        &[],
+        &[
+            ("FAKE_OMP_MODE", "tools"),
+            ("FAKE_OMP_LANE_TOOL_CALLS", lane_script),
+            ("FAKE_OMP_TOOL_CALLS", lead_script),
+        ],
+        tools,
+    );
+    lead.prompt_and_wait(&prompt("run-tools z"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("lead prompt");
+    let call = calls.recv_timeout(WAIT).expect("other_tool call");
+    assert_eq!(call.tool, "other_tool");
+    assert!(calls.try_recv().is_err(), "exactly one call");
+}
+
+#[test]
+fn touch_after_the_nth_tool_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("marker");
+    let lane_dir = dir.path().join("lanes/1/session");
+    let lane_dir = lane_dir.to_str().expect("utf-8 path");
+    let script = concat!(
+        r#"{"tool":"lane_done","arguments":{"evidence":"one"}}"#,
+        "\n",
+        r#"{"tool":"lane_done","arguments":{"evidence":"two"}}"#,
+        "\n",
+        r#"{"tool":"lane_done","arguments":{"evidence":"three"}}"#,
+    );
+    // Each call reports whether the marker exists when the call is read; the
+    // first two are refused, the third is accepted.
+    let (tx, seen) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let seen_marker = marker.clone();
+    let handled = std::sync::atomic::AtomicUsize::new(0);
+    let parameters: Map<String, Value> =
+        serde_json::from_value(json!({"type": "object"})).expect("schema object");
+    let tool = HostTool::new(
+        "lane_done",
+        "Records whether the marker exists.",
+        parameters,
+        move |_arguments, _context| {
+            tx.lock()
+                .expect("sender lock")
+                .send(seen_marker.exists())
+                .expect("report marker");
+            let call = handled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call < 3 {
+                Err("E_TEST_REFUSED: refused".into())
+            } else {
+                Ok("done".to_owned().into())
+            }
+        },
+    );
+    let marker_value = marker.to_str().expect("utf-8 path");
+    let (client, _events) = spawn_env(
+        &["--session-dir", lane_dir],
+        &[
+            ("FAKE_OMP_LANE_MODE", "tools"),
+            ("FAKE_OMP_LANE_TOOL_CALLS", script),
+            ("FAKE_OMP_TOUCH_ON_TOOL_ERROR", marker_value),
+            ("FAKE_OMP_TOUCH_AFTER_ERRORS", "2"),
+        ],
+        vec![tool],
+    );
+    let turn = client
+        .prompt_and_wait(&prompt("run-lane-tools"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("lane prompt");
+    assert_eq!(turn.assistant_text.as_deref(), Some("echo: run-lane-tools"));
+    let seen: Vec<bool> = (0..3)
+        .map(|_| seen.recv_timeout(WAIT).expect("call handled"))
+        .collect();
+    assert_eq!(seen, [false, false, true]);
+    assert!(marker.exists(), "marker stays after the final reply");
+}
+
+#[test]
 fn steer_hold_keeps_both_prompts_open() {
     let (client, events) = spawn_env(
         &[],

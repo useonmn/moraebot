@@ -27,6 +27,17 @@
 //! just before it is written, which orders the calls against the received
 //! `host_tool_result` lines.
 //!
+//! Lane tool script: a lane fake (its `--session-dir` contains `/lanes/`) in
+//! mode `tools` reads FAKE_OMP_LANE_TOOL_TRIGGER (default `run-lane-tools`) and
+//! FAKE_OMP_LANE_TOOL_CALLS (same line format as FAKE_OMP_TOOL_CALLS) instead of
+//! FAKE_OMP_TOOL_TRIGGER and FAKE_OMP_TOOL_CALLS, which only a lead fake reads.
+//!
+//! Touch on a refused call: FAKE_OMP_TOUCH_ON_TOOL_ERROR=<path> with
+//! FAKE_OMP_TOUCH_AFTER_ERRORS=<n> (default 1) creates `<path>` empty (parents
+//! are not created) when the n-th `host_tool_result` frame with
+//! `"isError": true` arrives, counted over the child's life, before the next
+//! call or the final reply is written. It applies to any fake, lead or lane.
+//!
 //! Steer: in mode `steer` the first prompt answers `agent_start` and waits. A
 //! later prompt with `"streamingBehavior":"steer"` is acknowledged and handled
 //! by FAKE_OMP_STEER_CASE: `merged` (one run answers both), `separate` (two
@@ -48,6 +59,7 @@ use serde_json::{Value, json};
 
 const SESSION_ID: &str = "fake-session-1";
 const DEFAULT_TOOL_TRIGGER: &str = "run-tools";
+const DEFAULT_LANE_TOOL_TRIGGER: &str = "run-lane-tools";
 
 /// One host tool call still to be offered to the host.
 struct PlannedCall {
@@ -73,6 +85,10 @@ struct SteerTurn {
 
 struct Fake {
     mode: String,
+    /// The `--session-dir` contains `/lanes/`: this fake is a lane child.
+    lane: bool,
+    /// `host_tool_result` frames with `isError` true seen over the child's life.
+    tool_errors: usize,
     /// Host tool calls written over the child's life (default call ids).
     total_calls: usize,
     tool_turn: Option<ToolTurn>,
@@ -85,7 +101,8 @@ struct Fake {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mode = select_mode(&argv);
+    let lane = is_lane(&argv);
+    let mode = select_mode(lane);
     let log = std::env::var_os("FAKE_OMP_LOG").map(std::path::PathBuf::from);
     if let Some(path) = &log {
         let argv = serde_json::to_string(&argv).expect("argv is serializable");
@@ -117,6 +134,8 @@ fn main() {
 
     let mut fake = Fake {
         mode,
+        lane,
+        tool_errors: 0,
         total_calls: 0,
         tool_turn: None,
         steer_turn: None,
@@ -138,9 +157,8 @@ fn main() {
     }
 }
 
-/// FAKE_OMP_LANE_MODE for a lane child (its `--session-dir` contains
-/// `/lanes/`), FAKE_OMP_MODE otherwise.
-fn select_mode(argv: &[String]) -> String {
+/// Whether the `--session-dir` argument contains `/lanes/` (a lane child).
+fn is_lane(argv: &[String]) -> bool {
     let session_dir = argv.iter().enumerate().find_map(|(index, arg)| {
         if arg == "--session-dir" {
             argv.get(index + 1).map(String::as_str)
@@ -148,7 +166,12 @@ fn select_mode(argv: &[String]) -> String {
             arg.strip_prefix("--session-dir=")
         }
     });
-    let variable = if session_dir.is_some_and(|dir| dir.contains("/lanes/")) {
+    session_dir.is_some_and(|dir| dir.contains("/lanes/"))
+}
+
+/// FAKE_OMP_LANE_MODE for a lane child, FAKE_OMP_MODE otherwise.
+fn select_mode(lane: bool) -> String {
+    let variable = if lane {
         "FAKE_OMP_LANE_MODE"
     } else {
         "FAKE_OMP_MODE"
@@ -217,10 +240,23 @@ impl Fake {
                 self.start_tool_turn(&id, frame, calls, out);
             }
             "prompt" if mode == "tools" => {
-                let trigger = std::env::var("FAKE_OMP_TOOL_TRIGGER")
-                    .unwrap_or_else(|_| DEFAULT_TOOL_TRIGGER.to_owned());
+                let (trigger_variable, default_trigger, calls_variable) = if self.lane {
+                    (
+                        "FAKE_OMP_LANE_TOOL_TRIGGER",
+                        DEFAULT_LANE_TOOL_TRIGGER,
+                        "FAKE_OMP_LANE_TOOL_CALLS",
+                    )
+                } else {
+                    (
+                        "FAKE_OMP_TOOL_TRIGGER",
+                        DEFAULT_TOOL_TRIGGER,
+                        "FAKE_OMP_TOOL_CALLS",
+                    )
+                };
+                let trigger =
+                    std::env::var(trigger_variable).unwrap_or_else(|_| default_trigger.to_owned());
                 if prompt_message(frame).contains(&trigger) {
-                    let calls = scripted_calls();
+                    let calls = scripted_calls(calls_variable);
                     self.start_tool_turn(&id, frame, calls, out);
                 } else {
                     prompt("ok", &id, frame, out);
@@ -229,6 +265,10 @@ impl Fake {
             "prompt" if mode == "steer" => self.steer_prompt(&id, frame, out),
             "prompt" => prompt(mode, &id, frame, out),
             "host_tool_result" => {
+                if frame.get("isError").and_then(Value::as_bool) == Some(true) {
+                    self.tool_errors += 1;
+                    touch_on_tool_error(self.tool_errors);
+                }
                 if let Some(active) = self.tool_turn.take() {
                     self.tool_turn = self.advance_tool_turn(active, out);
                 }
@@ -369,19 +409,42 @@ fn send_file_calls() -> VecDeque<PlannedCall> {
         .collect()
 }
 
-/// FAKE_OMP_TOOL_CALLS: one JSON object per non-empty line.
-fn scripted_calls() -> VecDeque<PlannedCall> {
-    let script = std::env::var("FAKE_OMP_TOOL_CALLS").unwrap_or_default();
+/// Creates FAKE_OMP_TOUCH_ON_TOOL_ERROR when `errors`, the count of refused
+/// calls so far, reaches FAKE_OMP_TOUCH_AFTER_ERRORS (default 1).
+fn touch_on_tool_error(errors: usize) {
+    let Some(path) = std::env::var_os("FAKE_OMP_TOUCH_ON_TOOL_ERROR") else {
+        return;
+    };
+    let after = std::env::var("FAKE_OMP_TOUCH_AFTER_ERRORS")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("FAKE_OMP_TOUCH_AFTER_ERRORS is a number")
+        })
+        .unwrap_or(1);
+    if errors == after {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .expect("create FAKE_OMP_TOUCH_ON_TOOL_ERROR");
+    }
+}
+
+/// The script in `variable`: one JSON object per non-empty line.
+fn scripted_calls(variable: &str) -> VecDeque<PlannedCall> {
+    let script = std::env::var(variable).unwrap_or_default();
     script
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let call: Value = serde_json::from_str(line).expect("FAKE_OMP_TOOL_CALLS line is JSON");
+            let call: Value = serde_json::from_str(line).expect("tool script line is JSON");
             PlannedCall {
                 tool: call
                     .get("tool")
                     .and_then(Value::as_str)
-                    .expect("FAKE_OMP_TOOL_CALLS line has a tool")
+                    .expect("tool script line has a tool")
                     .to_owned(),
                 arguments: call.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 tool_call_id: call.get("id").and_then(Value::as_str).map(str::to_owned),
