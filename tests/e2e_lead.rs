@@ -344,8 +344,8 @@ fn sends(adapter: &FakeAdapter) -> Vec<(String, String)> {
         .collect()
 }
 
-fn lane_start_script(task: &str) -> String {
-    json!({"tool": "lane_start", "arguments": {"task": task}}).to_string()
+fn lane_start_script(task: &str, done: &str) -> String {
+    json!({"tool": "lane_start", "arguments": {"task": task, "done": done}}).to_string()
 }
 
 /// (a) One lead child answers a DM and a thread, each in its own place; a lane the lead
@@ -354,7 +354,7 @@ fn lane_start_script(task: &str) -> String {
 async fn one_lead_answers_each_conversation_and_the_lane_result_returns_to_its_thread() {
     let mut rig = Rig::discord();
     let (adapter, dynamic) = fake_adapter();
-    let script = lane_start_script("summarize the notes");
+    let script = lane_start_script("summarize the notes", "file .");
     let running = Running::start(rig.gateway(
         dynamic,
         &[
@@ -374,17 +374,20 @@ async fn one_lead_answers_each_conversation_and_the_lane_result_returns_to_its_t
     bounded(adapter.wait_for_send(3)).await;
     running.stop().await;
 
+    let sent = sends(&adapter);
     assert_eq!(
-        sends(&adapter),
-        vec![
+        sent[..2],
+        [
             (DM_CHANNEL.to_owned(), "echo: hello lead".to_owned()),
             (THREAD.to_owned(), "echo: run-tools please".to_owned()),
-            (
-                THREAD.to_owned(),
-                "echo: echo: summarize the notes".to_owned()
-            ),
         ],
         "each reply goes to the conversation its input came from"
+    );
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[2].0, THREAD);
+    assert!(
+        sent[2].1.starts_with("echo: echo: summarize the notes"),
+        "{sent:?}"
     );
     let store = rig.store();
     let lane = store.lane(1).expect("read lane").expect("lane exists");
@@ -412,7 +415,14 @@ async fn one_lead_answers_each_conversation_and_the_lane_result_returns_to_its_t
         .filter(|frame| frame_tag(frame).is_none())
         .map(|frame| frame["message"].clone())
         .collect();
-    assert_eq!(untagged, ["summarize the notes"], "the lane got its task");
+    assert_eq!(untagged.len(), 1, "{untagged:?}");
+    assert!(
+        untagged[0]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("summarize the notes"),
+        "the lane got its task"
+    );
     rig.tap.assert_no_child_left();
 }
 
@@ -638,7 +648,7 @@ async fn slice3_home_is_migrated_and_old_session_folder_is_untouched() {
 async fn shutdown_while_a_lane_runs_marks_it_and_the_next_run_posts_one_notice() {
     let mut rig = Rig::discord();
     let (adapter, dynamic) = fake_adapter();
-    let script = lane_start_script("long job");
+    let script = lane_start_script("long job", "file .");
     let running = Running::start(rig.gateway(
         dynamic,
         &[

@@ -35,7 +35,6 @@ pub const E_CHECK_TIMEOUT: &str = "E_CHECK_TIMEOUT";
 pub const E_CHECK_SPAWN: &str = "E_CHECK_SPAWN";
 
 /// Bytes of command output kept for a failure detail.
-#[cfg_attr(not(test), allow(dead_code))]
 const OUTPUT_HEAD_BYTES: u64 = 4096;
 
 /// One checkable part of a Done line.
@@ -240,7 +239,6 @@ pub struct Stopped;
 /// `started(pid)` runs right after a command spawned (`false`: stopping, kill it and return
 /// `Stopped`); `ended(pid)` runs once per started pid after its leader was reaped and its
 /// group killed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run(
     line: &DoneLine,
     work_dir: &Path,
@@ -273,7 +271,6 @@ pub(crate) fn run(
     Ok(checks)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn check_file(
     path: &str,
     work_dir: &Path,
@@ -295,7 +292,6 @@ fn check_file(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn check_command(
     argv: &[String],
     work_dir: &Path,
@@ -388,7 +384,6 @@ fn check_command(
 }
 
 /// The first bytes of the command's stderr, else of its stdout (lossy UTF-8).
-#[cfg_attr(not(test), allow(dead_code))]
 fn output_head(out_dir: &Path) -> String {
     for name in ["stderr", "stdout"] {
         let mut head = Vec::new();
@@ -403,7 +398,6 @@ fn output_head(out_dir: &Path) -> String {
 }
 
 /// Folds whitespace runs to one space and cuts to `DETAIL_CHARS` characters.
-#[cfg_attr(not(test), allow(dead_code))]
 fn short(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()

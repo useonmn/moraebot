@@ -1,16 +1,25 @@
 //! Lanes: separate headless omp children started by the lead through host tools. Messenger-agnostic.
 //!
 //! The lead calls `lane_start`, `lane_message` and `lane_status` (registered on the lead
-//! child next to `send_file`). A lane is its own omp RPC child with no host tools and no
-//! appended system prompt; it runs one prompt on a worker thread and closes. Its result
-//! is stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same
-//! transaction as the lane's new state, and the dispatcher is woken; the lead answers it
-//! in a normal turn. Handlers never wait for lane work.
+//! child next to `send_file`). A lane is its own omp RPC child with no appended system
+//! prompt; it runs one prompt on a worker thread and closes. A lane with a done line gets
+//! exactly one host tool, `lane_done`: the lane claims its work is done, moraebot runs
+//! the Done checks inside that call and refuses a claim that fails them. Its result is
+//! stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same transaction as
+//! the lane's new state, and the dispatcher is woken; the lead answers it in a normal
+//! turn. Handlers never wait for lane work.
 //!
-//! Lock order is `inner` -> store everywhere. A handler holds `inner` from the
-//! `stopping` check until the new worker is registered, and a worker writes its result
-//! and removes its own registration under one hold of `inner`, so at most one worker per
-//! lane is ever registered and `shutdown_all` sees every lane child that exists.
+//! Lock order is claim -> `inner` -> store everywhere; nothing takes a claim lock while
+//! holding `inner`. A handler holds `inner` from the `stopping` check until the new
+//! worker is registered, and a worker writes its result and removes its own registration
+//! under one hold of `inner`, so at most one worker per lane is ever registered and
+//! `shutdown_all` sees every lane child that exists. If omp ever ended a turn while a
+//! `lane_done` call was still running, `run_prompt` waits on the claim lock for that one
+//! check; it holds no lock while it waits, so this is not a deadlock.
+//!
+//! Shutdown kills every lane child first, then every running check, then waits until
+//! each killed check was reaped: a check's refusal never reaches a live lane, so a turn
+//! cut during a check is always left for `recover_on_start`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -18,11 +27,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use omp_rpc::{HostTool, HostToolError, PromptCommand, ToolLoadMode};
+use omp_rpc::{HostTool, HostToolContext, HostToolError, PromptCommand, ToolLoadMode};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
 use crate::config::Config;
+use crate::done::{self, DoneLine};
 use crate::lead::{self, LaneResult};
 use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
@@ -61,6 +71,8 @@ const STATUS_TASK_CHARS: usize = 200;
 struct LaneChild {
     kill: Option<GroupKill>,
     worker: JoinHandle<()>,
+    /// The prompt (job) this worker runs.
+    seq: i64,
 }
 
 #[derive(Default)]
@@ -68,6 +80,8 @@ struct LaneSet {
     /// Set by `stop_accepting`: no lane starts and no child is kept from then on.
     stopping: bool,
     children: HashMap<i64, LaneChild>,
+    /// Running check pids -> `(lane id, seq)` of the job whose `lane_done` call started it.
+    checks: HashMap<u32, (i64, i64)>,
 }
 
 /// One lane prompt for a worker thread.
@@ -77,6 +91,21 @@ struct Job {
     conversation_key: String,
     text: String,
     previous_session: Option<String>,
+    done: Option<DoneLine>,
+}
+
+/// What the lane's `lane_done` calls of one job established; the last call decides.
+enum Claim {
+    None,
+    Failed { receipt: String },
+    Accepted { receipt: String },
+}
+
+/// A lane prompt that ran, with its claim state applied.
+enum LaneOutcome {
+    Plain(Outcome),
+    Done { text: String, receipt: String },
+    Unmet { text: String, receipt: String },
 }
 
 pub struct LaneManager {
@@ -84,7 +113,9 @@ pub struct LaneManager {
     store: Arc<Mutex<Store>>,
     wake: Arc<Notify>,
     turn: Arc<Mutex<Option<TurnContext>>>,
-    turn_timeout: Duration,
+    pub(crate) turn_timeout: Duration,
+    /// Kill deadline of one Done check command.
+    pub(crate) check_timeout: Duration,
     inner: Mutex<LaneSet>,
     pids: watch::Sender<Vec<u32>>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
@@ -112,6 +143,7 @@ impl LaneManager {
             wake: Arc::default(),
             turn,
             turn_timeout,
+            check_timeout: done::CHECK_TIMEOUT,
             inner: Mutex::default(),
             pids: watch::channel(Vec::new()).0,
             extra_env: Vec::new(),
@@ -123,7 +155,8 @@ impl LaneManager {
         Arc::clone(&self.wake)
     }
 
-    /// Pids of lane children that are spawned and not yet reaped.
+    /// Pids of lane children and of Done check commands that are spawned and not yet
+    /// reaped.
     pub fn running_pids(&self) -> watch::Receiver<Vec<u32>> {
         self.pids.subscribe()
     }
@@ -133,21 +166,39 @@ impl LaneManager {
         lock(&self.inner).stopping = true;
     }
 
-    /// Stops accepting, then kills every lane child (including one still starting) and
-    /// joins its worker within `ABORT_JOIN_BOUND`. A lane the kill ended keeps its
-    /// `running` row for `recover_on_start`.
+    /// Stops accepting, then kills every lane child (including one still starting), then
+    /// every running check, waits until each killed check was reaped, and joins each
+    /// worker; every wait is bounded by `ABORT_JOIN_BOUND`. A lane the kill ended keeps
+    /// its `running` row for `recover_on_start`.
     pub async fn shutdown_all(&self) {
-        let children: Vec<(i64, LaneChild)> = {
+        let mut pids = self.pids.subscribe();
+        let (children, checks): (Vec<(i64, LaneChild)>, Vec<u32>) = {
             let mut set = lock(&self.inner);
             set.stopping = true;
-            set.children.drain().collect()
+            (
+                set.children.drain().collect(),
+                set.checks.keys().copied().collect(),
+            )
         };
         for (_, child) in &children {
             if let Some(group) = &child.kill {
                 group.kill();
             }
         }
-        for (id, LaneChild { kill, worker }) in children {
+        // Children first: a check's refusal can never reach a live lane.
+        for pid in &checks {
+            omp::kill_group(*pid);
+        }
+        if !checks.is_empty() {
+            let reaped = pids.wait_for(|running| !running.iter().any(|p| checks.contains(p)));
+            if !matches!(
+                tokio::time::timeout(ABORT_JOIN_BOUND, reaped).await,
+                Ok(Ok(_))
+            ) {
+                tracing::error!(checks = checks.len(), "a done check did not stop in time");
+            }
+        }
+        for (id, LaneChild { kill, worker, .. }) in children {
             let joined = tokio::task::spawn_blocking(move || worker.join());
             match tokio::time::timeout(ABORT_JOIN_BOUND, joined).await {
                 Ok(Ok(Ok(()))) => {
@@ -172,14 +223,19 @@ impl LaneManager {
                 LANE_START_TOOL,
                 "Start a lane: a separate agent that works on `task` in the background, in \
                  the same work folder. `task` must be self-contained; the lane does not see \
-                 the conversation. Returns the lane id at once; the lane's result comes back \
-                 to you later as a new message.",
+                 the conversation. `done` is the Done line moraebot checks when the lane \
+                 claims it is done. Returns the lane id at once; the lane's result comes \
+                 back to you later as a new message.",
                 schema(json!({
                     "type": "object",
                     "properties": {
-                        "task": {"type": "string", "description": "The self-contained task."}
+                        "task": {"type": "string", "description": "The self-contained task."},
+                        "done": {
+                            "type": "string",
+                            "description": "Done line: `command [...]` and/or `file <path>`, joined with `;`."
+                        }
                     },
-                    "required": ["task"],
+                    "required": ["task", "done"],
                     "additionalProperties": false
                 })),
                 move |arguments, ctx| start.lane_start(&arguments, ctx.tool_call_id()),
@@ -227,6 +283,14 @@ impl LaneManager {
             .and_then(Value::as_str)
             .filter(|task| !task.trim().is_empty())
             .ok_or_else(|| refused(E_LANE_ARGS, "task must be a non-empty string"))?;
+        let line = arguments
+            .get("done")
+            .and_then(Value::as_str)
+            .filter(|line| !line.trim().is_empty())
+            .ok_or_else(|| refused(E_LANE_ARGS, "done must be a non-empty string"))?;
+        let line = DoneLine::parse(line)
+            .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
+        let canonical = line.to_string();
         let conversation_key = lock(&self.turn)
             .as_ref()
             .map(|turn| turn.conversation_key.clone())
@@ -236,7 +300,13 @@ impl LaneManager {
             return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
         }
         let started = lock(&self.store)
-            .start_lane(tool_call_id, &conversation_key, task, None, MAX_RUNNING_LANES)
+            .start_lane(
+                tool_call_id,
+                &conversation_key,
+                task,
+                Some(&canonical),
+                MAX_RUNNING_LANES,
+            )
             .map_err(|e| refused(e.code(), &e.to_string()))?;
         let id = match started {
             LaneStart::New(id) => {
@@ -248,6 +318,7 @@ impl LaneManager {
                         conversation_key,
                         text: task.to_owned(),
                         previous_session: None,
+                        done: Some(line),
                     },
                 );
                 id
@@ -287,23 +358,28 @@ impl LaneManager {
         let job = {
             let mut store = lock(&self.store);
             let store_err = |e: crate::store::StoreError| refused(e.code(), &e.to_string());
+            let lane = store
+                .lane(id)
+                .map_err(store_err)?
+                .ok_or_else(|| refused(E_LANE_UNKNOWN, "no lane has this id"))?;
+            let line = lane
+                .done
+                .as_deref()
+                .map(DoneLine::parse)
+                .transpose()
+                .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
             match store
                 .message_lane(id, MAX_RUNNING_LANES)
                 .map_err(store_err)?
             {
-                LaneMessage::Seq(seq) => {
-                    let lane = store
-                        .lane(id)
-                        .map_err(store_err)?
-                        .ok_or_else(|| refused(E_LANE_UNKNOWN, "no lane has this id"))?;
-                    Job {
-                        id,
-                        seq,
-                        conversation_key: lane.conversation_key,
-                        text: text.to_owned(),
-                        previous_session: lane.omp_session_id,
-                    }
-                }
+                LaneMessage::Seq(seq) => Job {
+                    id,
+                    seq,
+                    conversation_key: lane.conversation_key,
+                    text: text.to_owned(),
+                    previous_session: lane.omp_session_id,
+                    done: line,
+                },
                 LaneMessage::Unknown => {
                     return Err(refused(E_LANE_UNKNOWN, "no lane has this id"));
                 }
@@ -352,6 +428,7 @@ impl LaneManager {
                     "state": lane.state.as_str(),
                     "error": lane.error,
                     "prompts": lane.prompts,
+                    "done": lane.done,
                     "task": lane.task.chars().take(STATUS_TASK_CHARS).collect::<String>(),
                 })
             })
@@ -373,7 +450,14 @@ impl LaneManager {
             .spawn(move || manager.run_worker(job))
         {
             Ok(worker) => {
-                set.children.insert(id, LaneChild { kill: None, worker });
+                set.children.insert(
+                    id,
+                    LaneChild {
+                        kill: None,
+                        worker,
+                        seq,
+                    },
+                );
                 tracing::info!(lane = id, seq, "lane started");
             }
             Err(e) => {
@@ -397,6 +481,12 @@ impl LaneManager {
         let written = {
             let mut set = lock(&self.inner);
             let written = self.write_result(&set, job.id, job.seq, &job.conversation_key, outcome);
+            // A check outlives no job: `close` does not join a running tool handler.
+            for (check, owner) in &set.checks {
+                if *owner == (job.id, job.seq) {
+                    omp::kill_group(*check);
+                }
+            }
             if let Some(mut child) = set.children.remove(&job.id) {
                 if let Some(group) = child.kill.as_mut() {
                     // The child was reaped by `close` above.
@@ -413,8 +503,134 @@ impl LaneManager {
         }
     }
 
+    /// The `lane_done` tool of one job: its handler checks `line` and records the claim.
+    fn lane_done_tool(
+        self: &Arc<Self>,
+        job: &Job,
+        line: &DoneLine,
+        claim: &Arc<Mutex<Claim>>,
+    ) -> HostTool {
+        let (id, seq) = (job.id, job.seq);
+        let check_dir = self
+            .config
+            .home
+            .join("lanes")
+            .join(id.to_string())
+            .join("check")
+            .join(seq.to_string());
+        if omp::private_dir(&check_dir).is_err() {
+            tracing::warn!(
+                lane = id,
+                code = done::E_CHECK_SPAWN,
+                "could not create the lane's check folder"
+            );
+        }
+        let manager = Arc::clone(self);
+        let line = line.clone();
+        let claim = Arc::clone(claim);
+        HostTool::new(
+            done::LANE_DONE_TOOL,
+            "Claim that your work is done. moraebot runs this lane's Done checks now; a \
+             refusal lists what still fails.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "evidence": {
+                        "type": "string",
+                        "description": "What you did and how you checked it."
+                    }
+                },
+                "required": ["evidence"],
+                "additionalProperties": false
+            })),
+            move |arguments, ctx| {
+                manager.lane_done(&arguments, ctx, (id, seq), &line, &check_dir, &claim)
+            },
+        )
+        .load_mode(ToolLoadMode::Essential)
+    }
+
+    /// Handles one `lane_done` call on its own client thread. The claim lock is held for
+    /// the whole call, so parallel calls of one lane run one after another.
+    fn lane_done(
+        &self,
+        arguments: &Map<String, Value>,
+        ctx: &HostToolContext,
+        (id, seq): (i64, i64),
+        line: &DoneLine,
+        check_dir: &std::path::Path,
+        claim: &Mutex<Claim>,
+    ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        let evidence = arguments
+            .get("evidence")
+            .and_then(Value::as_str)
+            .filter(|evidence| !evidence.trim().is_empty())
+            .ok_or_else(|| refused(E_LANE_ARGS, "evidence must be a non-empty string"))?;
+        let stopping = || refused(E_LANE_STOPPING, "the gateway is stopping");
+        let mut claim = lock(claim);
+        if lock(&self.inner).stopping {
+            return Err(stopping());
+        }
+        let checks = done::run(
+            line,
+            &self.config.work_dir,
+            check_dir,
+            &omp::check_env(&self.extra_env),
+            self.check_timeout,
+            |pid| {
+                let cancelled = ctx.is_cancelled();
+                let mut set = lock(&self.inner);
+                let current = set.children.get(&id).is_some_and(|child| child.seq == seq);
+                if set.stopping || cancelled || !current {
+                    return false;
+                }
+                set.checks.insert(pid, (id, seq));
+                self.pids.send_modify(|pids| pids.push(pid));
+                true
+            },
+            |pid| {
+                let mut set = lock(&self.inner);
+                set.checks.remove(&pid);
+                self.pids.send_modify(|pids| pids.retain(|p| *p != pid));
+            },
+        );
+        let checks = match checks {
+            Ok(checks) if !lock(&self.inner).stopping => checks,
+            _ => return Err(stopping()),
+        };
+        let receipt = done::receipt(evidence, &checks);
+        if done::all_passed(&checks) {
+            tracing::info!(
+                lane = id,
+                seq,
+                signals = checks.len(),
+                "lane done claim accepted"
+            );
+            *claim = Claim::Accepted { receipt };
+            return Ok(
+                "accepted: every Done check passed. End your turn now with a short \
+                       summary of what you did."
+                    .into(),
+            );
+        }
+        let failing: Vec<&str> = checks.iter().filter_map(|check| check.code).collect();
+        tracing::info!(
+            lane = id,
+            seq,
+            signals = checks.len(),
+            codes = ?failing,
+            "lane done claim refused"
+        );
+        *claim = Claim::Failed { receipt };
+        Err(refused(done::E_DONE_UNMET, &done::not_done(&checks)))
+    }
+
     /// `Err` is a failure before the prompt was sent (the child did not open).
-    fn run_prompt(&self, job: &Job, pid: &mut Option<u32>) -> Result<Outcome, Outcome> {
+    fn run_prompt(
+        self: &Arc<Self>,
+        job: &Job,
+        pid: &mut Option<u32>,
+    ) -> Result<LaneOutcome, Outcome> {
         let name = format!("lane-{}", job.id);
         let session_dir = omp::lane_session_dir(&self.config, job.id);
         let command = omp::private_dir(&session_dir)
@@ -430,12 +646,17 @@ impl LaneManager {
                 code: E_OMP_SPAWN,
                 detail: e.to_string(),
             })?;
+        let claim = Arc::new(Mutex::new(Claim::None));
+        let tools = match &job.done {
+            Some(line) => vec![self.lane_done_tool(job, line, &claim)],
+            None => Vec::new(),
+        };
         let OpenedChild {
             client, session_id, ..
         } = omp::open_child(
             &name,
             command,
-            Vec::new(),
+            tools,
             session_dir.to_string_lossy().into_owned(),
             job.previous_session.clone(),
             |group| {
@@ -462,12 +683,35 @@ impl LaneManager {
                 "could not store the lane's omp session id"
             );
         }
+        let message = match &job.done {
+            Some(line) => job.text.clone() + &done::lane_footer(line),
+            None => job.text.clone(),
+        };
         let prompt = PromptCommand {
-            message: job.text.clone(),
+            message,
             images: None,
             streaming_behavior: None,
         };
         let outcome = omp::map_result(client.prompt_and_wait(&prompt, self.turn_timeout));
+        let replied = match (&outcome, &job.done) {
+            (Outcome::Reply(text), Some(_)) => Some(text.clone()),
+            (Outcome::NoAgent, Some(_)) => Some(EMPTY_REPLY.to_owned()),
+            _ => None,
+        };
+        let outcome = match replied {
+            None => LaneOutcome::Plain(outcome),
+            Some(text) => match &*lock(&claim) {
+                Claim::None => LaneOutcome::Plain(outcome),
+                Claim::Accepted { receipt } => LaneOutcome::Done {
+                    text,
+                    receipt: receipt.clone(),
+                },
+                Claim::Failed { receipt } => LaneOutcome::Unmet {
+                    text,
+                    receipt: receipt.clone(),
+                },
+            },
+        };
         omp::close(&name, client);
         Ok(outcome)
     }
@@ -482,13 +726,13 @@ impl LaneManager {
         id: i64,
         seq: i64,
         conversation_key: &str,
-        outcome: Result<Outcome, Outcome>,
+        outcome: Result<LaneOutcome, Outcome>,
     ) -> bool {
         let killed = set.stopping
-            && match &outcome {
-                Err(_) | Ok(Outcome::NeedsCheck { .. }) => true,
-                Ok(_) => false,
-            };
+            && matches!(
+                &outcome,
+                Err(_) | Ok(LaneOutcome::Plain(Outcome::NeedsCheck { .. }))
+            );
         if killed {
             tracing::info!(
                 lane = id,
@@ -497,26 +741,29 @@ impl LaneManager {
             );
             return false;
         }
-        let outcome = outcome.unwrap_or_else(|failed| failed);
-        let (text, state) = match &outcome {
-            Outcome::Reply(text) => (
-                lead::lane_result(conversation_key, id, &LaneResult::Text(text)),
-                LaneState::Idle,
-            ),
-            Outcome::NoAgent => (
-                lead::lane_result(conversation_key, id, &LaneResult::Text(EMPTY_REPLY)),
-                LaneState::Idle,
-            ),
-            Outcome::Failed { code, .. } => (
-                lead::lane_result(conversation_key, id, &LaneResult::Failed(code)),
+        let outcome = outcome.unwrap_or_else(LaneOutcome::Plain);
+        let (result, state, code) = match &outcome {
+            LaneOutcome::Plain(plain) => {
+                let (result, state) = match plain {
+                    Outcome::Reply(text) => (LaneResult::Text(text), LaneState::Idle),
+                    Outcome::NoAgent => (LaneResult::Text(EMPTY_REPLY), LaneState::Idle),
+                    Outcome::Failed { code, .. } => (LaneResult::Failed(code), LaneState::Failed),
+                    Outcome::NeedsCheck { code, .. } => {
+                        (LaneResult::Failed(code), LaneState::NeedsCheck)
+                    }
+                };
+                (result, state, plain.code())
+            }
+            LaneOutcome::Done { text, receipt } => {
+                (LaneResult::Done { text, receipt }, LaneState::Idle, None)
+            }
+            LaneOutcome::Unmet { text, receipt } => (
+                LaneResult::Unmet { text, receipt },
                 LaneState::Failed,
-            ),
-            Outcome::NeedsCheck { code, .. } => (
-                lead::lane_result(conversation_key, id, &LaneResult::Failed(code)),
-                LaneState::NeedsCheck,
+                Some(done::E_DONE_UNMET),
             ),
         };
-        let code = outcome.code();
+        let text = lead::lane_result(conversation_key, id, &result);
         match lock(&self.store).finish_lane(id, seq, &text, state, code) {
             Ok(written) => {
                 tracing::info!(

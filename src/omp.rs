@@ -641,9 +641,21 @@ impl OmpManager {
         }
     }
 
-    /// Overrides the turn time limit (tests use a short one).
+    /// Overrides the turn time limit of the lead and every lane (tests use a short one).
     pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
         self.turn_timeout = timeout;
+        // The lane manager is first shared when the lead child starts.
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .turn_timeout = timeout;
+        self
+    }
+
+    /// Overrides the kill deadline of one lane Done check command (tests use a short one).
+    pub fn with_check_timeout(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .check_timeout = timeout;
         self
     }
 

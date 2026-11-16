@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::done::{self, E_DONE_SYNTAX, E_DONE_UNMET};
 use moraebot::lane::{
     self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_INTERRUPTED, E_LANE_LIMIT, E_LANE_STOPPING,
     E_LANE_UNKNOWN,
@@ -140,7 +141,109 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
 }
 
 fn lane_start(task: &str) -> Value {
-    json!({"tool": lane::LANE_START_TOOL, "arguments": {"task": task}})
+    lane_start_done(task, "file .")
+}
+
+fn lane_start_done(task: &str, done: &str) -> Value {
+    json!({"tool": lane::LANE_START_TOOL, "arguments": {"task": task, "done": done}})
+}
+
+/// A check command that appends its own pid to the fake-omp log and keeps that pid as
+/// the group leader until it is killed.
+const CHECK_ARGV: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "echo CHECK pid=$$ >> \"$FAKE_OMP_LOG\"; exec /bin/sleep 600",
+];
+
+fn check_done_line() -> String {
+    format!("command {}", serde_json::to_string(&CHECK_ARGV).unwrap())
+}
+
+/// `n` scripted `lane_done` calls for a lane in mode `tools`.
+fn lane_done_calls(n: usize) -> String {
+    vec![json!({"tool": done::LANE_DONE_TOOL, "arguments": {"evidence": "e"}}).to_string(); n]
+        .join("\n")
+}
+
+impl Harness {
+    /// A manager whose lead starts one lane (mode `tools`, task with `run-lane-tools`)
+    /// with `done`, and whose lane makes `calls` `lane_done` calls.
+    fn done_manager(&self, done: &str, calls: usize) -> OmpManager {
+        self.manager("tools", &[lane_start_done("run-lane-tools t1", done)])
+            .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(calls))])
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.config.work_dir.join("marker")
+    }
+
+    /// Results of the lane's `lane_done` calls, in log order: chosen by content, since
+    /// the lead's lane tools answer with JSON.
+    fn lane_tool_results(&self) -> Vec<(bool, String)> {
+        self.tool_results()
+            .into_iter()
+            .filter(|(_, text)| text.starts_with("accepted:") || text.starts_with("E_"))
+            .collect()
+    }
+
+    /// Frames of `kind` logged after the lane `START` line number `nth`.
+    fn frames_after_start(&self, nth: usize, kind: &str) -> Vec<Value> {
+        let start = self.lane_starts()[nth];
+        self.log_lines()[start..]
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|f| f["type"] == kind)
+            .collect()
+    }
+
+    /// Pids the check commands logged (`CHECK pid=<pid>`).
+    fn check_pids(&self) -> Vec<u32> {
+        self.log_lines()
+            .iter()
+            .filter_map(|l| l.strip_prefix("CHECK pid="))
+            .map(|pid| pid.trim().parse().expect("check pid"))
+            .collect()
+    }
+
+    /// The pid in the lane `START` line number `nth`.
+    fn lane_pid(&self, nth: usize) -> u32 {
+        let line = &self.log_lines()[self.lane_starts()[nth]];
+        let rest = line.strip_prefix("START pid=").expect("START line");
+        rest.split_once(' ')
+            .expect("pid then argv")
+            .0
+            .parse()
+            .expect("pid")
+    }
+}
+
+fn has_done_footer(frame: &Value, line: &str) -> bool {
+    frame["message"]
+        .as_str()
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l == format!("[moraebot] Done = {line}"))
+}
+
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Prompts the lead with `input` and waits until a lane result row was stored.
+async fn prompt_until_lane_result(omp: &OmpManager, message: i64, input: &str) {
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    bounded(omp.prompt(KEY, message, input)).await;
+    bounded(notified).await;
+}
+
+fn result_tag(h: &Harness, row: i64) -> lead::Tag {
+    lead::parse_tag(&queued_row(h, row).text).expect("tagged result")
 }
 
 /// The `lane_id` in a successful `lane_start` result (JSON on its first line).
@@ -202,7 +305,7 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
     assert_eq!(tag.conversation, KEY);
     assert_eq!(tag.lane, Some(1));
     assert_eq!(tag.failed, None);
-    assert_eq!(row.text.split_once('\n').unwrap().1, "echo: t1");
+    assert!(row.text.split_once('\n').unwrap().1.starts_with("echo: t1"));
 
     let lines = h.log_lines();
     let starts = h.lane_starts();
@@ -213,12 +316,10 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
         !argv.iter().any(|a| a.starts_with("--append-system-prompt")),
         "{argv:?}"
     );
-    assert!(
-        !lines[starts[0]..]
-            .iter()
-            .any(|l| l.contains(r#""type":"set_host_tools""#)),
-        "a lane child gets no host tools"
-    );
+    let tools = h.frames_after_start(0, "set_host_tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(tools[0]["tools"][0]["name"], done::LANE_DONE_TOOL);
     omp.shutdown_all().await;
 }
 
@@ -313,7 +414,14 @@ async fn lane_message_resumes_idle_lane_session() {
 
     let second = queued_row(&h, 2);
     assert_eq!(second.message_id, "1:2");
-    assert_eq!(second.text.split_once('\n').unwrap().1, "echo: t2");
+    assert!(
+        second
+            .text
+            .split_once('\n')
+            .unwrap()
+            .1
+            .starts_with("echo: t2")
+    );
     let lane = h.lane(1);
     assert_eq!(lane.state, LaneState::Idle);
     assert_eq!(lane.prompts, 2);
@@ -380,7 +488,7 @@ async fn lane_args_are_validated() {
     let omp = h.manager(
         "ok",
         &[
-            call(lane::LANE_START_TOOL, json!({"task": ""})),
+            call(lane::LANE_START_TOOL, json!({"task": "", "done": "file ."})),
             call(lane::LANE_START_TOOL, json!({})),
             call(lane::LANE_MESSAGE_TOOL, json!({"text": "x"})),
             call(lane::LANE_MESSAGE_TOOL, json!({"lane_id": 1})),
@@ -475,7 +583,11 @@ async fn lane_failure_comes_back_as_failed_tag() {
 #[tokio::test]
 async fn duplicate_tool_call_starts_one_lane() {
     let h = Harness::new();
-    let dup = json!({"tool": lane::LANE_START_TOOL, "arguments": {"task": "t1"}, "id": "dup"});
+    let dup = json!({
+        "tool": lane::LANE_START_TOOL,
+        "arguments": {"task": "t1", "done": "file ."},
+        "id": "dup"
+    });
     let omp = h.manager("hang", &[dup.clone(), dup]);
     bounded(omp.prompt(KEY, 1, "run-tools go")).await;
     let results = h.tool_results();
@@ -485,5 +597,303 @@ async fn duplicate_tool_call_starts_one_lane() {
     assert_eq!(h.store.lock().unwrap().lanes().unwrap().len(), 1);
     await_running_pids(&omp).await;
     assert_eq!(omp.lanes().running_pids().borrow().len(), 1);
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_start_requires_a_checkable_done_line() {
+    let h = Harness::new();
+    let start = |args: Value| json!({"tool": lane::LANE_START_TOOL, "arguments": args});
+    let omp = h.manager(
+        "ok",
+        &[
+            start(json!({"task": "t1"})),
+            start(json!({"task": "t1", "done": "  "})),
+            start(json!({"task": "t1", "done": "url http://127.0.0.1/"})),
+        ],
+    );
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert_refused(&results[0], E_LANE_ARGS);
+    assert_refused(&results[1], E_LANE_ARGS);
+    assert_refused(&results[2], E_DONE_SYNTAX);
+    assert!(h.store.lock().unwrap().lanes().unwrap().is_empty());
+    assert!(h.lane_starts().is_empty());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_with_done_line_gets_lane_done() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start_done("t1", "file .")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let tools = h.frames_after_start(0, "set_host_tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    let names: Vec<&Value> = tools[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["name"])
+        .collect();
+    assert_eq!(names, [done::LANE_DONE_TOOL]);
+    let prompts = h.frames_after_start(0, "prompt");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(has_done_footer(&prompts[0], "file ."), "{prompts:?}");
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_without_done_line_gets_no_tool() {
+    let h = Harness::new();
+    {
+        let mut store = h.store.lock().unwrap();
+        let started = store.start_lane("toolu_old", KEY, "t1", None, 3).unwrap();
+        assert_eq!(started, moraebot::store::LaneStart::New(1));
+        let text = lead::lane_result(KEY, 1, &lead::LaneResult::Text("old"));
+        assert!(
+            store
+                .finish_lane(1, 1, &text, LaneState::Idle, None)
+                .unwrap()
+        );
+    }
+    let omp = h.manager(
+        "ok",
+        &[json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}})],
+    );
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(h.lane_starts().len(), 1);
+    let start = h.lane_starts()[0];
+    assert!(
+        !h.log_lines()[start..]
+            .iter()
+            .any(|l| l.contains(done::LANE_DONE_TOOL)),
+        "a lane without a done line gets no lane_done"
+    );
+    let prompts = h.frames_after_start(0, "prompt");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        !prompts[0]["message"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("[moraebot] Done =")),
+        "{prompts:?}"
+    );
+    let row = queued_row(&h, 2);
+    assert_eq!(row.message_id, "1:2");
+    let tag = lead::parse_tag(&row.text).expect("tagged result");
+    assert!(!tag.done);
+    assert_eq!(tag.failed, None);
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn accepted_claim_gives_done_tag_and_receipt() {
+    let h = Harness::new();
+    std::fs::write(h.marker(), "").unwrap();
+    let omp = h.done_manager("file marker", 1);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let tag = result_tag(&h, 1);
+    assert!(tag.done, "{tag:?}");
+    assert_eq!(tag.failed, None);
+    let lane = h.lane(1);
+    assert_eq!(lane.state, LaneState::Idle);
+    assert_eq!(lane.error, None);
+    assert_eq!(h.lane_starts().len(), 1);
+    assert_eq!(h.frames_after_start(0, "prompt").len(), 1);
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn refused_claim_keeps_the_lane_working_until_it_passes() {
+    let h = Harness::new();
+    let omp = h.done_manager("file marker", 2).with_extra_env([(
+        "FAKE_OMP_TOUCH_ON_TOOL_ERROR",
+        h.marker().to_string_lossy().into_owned(),
+    )]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_refused(&results[0], E_DONE_UNMET);
+    assert!(
+        results[0].1.contains("file marker -> E_CHECK_MISSING"),
+        "{results:?}"
+    );
+    assert!(!results[1].0, "{results:?}");
+    assert!(result_tag(&h, 1).done);
+    assert_eq!(h.lane_starts().len(), 1);
+    assert_eq!(
+        h.frames_after_start(0, "prompt").len(),
+        1,
+        "moraebot sent no prompt of its own"
+    );
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn no_limit_on_refused_claims() {
+    let h = Harness::new();
+    let omp = h.done_manager("file marker", 5).with_extra_env([
+        (
+            "FAKE_OMP_TOUCH_ON_TOOL_ERROR",
+            h.marker().to_string_lossy().into_owned(),
+        ),
+        ("FAKE_OMP_TOUCH_AFTER_ERRORS", "4".to_owned()),
+    ]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 5, "{results:?}");
+    for result in &results[..4] {
+        assert_refused(result, E_DONE_UNMET);
+    }
+    assert!(!results[4].0, "{results:?}");
+    assert!(result_tag(&h, 1).done);
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn last_failed_claim_reports_unmet() {
+    let h = Harness::new();
+    let m1 = h.done_manager("file marker", 1);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    let tag = result_tag(&h, 1);
+    assert_eq!(tag.failed.as_deref(), Some(E_DONE_UNMET));
+    let lane = h.lane(1);
+    assert_eq!(lane.state, LaneState::Failed);
+    assert_eq!(lane.error.as_deref(), Some(E_DONE_UNMET));
+    assert_eq!(h.lane_starts().len(), 1);
+    assert_eq!(h.frames_after_start(0, "prompt").len(), 1);
+    bounded(m1.shutdown_all()).await;
+
+    std::fs::write(h.marker(), "").unwrap();
+    let m2 = h
+        .manager(
+            "tools",
+            &[json!({
+                "tool": lane::LANE_MESSAGE_TOOL,
+                "arguments": {"lane_id": 1, "text": "run-lane-tools again"}
+            })],
+        )
+        .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(1))]);
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    assert!(result_tag(&h, 2).done);
+    assert_eq!(h.lane(1).prompts, 2);
+    let prompts = h.frames_after_start(1, "prompt");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(has_done_footer(&prompts[0], "file marker"), "{prompts:?}");
+    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn no_claim_gives_the_unchecked_result_tag() {
+    let h = Harness::new();
+    std::fs::write(h.marker(), "").unwrap();
+    let omp = h.manager("ok", &[lane_start_done("t1", "file marker")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let tag = result_tag(&h, 1);
+    assert!(!tag.done, "{tag:?}");
+    assert_eq!(tag.failed, None);
+    assert_eq!(h.lane(1).state, LaneState::Idle);
+    assert!(h.lane_tool_results().is_empty());
+    bounded(omp.shutdown_all()).await;
+}
+
+/// Time-limit exception: the 1 s check timeout is the behavior under test.
+#[tokio::test]
+async fn check_timeout_refuses_the_claim() {
+    let h = Harness::new();
+    let omp = h
+        .done_manager(&check_done_line(), 1)
+        .with_check_timeout(Duration::from_secs(1));
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_refused(&results[0], E_DONE_UNMET);
+    assert!(results[0].1.contains("-> E_CHECK_TIMEOUT:"), "{results:?}");
+    assert_eq!(result_tag(&h, 1).failed.as_deref(), Some(E_DONE_UNMET));
+    for pid in h.check_pids() {
+        assert!(!process_exists(pid), "check {pid} was reaped");
+    }
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn shutdown_during_a_check_kills_it_and_writes_no_result() {
+    let h = Harness::new();
+    let omp = h.done_manager(&check_done_line(), 1);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let mut pids = omp.lanes().running_pids();
+    let running = bounded(pids.wait_for(|p| p.len() == 2))
+        .await
+        .expect("pid channel open")
+        .clone();
+    let lane_pid = h.lane_pid(0);
+    assert!(running.contains(&lane_pid), "{running:?}");
+    let check_pid = *running.iter().find(|p| **p != lane_pid).unwrap();
+
+    tokio::time::timeout(
+        omp::ABORT_JOIN_BOUND + Duration::from_secs(5),
+        omp.shutdown_all(),
+    )
+    .await
+    .expect("shutdown finished");
+    assert!(
+        !process_exists(check_pid),
+        "the check was killed and reaped"
+    );
+    assert!(omp.lanes().running_pids().borrow().is_empty());
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 0, "no result row");
+    assert_eq!(h.lane(1).state, LaneState::Running);
+    h.store.lock().unwrap().recover_on_start().unwrap();
+    let lane = h.lane(1);
+    assert_eq!(lane.state, LaneState::NeedsCheck);
+    assert_eq!(lane.error.as_deref(), Some(E_LANE_INTERRUPTED));
+}
+
+/// Time-limit exception: the 3 s turn timeout is the behavior under test.
+#[tokio::test]
+async fn turn_timeout_during_a_check_kills_the_check() {
+    let h = Harness::new();
+    let omp = h
+        .done_manager(&check_done_line(), 1)
+        .with_turn_timeout(Duration::from_secs(3));
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(
+        result_tag(&h, 1).failed.as_deref(),
+        Some(omp::E_TURN_TIMEOUT)
+    );
+    let mut pids = omp.lanes().running_pids();
+    bounded(pids.wait_for(|p| p.is_empty()))
+        .await
+        .expect("pid channel open");
+    for pid in h.check_pids() {
+        assert!(!process_exists(pid), "check {pid} was killed");
+    }
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_status_lists_done_line() {
+    let h = Harness::new();
+    let omp = h.manager(
+        "hang",
+        &[
+            lane_start_done("t1", "file marker"),
+            json!({"tool": lane::LANE_STATUS_TOOL, "arguments": {}}),
+        ],
+    );
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let results = h.tool_results();
+    let status = results
+        .iter()
+        .find(|(_, text)| text.starts_with('['))
+        .expect("lane_status result");
+    let listed: Value = serde_json::from_str(&status.1).expect("status json");
+    assert_eq!(listed[0]["lane_id"], 1);
+    assert_eq!(listed[0]["done"], "file marker");
     bounded(omp.shutdown_all()).await;
 }
