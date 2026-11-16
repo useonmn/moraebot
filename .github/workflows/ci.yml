@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: No personal paths or emails in tracked files
+        # The pattern is split with '' so this file does not match itself.
+        run: |
+          if git grep -nIiE '/Use''rs/|/hom''e/[a-z]|@gmai''l\.com'; then
+            echo "Found a personal path or email in tracked files."
+            exit 1
+          fi
