@@ -265,6 +265,7 @@ fn event(message_id: &str, author_id: &str, thread_id: Option<&str>, text: &str)
         thread_id: thread_id.map(str::to_owned),
         is_dm: false,
         text: text.into(),
+        attachments: Vec::new(),
     }
 }
 

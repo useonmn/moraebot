@@ -1,12 +1,22 @@
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
 
+use crate::files::Progress;
+
 pub const E_ADAPTER_SEND: &str = "E_ADAPTER_SEND";
 pub const E_ADAPTER_THREAD: &str = "E_ADAPTER_THREAD";
 pub const E_ADAPTER_TYPING: &str = "E_ADAPTER_TYPING";
 pub const E_ADAPTER_START: &str = "E_ADAPTER_START";
+/// This messenger does not support files (the default of the file methods).
+pub const E_ADAPTER_FILES: &str = "E_ADAPTER_FILES";
+/// An upload failed in a way that may work next time (network, rate limit, 5xx).
+pub const E_ADAPTER_UPLOAD: &str = "E_ADAPTER_UPLOAD";
+/// The messenger permanently refused an upload (missing permission, file too large for
+/// the messenger, unreadable file); the core skips the file.
+pub const E_ADAPTER_UPLOAD_DENIED: &str = "E_ADAPTER_UPLOAD_DENIED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEvent {
@@ -17,6 +27,28 @@ pub struct InboundEvent {
     pub thread_id: Option<String>,
     pub is_dm: bool,
     pub text: String,
+    pub attachments: Vec<InboundAttachment>,
+}
+
+/// One file attached to an inbound message. Only the adapter that produced `reference`
+/// can fetch it; an empty reference means the messenger cannot serve the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAttachment {
+    pub name: String,
+    pub size: u64,
+    pub mime: Option<String>,
+    pub reference: AttachmentRef,
+}
+
+/// Opaque, messenger-specific pointer to a file. It may be a signed or token-gated URL,
+/// so it never shows up in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentRef(pub String);
+
+impl std::fmt::Debug for AttachmentRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttachmentRef(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +123,31 @@ pub trait MessengerAdapter: Send + Sync {
 
     async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError>;
 
+    /// Downloads `attachment` into `dest` with no size limit and returns the bytes written.
+    /// Calls `progress.record(n)` after every chunk written so the core's stall watchdog
+    /// sees the download moving. Must not follow redirects. Messengers without file
+    /// support keep this default.
+    async fn fetch_attachment(
+        &self,
+        _attachment: &InboundAttachment,
+        _dest: &Path,
+        _progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        Err(files_unsupported())
+    }
+
+    /// Reads the file at `path` whole and posts it in one upload into `target` (the same
+    /// target format `send` takes). A permanent refusal is `E_ADAPTER_UPLOAD_DENIED`; any
+    /// other code is transient. No timer of its own: the core bounds the whole call.
+    async fn send_file(
+        &self,
+        _target: &str,
+        _path: &Path,
+        _name: &str,
+    ) -> Result<SendResult, AdapterError> {
+        Err(files_unsupported())
+    }
+
     /// A counter that increases on every (re)connect of the messenger, so the core can
     /// re-send replies whose send failed. `None`: the adapter never reconnects.
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
@@ -99,6 +156,13 @@ pub trait MessengerAdapter: Send + Sync {
 
     /// Closes the messenger connection after the gateway stopped.
     async fn shutdown(&self) {}
+}
+
+fn files_unsupported() -> AdapterError {
+    AdapterError {
+        code: E_ADAPTER_FILES,
+        message: "this messenger does not support files".to_owned(),
+    }
 }
 
 /// The next reconnect delay: `current` doubled, capped at `max`. `start` is the floor a
@@ -238,6 +302,7 @@ mod tests {
             thread_id: None,
             is_dm: false,
             text: "hello".into(),
+            attachments: Vec::new(),
         })
         .await;
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -245,5 +310,74 @@ mod tests {
             .expect("event timed out")
             .expect("channel closed");
         assert_eq!(event.text, "hello");
+    }
+
+    #[test]
+    fn attachment_ref_debug_is_redacted() {
+        let event = InboundEvent {
+            message_id: "1".into(),
+            author_id: "111".into(),
+            author_is_bot: false,
+            channel_id: "222".into(),
+            thread_id: None,
+            is_dm: false,
+            text: String::new(),
+            attachments: vec![InboundAttachment {
+                name: "a.txt".into(),
+                size: 1,
+                mime: None,
+                reference: AttachmentRef("https://example.invalid/SENTINEL".into()),
+            }],
+        };
+        let shown = format!("{event:?}");
+        assert!(!shown.contains("SENTINEL") && !shown.contains("example.invalid"));
+    }
+
+    struct Minimal;
+
+    #[async_trait]
+    impl MessengerAdapter for Minimal {
+        fn platform(&self) -> &'static str {
+            "minimal"
+        }
+        fn message_limit(&self) -> usize {
+            10
+        }
+        fn behavior_hints(&self) -> &'static str {
+            ""
+        }
+        async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
+            unreachable!()
+        }
+        async fn send(&self, _: &str, _: &str) -> Result<SendResult, AdapterError> {
+            unreachable!()
+        }
+        async fn create_thread(&self, _: &str, _: &str, _: &str) -> Result<String, AdapterError> {
+            unreachable!()
+        }
+        async fn start_typing(&self, _: &str) -> Result<TypingHandle, AdapterError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_file_methods_return_files_unsupported() {
+        let attachment = InboundAttachment {
+            name: "a".into(),
+            size: 0,
+            mime: None,
+            reference: AttachmentRef(String::new()),
+        };
+        let progress = Progress::new();
+        let fetch = Minimal
+            .fetch_attachment(&attachment, Path::new("x"), &progress)
+            .await
+            .unwrap_err();
+        assert_eq!(fetch.code, E_ADAPTER_FILES);
+        let send = Minimal
+            .send_file("t", Path::new("x"), "x")
+            .await
+            .unwrap_err();
+        assert_eq!(send.code, E_ADAPTER_FILES);
     }
 }

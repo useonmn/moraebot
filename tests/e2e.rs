@@ -238,6 +238,7 @@ fn owner_message(message_id: &str, text: &str) -> InboundEvent {
         thread_id: None,
         is_dm: false,
         text: text.into(),
+        attachments: Vec::new(),
     }
 }
 

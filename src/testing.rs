@@ -1,16 +1,21 @@
 use crate::adapter::{
-    AdapterError, E_ADAPTER_SEND, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
+    AdapterError, E_ADAPTER_SEND, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent,
+    MessengerAdapter, SendResult, TypingHandle,
 };
+use crate::files::{E_FILE_WRITE, Progress};
 use crate::slack::{
     E_SLACK_API, E_SLACK_AUTH, PostOutcome, SlackSocket, SlackTransport, SocketMessage,
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
@@ -26,10 +31,45 @@ pub enum Call {
     StartTyping {
         channel: String,
     },
+    FetchAttachment {
+        reference: String,
+        dest: PathBuf,
+    },
+    SendFile {
+        target: String,
+        name: String,
+        bytes: u64,
+    },
+}
+
+/// The test's end of a streamed fetch: send chunks, read the running byte total, drop
+/// `chunks` to finish the fetch.
+pub struct FetchFeed {
+    pub chunks: mpsc::Sender<Vec<u8>>,
+    pub written: mpsc::UnboundedReceiver<u64>,
+}
+
+enum FetchMode {
+    Hold(Arc<Notify>),
+    Stream {
+        chunks: mpsc::Receiver<Vec<u8>>,
+        written: mpsc::UnboundedSender<u64>,
+    },
+}
+
+#[derive(Default)]
+struct FileScript {
+    attachment_bytes: HashMap<String, Vec<u8>>,
+    fetch_failures: VecDeque<&'static str>,
+    send_failures: VecDeque<&'static str>,
+    fetch_modes: VecDeque<FetchMode>,
+    send_holds: VecDeque<Arc<Notify>>,
 }
 
 pub struct FakeAdapter {
     calls: Mutex<Vec<Call>>,
+    call_count: watch::Sender<usize>,
+    files: Mutex<FileScript>,
     sent_count: watch::Sender<usize>,
     fail_next_send: AtomicBool,
     reconnects: watch::Sender<u64>,
@@ -48,6 +88,8 @@ impl FakeAdapter {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         Self {
             calls: Mutex::new(Vec::new()),
+            call_count: watch::channel(0).0,
+            files: Mutex::new(FileScript::default()),
             sent_count: watch::channel(0).0,
             fail_next_send: AtomicBool::new(false),
             reconnects: watch::channel(0).0,
@@ -74,6 +116,81 @@ impl FakeAdapter {
             .send(event)
             .await
             .expect("inbound receiver was dropped");
+    }
+
+    /// The bytes `fetch_attachment` writes for an attachment with this reference.
+    pub fn set_attachment_bytes(&self, reference: &str, bytes: Vec<u8>) {
+        self.script()
+            .attachment_bytes
+            .insert(reference.to_owned(), bytes);
+    }
+
+    /// The next `fetch_attachment` fails with `code` (calls queue up).
+    pub fn fail_next_fetch(&self, code: &'static str) {
+        self.script().fetch_failures.push_back(code);
+    }
+
+    /// The next `send_file` fails with `code` after recording its call (calls queue up).
+    pub fn fail_next_send_file(&self, code: &'static str) {
+        self.script().send_failures.push_back(code);
+    }
+
+    /// The next `fetch_attachment` records its call, then waits for the returned `Notify`
+    /// before returning its scripted result. It records no progress while it waits.
+    pub fn hold_next_fetch(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.script()
+            .fetch_modes
+            .push_back(FetchMode::Hold(gate.clone()));
+        gate
+    }
+
+    /// The next `fetch_attachment` writes every chunk the test sends, records progress per
+    /// chunk and returns the total once the sender is dropped.
+    pub fn stream_next_fetch(&self) -> FetchFeed {
+        let (chunks_tx, chunks) = mpsc::channel(1);
+        let (written, written_rx) = mpsc::unbounded_channel();
+        self.script()
+            .fetch_modes
+            .push_back(FetchMode::Stream { chunks, written });
+        FetchFeed {
+            chunks: chunks_tx,
+            written: written_rx,
+        }
+    }
+
+    /// The next `send_file` records its call, then waits for the returned `Notify` and
+    /// returns `Ok`. Never notified: it never completes.
+    pub fn hold_next_send_file(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.script().send_holds.push_back(gate.clone());
+        gate
+    }
+
+    /// Resolves once a recorded call satisfies `pred`. Wrap it in a timeout.
+    pub async fn wait_for_call(&self, pred: impl Fn(&Call) -> bool) {
+        let mut changed = self.call_count.subscribe();
+        loop {
+            if self.calls().iter().any(&pred) {
+                return;
+            }
+            changed
+                .changed()
+                .await
+                .expect("fake adapter owns the sender");
+        }
+    }
+
+    fn script(&self) -> std::sync::MutexGuard<'_, FileScript> {
+        self.files.lock().expect("fake adapter files lock")
+    }
+
+    fn record(&self, call: Call) {
+        self.calls
+            .lock()
+            .expect("fake adapter calls lock")
+            .push(call);
+        self.call_count.send_modify(|count| *count += 1);
     }
 
     pub async fn wait_for_send(&self, n: usize) {
@@ -111,12 +228,12 @@ impl MessengerAdapter for FakeAdapter {
 
     async fn send(&self, channel: &str, text: &str) -> Result<SendResult, AdapterError> {
         let attempt = {
-            let mut calls = self.calls.lock().expect("fake adapter calls lock");
-            calls.push(Call::Send {
+            self.record(Call::Send {
                 channel: channel.to_owned(),
                 text: text.to_owned(),
             });
-            let attempt = calls
+            let attempt = self
+                .calls()
                 .iter()
                 .filter(|call| matches!(call, Call::Send { .. }))
                 .count();
@@ -140,30 +257,135 @@ impl MessengerAdapter for FakeAdapter {
         from_message_id: &str,
         name: &str,
     ) -> Result<String, AdapterError> {
-        self.calls
-            .lock()
-            .expect("fake adapter calls lock")
-            .push(Call::CreateThread {
-                channel_id: channel_id.to_owned(),
-                from_message_id: from_message_id.to_owned(),
-                name: name.to_owned(),
-            });
+        self.record(Call::CreateThread {
+            channel_id: channel_id.to_owned(),
+            from_message_id: from_message_id.to_owned(),
+            name: name.to_owned(),
+        });
         Ok(from_message_id.to_owned())
     }
 
     async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError> {
-        self.calls
-            .lock()
-            .expect("fake adapter calls lock")
-            .push(Call::StartTyping {
-                channel: channel.to_owned(),
-            });
+        self.record(Call::StartTyping {
+            channel: channel.to_owned(),
+        });
         Ok(TypingHandle::new(|| {}))
+    }
+
+    async fn fetch_attachment(
+        &self,
+        attachment: &InboundAttachment,
+        dest: &Path,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        self.record(Call::FetchAttachment {
+            reference: attachment.reference.0.clone(),
+            dest: dest.to_owned(),
+        });
+        let mode = self.script().fetch_modes.pop_front();
+        if let Some(FetchMode::Stream {
+            mut chunks,
+            written,
+        }) = mode
+        {
+            let mut file = create_private_file(dest)?;
+            let mut total = 0u64;
+            while let Some(chunk) = chunks.recv().await {
+                file.write_all(&chunk).map_err(|e| write_failure(&e))?;
+                progress.record(chunk.len() as u64);
+                total += chunk.len() as u64;
+                let _ = written.send(total);
+            }
+            return Ok(total);
+        }
+        if let Some(FetchMode::Hold(gate)) = mode {
+            gate.notified().await;
+        }
+        let (failure, bytes) = {
+            let mut script = self.script();
+            (
+                script.fetch_failures.pop_front(),
+                script
+                    .attachment_bytes
+                    .get(&attachment.reference.0)
+                    .cloned(),
+            )
+        };
+        if let Some(code) = failure {
+            return Err(AdapterError {
+                code,
+                message: "injected fetch failure".to_owned(),
+            });
+        }
+        let bytes = bytes.unwrap_or_default();
+        create_private_file(dest)?
+            .write_all(&bytes)
+            .map_err(|e| write_failure(&e))?;
+        progress.record(bytes.len() as u64);
+        Ok(bytes.len() as u64)
+    }
+
+    async fn send_file(
+        &self,
+        target: &str,
+        path: &Path,
+        name: &str,
+    ) -> Result<SendResult, AdapterError> {
+        let data = tokio::fs::read(path).await;
+        self.record(Call::SendFile {
+            target: target.to_owned(),
+            name: name.to_owned(),
+            bytes: data.as_ref().map_or(0, |data| data.len() as u64),
+        });
+        let (failure, hold) = {
+            let mut script = self.script();
+            (
+                script.send_failures.pop_front(),
+                script.send_holds.pop_front(),
+            )
+        };
+        if let Some(code) = failure {
+            return Err(AdapterError {
+                code,
+                message: "injected send_file failure".to_owned(),
+            });
+        }
+        if data.is_err() {
+            return Err(AdapterError {
+                code: E_ADAPTER_UPLOAD_DENIED,
+                message: "the file could not be read".to_owned(),
+            });
+        }
+        if let Some(gate) = hold {
+            gate.notified().await;
+        }
+        Ok(SendResult {
+            message_id: format!("fake-file-{name}"),
+        })
     }
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         Some(self.reconnects.subscribe())
     }
+}
+
+/// A failed local write, like `files::fetch_to_file` reports it: the code and the error kind
+/// only, never a path.
+fn write_failure(err: &std::io::Error) -> AdapterError {
+    AdapterError {
+        code: E_FILE_WRITE,
+        message: format!("could not write the file: {:?}", err.kind()),
+    }
+}
+
+/// Creates `dest` like `files::fetch_to_file` does: new, 0600, parent must exist.
+fn create_private_file(dest: &Path) -> Result<std::fs::File, AdapterError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)
+        .map_err(|e| write_failure(&e))
 }
 
 /// What `FakeSlackTransport` saw, in call order.
@@ -399,5 +621,209 @@ impl SlackTransport for FakeSlackTransport {
                 state.record.posts.len()
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::AttachmentRef;
+    use crate::adapter::E_ADAPTER_FILES;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn attachment(reference: &str) -> InboundAttachment {
+        InboundAttachment {
+            name: "a.bin".into(),
+            size: 0,
+            mime: None,
+            reference: AttachmentRef(reference.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_fetch_records_and_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.bin");
+        let fake = FakeAdapter::new();
+        fake.set_attachment_bytes("ref-1", vec![7; 5]);
+        let progress = Progress::new();
+        let n = fake
+            .fetch_attachment(&attachment("ref-1"), &dest, &progress)
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(progress.bytes(), 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![7; 5]);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![Call::FetchAttachment {
+                reference: "ref-1".into(),
+                dest
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_streamed_fetch_writes_each_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("s.bin");
+        let fake = Arc::new(FakeAdapter::new());
+        let mut feed = fake.stream_next_fetch();
+        let task = {
+            let fake = fake.clone();
+            let dest = dest.clone();
+            tokio::spawn(async move {
+                let progress = Progress::new();
+                fake.fetch_attachment(&attachment("s"), &dest, &progress)
+                    .await
+            })
+        };
+        let limit = Duration::from_secs(30);
+        feed.chunks.send(b"abc".to_vec()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(limit, feed.written.recv())
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        feed.chunks.send(b"def".to_vec()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(limit, feed.written.recv())
+                .await
+                .unwrap(),
+            Some(6)
+        );
+        drop(feed.chunks);
+        let result = tokio::time::timeout(limit, task).await.unwrap().unwrap();
+        assert_eq!(result.unwrap(), 6);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_held_fetch_waits_for_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("h.bin");
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_attachment_bytes("h", vec![1, 2]);
+        let gate = fake.hold_next_fetch();
+        let task = {
+            let fake = fake.clone();
+            let dest = dest.clone();
+            tokio::spawn(async move {
+                fake.fetch_attachment(&attachment("h"), &dest, &Progress::new())
+                    .await
+            })
+        };
+        let limit = Duration::from_secs(30);
+        tokio::time::timeout(
+            limit,
+            fake.wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dest.exists(),
+            "a held fetch writes nothing before the notify"
+        );
+        assert!(!task.is_finished());
+        gate.notify_one();
+        let n = tokio::time::timeout(limit, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(dest.exists());
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_fetch_without_parent_dir_is_write_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir");
+        let fake = FakeAdapter::new();
+        let err = fake
+            .fetch_attachment(&attachment("x"), &missing.join("f.bin"), &Progress::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, E_FILE_WRITE);
+        assert!(!missing.exists(), "the fake never creates directories");
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_send_file_unreadable_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fake = FakeAdapter::new();
+        let err = fake.send_file("t", &path, "secret.bin").await.unwrap_err();
+        assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_held_send_file_waits_for_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"xyz").unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        let gate = fake.hold_next_send_file();
+        let task = {
+            let fake = fake.clone();
+            let path = path.clone();
+            tokio::spawn(async move { fake.send_file("t", &path, "f.bin").await })
+        };
+        let limit = Duration::from_secs(30);
+        tokio::time::timeout(
+            limit,
+            fake.wait_for_call(|c| matches!(c, Call::SendFile { .. })),
+        )
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        gate.notify_one();
+        tokio::time::timeout(limit, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_send_file_reads_whole_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        std::fs::write(&path, vec![9u8; 200 * 1024]).unwrap();
+        let fake = FakeAdapter::new();
+        fake.send_file("thread-1", &path, "big.bin").await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![Call::SendFile {
+                target: "thread-1".into(),
+                name: "big.bin".into(),
+                bytes: 200 * 1024
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_injected_file_failures_return_their_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let fake = FakeAdapter::new();
+        fake.fail_next_fetch(E_ADAPTER_FILES);
+        fake.fail_next_send_file(E_ADAPTER_FILES);
+        let fetch = fake
+            .fetch_attachment(&attachment("x"), &dir.path().join("o"), &Progress::new())
+            .await
+            .unwrap_err();
+        assert_eq!(fetch.code, E_ADAPTER_FILES);
+        let send = fake.send_file("t", &path, "f.bin").await.unwrap_err();
+        assert_eq!(send.code, E_ADAPTER_FILES);
+        assert_eq!(fake.calls().len(), 2, "failing calls are recorded");
     }
 }

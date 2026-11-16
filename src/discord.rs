@@ -100,6 +100,7 @@ pub fn map_message(raw: &RawMessage<'_>, scope: &Scope) -> Option<InboundEvent> 
         thread_id,
         is_dm,
         text: raw.text.to_owned(),
+        attachments: Vec::new(),
     })
 }
 
@@ -514,6 +515,7 @@ mod tests {
                 thread_id: None,
                 is_dm: false,
                 text: "hello".into(),
+                attachments: Vec::new(),
             }
         );
     }

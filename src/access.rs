@@ -49,6 +49,7 @@ mod tests {
             thread_id: None,
             is_dm: false,
             text: "hello".into(),
+            attachments: Vec::new(),
         }
     }
 

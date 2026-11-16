@@ -159,6 +159,7 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         thread_id,
         is_dm,
         text: text.to_string(),
+        attachments: Vec::new(),
     })
 }
 
