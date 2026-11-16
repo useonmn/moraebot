@@ -4,17 +4,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use moraebot::access::DropReason;
-use moraebot::adapter::{InboundEvent, MessengerAdapter};
+use moraebot::adapter::{
+    AdapterError, E_ADAPTER_THREAD, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
+};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, MESSAGE_LIMIT, N_FAILED, N_INTERRUPTED,
-    N_REPLY_TRUNCATED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
+    N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::store::{State, Store};
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
+use tokio::sync::{mpsc, watch};
 
 const OWNER: &str = "111";
 const STRANGER: &str = "222";
@@ -35,7 +39,16 @@ impl Harness {
         Self::open_with(root, mode, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")))
     }
 
+    /// Like [`Self::open`], but every `create_thread` call is recorded and then fails.
+    fn open_failing_threads(root: &Path) -> Self {
+        Self::build(root, "ok", PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")), true)
+    }
+
     fn open_with(root: &Path, mode: &str, omp_path: PathBuf) -> Self {
+        Self::build(root, mode, omp_path, false)
+    }
+
+    fn build(root: &Path, mode: &str, omp_path: PathBuf, fail_threads: bool) -> Self {
         let home = root.join("home");
         let work_dir = root.join("work");
         std::fs::create_dir_all(home.join("secrets")).expect("home");
@@ -60,7 +73,11 @@ impl Harness {
             ("FAKE_OMP_LOG", root.join("fake-omp.log").to_string_lossy().into_owned()),
         ]);
         let adapter = Arc::new(FakeAdapter::new());
-        let as_dyn: Arc<dyn MessengerAdapter> = adapter.clone();
+        let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
+            Arc::new(ThreadFailAdapter(Arc::clone(&adapter)))
+        } else {
+            adapter.clone()
+        };
         let dispatcher = Arc::new(Dispatcher::new(&config, as_dyn, Arc::clone(&store), omp));
         Self { root: root.to_owned(), config, store, adapter, dispatcher }
     }
@@ -126,6 +143,57 @@ impl Harness {
 
     async fn close(self) {
         self.dispatcher.shutdown().await;
+    }
+
+    /// Stores a channel message exactly as `handle_event` does, without opening its
+    /// thread: the state left by a crash between admission and `create_thread`.
+    fn admit_without_thread(&self, message_id: &str, text: &str) -> i64 {
+        let admitted = self
+            .store
+            .lock()
+            .unwrap()
+            .admit("fake", message_id, &format!("fake:th:{message_id}"), CHANNEL, OWNER, text)
+            .unwrap();
+        match admitted {
+            moraebot::store::Admitted::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+}
+
+/// A [`FakeAdapter`] whose `create_thread` is recorded and then fails.
+struct ThreadFailAdapter(Arc<FakeAdapter>);
+
+#[async_trait]
+impl MessengerAdapter for ThreadFailAdapter {
+    fn platform(&self) -> &'static str {
+        self.0.platform()
+    }
+
+    async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
+        self.0.start().await
+    }
+
+    async fn send(&self, channel: &str, text: &str) -> Result<SendResult, AdapterError> {
+        self.0.send(channel, text).await
+    }
+
+    async fn create_thread(
+        &self,
+        channel_id: &str,
+        from_message_id: &str,
+        name: &str,
+    ) -> Result<String, AdapterError> {
+        self.0.create_thread(channel_id, from_message_id, name).await?;
+        Err(AdapterError { code: E_ADAPTER_THREAD, message: "injected thread failure".to_owned() })
+    }
+
+    async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError> {
+        self.0.start_typing(channel).await
+    }
+
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        self.0.reconnects()
     }
 }
 
@@ -207,6 +275,119 @@ async fn round_trip_creates_thread_and_replies() {
     assert_eq!(row.conversation_key, format!("fake:th:{mid}"));
     assert_eq!(row.reply.as_deref(), Some("echo: hello"));
     assert!(!h.step().await);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn crash_before_thread_creation_opens_thread_at_startup_then_runs_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000140";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let id = h.admit_without_thread(mid, "hello");
+        h.close().await;
+        id
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.threads_created(), 1);
+    assert!(h.prompts().is_empty(), "startup itself never prompts");
+    h.drain().await;
+
+    assert_eq!(
+        h.adapter.calls(),
+        vec![
+            Call::CreateThread {
+                channel_id: CHANNEL.into(),
+                from_message_id: mid.into(),
+                name: "hello".into(),
+            },
+            Call::StartTyping { channel: mid.into() },
+            Call::Send { channel: mid.into(), text: "echo: hello".into() },
+        ]
+    );
+    assert_eq!(h.prompts().len(), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn crash_before_thread_creation_and_failed_retry_marks_failed_with_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000141";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let id = h.admit_without_thread(mid, "hello");
+        h.close().await;
+        id
+    };
+
+    let h = Harness::open_failing_threads(dir.path());
+    bounded(h.dispatcher.startup()).await.unwrap();
+    h.drain().await;
+    let row = h.row(id);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(E_ADAPTER_THREAD));
+    assert!(row.notice_sent);
+    assert_eq!(h.threads_created(), 1);
+    assert_eq!(h.sends(), vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]);
+    assert!(h.prompts().is_empty());
+    assert_eq!(h.starts(), 0);
+    h.close().await;
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(!h.step().await);
+    assert!(h.adapter.calls().is_empty(), "no second thread attempt and no second notice");
+    assert!(h.prompts().is_empty());
+    assert_eq!(h.row(id).state, State::Failed);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn worker_never_prompts_a_thread_starter_without_its_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_failing_threads(dir.path());
+    let mid = "1300000000000000142";
+    let id = h.admit_without_thread(mid, "hello");
+    assert!(h.step().await);
+    assert!(!h.step().await);
+
+    let row = h.row(id);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(E_ADAPTER_THREAD));
+    assert!(row.notice_sent);
+    assert!(h.prompts().is_empty());
+    assert_eq!(h.starts(), 0);
+    assert_eq!(
+        h.adapter.calls(),
+        vec![
+            Call::CreateThread {
+                channel_id: CHANNEL.into(),
+                from_message_id: mid.into(),
+                name: "hello".into(),
+            },
+            Call::Send { channel: CHANNEL.into(), text: notice_text(N_THREAD_FAILED).into() },
+        ]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn thread_creation_failure_on_arrival_marks_failed_with_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_failing_threads(dir.path());
+    let handled = h.handle(channel_msg("1300000000000000143", "hello")).await;
+    let Handled::ThreadFailed(id) = handled else { panic!("expected ThreadFailed, got {handled:?}") };
+    assert!(!h.step().await);
+
+    let row = h.row(id);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(E_ADAPTER_THREAD));
+    assert!(row.notice_sent);
+    assert!(h.prompts().is_empty());
+    assert_eq!(h.sends(), vec![(CHANNEL.to_owned(), notice_text(N_THREAD_FAILED).to_owned())]);
     h.close().await;
 }
 

@@ -5,6 +5,12 @@
 //! forwarded), pick the conversation key, store the row FIRST (a duplicate stops here),
 //! and only then open a thread for a message posted directly in the channel.
 //!
+//! A row that starts its own thread (key `<platform>:th:<its own message id>`) is run only
+//! once that thread is known (`known_threads`). A row left without a thread by a crash
+//! between admission and thread creation gets one more creation attempt at startup (or
+//! at dequeue); if that fails it becomes `failed` with one notice in the channel, and it
+//! never reaches omp.
+//!
 //! One worker serves the global FIFO with one message in flight. A reply is stored
 //! (`reply_pending`) before it is sent and the row becomes `done` only after every chunk
 //! was accepted; a failed send is retried after the adapter reconnects and at startup.
@@ -22,7 +28,7 @@ use crate::adapter::{ConversationKey, InboundEvent, MessengerAdapter, split_repl
 use crate::config::Config;
 use crate::omp::{E_COST_CAP, OmpManager, Outcome};
 pub use crate::store::E_DISPATCH_HELD;
-use crate::store::{Admitted, State, Store, StoreError};
+use crate::store::{Admitted, InboxRow, State, Store, StoreError};
 
 /// Empty, attachment-only or `/` message: not forwarded to omp.
 pub const N_UNSUPPORTED_INPUT: &str = "N_UNSUPPORTED_INPUT";
@@ -95,6 +101,11 @@ pub fn reply_target(key: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+/// Whether the row opened its own thread: its key is `<platform>:th:<its message id>`.
+fn is_thread_starter(row: &InboxRow) -> bool {
+    row.conversation_key == ConversationKey::thread(&row.platform, &row.message_id).as_str()
+}
+
 /// Resolves at the adapter's next reconnect; never, when it has no reconnect signal.
 async fn next_reconnect(reconnects: &mut Option<watch::Receiver<u64>>) {
     let Some(rx) = reconnects else {
@@ -161,6 +172,12 @@ impl Dispatcher {
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
         self.post_needs_check_notices().await?;
+        let starters = self.store().queued_thread_starters()?;
+        for row in starters {
+            if !self.store().is_known_thread(&row.platform, &row.message_id)? {
+                self.open_missing_thread(&row).await?;
+            }
+        }
         for row in recovered.reply_pending {
             self.send_reply(row.id, &row.conversation_key, row.reply.as_deref().unwrap_or_default())
                 .await?;
@@ -282,9 +299,7 @@ impl Dispatcher {
             {
                 Ok(thread) => self.store().remember_thread(platform, &thread)?,
                 Err(err) => {
-                    tracing::warn!(row = id, code = err.code, "thread creation failed");
-                    self.store().mark(id, State::Failed, Some(err.code))?;
-                    self.notify(&event.channel_id, N_THREAD_FAILED).await;
+                    self.thread_failed(id, err.code, &event.channel_id).await?;
                     return Ok(Handled::ThreadFailed(id));
                 }
             }
@@ -314,6 +329,12 @@ impl Dispatcher {
             self.store().mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
             return Ok(true);
         };
+        if is_thread_starter(&row)
+            && !self.store().is_known_thread(&row.platform, &row.message_id)?
+            && !self.open_missing_thread(&row).await?
+        {
+            return Ok(true);
+        }
 
         self.store().mark(row.id, State::Processing, None)?;
         let typing = match self.adapter.start_typing(target).await {
@@ -349,6 +370,37 @@ impl Dispatcher {
             }
         }
         Ok(true)
+    }
+
+    /// Opens the thread of a queued thread-starter row whose creation never completed.
+    /// Returns whether the row may run; otherwise it is `failed` and announced.
+    async fn open_missing_thread(&self, row: &InboxRow) -> Result<bool, StoreError> {
+        let Some(channel) = self.store().channel_of(&row.conversation_key)? else {
+            self.store().mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
+            return Ok(false);
+        };
+        match self.adapter.create_thread(&channel, &row.message_id, &row.text).await {
+            Ok(thread) => {
+                self.store().remember_thread(&row.platform, &thread)?;
+                tracing::info!(row = row.id, "missing thread opened");
+                Ok(true)
+            }
+            Err(err) => {
+                self.thread_failed(row.id, err.code, &channel).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Marks a row whose thread could not be opened `failed` and posts one notice in the
+    /// channel; `notice_sent` records the delivery.
+    async fn thread_failed(&self, id: i64, code: &str, channel: &str) -> Result<(), StoreError> {
+        tracing::warn!(row = id, code, "thread creation failed");
+        self.store().mark(id, State::Failed, Some(code))?;
+        if self.notify(channel, N_THREAD_FAILED).await {
+            self.store().mark_notice_sent(id)?;
+        }
+        Ok(())
     }
 
     /// Re-sends replies whose earlier send failed (call after a reconnect).

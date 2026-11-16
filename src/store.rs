@@ -285,6 +285,28 @@ impl Store {
             .optional()?)
     }
 
+    /// Queued rows that start their own thread: key `<platform>:th:<own message_id>`.
+    pub fn queued_thread_starters(&self) -> Result<Vec<InboxRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM inbox
+             WHERE state = 'queued' AND conversation_key = platform || ':th:' || message_id
+             ORDER BY id"
+        ))?;
+        Ok(stmt.query_map([], map_row)?.collect::<Result<_, _>>()?)
+    }
+
+    /// The channel a conversation was started in.
+    pub fn channel_of(&self, conversation_key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT channel_id FROM conversations WHERE conversation_key = ?1",
+                [conversation_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn mark(&self, id: i64, state: State, error: Option<&str>) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             &format!("UPDATE inbox SET state = ?2, error = ?3, updated_at = {NOW} WHERE id = ?1"),
