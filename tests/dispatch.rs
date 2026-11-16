@@ -7,13 +7,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use moraebot::access::DropReason;
 use moraebot::adapter::{
-    AdapterError, E_ADAPTER_THREAD, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
+    AdapterError, AttachmentRef, E_ADAPTER_THREAD, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
+    InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
-    Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_INTERRUPTED,
-    N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
+    Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
+    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_REPLY_TRUNCATED, N_THREAD_FAILED,
+    N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
+use moraebot::files::{self, OutFile};
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::store::{State, Store};
 use moraebot::testing::{Call, FakeAdapter};
@@ -47,14 +50,38 @@ impl Harness {
             "ok",
             PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             true,
+            Vec::new(),
         )
     }
 
     fn open_with(root: &Path, mode: &str, omp_path: PathBuf) -> Self {
-        Self::build(root, mode, omp_path, false)
+        Self::build(root, mode, omp_path, false, Vec::new())
     }
 
-    fn build(root: &Path, mode: &str, omp_path: PathBuf, fail_threads: bool) -> Self {
+    /// fake-omp in mode `send_file`: every turn calls the `send_file` host tool once per
+    /// path, then replies `echo: <message>`.
+    fn open_sending(root: &Path, paths: &[PathBuf]) -> Self {
+        let script = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::build(
+            root,
+            "send_file",
+            PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+            false,
+            vec![("FAKE_OMP_SEND_FILE", script)],
+        )
+    }
+
+    fn build(
+        root: &Path,
+        mode: &str,
+        omp_path: PathBuf,
+        fail_threads: bool,
+        extra_env: Vec<(&'static str, String)>,
+    ) -> Self {
         let home = root.join("home");
         let work_dir = root.join("work");
         std::fs::create_dir_all(home.join("secrets")).expect("home");
@@ -80,13 +107,15 @@ impl Harness {
         let store = Arc::new(Mutex::new(
             Store::open(&home.join("inbox.sqlite")).expect("store"),
         ));
-        let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env([
+        let mut env = vec![
             ("FAKE_OMP_MODE", mode.to_owned()),
             (
                 "FAKE_OMP_LOG",
                 root.join("fake-omp.log").to_string_lossy().into_owned(),
             ),
-        ]);
+        ];
+        env.extend(extra_env);
+        let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env(env);
         let adapter = Arc::new(FakeAdapter::new());
         let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
             Arc::new(ThreadFailAdapter(Arc::clone(&adapter)))
@@ -932,4 +961,773 @@ async fn token_sentinel_absent_from_logs_db_and_omp_io() {
             .any(|w| w == TOKEN_SENTINEL.as_bytes());
         assert!(!found, "token sentinel leaked into {}", path.display());
     }
+}
+
+// ---- slice 3: inbound and outbound files ----
+
+fn attachment(name: &str, reference: &str, size: u64) -> InboundAttachment {
+    InboundAttachment {
+        name: name.into(),
+        size,
+        mime: Some("text/plain".into()),
+        reference: AttachmentRef(reference.into()),
+    }
+}
+
+fn with_files(mut ev: InboundEvent, attachments: Vec<InboundAttachment>) -> InboundEvent {
+    ev.attachments = attachments;
+    ev
+}
+
+fn fetches(h: &Harness) -> Vec<PathBuf> {
+    h.adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::FetchAttachment { dest, .. } => Some(dest),
+            _ => None,
+        })
+        .collect()
+}
+
+fn file_sends(h: &Harness) -> Vec<(String, u64)> {
+    h.adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::SendFile { name, bytes, .. } => Some((name, bytes)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn notices(h: &Harness, code: &str) -> usize {
+    h.sends()
+        .iter()
+        .filter(|(_, text)| text == notice_text(code))
+        .count()
+}
+
+fn out_files(h: &Harness, id: i64) -> Vec<OutFile> {
+    serde_json::from_str(h.row(id).out_files.as_deref().expect("out_files stored")).unwrap()
+}
+
+/// The paths listed in a prompt's attached-files block.
+fn listed_paths(message: &str) -> Vec<PathBuf> {
+    message
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .filter_map(|l| l.split_once(" (name: ").map(|(p, _)| PathBuf::from(p)))
+        .collect()
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn handled_files_rejected(handled: Handled, notice: &str) {
+    assert_eq!(
+        handled,
+        Handled::FilesRejected(match notice {
+            N_FILE_NOT_ALLOWED => N_FILE_NOT_ALLOWED,
+            _ => N_FILE_NOT_RECEIVED,
+        })
+    );
+}
+
+/// A file in the harness work folder; returns its canonical path.
+fn work_file(h: &Harness, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = h.config.work_dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path.canonicalize().unwrap()
+}
+
+/// Leaves a `reply_pending` row with its text delivered and one outbound file, as a
+/// process that stopped during the file upload would (`attempting` when `in_flight`).
+async fn seed_reply_with_file(h: &Harness, mid: &str, file: &Path, in_flight: bool) -> i64 {
+    let id = queued(h.handle(channel_msg(mid, "hello")).await);
+    let entry = OutFile {
+        path: file.to_owned(),
+        name: file.file_name().unwrap().to_string_lossy().into_owned(),
+        sent: false,
+        skipped: false,
+        attempting: false,
+        attempts: 0,
+    };
+    let json = serde_json::to_string(&vec![entry]).unwrap();
+    let store = h.store.lock().unwrap();
+    store.mark(id, State::Processing, None).unwrap();
+    store.save_reply(id, "echo: hello", Some(&json)).unwrap();
+    store.mark_text_sent(id).unwrap();
+    if in_flight {
+        store.mark_file_attempting(id, 0).unwrap();
+    }
+    id
+}
+
+#[tokio::test]
+async fn attachment_downloaded_after_store_and_listed_in_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let mid = "1300000000000000200";
+    let inbox = h.config.work_dir.join(files::INBOX_DIR);
+    let slug_dir = inbox.join(format!("fake-th-{mid}"));
+    let row_dir = slug_dir.join("1");
+    assert!(!inbox.exists());
+    h.adapter
+        .set_attachment_bytes("ref-1", b"hello file".to_vec());
+    let gate = h.adapter.hold_next_fetch();
+    let ev = with_files(
+        channel_msg(mid, "look at this"),
+        vec![attachment("notes.txt", "ref-1", 10)],
+    );
+    let d = Arc::clone(&h.dispatcher);
+    let join = tokio::spawn(async move { d.handle_event(ev).await });
+    bounded(
+        h.adapter
+            .wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+    )
+    .await;
+    // The fetch runs only once the row is stored, and the row waits for its files.
+    assert_eq!(h.count(), 1);
+    let waiting = h.row(1);
+    assert_eq!(waiting.state, State::Queued);
+    assert!(!waiting.files_ready);
+    gate.notify_one();
+    let id = queued(bounded(join).await.unwrap().unwrap());
+    h.drain().await;
+
+    for level in [&inbox, &slug_dir, &row_dir] {
+        assert_eq!(mode(level), 0o700, "inbox level mode");
+    }
+    let prompts = h.prompts();
+    assert_eq!(prompts.len(), 1);
+    let message = prompts[0]["message"].as_str().unwrap().to_owned();
+    assert!(message.starts_with("look at this\n\n[Attached files, saved on disk]\n"));
+    let listed = listed_paths(&message);
+    assert_eq!(listed, fetches(&h));
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].is_absolute());
+    assert_eq!(listed[0].parent().unwrap(), row_dir);
+    assert_eq!(std::fs::read(&listed[0]).unwrap(), b"hello file");
+    assert_eq!(mode(&listed[0]), 0o600);
+    assert_eq!(h.row(id).state, State::Done);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn relative_work_dir_lists_absolute_paths() {
+    std::fs::create_dir_all("target").unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("s3-rel-")
+        .tempdir_in("target")
+        .unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let root = tmp.path().strip_prefix(&cwd).unwrap_or(tmp.path());
+    assert!(root.is_relative());
+    let h = Harness::open(root, "ok");
+    assert!(h.config.work_dir.is_relative());
+    h.adapter.set_attachment_bytes("ref-1", b"abc".to_vec());
+    let mid = "1300000000000000201";
+    queued(
+        h.handle(with_files(
+            channel_msg(mid, "hi"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await,
+    );
+    h.drain().await;
+
+    let message = h.prompts()[0]["message"].as_str().unwrap().to_owned();
+    let listed = listed_paths(&message);
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].is_absolute());
+    let expected_dir = cwd
+        .join(root)
+        .join("work")
+        .join(files::INBOX_DIR)
+        .join(format!("fake-th-{mid}"))
+        .join("1");
+    assert_eq!(listed[0].parent().unwrap(), expected_dir);
+    assert!(listed[0].is_file());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn inbox_dir_failure_fails_row_without_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    std::fs::write(h.config.work_dir.join(files::INBOX_DIR), b"not a folder").unwrap();
+    let mid = "1300000000000000202";
+    let handled = h
+        .handle(with_files(
+            channel_msg(mid, "hi"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await;
+    handled_files_rejected(handled, N_FILE_NOT_RECEIVED);
+    assert!(!h.step().await);
+    let row = h.row(1);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(files::E_FILE_WRITE));
+    assert!(row.notice_sent);
+    assert!(fetches(&h).is_empty());
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FILE_NOT_RECEIVED).to_owned())]
+    );
+    assert!(h.prompts().is_empty());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn attachment_only_message_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    h.adapter.set_attachment_bytes("ref-1", b"img".to_vec());
+    let mid = "1300000000000000203";
+    let id = queued(
+        h.handle(with_files(
+            channel_msg(mid, ""),
+            vec![attachment("photo.png", "ref-1", 3)],
+        ))
+        .await,
+    );
+    h.drain().await;
+    let message = h.prompts()[0]["message"].as_str().unwrap().to_owned();
+    assert!(message.starts_with("[Attached files, saved on disk]\n"));
+    assert_eq!(listed_paths(&message).len(), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(notices(&h, N_UNSUPPORTED_INPUT), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn non_owner_attachment_never_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let handled = h
+        .handle(with_files(
+            event("1300000000000000204", STRANGER, None, "hi"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await;
+    assert_eq!(handled, Handled::Dropped(DropReason::NotOwner));
+    assert_eq!(h.count(), 0);
+    assert!(h.adapter.calls().is_empty());
+    assert!(!h.config.work_dir.join(files::INBOX_DIR).exists());
+}
+
+#[tokio::test]
+async fn too_many_files_rejected_without_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let many: Vec<InboundAttachment> = (0..=files::MAX_FILES)
+        .map(|i| attachment(&format!("f{i}.txt"), &format!("ref-{i}"), 1))
+        .collect();
+    assert_eq!(many.len(), 11);
+    let handled = h
+        .handle(with_files(channel_msg("1300000000000000205", "hi"), many))
+        .await;
+    assert_eq!(handled, Handled::FilesRejected(N_FILE_NOT_RECEIVED));
+    assert_eq!(h.count(), 0);
+    assert!(fetches(&h).is_empty());
+    assert_eq!(h.threads_created(), 0);
+    assert_eq!(
+        h.sends(),
+        vec![(
+            CHANNEL.to_owned(),
+            notice_text(N_FILE_NOT_RECEIVED).to_owned()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn large_declared_size_is_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    h.adapter.set_attachment_bytes("ref-1", b"small".to_vec());
+    let mid = "1300000000000000206";
+    let id = queued(
+        h.handle(with_files(
+            channel_msg(mid, "big"),
+            vec![attachment("big.bin", "ref-1", 5 * 1024 * 1024 * 1024)],
+        ))
+        .await,
+    );
+    h.drain().await;
+    assert_eq!(fetches(&h).len(), 1);
+    assert_eq!(h.prompts().len(), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(h.sends().len(), 1, "only the reply, no notice");
+    h.close().await;
+}
+
+async fn fetch_fails_with(code: &'static str, notice: &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    h.adapter.fail_next_fetch(code);
+    let mid = "1300000000000000207";
+    let handled = h
+        .handle(with_files(
+            channel_msg(mid, "hi"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await;
+    handled_files_rejected(handled, notice);
+    assert!(!h.step().await);
+    let row = h.row(1);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(code));
+    assert!(row.notice_sent);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(notice).to_owned())]
+    );
+    assert!(h.prompts().is_empty());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn fetch_failure_fails_row_with_notice() {
+    fetch_fails_with(files::E_FILE_FETCH, N_FILE_NOT_RECEIVED).await;
+}
+
+#[tokio::test]
+async fn disk_full_fails_row_with_notice() {
+    fetch_fails_with(files::E_FILE_WRITE, N_FILE_NOT_RECEIVED).await;
+}
+
+#[tokio::test]
+async fn denied_download_posts_permission_notice() {
+    fetch_fails_with(files::E_FILE_DENIED, N_FILE_NOT_ALLOWED).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fetch_timeout_fails_row_with_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let _gate = h.adapter.hold_next_fetch();
+    let mid = "1300000000000000208";
+    let ev = with_files(
+        channel_msg(mid, "hi"),
+        vec![attachment("a.txt", "ref-1", 3)],
+    );
+    let start = tokio::time::Instant::now();
+    let handled = tokio::time::timeout(files::STALL_TIMEOUT + BOUND, h.dispatcher.handle_event(ev))
+        .await
+        .expect("the stall watchdog ends the fetch")
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= files::STALL_TIMEOUT, "elapsed {elapsed:?}");
+    assert!(
+        elapsed < files::STALL_TIMEOUT + BOUND,
+        "elapsed {elapsed:?}"
+    );
+    assert_eq!(handled, Handled::FilesRejected(N_FILE_NOT_RECEIVED));
+    let row = h.row(1);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(files::E_FILE_FETCH));
+    assert_eq!(notices(&h, N_FILE_NOT_RECEIVED), 1);
+
+    let slash = h.handle(channel_msg("1300000000000000209", "/x")).await;
+    assert_eq!(slash, Handled::Notice(N_UNSUPPORTED_INPUT));
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_progressing_download_succeeds_past_stall_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let mut feed = h.adapter.stream_next_fetch();
+    let ev = with_files(
+        channel_msg("1300000000000000210", "hi"),
+        vec![attachment("slow.bin", "ref-1", 16)],
+    );
+    let start = tokio::time::Instant::now();
+    let d = Arc::clone(&h.dispatcher);
+    let join = tokio::spawn(async move { d.handle_event(ev).await });
+    bounded(
+        h.adapter
+            .wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+    )
+    .await;
+    for total in [4u64, 8, 12, 16] {
+        tokio::time::advance(Duration::from_secs(100)).await;
+        feed.chunks.send(vec![b'x'; 4]).await.unwrap();
+        assert_eq!(bounded(feed.written.recv()).await, Some(total));
+    }
+    drop(feed.chunks);
+    let id = queued(bounded(join).await.unwrap().unwrap());
+    assert!(start.elapsed() >= Duration::from_secs(400));
+    let row = h.row(id);
+    assert_eq!(row.state, State::Queued);
+    assert!(row.files_ready);
+    let saved = fetches(&h);
+    assert_eq!(std::fs::read(&saved[0]).unwrap().len(), 16);
+    assert_eq!(notices(&h, N_FILE_NOT_RECEIVED), 0);
+}
+
+#[tokio::test]
+async fn download_ending_after_hold_keeps_hold_and_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_with(dir.path(), "hang", exit1_wrapper(dir.path()));
+    let thread = "1300000000000000211";
+    let first = queued(h.handle(channel_msg(thread, "first")).await);
+    h.adapter.fail_next_fetch(files::E_FILE_FETCH);
+    let gate = h.adapter.hold_next_fetch();
+    let b = with_files(
+        event("1300000000000000212", OWNER, Some(thread), "second"),
+        vec![attachment("a.txt", "ref-1", 3)],
+    );
+    let d = Arc::clone(&h.dispatcher);
+    let join = tokio::spawn(async move { d.handle_event(b).await });
+    bounded(
+        h.adapter
+            .wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+    )
+    .await;
+    assert!(h.step().await);
+    assert_eq!(h.row(first).state, State::NeedsCheck);
+    gate.notify_one();
+    bounded(join).await.unwrap().unwrap();
+
+    let held = h.row(2);
+    assert_eq!(held.state, State::NeedsCheck);
+    assert_eq!(held.error.as_deref(), Some(E_DISPATCH_HELD));
+    assert_eq!(
+        h.sends(),
+        vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
+    assert_eq!(notices(&h, N_FILE_NOT_RECEIVED), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn slash_with_attachment_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let handled = h
+        .handle(with_files(
+            channel_msg("1300000000000000213", "/model x"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await;
+    assert_eq!(handled, Handled::Notice(N_UNSUPPORTED_INPUT));
+    assert_eq!(h.count(), 0);
+    assert!(fetches(&h).is_empty());
+}
+
+#[tokio::test]
+async fn outbound_file_sent_after_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("work").join("report.txt");
+    let h = Harness::open_sending(dir.path(), std::slice::from_ref(&report));
+    work_file(&h, "report.txt", b"twelve bytes");
+    let mid = "1300000000000000220";
+    let id = queued(h.handle(channel_msg(mid, "make a report")).await);
+    h.drain().await;
+
+    let order: Vec<&str> = h
+        .adapter
+        .calls()
+        .iter()
+        .filter_map(|c| match c {
+            Call::Send { .. } => Some("send"),
+            Call::SendFile { .. } => Some("file"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["send", "file"]);
+    assert_eq!(file_sends(&h), vec![("report.txt".to_owned(), 12)]);
+    assert_eq!(h.row(id).state, State::Done);
+    let entries = out_files(&h, id);
+    assert!(entries[0].sent && !entries[0].skipped && !entries[0].attempting);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn outbound_transient_error_notifies_once_and_resends_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("work").join("report.txt");
+    let h = Harness::open_sending(dir.path(), std::slice::from_ref(&report));
+    work_file(&h, "report.txt", b"data");
+    h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD);
+    let id = queued(h.handle(channel_msg("1300000000000000221", "go")).await);
+    h.drain().await;
+    assert_eq!(h.row(id).state, State::ReplyPending);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert!(!out_files(&h, id)[0].attempting);
+
+    bounded(h.dispatcher.resend_pending()).await.unwrap();
+    assert_eq!(file_sends(&h).len(), 2);
+    assert_eq!(h.sends().len(), 2, "one text send, one notice");
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    assert!(out_files(&h, id)[0].sent);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn outbound_permission_error_skips_file_with_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("work").join("report.txt");
+    let h = Harness::open_sending(dir.path(), std::slice::from_ref(&report));
+    work_file(&h, "report.txt", b"data");
+    h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD_DENIED);
+    let id = queued(h.handle(channel_msg("1300000000000000222", "go")).await);
+    h.drain().await;
+    assert_eq!(h.row(id).state, State::Done);
+    assert!(out_files(&h, id)[0].skipped);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert_eq!(h.sends().len(), 2, "one text send, one notice");
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
+    assert_eq!(file_sends(&h).len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn outbound_file_deleted_before_send_is_skipped_with_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("work").join("report.txt");
+    let h = Harness::open_sending(dir.path(), std::slice::from_ref(&report));
+    let path = work_file(&h, "report.txt", b"data");
+    h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD);
+    let id = queued(h.handle(channel_msg("1300000000000000223", "go")).await);
+    h.drain().await;
+    assert_eq!(h.row(id).state, State::ReplyPending);
+    std::fs::remove_file(&path).unwrap();
+    bounded(h.dispatcher.resend_pending()).await.unwrap();
+    assert_eq!(file_sends(&h).len(), 1, "no upload of the deleted file");
+    assert!(out_files(&h, id)[0].skipped);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn outbound_unreadable_file_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let h = Harness::open_sending(dir.path(), &[work.join("one.txt"), work.join("two.txt")]);
+    let one = work_file(&h, "one.txt", b"first");
+    work_file(&h, "two.txt", b"second");
+    h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD);
+    let id = queued(h.handle(channel_msg("1300000000000000224", "go")).await);
+    h.drain().await;
+    assert_eq!(h.row(id).state, State::ReplyPending);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+
+    std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o000)).unwrap();
+    h.adapter.reconnect();
+    bounded(h.dispatcher.resend_pending()).await.unwrap();
+    std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        file_sends(&h),
+        vec![("one.txt".to_owned(), 5), ("two.txt".to_owned(), 6)],
+        "the unreadable file is not uploaded again"
+    );
+    let entries = out_files(&h, id);
+    assert!(entries[0].skipped && entries[1].sent);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert_eq!(h.sends().len(), 2, "one text send, one notice");
+    assert_eq!(h.row(id).state, State::Done);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn startup_announces_incomplete_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000225";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let mut store = h.store.lock().unwrap();
+        let admitted = store
+            .admit_with_files(
+                "fake",
+                mid,
+                &format!("fake:th:{mid}"),
+                CHANNEL,
+                OWNER,
+                "hi",
+                Some(r#"[{"name":"a.txt","size":3,"mime":null}]"#),
+            )
+            .unwrap();
+        store.remember_thread("fake", mid).unwrap();
+        drop(store);
+        match admitted {
+            moraebot::store::Admitted::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        }
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(!h.step().await);
+    let row = h.row(id);
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(row.error.as_deref(), Some(files::E_FILE_INCOMPLETE));
+    assert!(row.notice_sent);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FILE_NOT_RECEIVED).to_owned())]
+    );
+    assert!(h.prompts().is_empty());
+    drop(h);
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(h.sends().is_empty(), "the notice is posted once");
+}
+
+#[tokio::test]
+async fn file_in_flight_at_crash_is_skipped_once_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000226";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let file = work_file(&h, "report.txt", b"data");
+        let id = seed_reply_with_file(&h, mid, &file, true).await;
+        h.close().await;
+        id
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(file_sends(&h).is_empty());
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FILE_NOT_SENT).to_owned())]
+    );
+    assert_eq!(h.row(id).state, State::Done);
+    let entry = &out_files(&h, id)[0];
+    assert!(entry.skipped && !entry.attempting);
+    h.close().await;
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(h.adapter.calls().is_empty());
+    h.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_timeout_skips_file_with_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000227";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let file = work_file(&h, "report.txt", b"data");
+        let id = seed_reply_with_file(&h, mid, &file, false).await;
+        h.close().await;
+        id
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    let _gate = h.adapter.hold_next_send_file();
+    let start = tokio::time::Instant::now();
+    tokio::time::timeout(files::UPLOAD_TIMEOUT + BOUND, h.dispatcher.startup())
+        .await
+        .expect("the upload timeout ends the call")
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= files::UPLOAD_TIMEOUT, "elapsed {elapsed:?}");
+    assert!(
+        elapsed < files::UPLOAD_TIMEOUT + BOUND,
+        "elapsed {elapsed:?}"
+    );
+    assert_eq!(file_sends(&h).len(), 1);
+    assert_eq!(h.row(id).state, State::Done);
+    let entry = &out_files(&h, id)[0];
+    assert!(entry.skipped && !entry.attempting);
+    assert_eq!(entry.attempts, 1);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FILE_NOT_SENT).to_owned())],
+        "one notice, no text send"
+    );
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
+    assert_eq!(file_sends(&h).len(), 1);
+    h.close().await;
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(h.adapter.calls().is_empty());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn transient_upload_failure_is_skipped_after_max_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "1300000000000000228";
+    let id = {
+        let h = Harness::open(dir.path(), "ok");
+        let file = work_file(&h, "report.txt", b"data");
+        let id = seed_reply_with_file(&h, mid, &file, false).await;
+        h.close().await;
+        id
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD);
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(file_sends(&h).len(), 1);
+    assert_eq!(notices(&h, N_FILE_NOT_SENT), 1);
+    assert_eq!(h.row(id).state, State::ReplyPending);
+    for attempts in [2, 3] {
+        h.adapter.fail_next_send_file(E_ADAPTER_UPLOAD);
+        assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
+        assert_eq!(file_sends(&h).len(), attempts);
+    }
+    bounded(h.dispatcher.resend_pending()).await.unwrap();
+    assert_eq!(file_sends(&h).len(), 3, "no fourth attempt");
+    let entry = &out_files(&h, id)[0];
+    assert!(entry.skipped && !entry.sent);
+    assert_eq!(entry.attempts, files::MAX_UPLOAD_ATTEMPTS);
+    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(
+        h.sends(),
+        vec![(mid.to_owned(), notice_text(N_FILE_NOT_SENT).to_owned())],
+        "one notice in total, no text send"
+    );
+    h.close().await;
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(h.adapter.calls().is_empty());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn next_message_waits_while_file_downloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let inbound = h.adapter.start().await.unwrap();
+    let runner = tokio::spawn(Arc::clone(&h.dispatcher).run(inbound));
+    let first = "1300000000000000230";
+    let second = "1300000000000000231";
+    let gate = h.adapter.hold_next_fetch();
+    h.adapter
+        .inject(with_files(
+            channel_msg(first, "with file"),
+            vec![attachment("a.txt", "ref-1", 3)],
+        ))
+        .await;
+    bounded(
+        h.adapter
+            .wait_for_call(|c| matches!(c, Call::FetchAttachment { .. })),
+    )
+    .await;
+    h.adapter.inject(channel_msg(second, "plain")).await;
+    // `run` awaits one event at a time, so the second message is not admitted yet.
+    assert_eq!(h.count(), 1);
+    let second_thread = |c: &Call| matches!(c, Call::CreateThread { from_message_id, .. } if from_message_id == second);
+    assert!(!h.adapter.calls().iter().any(second_thread));
+
+    gate.notify_one();
+    bounded(h.adapter.wait_for_call(second_thread)).await;
+    bounded(h.adapter.wait_for_send(2)).await;
+    let targets: Vec<String> = h.sends().into_iter().map(|(channel, _)| channel).collect();
+    assert_eq!(targets, [first, second], "FIFO order unchanged");
+    runner.abort();
+    let _ = runner.await;
+    h.close().await;
 }
