@@ -1,12 +1,12 @@
 # moraebot
 
-moraebot lets you talk to a coding agent on your Mac from a chat app. You send a message in Discord, moraebot hands it to omp, a coding agent CLI, running on your Mac, and the reply comes back in the same conversation.
+moraebot lets you talk to a coding agent on your Mac from a chat app. You send a message in Discord or Slack, moraebot hands it to omp, a coding agent CLI, running on your Mac, and the reply comes back in the same conversation.
 
 ## Status
 
-This is slice 1, the smallest version that works end to end.
+This is slice 2. It adds Slack next to Discord.
 
-- Discord only. Other messengers come later.
+- Discord or Slack, one at a time. Other messengers come later.
 - macOS only. It runs as a per-user LaunchAgent.
 - One owner. Only you can talk to the bot (`access_mode = "owner_only"`).
 - One task at a time. Messages wait in a queue and run in order.
@@ -17,9 +17,9 @@ This is slice 1, the smallest version that works end to end.
 >
 > moraebot runs omp without asking for approval. Anyone who can talk to the bot can run commands on this Mac, with your user's permissions.
 >
-> - Keep `access_mode = "owner_only"`. It's the default and the only mode in slice 1.
+> - Keep `access_mode = "owner_only"`. It's the default and the only mode for now.
 > - Use a private channel that only you can see.
-> - Turn on two-factor login for your Discord account. That account is now a key to your Mac.
+> - Turn on two-factor login for your Discord or Slack account. That account is now a key to your Mac.
 > - The work folder is not a sandbox. omp can read and change files outside it.
 > - Never share the bot token. Anyone holding it can pretend to be your bot.
 
@@ -27,7 +27,7 @@ The bot only runs while you're logged in to macOS and the Mac is awake.
 
 ## Install
 
-You'll need macOS, a Discord account, and omp already installed and working in your terminal.
+You'll need macOS, a Discord or Slack account, and omp already installed and working in your terminal.
 
 ### 1. Install Rust
 
@@ -51,36 +51,29 @@ cargo build --release
 
 The binary ends up at `target/release/moraebot`. The commands below call it `moraebot`. Either run it by that path or copy it somewhere on your `PATH`.
 
-### 3. Create the Discord application and bot
+### 3. Pick a messenger
 
-Click paths in the Discord Developer Portal are given as a guide (screen names may change).
+moraebot talks to one messenger at a time: Discord or Slack. Each one has its own setup guide with the exact app settings, in the order the portal shows them:
 
-1. Open <https://discord.com/developers/applications> and click **New Application**. Give it a name.
-2. On the **General Information** page, copy the **Application ID**. You'll need it for the invite link.
-3. Open the **Bot** page. Click **Reset Token** and copy the token. Discord shows it only once. Keep it somewhere safe for step 6.
-4. On the same **Bot** page, under **Privileged Gateway Intents**, turn on **Message Content Intent** and save. Without it the bot sees empty messages.
+- Discord: [docs/guides/discord.md](docs/guides/discord.md)
+- Slack: [docs/guides/slack.md](docs/guides/slack.md)
 
-### 4. Invite the bot to your server
+Follow the guide for the messenger you want, then come back here. The guides are the only place the fixed settings are written down, so this README doesn't repeat them.
 
-Put your Application ID into this link and open it in a browser:
+You can also print a guide in the terminal:
 
-```text
-https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=309237713920
+```sh
+moraebot guide discord
+moraebot guide slack
 ```
 
-`309237713920` grants exactly these permissions: View Channels, Send Messages, Read Message History, Create Public Threads, and Send Messages in Threads. Pick your server and confirm.
+### 4. Set up with your agent (optional)
 
-Then create a private channel for the bot (or reuse one only you can see) and make sure the bot can see it.
+Each guide ends with an "Agent-assisted setup (optional)" section. It's a prompt you can hand to a coding agent so it walks you through the portal clicks. The agent never needs your tokens. You type those into moraebot yourself.
 
-### 5. Copy your user id and the channel id
+### 5. Run `moraebot init`
 
-Discord ids are long numbers. To copy them, turn on Developer Mode first (screen names may change):
-
-1. In the Discord app, open **User Settings > Advanced** and turn on **Developer Mode**.
-2. Right-click your own name and choose **Copy User ID**. That's your owner id.
-3. Right-click the bot's channel and choose **Copy Channel ID**.
-
-### 6. Run `moraebot init`
+On the first run:
 
 ```sh
 moraebot init
@@ -88,29 +81,68 @@ moraebot init
 
 It asks a few questions, in order:
 
-1. Which messenger to use. Only Discord is available in slice 1.
-2. Your owner user id, the channel id, and the bot token. The token isn't echoed while you type or paste it. It's saved to `~/.moraebot/secrets/discord.token` with mode `600` (readable only by you).
+1. Which messenger to use (Discord or Slack).
+2. That messenger's questions (see the list below). Tokens aren't echoed while you type or paste them. Each one is saved to its own file under `~/.moraebot/secrets/` with mode `600` (readable only by you).
 3. The path to `omp` (found on your `PATH`, you confirm it) and the work folder. Press Enter to accept the default `~/moraebot-work`.
 
 Then it creates `~/.moraebot` (mode `700`), writes `~/.moraebot/config.toml`, and runs the same checks as `check-config`. If a config already exists, it asks before overwriting it. The default answer is No.
 
-The written config looks roughly like this. You can edit it by hand later.
+### 6. Change or add a messenger
+
+To switch messengers, or to fix one messenger's answers, run setup for it:
+
+```sh
+moraebot setup slack
+moraebot setup discord
+```
+
+setup asks only that messenger's questions, keeps the rest of your config, and makes that messenger the active one. When a section already exists, its current ids are offered as defaults and pressing Enter keeps a saved token.
+
+Discord asks:
+
+1. Your Discord owner user id.
+2. The Discord channel id.
+3. The Discord bot token (saved to `~/.moraebot/secrets/discord.token`).
+
+Slack first prints a link that creates the app with the manifest filled in, then asks:
+
+1. Your Slack owner member id (starts with `U`).
+2. The Slack channel id (starts with `C` or `G`).
+3. The Slack bot token, `xoxb-...` (saved to `~/.moraebot/secrets/slack-bot.token`).
+4. The Slack app-level token, `xapp-...` (saved to `~/.moraebot/secrets/slack-app.token`).
+
+Restart moraebot after setup so it picks up the change.
+
+### The config file
+
+The written config looks roughly like this. You can edit it by hand later. Only the section named by `messenger` is used. The other one can stay in the file, so switching back is a one-word change.
 
 ```toml
-# Your Discord user id. Only this account can talk to the bot.
-owner_id = <YOUR_DISCORD_USER_ID>
-# File holding the bot token. Must be mode 600.
-token_file = "~/.moraebot/secrets/discord.token"
+# The active messenger: "discord" or "slack". Only one runs at a time.
+messenger = "discord"
 # Folder omp starts in. This is not a sandbox.
 work_dir = "~/moraebot-work"
 # Absolute path to omp.
 omp_path = "<PATH_TO_OMP>"
-# Only owner_only exists in slice 1.
+# Only owner_only exists for now.
 access_mode = "owner_only"
 
 [discord]
+# Your Discord user id. Only this account can talk to the bot.
+owner_id = <YOUR_DISCORD_USER_ID>
 # The one channel the bot listens in. Threads under it and your DMs also work.
 channel_id = <YOUR_CHANNEL_ID>
+# File holding the bot token. Must be mode 600.
+token_file = "~/.moraebot/secrets/discord.token"
+
+# [slack]
+# # Your Slack member id. Only this account can talk to the bot.
+# owner_id = "<YOUR_SLACK_MEMBER_ID>"
+# # The one channel the bot listens in. Thread replies under it and your DMs also work.
+# channel_id = "<YOUR_CHANNEL_ID>"
+# # Token files. Both must be mode 600.
+# bot_token_file = "~/.moraebot/secrets/slack-bot.token"
+# app_token_file = "~/.moraebot/secrets/slack-app.token"
 
 [omp]
 # Optional. No time limit when left out.
@@ -118,6 +150,8 @@ channel_id = <YOUR_CHANNEL_ID>
 # Optional. No cost limit when left out.
 # max_cost_usd = 5.0
 ```
+
+Configs written by slice 1 (top-level `owner_id` and `token_file`, no `messenger` line) still load as Discord. You don't need to rewrite them.
 
 Set `MORAEBOT_HOME` if you want moraebot's home somewhere other than `~/.moraebot`.
 
@@ -127,7 +161,7 @@ Set `MORAEBOT_HOME` if you want moraebot's home somewhere other than `~/.moraebo
 moraebot check-config
 ```
 
-Every line should start with `OK`. A `FAIL` line says what to fix, for example a token file that other users can read (`chmod 600 ~/.moraebot/secrets/discord.token`). The command exits non-zero if anything fails. Use `--config <path>` to check a different file.
+Every line should start with `OK`. A `FAIL` line says what to fix, for example a token file that other users can read (`chmod 600 ~/.moraebot/secrets/slack-bot.token`). The command exits non-zero if anything fails. Use `--config <path>` to check a different file.
 
 ### 8. Start it in the background
 
@@ -144,6 +178,20 @@ moraebot run
 ```
 
 Stop it with Ctrl+C.
+
+## Behavior hints
+
+moraebot gives omp a short built-in note about the messenger it's answering in, for example how long a reply may be and which formatting renders. To replace it, write your own text to:
+
+```text
+~/.moraebot/hints/discord.md
+~/.moraebot/hints/slack.md
+```
+
+- The file for the active messenger replaces the built-in text.
+- It can be at most 8 KiB. A bigger file fails `check-config`.
+- An empty file turns the hints off.
+- Restart moraebot to apply a change.
 
 ## Logs
 
@@ -163,6 +211,15 @@ After installing, check these by hand once:
 - [ ] **Restart notice.** Send something long, then restart moraebot mid-task (`launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway`). After it comes back you get one notice saying the task was interrupted.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
+If you use Slack, also check these:
+
+- [ ] **Invite the bot.** In the bot's channel, run `/invite @<bot name>`. Without it the bot sees nothing there.
+- [ ] **Channel post.** Post in the channel. The reply arrives in a thread under your message.
+- [ ] **Thread reply.** Reply in that thread. The answer stays in the same thread and the same conversation.
+- [ ] **DM.** Send the bot a direct message. A reply comes back in the DM.
+- [ ] **Strangers get nothing.** Post from a second Slack account. The bot doesn't reply and doesn't store it.
+- [ ] **Reconnect (optional).** For a quick test, add `&debug_reconnects=true` to the end of the Socket Mode `wss` URL (for example in a debug build). Slack then drops the connection on purpose, and the logs show moraebot reconnecting within 360 seconds.
+
 ## Stop and uninstall
 
 ```sh
@@ -175,4 +232,4 @@ This unloads the LaunchAgent and removes its plist. To remove everything else to
 rm -rf ~/.moraebot
 ```
 
-That deletes the config, the token file, the message database, and the logs. Your work folder is left alone. Finally, delete the application in the Discord Developer Portal if you no longer need the bot.
+That deletes the config, the token file, the message database, and the logs. Your work folder is left alone. Finally, delete the Discord application or the Slack app if you no longer need the bot.

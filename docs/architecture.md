@@ -80,6 +80,8 @@ moraebot은 세 부분으로 이루어집니다.
 2. **SQLite**: 파일 하나로 된 작은 데이터베이스입니다. 별도 서버가 필요 없습니다. 받은 메시지, 대화 목록, 허용 사용자 같은 상태를 저장합니다.
 3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 대화 하나에 omp 하나가 돕니다.
 
+> **slice 2 메모.** 이제 Slack도 붙습니다. Slack은 Socket Mode(WebSocket)로 연결하고, 코드는 `src/slack.rs`에 있습니다. 메신저는 한 번에 하나만 켜집니다(`config.toml`의 `messenger`). 앱 설정 방법은 `docs/guides/`의 메신저별 안내서에 있습니다. 아래 그림의 Discord 자리에 Slack이 들어가도 흐름은 같습니다.
+
 메시지 하나가 지나가는 길은 이렇습니다.
 
 ```
@@ -119,6 +121,11 @@ moraebot은 세 부분으로 이루어집니다.
 dinobot은 Discord를 interactions 웹훅으로만 받습니다. 이 방식은 슬래시 명령만 받고 일반 메시지는 못 받습니다. moraebot은 이 방식을 쓰지 않습니다.
 
 **Rust 라이브러리.** Discord 쪽 후보는 `serenity` 0.12.5와 `twilight-gateway` 0.18.0입니다. serenity는 기능이 다 들어 있어 쓰기 쉽고, twilight는 필요한 부분만 골라 쓰는 가벼운 구성입니다. **serenity로 시작**하기를 권장합니다. 첫 단계는 받아서 저장하고 넘기는 일뿐이라 쉬운 쪽이 낫습니다. SQLite는 Rust용 라이브러리 `rusqlite` 0.43.0을 씁니다. 쓰기는 한 곳(쓰기만 맡는 별도 작업 흐름(스레드) 하나)에서만 합니다.
+
+**Slack은 이렇게 붙습니다(slice 2).** `src/slack.rs`가 Socket Mode로 연결합니다. 공개 HTTP 주소가 필요 없습니다. 고정 설정(scope, event)은 `docs/guides/slack.md`에만 적습니다. 알아 둘 점 두 가지입니다.
+
+- Slack 이벤트는 저장소에 들어가기 전에 ack합니다. 그래서 ack와 `admit` 사이에 죽으면 그 메시지는 사라집니다. Discord와 같은 위험입니다.
+- Slack의 `file_share` 메시지는 조용히 버립니다. Discord처럼 `N_UNSUPPORTED_INPUT` 알림을 보내지 않습니다. 이번 단계에서는 받아들인 차이입니다.
 
 ### 2.2 무엇을 "대화 하나"로 볼까
 
