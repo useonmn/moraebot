@@ -44,7 +44,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SESSION_ID: &str = "fake-session-1";
 const DEFAULT_TOOL_TRIGGER: &str = "run-tools";
@@ -498,11 +498,15 @@ fn send(out: &mut impl Write, frame: &Value) {
         .expect("write frame to stdout");
 }
 
+/// Appends `line` and its newline in one `write` call: a lead and its lanes share the
+/// log, and `writeln!` on a `File` writes the text and the newline separately, so
+/// another child's line could land between them and merge two lines into one.
 fn log_line(path: &Path, line: &str) {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .expect("open FAKE_OMP_LOG");
-    writeln!(file, "{line}").expect("write FAKE_OMP_LOG");
+    file.write_all(format!("{line}\n").as_bytes())
+        .expect("write FAKE_OMP_LOG");
 }
