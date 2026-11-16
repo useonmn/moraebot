@@ -12,6 +12,7 @@ use std::time::Duration;
 use moraebot::adapter::MessengerAdapter;
 use moraebot::config::{AccessMode, Config, OmpConfig, Platform, SlackConfig};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
+use moraebot::lead;
 use moraebot::slack::{DEFAULT_HINTS, SlackAdapter};
 use moraebot::store::{State, Store};
 use moraebot::testing::{FakeSlackSession, FakeSlackTransport};
@@ -275,7 +276,10 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
     assert_eq!(rig.row_state(2), State::Done);
     rig.tap.wait_for_prompts(2).await;
     assert_eq!(rig.tap.pids().len(), 1, "one omp child serves the thread");
-    let hints_flag = format!("--append-system-prompt={DEFAULT_HINTS}");
+    let hints_flag = format!(
+        "--append-system-prompt={}",
+        lead::system_prompt(lead::DEFAULT_GUIDANCE, DEFAULT_HINTS)
+    );
     assert!(
         rig.tap.argvs()[0].contains(&hints_flag),
         "omp gets the Slack default hints"
