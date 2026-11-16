@@ -14,17 +14,20 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serenity::all::{
-    Channel, ChannelId, ChannelType, Client, Context, CreateThread, EventHandler, GatewayIntents,
-    Http, Message, MessageId, MessageType, Ready, ResumedEvent, ShardManager,
+    Channel, ChannelId, ChannelType, Client, Context, CreateAttachment, CreateMessage,
+    CreateThread, EventHandler, GatewayIntents, Http, Message, MessageId, MessageType, Ready,
+    ResumedEvent, ShardManager,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{
-    AdapterError, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD, InboundEvent,
-    MessengerAdapter, SendResult, TypingHandle, next_backoff, split_reply,
+    AdapterError, AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD,
+    E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
+    SendResult, TypingHandle, next_backoff, split_reply,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
+use crate::files::{self, Progress};
 
 pub const PLATFORM: &str = "discord";
 /// Discord's message length limit, counted in characters.
@@ -35,7 +38,9 @@ pub const THREAD_NAME_FALLBACK: &str = "moraebot";
 /// Sent instead of an empty reply, which Discord would reject.
 pub const EMPTY_REPLY: &str = "(empty reply)";
 /// Built-in behavior hints for omp; `<home>/hints/discord.md` overrides them.
-pub const DEFAULT_HINTS: &str = "Your replies are posted to Discord. One message holds at most 2000 characters; longer replies are split into several messages. Discord markdown works: **bold**, *italic*, `code`, fenced code blocks, > quotes, - lists. Tables do not render, use lists. Keep answers short.";
+pub const DEFAULT_HINTS: &str = "Your replies are posted to Discord. One message holds at most 2000 characters; longer replies are split into several messages. Discord markdown works: **bold**, *italic*, `code`, fenced code blocks, > quotes, - lists. Tables do not render, use lists. Keep answers short. Files the owner attaches are saved on disk; their paths are listed at the end of the message. To send a file back, call the send_file tool with a path inside the work folder (at most 10 files per reply).";
+/// The only hosts attachments are downloaded from (exact match, https).
+pub const DOWNLOAD_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 
 pub const E_DISCORD_TOKEN: &str = "E_DISCORD_TOKEN";
 pub const E_DISCORD_ID: &str = "E_DISCORD_ID";
@@ -72,10 +77,22 @@ pub struct RawMessage<'a> {
     pub channel_id: u64,
     pub location: Location,
     pub text: &'a str,
+    pub attachments: &'a [AttachmentMeta],
+}
+
+/// The fields of a Discord attachment moraebot uses. `url` is signed, so it is kept as an
+/// `AttachmentRef`, whose `Debug` is redacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub url: AttachmentRef,
 }
 
 /// Turns a message into a core event, or `None` when it is outside the listening scope.
-/// Empty text is kept as an empty `text` so the core can answer it with its fixed notice.
+/// Empty text is kept as an empty `text`: with attachments it is a files-only message, without
+/// them the core answers it with its fixed notice.
 pub fn map_message(raw: &RawMessage<'_>, scope: &Scope) -> Option<InboundEvent> {
     if raw.from_self || !raw.is_regular {
         return None;
@@ -100,8 +117,62 @@ pub fn map_message(raw: &RawMessage<'_>, scope: &Scope) -> Option<InboundEvent> 
         thread_id,
         is_dm,
         text: raw.text.to_owned(),
-        attachments: Vec::new(),
+        attachments: raw
+            .attachments
+            .iter()
+            .map(|meta| InboundAttachment {
+                name: meta.filename.clone(),
+                size: meta.size,
+                mime: meta.content_type.clone(),
+                reference: meta.url.clone(),
+            })
+            .collect(),
     })
+}
+
+/// The adapter error code for a failed upload: a 4xx other than 429 (missing permission,
+/// file too large for Discord) is a permanent refusal; 429, 5xx and network errors (`None`)
+/// may work next time.
+pub fn upload_error_code(status: Option<u16>) -> &'static str {
+    match status {
+        Some(status) if (400..500).contains(&status) && status != 429 => E_ADAPTER_UPLOAD_DENIED,
+        _ => E_ADAPTER_UPLOAD,
+    }
+}
+
+/// Reads `path` whole and posts it as one attachment into `channel_id` through serenity,
+/// which sends the token and waits out rate limits. Returns the new message id.
+async fn upload_file(
+    http: &Http,
+    channel_id: u64,
+    path: &Path,
+    name: &str,
+) -> Result<String, AdapterError> {
+    let data = tokio::fs::read(path).await.map_err(|err| AdapterError {
+        code: E_ADAPTER_UPLOAD_DENIED,
+        message: format!("cannot read the file ({:?})", err.kind()),
+    })?;
+    let message = ChannelId::new(channel_id)
+        .send_files(
+            http,
+            [CreateAttachment::bytes(data, name)],
+            CreateMessage::new(),
+        )
+        .await
+        .map_err(|err| {
+            let status = match &err {
+                serenity::Error::Http(http_err) => http_err.status_code().map(|s| s.as_u16()),
+                _ => None,
+            };
+            AdapterError {
+                code: upload_error_code(status),
+                message: match status {
+                    Some(status) => format!("upload failed with HTTP {status}"),
+                    None => "upload failed".to_owned(),
+                },
+            }
+        })?;
+    Ok(message.id.get().to_string())
 }
 
 pub fn guild_location(is_thread: bool, parent_id: Option<u64>) -> Location {
@@ -240,6 +311,16 @@ impl EventHandler for Handler {
         let Some(location) = self.locate(&ctx, &msg).await else {
             return;
         };
+        let attachments: Vec<AttachmentMeta> = msg
+            .attachments
+            .iter()
+            .map(|a| AttachmentMeta {
+                filename: a.filename.clone(),
+                size: u64::from(a.size),
+                content_type: a.content_type.clone(),
+                url: AttachmentRef(a.url.clone()),
+            })
+            .collect();
         let raw = RawMessage {
             message_id: msg.id.get(),
             author_id: msg.author.id.get(),
@@ -249,6 +330,7 @@ impl EventHandler for Handler {
             channel_id: msg.channel_id.get(),
             location,
             text: &msg.content,
+            attachments: &attachments,
         };
         if let Some(event) = map_message(&raw, &self.scope)
             && self.tx.send(event).await.is_err()
@@ -278,6 +360,8 @@ struct Runtime {
 pub struct DiscordAdapter {
     token: Arc<Token>,
     http: Arc<Http>,
+    /// Downloads only; uploads go through `http`.
+    file_client: reqwest::Client,
     scope: Scope,
     runtime: Arc<Mutex<Runtime>>,
     shutdown: watch::Sender<bool>,
@@ -292,6 +376,7 @@ impl DiscordAdapter {
         Ok(Self {
             token: Arc::new(token),
             http,
+            file_client: files::file_client(),
             scope,
             runtime: Arc::new(Mutex::new(Runtime::default())),
             shutdown: watch::channel(false).0,
@@ -447,6 +532,26 @@ impl MessengerAdapter for DiscordAdapter {
         }))
     }
 
+    async fn fetch_attachment(
+        &self,
+        attachment: &InboundAttachment,
+        dest: &Path,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        let url = files::check_url(&attachment.reference.0, &DOWNLOAD_HOSTS)?;
+        files::fetch_to_file(&self.file_client, url, None, dest, false, progress).await
+    }
+
+    async fn send_file(
+        &self,
+        target: &str,
+        path: &Path,
+        name: &str,
+    ) -> Result<SendResult, AdapterError> {
+        let message_id = upload_file(&self.http, parse_id(target)?, path, name).await?;
+        Ok(SendResult { message_id })
+    }
+
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         Some(self.reconnects.subscribe())
     }
@@ -495,6 +600,383 @@ mod tests {
             channel_id,
             location,
             text,
+            attachments: &[],
+        }
+    }
+
+    fn meta(name: &str, url: &str) -> AttachmentMeta {
+        AttachmentMeta {
+            filename: name.to_owned(),
+            size: 1234,
+            content_type: Some("application/pdf".to_owned()),
+            url: AttachmentRef(url.to_owned()),
+        }
+    }
+
+    const CDN_URL: &str = "https://cdn.discordapp.com/attachments/222/555/report.pdf";
+
+    #[test]
+    fn attachment_only_message_maps() {
+        let metas = [meta("report.pdf", CDN_URL)];
+        let mut message = raw(Location::GuildChannel, CHANNEL, OWNER, "");
+        message.attachments = &metas;
+        let event = map_message(&message, &scope()).expect("event");
+        assert!(event.text.is_empty());
+        assert_eq!(event.attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_metadata_copied() {
+        let metas = [
+            meta("report.pdf", CDN_URL),
+            AttachmentMeta {
+                filename: "photo.png".to_owned(),
+                size: 7,
+                content_type: None,
+                url: AttachmentRef("https://media.discordapp.net/x/photo.png".to_owned()),
+            },
+        ];
+        let location = Location::Thread {
+            parent_id: Some(CHANNEL),
+        };
+        let mut message = raw(location, THREAD, OWNER, "look");
+        message.attachments = &metas;
+        let event = map_message(&message, &scope()).expect("event");
+        assert_eq!(event.text, "look");
+        assert_eq!(
+            event.attachments,
+            vec![
+                InboundAttachment {
+                    name: "report.pdf".into(),
+                    size: 1234,
+                    mime: Some("application/pdf".into()),
+                    reference: AttachmentRef(CDN_URL.into()),
+                },
+                InboundAttachment {
+                    name: "photo.png".into(),
+                    size: 7,
+                    mime: None,
+                    reference: AttachmentRef("https://media.discordapp.net/x/photo.png".into()),
+                },
+            ]
+        );
+        assert!(!format!("{event:?}").contains("cdn.discordapp.com"));
+    }
+
+    #[test]
+    fn non_owner_attachment_still_dropped() {
+        let metas = [meta("report.pdf", CDN_URL)];
+        for (location, channel_id, author) in [
+            (Location::Dm, 555, OTHER),
+            (Location::GuildChannel, 999, OWNER),
+            (
+                Location::Thread {
+                    parent_id: Some(999),
+                },
+                THREAD,
+                OWNER,
+            ),
+        ] {
+            let mut message = raw(location, channel_id, author, "");
+            message.attachments = &metas;
+            assert_eq!(map_message(&message, &scope()), None, "{location:?}");
+        }
+        let mut own = raw(Location::GuildChannel, CHANNEL, OWNER, "");
+        own.attachments = &metas;
+        own.from_self = true;
+        assert_eq!(map_message(&own, &scope()), None);
+    }
+
+    #[tokio::test]
+    async fn download_host_allowlist() {
+        assert!(files::check_url(CDN_URL, &DOWNLOAD_HOSTS).is_ok());
+        assert!(files::check_url("https://media.discordapp.net/a/b.png", &DOWNLOAD_HOSTS).is_ok());
+        for bad in [
+            "https://cdn.discordapp.com.evil.test/attachments/1/2/x",
+            "http://cdn.discordapp.com/attachments/1/2/x",
+            "https://evil.test/x",
+            "",
+        ] {
+            assert_eq!(
+                files::check_url(bad, &DOWNLOAD_HOSTS).unwrap_err().code,
+                files::E_FILE_HOST,
+                "{bad:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let adapter =
+            DiscordAdapter::new(&token_file(dir.path(), "test-token-111"), scope()).unwrap();
+        let dest = dir.path().join("x");
+        let attachment = InboundAttachment {
+            name: "x".into(),
+            size: 1,
+            mime: None,
+            reference: AttachmentRef("https://cdn.discordapp.com.evil.test/x".into()),
+        };
+        let err = adapter
+            .fetch_attachment(&attachment, &dest, &Progress::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, files::E_FILE_HOST);
+        assert!(!err.message.contains("evil.test"));
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn default_hints_mention_send_file() {
+        assert!(DEFAULT_HINTS.contains("send_file"));
+        assert!(DEFAULT_HINTS.contains("at most 10 files"));
+    }
+
+    #[test]
+    fn upload_error_classification() {
+        for status in [400, 403, 404, 413] {
+            assert_eq!(
+                upload_error_code(Some(status)),
+                E_ADAPTER_UPLOAD_DENIED,
+                "{status}"
+            );
+        }
+        for status in [Some(429), Some(500), Some(502), None] {
+            assert_eq!(upload_error_code(status), E_ADAPTER_UPLOAD, "{status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_local_file_is_upload_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter =
+            DiscordAdapter::new(&token_file(dir.path(), "test-token-111"), scope()).unwrap();
+        let locked = dir.path().join("locked.txt");
+        std::fs::write(&locked, b"secret").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        for path in [locked.clone(), dir.path().join("missing.txt")] {
+            let err = adapter
+                .send_file("222", &path, "locked.txt")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED, "{path:?}");
+            assert!(!err.message.contains("locked.txt"));
+        }
+    }
+
+    /// One request as the loopback server saw it.
+    struct Seen {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Status(u16, &'static str),
+        DropAfterHead,
+    }
+
+    const MESSAGE_JSON: &str = r#"{"id":"333","channel_id":"222","author":{"id":"111","username":"fake","discriminator":"0","avatar":null},"content":"","timestamp":"2026-01-01T00:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#;
+    const WAIT: Duration = Duration::from_secs(30);
+
+    /// A loopback HTTP server: every request on every connection is sent to the test and
+    /// answered with `reply`.
+    async fn discord_stub(reply: Reply) -> (String, mpsc::UnboundedReceiver<Seen>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            let mut chunk = [0u8; 8192];
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if let Reply::DropAfterHead = reply {
+                            let _ = tx.send(Seen {
+                                head,
+                                body: Vec::new(),
+                            });
+                            return;
+                        }
+                        while buf.len() < head_end + length {
+                            let mut chunk = [0u8; 65536];
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let body = buf[head_end..head_end + length].to_vec();
+                        buf.drain(..head_end + length);
+                        let _ = tx.send(Seen { head, body });
+                        let Reply::Status(status, json) = reply else {
+                            return;
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{json}",
+                            json.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, rx)
+    }
+
+    fn loopback_http(base: &str) -> Http {
+        serenity::all::HttpBuilder::new("test-token-111")
+            .proxy(base)
+            .ratelimiter_disabled(true)
+            .build()
+    }
+
+    fn temp_file(dir: &Path, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    async fn next_request(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
+        tokio::time::timeout(WAIT, rx.recv())
+            .await
+            .expect("request in time")
+            .expect("server running")
+    }
+
+    #[tokio::test]
+    async fn upload_sends_file_once_through_serenity() {
+        let (base, mut rx) = discord_stub(Reply::Status(200, MESSAGE_JSON)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        let path = temp_file(dir.path(), "report.txt", &data);
+        let result = tokio::time::timeout(
+            WAIT,
+            upload_file(&loopback_http(&base), CHANNEL, &path, "report.txt"),
+        )
+        .await
+        .expect("upload in time");
+        assert_eq!(result, Ok("333".to_owned()));
+        let seen = next_request(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "exactly one request");
+        assert!(
+            seen.head
+                .starts_with("POST /api/v10/channels/222/messages "),
+            "{}",
+            seen.head.lines().next().unwrap_or_default()
+        );
+        assert!(
+            seen.head
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bot test-token-111"))
+        );
+        let marker = b"filename=\"report.txt\"";
+        let at = seen
+            .body
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("file part");
+        let start = at
+            + seen.body[at..]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("part head")
+            + 4;
+        assert_eq!(&seen.body[start..start + data.len()], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn upload_size_refusal_is_denied() {
+        let (base, mut rx) = discord_stub(Reply::Status(
+            413,
+            r#"{"code":40005,"message":"Request entity too large"}"#,
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_file(dir.path(), "big.bin", b"abc");
+        let err = tokio::time::timeout(
+            WAIT,
+            upload_file(&loopback_http(&base), CHANNEL, &path, "big.bin"),
+        )
+        .await
+        .expect("upload in time")
+        .unwrap_err();
+        assert_eq!(err.code, E_ADAPTER_UPLOAD_DENIED);
+        next_request(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "exactly one request");
+    }
+
+    #[tokio::test]
+    async fn upload_server_error_is_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_file(dir.path(), "a.txt", b"abc");
+        for reply in [
+            Reply::Status(500, r#"{"code":0,"message":"Internal Server Error"}"#),
+            Reply::DropAfterHead,
+        ] {
+            let (base, mut rx) = discord_stub(reply).await;
+            let err = tokio::time::timeout(
+                WAIT,
+                upload_file(&loopback_http(&base), CHANNEL, &path, "a.txt"),
+            )
+            .await
+            .expect("upload in time")
+            .unwrap_err();
+            assert_eq!(err.code, E_ADAPTER_UPLOAD);
+            next_request(&mut rx).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_never_logs_file_bytes_name_or_token() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        const MARKER: &str = "S3LOGMARK-file-bytes-7q2w";
+        const NAME: &str = "s3-secret-name-5k8.txt";
+        let capture = crate::logging::Capture::default();
+        let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
+            Some("trace"),
+            FmtSpan::NEW | FmtSpan::CLOSE,
+            capture.clone(),
+        ));
+        let (base, mut rx) = discord_stub(Reply::Status(200, MESSAGE_JSON)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let data = MARKER.repeat(200 * 1024 / MARKER.len() + 1).into_bytes();
+        let path = temp_file(dir.path(), NAME, &data);
+        let result = tokio::time::timeout(
+            WAIT,
+            upload_file(&loopback_http(&base), CHANNEL, &path, NAME),
+        )
+        .await
+        .expect("upload in time");
+        assert_eq!(result, Ok("333".to_owned()));
+        next_request(&mut rx).await;
+        tracing::info!(target: "moraebot::discord", "upload-log-probe-8d2");
+        let text = capture.contents();
+        assert!(text.contains("upload-log-probe-8d2"), "capture is wired");
+        for leak in [
+            MARKER,
+            "83, 51, 76, 79, 71, 77, 65, 82",
+            NAME,
+            "test-token-111",
+        ] {
+            assert!(!text.contains(leak), "leaked {leak}");
         }
     }
 
