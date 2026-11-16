@@ -14,6 +14,7 @@ use std::time::Duration;
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, SlackConfig};
 use moraebot::dispatch::{N_LANE_INTERRUPTED, N_UNSUPPORTED_INPUT, notice_text};
+use moraebot::done::{self, E_DONE_UNMET};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lane::E_LANE_INTERRUPTED;
 use moraebot::lead;
@@ -157,6 +158,35 @@ impl LogTap {
             .iter()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|frame| frame["type"] == "prompt")
+            .collect()
+    }
+
+    /// `(is_error, text)` of every `lane_done` answer, in log order: chosen by content,
+    /// since the lead's lane tools answer with JSON.
+    fn lane_tool_results(&self) -> Vec<(bool, String)> {
+        self.seen
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|frame| frame["type"] == "host_tool_result")
+            .map(|frame| {
+                (
+                    frame["isError"] == true,
+                    frame["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .filter(|(_, text)| text.starts_with("accepted:") || text.starts_with("E_"))
+            .collect()
+    }
+
+    /// Pids the check commands logged (`CHECK pid=<pid>`).
+    fn check_pids(&self) -> Vec<u32> {
+        self.seen
+            .iter()
+            .filter_map(|line| line.strip_prefix("CHECK pid="))
+            .map(|pid| pid.trim().parse().expect("check pid"))
             .collect()
     }
 
@@ -346,6 +376,29 @@ fn sends(adapter: &FakeAdapter) -> Vec<(String, String)> {
 
 fn lane_start_script(task: &str, done: &str) -> String {
     json!({"tool": "lane_start", "arguments": {"task": task, "done": done}}).to_string()
+}
+
+/// A check command that appends its own pid to the fake-omp log and keeps that pid as
+/// the group leader until it is killed.
+const CHECK_ARGV: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "echo CHECK pid=$$ >> \"$FAKE_OMP_LOG\"; exec /bin/sleep 600",
+];
+
+/// `n` scripted `lane_done` calls for a lane in mode `tools`.
+fn lane_done_calls(n: usize) -> String {
+    vec![json!({"tool": done::LANE_DONE_TOOL, "arguments": {"evidence": "e"}}).to_string(); n]
+        .join("\n")
+}
+
+/// Whether a log line is a lead prompt frame carrying a lane result tag.
+fn is_lane_result_prompt(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(|frame| frame["type"] == "prompt")
+        .and_then(|frame| frame_tag(&frame))
+        .is_some_and(|tag| tag.lane.is_some())
 }
 
 /// (a) One lead child answers a DM and a thread, each in its own place; a lane the lead
@@ -755,5 +808,181 @@ async fn production_shutdown_with_a_steered_row_marks_the_group_and_reaps_the_le
     let leads = rig.tap.lead_pids();
     assert_eq!(leads.len(), 1);
     assert!(!process_exists(leads[0]), "the lead child is gone");
+    rig.tap.assert_no_child_left();
+}
+
+/// The lead's lanes run in mode `tools` with `calls` scripted `lane_done` calls; the
+/// lead starts one lane from `run-tools` with `task` and `done`.
+fn done_vars(script: &str, calls: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("FAKE_OMP_MODE", "tools".to_owned()),
+        ("FAKE_OMP_TOOL_CALLS", script.to_owned()),
+        ("FAKE_OMP_LANE_MODE", "tools".to_owned()),
+        ("FAKE_OMP_LANE_TOOL_CALLS", calls.to_owned()),
+    ]
+}
+
+fn as_pairs<'a>(vars: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    vars.iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
+}
+
+/// (f) A lane's refused claim keeps it working in the same turn; its accepted claim
+/// reaches the lead as a `done` result answered in the thread the lane started from.
+#[tokio::test]
+async fn refused_then_accepted_claim_reaches_the_lead_in_the_starting_thread() {
+    let mut rig = Rig::discord();
+    let (adapter, dynamic) = fake_adapter();
+    let marker = rig.config.work_dir.join("marker");
+    let marker_text = marker.to_string_lossy().into_owned();
+    let script = lane_start_script("run-lane-tools t1", "file marker");
+    let mut vars = done_vars(&script, &lane_done_calls(2));
+    vars.push(("FAKE_OMP_TOUCH_ON_TOOL_ERROR", marker_text));
+    let running = Running::start(rig.gateway(dynamic, &as_pairs(&vars)));
+
+    adapter
+        .inject(in_thread(THREAD, "1300000000000000001", "run-tools please"))
+        .await;
+    rig.tap.wait_for(is_lane_result_prompt).await;
+    bounded(adapter.wait_for_send(2)).await;
+    running.stop().await;
+
+    let sent = sends(&adapter);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent.iter().all(|(target, _)| target == THREAD), "{sent:?}");
+    rig.tap.drain().await;
+    let tags: Vec<lead::Tag> = rig.tap.prompts().iter().filter_map(frame_tag).collect();
+    let lane_tags: Vec<&lead::Tag> = tags.iter().filter(|tag| tag.lane.is_some()).collect();
+    assert_eq!(lane_tags.len(), 1);
+    assert_eq!(lane_tags[0].lane, Some(1));
+    assert!(lane_tags[0].done);
+    assert_eq!(lane_tags[0].failed, None);
+    assert_eq!(lane_tags[0].conversation, "fake:th:222");
+    assert_eq!(rig.tap.lane_pids().len(), 1, "one lane START");
+    let lane_prompts = rig
+        .tap
+        .prompts()
+        .iter()
+        .filter(|frame| frame_tag(frame).is_none())
+        .count();
+    assert_eq!(
+        lane_prompts, 1,
+        "moraebot sent the lane no prompt of its own"
+    );
+    let results = rig.tap.lane_tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].0, "the first claim was refused");
+    assert!(results[0].1.starts_with(E_DONE_UNMET), "{results:?}");
+    assert!(!results[1].0, "the second claim was accepted");
+    let lane = rig
+        .store()
+        .lane(1)
+        .expect("read lane")
+        .expect("lane exists");
+    assert_eq!(lane.state, LaneState::Idle);
+    assert_eq!(lane.error, None);
+    rig.tap.assert_no_child_left();
+}
+
+/// (g) A lane whose last claim failed reaches the lead as `failed code=E_DONE_UNMET` in
+/// the starting thread; the gateway posts nothing of its own.
+#[tokio::test]
+async fn unmet_lane_result_reaches_the_lead_with_its_code() {
+    let mut rig = Rig::discord();
+    let (adapter, dynamic) = fake_adapter();
+    let script = lane_start_script("run-lane-tools t1", "file marker");
+    let vars = done_vars(&script, &lane_done_calls(1));
+    let running = Running::start(rig.gateway(dynamic, &as_pairs(&vars)));
+
+    adapter
+        .inject(in_thread(THREAD, "1300000000000000001", "run-tools please"))
+        .await;
+    rig.tap.wait_for(is_lane_result_prompt).await;
+    bounded(adapter.wait_for_send(2)).await;
+    running.stop().await;
+
+    let sent = sends(&adapter);
+    assert_eq!(sent.len(), 2, "only the lead's two replies: {sent:?}");
+    assert!(
+        sent.iter()
+            .all(|(target, text)| target == THREAD && text.starts_with("echo: ")),
+        "{sent:?}"
+    );
+    rig.tap.drain().await;
+    let tags: Vec<lead::Tag> = rig.tap.prompts().iter().filter_map(frame_tag).collect();
+    let lane_tags: Vec<&lead::Tag> = tags.iter().filter(|tag| tag.lane.is_some()).collect();
+    assert_eq!(lane_tags.len(), 1);
+    assert_eq!(lane_tags[0].failed.as_deref(), Some(E_DONE_UNMET));
+    assert!(!lane_tags[0].done);
+    assert_eq!(lane_tags[0].conversation, "fake:th:222");
+    let results = rig.tap.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].0);
+    let lane = rig
+        .store()
+        .lane(1)
+        .expect("read lane")
+        .expect("lane exists");
+    assert_eq!(lane.state, LaneState::Failed);
+    assert_eq!(lane.error.as_deref(), Some(E_DONE_UNMET));
+    rig.tap.assert_no_child_left();
+}
+
+/// (h) Stopping the gateway while a lane's check runs kills the check and the lane, writes
+/// no lane result, and the next run posts one `N_LANE_INTERRUPTED` in the lane's thread.
+#[tokio::test]
+async fn shutdown_during_a_check_leaves_no_process_and_the_next_run_posts_one_notice() {
+    let mut rig = Rig::discord();
+    let (adapter, dynamic) = fake_adapter();
+    let check = format!("command {}", serde_json::to_string(&CHECK_ARGV).unwrap());
+    let script = lane_start_script("run-lane-tools long", &check);
+    let vars = done_vars(&script, &lane_done_calls(1));
+    let running = Running::start(rig.gateway(dynamic, &as_pairs(&vars)));
+
+    adapter
+        .inject(in_thread(THREAD, "1300000000000000001", "run-tools please"))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    rig.tap
+        .wait_for(|line| line.starts_with("CHECK pid="))
+        .await;
+    let check_pid = rig.tap.check_pids()[0];
+    running.stop().await;
+
+    assert!(!process_exists(check_pid), "the check {check_pid} is gone");
+    let store = rig.store();
+    let lane = store.lane(1).expect("read lane").expect("lane exists");
+    assert_eq!(lane.state, LaneState::NeedsCheck);
+    assert_eq!(lane.error.as_deref(), Some(E_LANE_INTERRUPTED));
+    assert!(!lane.notice_sent);
+    assert_eq!(store.count().expect("count rows"), 1, "no lane result row");
+    drop(store);
+    rig.tap.drain().await;
+    assert_eq!(rig.tap.lane_pids().len(), 1);
+    assert_eq!(rig.tap.check_pids(), vec![check_pid], "one check ran");
+    rig.tap.assert_no_child_left();
+
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(rig.gateway(dynamic, &[("FAKE_OMP_MODE", "ok")]));
+    bounded(adapter.wait_for_send(1)).await;
+    running.stop().await;
+
+    assert_eq!(
+        sends(&adapter),
+        vec![(
+            THREAD.to_owned(),
+            notice_text(N_LANE_INTERRUPTED).to_owned()
+        )]
+    );
+    let lane = rig
+        .store()
+        .lane(1)
+        .expect("read lane")
+        .expect("lane exists");
+    assert!(lane.notice_sent);
+    rig.tap.drain().await;
+    assert_eq!(rig.tap.lane_pids().len(), 1, "the lane was not restarted");
+    assert_eq!(rig.tap.check_pids(), vec![check_pid], "no check ran again");
     rig.tap.assert_no_child_left();
 }
