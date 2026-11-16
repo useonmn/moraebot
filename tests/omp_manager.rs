@@ -355,6 +355,20 @@ async fn killed_child_is_lost_then_respawned() {
 }
 
 #[tokio::test]
+async fn exit1_is_lost() {
+    let h = Harness::new();
+    let manager = h.manager("exit1");
+    let outcome = bounded(manager.prompt(KEY_A, "hi")).await;
+    assert!(matches!(outcome, Outcome::NeedsCheck { .. }), "{outcome:?}");
+    assert_eq!(outcome.code(), Some(omp::E_CHILD_LOST));
+    assert_eq!(manager.child_pid().await, None);
+    let pids = h.start_pids();
+    assert_eq!(pids.len(), 1);
+    assert!(!alive(pids[0]), "exited child must be gone");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn missing_omp_binary_is_spawn_failure() {
     let mut h = Harness::new();
     h.config.omp_path = h.dir.path().join("no-such-omp");
