@@ -2,7 +2,7 @@
 //! and the dispatcher, and shuts them down in order.
 //!
 //! The adapter is injected, so tests run the whole gateway with `FakeAdapter` while
-//! `moraebot run` passes the Discord adapter.
+//! `moraebot run` passes the configured messenger's adapter.
 //!
 //! Shutdown order: stop taking events from the adapter, let the event being handled
 //! finish its store write, drop the in-flight turn, close and reap the omp child, then
@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinError;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
+use crate::hints;
 use crate::omp::OmpManager;
 use crate::store::{Store, StoreError};
 
@@ -38,6 +39,8 @@ pub enum GatewayError {
     Store(#[from] StoreError),
     #[error("{0}")]
     Adapter(#[from] AdapterError),
+    #[error("{0}")]
+    Config(#[from] ConfigError),
     #[error("{E_GATEWAY_TASK}: dispatcher task failed: {0}")]
     Task(JoinError),
     #[error("{E_GATEWAY_SIGNAL}: cannot listen for signals: {0}")]
@@ -51,6 +54,7 @@ impl GatewayError {
         match self {
             Self::Store(err) => err.code(),
             Self::Adapter(err) => err.code,
+            Self::Config(err) => err.code,
             Self::Task(_) => E_GATEWAY_TASK,
             Self::Signal(_) => E_GATEWAY_SIGNAL,
             Self::ShutdownTimeout => E_SHUTDOWN_TIMEOUT,
@@ -66,11 +70,13 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// Opens the inbox and builds the omp manager. A second gateway on the same home
-    /// fails here with `E_ALREADY_RUNNING`. Nothing is started yet.
+    /// Opens the inbox and builds the omp manager with the adapter's behavior hints (or
+    /// the home's override file, `E_HINTS_FILE` when unusable). A second gateway on the
+    /// same home fails here with `E_ALREADY_RUNNING`. Nothing is started yet.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
+        let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
-        let omp = OmpManager::new(config.clone(), Arc::clone(&store));
+        let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_hints(hints);
         Ok(Self { config: config.clone(), adapter, store, omp })
     }
 

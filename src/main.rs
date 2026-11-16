@@ -15,8 +15,8 @@ use tokio::signal::unix::{signal, SignalKind};
 
 /// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(20);
-/// Extra time for closing the Discord connection after the gateway stopped.
-const DISCORD_SHUTDOWN_BOUND: Duration = Duration::from_secs(4);
+/// Extra time for closing the messenger connection after the gateway stopped.
+const ADAPTER_SHUTDOWN_BOUND: Duration = Duration::from_secs(4);
 
 const USAGE: &str = "\
 Usage: moraebot <command>
@@ -185,9 +185,8 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
 }
 
 async fn serve(config: Config) -> Result<(), GatewayError> {
-    let discord = Arc::new(DiscordAdapter::from_config(&config)?);
-    let adapter: Arc<dyn MessengerAdapter> = discord.clone();
-    let gateway = Gateway::open(&config, adapter)?;
+    let adapter: Arc<dyn MessengerAdapter> = Arc::new(DiscordAdapter::from_config(&config)?);
+    let gateway = Gateway::open(&config, Arc::clone(&adapter))?;
 
     let mut terminate = signal(SignalKind::terminate()).map_err(GatewayError::Signal)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(GatewayError::Signal)?;
@@ -202,8 +201,8 @@ async fn serve(config: Config) -> Result<(), GatewayError> {
         _ = terminate.recv() => stop_gateway(stop, run).await,
         _ = interrupt.recv() => stop_gateway(stop, run).await,
     };
-    if tokio::time::timeout(DISCORD_SHUTDOWN_BOUND, discord.shutdown()).await.is_err() {
-        tracing::warn!("discord shutdown did not finish in time");
+    if tokio::time::timeout(ADAPTER_SHUTDOWN_BOUND, adapter.shutdown()).await.is_err() {
+        tracing::warn!(platform = adapter.platform(), "adapter shutdown did not finish in time");
     }
     result
 }

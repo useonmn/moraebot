@@ -11,7 +11,7 @@ use moraebot::adapter::{
 };
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
-    Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, MESSAGE_LIMIT, N_FAILED, N_INTERRUPTED,
+    Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_INTERRUPTED,
     N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
@@ -20,6 +20,7 @@ use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
+const LIMIT: usize = 2000;
 const OWNER: &str = "111";
 const STRANGER: &str = "222";
 const CHANNEL: &str = "333";
@@ -168,6 +169,14 @@ struct ThreadFailAdapter(Arc<FakeAdapter>);
 impl MessengerAdapter for ThreadFailAdapter {
     fn platform(&self) -> &'static str {
         self.0.platform()
+    }
+
+    fn message_limit(&self) -> usize {
+        self.0.message_limit()
+    }
+
+    fn behavior_hints(&self) -> &'static str {
+        self.0.behavior_hints()
     }
 
     async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
@@ -582,7 +591,7 @@ async fn long_reply_split_into_chunks_all_under_2000() {
     let reply = format!("echo: {text}");
     let chunks: Vec<String> = h.sends().into_iter().map(|(_, text)| text).collect();
     assert!(chunks.len() >= 3);
-    assert!(chunks.iter().all(|c| c.chars().count() <= MESSAGE_LIMIT));
+    assert!(chunks.iter().all(|c| c.chars().count() <= LIMIT));
     assert_eq!(chunks.concat(), reply);
     assert_eq!(h.row(id).state, State::Done);
     h.close().await;
@@ -590,12 +599,12 @@ async fn long_reply_split_into_chunks_all_under_2000() {
 
 #[test]
 fn reply_longer_than_ten_messages_is_cut_with_note() {
-    let text = "x".repeat(MESSAGE_LIMIT * (MAX_REPLY_MESSAGES + 3));
-    let chunks = reply_messages(&text);
+    let text = "x".repeat(LIMIT * (MAX_REPLY_MESSAGES + 3));
+    let chunks = reply_messages(&text, LIMIT);
     assert_eq!(chunks.len(), MAX_REPLY_MESSAGES);
-    assert!(chunks.iter().all(|c| c.chars().count() <= MESSAGE_LIMIT));
+    assert!(chunks.iter().all(|c| c.chars().count() <= LIMIT));
     assert!(chunks.last().unwrap().ends_with(notice_text(N_REPLY_TRUNCATED)));
-    assert_eq!(reply_messages("short"), ["short"]);
+    assert_eq!(reply_messages("short", LIMIT), ["short"]);
 }
 
 #[tokio::test]

@@ -86,6 +86,14 @@ impl MessengerAdapter for FakeAdapter {
         "fake"
     }
 
+    fn message_limit(&self) -> usize {
+        2000
+    }
+
+    fn behavior_hints(&self) -> &'static str {
+        "fake hints"
+    }
+
     async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
         Ok(self
             .inbound_rx

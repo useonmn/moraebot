@@ -115,8 +115,9 @@ pub fn map_turn(turn: PromptTurn) -> Outcome {
     }
 }
 
-/// Exact omp argv (without the program) for one conversation.
-pub fn omp_args(config: &Config, session_dir: &Path) -> Vec<OsString> {
+/// Exact omp argv (without the program) for one conversation. Non-empty `hints` become one
+/// `--append-system-prompt=<hints>` element; message text never goes into argv.
+pub fn omp_args(config: &Config, session_dir: &Path, hints: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
@@ -126,6 +127,9 @@ pub fn omp_args(config: &Config, session_dir: &Path) -> Vec<OsString> {
     args.push(config.work_dir.clone().into());
     args.push("--approval-mode".into());
     args.push("yolo".into());
+    if !hints.is_empty() {
+        args.push(format!("--append-system-prompt={hints}").into());
+    }
     if let Some(usd) = config.omp.max_cost_usd {
         args.push("--max-cost".into());
         args.push(usd.to_string().into());
@@ -150,11 +154,17 @@ pub fn stderr_log_path(config: &Config, key: &str) -> PathBuf {
     config.home.join("logs").join(format!("omp-{}.stderr.log", key_slug(key)))
 }
 
-/// Drops every variable whose name contains `DISCORD`; everything else (PATH,
+/// Messenger names: a variable whose name contains one (any case) never reaches omp.
+const MESSENGER_ENV_WORDS: [&str; 2] = ["DISCORD", "SLACK"];
+
+/// Drops every variable whose name contains a messenger name; everything else (PATH,
 /// HOME, model-provider credentials) is kept so omp can authenticate.
 fn child_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
-    vars.filter(|(name, _)| !name.to_string_lossy().to_ascii_uppercase().contains("DISCORD"))
-        .collect()
+    vars.filter(|(name, _)| {
+        let name = name.to_string_lossy().to_ascii_uppercase();
+        !MESSENGER_ENV_WORDS.iter().any(|word| name.contains(word))
+    })
+    .collect()
 }
 
 struct Started {
@@ -235,6 +245,7 @@ pub struct OmpManager {
     store: Arc<Mutex<Store>>,
     turn_timeout: Duration,
     extra_env: Vec<(OsString, OsString)>,
+    hints: String,
     live: tokio::sync::Mutex<Option<Live>>,
 }
 
@@ -245,7 +256,14 @@ impl OmpManager {
             .omp
             .turn_timeout_minutes
             .map_or(UNLIMITED, |minutes| Duration::from_secs(minutes.saturating_mul(60)));
-        Self { config, store, turn_timeout, extra_env: Vec::new(), live: Default::default() }
+        Self {
+            config,
+            store,
+            turn_timeout,
+            extra_env: Vec::new(),
+            hints: String::new(),
+            live: Default::default(),
+        }
     }
 
     /// Overrides the turn time limit (tests use a short one).
@@ -261,6 +279,12 @@ impl OmpManager {
         V: Into<OsString>,
     {
         self.extra_env.extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Behavior hints for the messenger, appended to omp's system prompt; empty = none.
+    pub fn with_hints(mut self, hints: String) -> Self {
+        self.hints = hints;
         self
     }
 
@@ -384,7 +408,7 @@ impl OmpManager {
 
         let mut command = Command::new(&self.config.omp_path);
         command
-            .args(omp_args(&self.config, session_dir))
+            .args(omp_args(&self.config, session_dir, &self.hints))
             .env_clear()
             .envs(child_env(std::env::vars_os().chain(self.extra_env.iter().cloned())))
             .stderr(Stdio::from(stderr));
@@ -558,8 +582,16 @@ mod tests {
     }
 
     #[test]
-    fn child_env_drops_only_discord_names() {
-        let vars = [("PATH", "p"), ("HOME", "h"), ("MY_DISCORD_X", "1"), ("discord_y", "2"), ("PROVIDER_API_KEY", "k")]
+    fn child_env_drops_only_messenger_names() {
+        let vars = [
+            ("PATH", "p"),
+            ("HOME", "h"),
+            ("MY_DISCORD_X", "1"),
+            ("discord_y", "2"),
+            ("SLACK_X", "3"),
+            ("my_slack_y", "4"),
+            ("PROVIDER_API_KEY", "k"),
+        ]
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let names: Vec<String> =

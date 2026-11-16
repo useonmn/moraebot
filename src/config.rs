@@ -459,6 +459,11 @@ impl Config {
                 result: self.ensure_home_layout(),
                 advisory: false,
             },
+            Check {
+                name: "hints",
+                result: self.check_hints(),
+                advisory: false,
+            },
         ]);
         checks
     }
@@ -533,6 +538,18 @@ impl Config {
             ConfigError::io(E_WORK_DIR, &format!("cannot create {}", path.display()), &e)
         })?;
         Ok(format!("{} (created)", path.display()))
+    }
+
+    /// Validates only the active messenger's override file; the built-in defaults live in
+    /// the adapters.
+    fn check_hints(&self) -> Result<String, ConfigError> {
+        let platform = self.messenger.as_str();
+        let path = crate::hints::override_path(&self.home, platform);
+        if !path.exists() {
+            return Ok("default when absent".to_owned());
+        }
+        crate::hints::load(&self.home, platform, "")?;
+        Ok(format!("override {}", path.display()))
     }
 
     fn check_omp(&self) -> Result<String, ConfigError> {

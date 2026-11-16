@@ -160,6 +160,43 @@ async fn max_cost_adds_flag_only_when_set() {
 }
 
 #[tokio::test]
+async fn flag_present_when_hints_set() {
+    let h = Harness::with_omp(OmpConfig { turn_timeout_minutes: None, max_cost_usd: Some(2.5) });
+    let manager = h.manager("ok").with_hints("probe hints".into());
+    bounded(manager.prompt(KEY_A, "hi")).await;
+    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
+    let mut expected = expected_argv(&h.config, KEY_A);
+    expected.extend(["--append-system-prompt=probe hints", "--max-cost", "2.5"].map(str::to_owned));
+    assert_eq!(start_argv(&start), expected);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn no_flag_when_hints_empty() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_hints(String::new());
+    bounded(manager.prompt(KEY_A, "hi")).await;
+    let start = h.log_lines().into_iter().find(|l| l.starts_with("START pid=")).unwrap();
+    assert!(start_argv(&start).iter().all(|a| !a.starts_with("--append-system-prompt")));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn injection_payload_arrives_byte_for_byte_with_hints_set() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_hints("probe hints".into());
+    let payload = "$(touch /tmp/moraebot-pwned-7f3a); touch /tmp/moraebot-pwned-7f3a-b";
+    let outcome = bounded(manager.prompt(KEY_A, payload)).await;
+    assert_eq!(outcome, Outcome::Reply(format!("echo: {payload}")));
+    let prompts = h.frames("prompt");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["message"], payload);
+    assert!(!Path::new("/tmp/moraebot-pwned-7f3a").exists());
+    assert!(!Path::new("/tmp/moraebot-pwned-7f3a-b").exists());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn multibyte_text_round_trips() {
     let h = Harness::new();
     let manager = h.manager("ok");

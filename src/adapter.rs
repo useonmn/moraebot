@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
 
@@ -70,6 +72,12 @@ impl Drop for TypingHandle {
 pub trait MessengerAdapter: Send + Sync {
     fn platform(&self) -> &'static str;
 
+    /// The longest message, in characters, this messenger accepts in one send.
+    fn message_limit(&self) -> usize;
+
+    /// Built-in formatting hints for omp about this messenger (overridable per home).
+    fn behavior_hints(&self) -> &'static str;
+
     async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError>;
 
     async fn send(&self, channel: &str, text: &str) -> Result<SendResult, AdapterError>;
@@ -88,6 +96,15 @@ pub trait MessengerAdapter: Send + Sync {
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         None
     }
+
+    /// Closes the messenger connection after the gateway stopped.
+    async fn shutdown(&self) {}
+}
+
+/// The next reconnect delay: `current` doubled, capped at `max`. `start` is the floor a
+/// zero delay grows from.
+pub fn next_backoff(current: Duration, start: Duration, max: Duration) -> Duration {
+    (current.max(start) * 2).min(max)
 }
 
 /// Splits `text` into chunks of at most `limit` characters. A cut falls after the last

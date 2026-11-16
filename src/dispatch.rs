@@ -48,8 +48,6 @@ pub const N_REPLY_TRUNCATED: &str = "N_REPLY_TRUNCATED";
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
 
-/// Discord's per-message character limit.
-pub const MESSAGE_LIMIT: usize = 2000;
 /// Longer replies are cut with a note.
 pub const MAX_REPLY_MESSAGES: usize = 10;
 
@@ -75,9 +73,10 @@ pub fn notice_text(code: &str) -> &'static str {
 }
 
 /// The messages to post for a reply: at most [`MAX_REPLY_MESSAGES`] chunks of at most
-/// [`MESSAGE_LIMIT`] characters, never blank; a longer reply ends with the cut note.
-pub fn reply_messages(text: &str) -> Vec<String> {
-    let mut chunks: Vec<String> = split_reply(text, MESSAGE_LIMIT)
+/// `limit` characters (the adapter's limit), never blank; a longer reply ends with the
+/// cut note.
+pub fn reply_messages(text: &str, limit: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = split_reply(text, limit)
         .into_iter()
         .filter(|chunk| !chunk.trim().is_empty())
         .collect();
@@ -86,7 +85,7 @@ pub fn reply_messages(text: &str) -> Vec<String> {
     }
     chunks.truncate(MAX_REPLY_MESSAGES);
     let note = notice_text(N_REPLY_TRUNCATED);
-    let room = MESSAGE_LIMIT - note.chars().count() - 1;
+    let room = limit - note.chars().count() - 1;
     let last = chunks.pop().unwrap_or_default();
     let head: String = last.chars().take(room).collect();
     chunks.push(format!("{head}\n{note}"));
@@ -426,7 +425,7 @@ impl Dispatcher {
             self.store().mark(id, State::Failed, Some(E_DISPATCH_KEY))?;
             return Ok(false);
         };
-        for chunk in reply_messages(reply) {
+        for chunk in reply_messages(reply, self.adapter.message_limit()) {
             if let Err(err) = self.adapter.send(target, &chunk).await {
                 tracing::warn!(row = id, code = err.code, "reply send failed, kept as reply_pending");
                 let mut pending = self.pending.lock().expect("pending lock");

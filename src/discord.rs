@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::adapter::{
     AdapterError, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD, InboundEvent,
-    MessengerAdapter, SendResult, TypingHandle, split_reply,
+    MessengerAdapter, SendResult, TypingHandle, next_backoff, split_reply,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
 
@@ -34,6 +34,8 @@ pub const THREAD_NAME_MIN_CHARS: usize = 2;
 pub const THREAD_NAME_FALLBACK: &str = "moraebot";
 /// Sent instead of an empty reply, which Discord would reject.
 pub const EMPTY_REPLY: &str = "(empty reply)";
+/// Built-in behavior hints for omp; `<home>/hints/discord.md` overrides them.
+pub const DEFAULT_HINTS: &str = "Your replies are posted to Discord. One message holds at most 2000 characters; longer replies are split into several messages. Discord markdown works: **bold**, *italic*, `code`, fenced code blocks, > quotes, - lists. Tables do not render, use lists. Keep answers short.";
 
 pub const E_DISCORD_TOKEN: &str = "E_DISCORD_TOKEN";
 pub const E_DISCORD_ID: &str = "E_DISCORD_ID";
@@ -147,10 +149,6 @@ pub fn intents() -> GatewayIntents {
     GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-}
-
-pub fn next_backoff(current: Duration) -> Duration {
-    (current * 2).min(BACKOFF_MAX)
 }
 
 /// The bot token. Its `Debug` never shows the value.
@@ -303,21 +301,6 @@ impl DiscordAdapter {
         )
     }
 
-    pub async fn shutdown(&self) {
-        self.shutdown.send_replace(true);
-        let (shard_manager, task) = {
-            let mut runtime = self.runtime.lock().expect("runtime lock");
-            (runtime.shard_manager.take(), runtime.task.take())
-        };
-        if let Some(shard_manager) = shard_manager {
-            shard_manager.shutdown_all().await;
-        }
-        if let Some(task) = task
-            && let Err(err) = task.await
-        {
-            tracing::warn!(error = %err, "discord gateway task ended abnormally");
-        }
-    }
 }
 
 /// Keeps a gateway connection up until shutdown. A failed or dropped connection (also a
@@ -363,7 +346,7 @@ async fn gateway_loop(
             () = tokio::time::sleep(delay) => {}
             _ = shutdown.wait_for(|stop| *stop) => return,
         }
-        delay = next_backoff(delay);
+        delay = next_backoff(delay, BACKOFF_START, BACKOFF_MAX);
     }
 }
 
@@ -371,6 +354,14 @@ async fn gateway_loop(
 impl MessengerAdapter for DiscordAdapter {
     fn platform(&self) -> &'static str {
         PLATFORM
+    }
+
+    fn message_limit(&self) -> usize {
+        MESSAGE_LIMIT
+    }
+
+    fn behavior_hints(&self) -> &'static str {
+        DEFAULT_HINTS
     }
 
     async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
@@ -443,6 +434,22 @@ impl MessengerAdapter for DiscordAdapter {
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         Some(self.reconnects.subscribe())
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown.send_replace(true);
+        let (shard_manager, task) = {
+            let mut runtime = self.runtime.lock().expect("runtime lock");
+            (runtime.shard_manager.take(), runtime.task.take())
+        };
+        if let Some(shard_manager) = shard_manager {
+            shard_manager.shutdown_all().await;
+        }
+        if let Some(task) = task
+            && let Err(err) = task.await
+        {
+            tracing::warn!(error = %err, "discord gateway task ended abnormally");
+        }
     }
 }
 
@@ -633,9 +640,10 @@ mod tests {
 
     #[test]
     fn backoff_doubles_and_caps() {
-        assert_eq!(next_backoff(BACKOFF_START), Duration::from_secs(10));
-        assert_eq!(next_backoff(Duration::from_secs(200)), BACKOFF_MAX);
-        assert_eq!(next_backoff(BACKOFF_MAX), BACKOFF_MAX);
+        let next = |delay| next_backoff(delay, BACKOFF_START, BACKOFF_MAX);
+        assert_eq!(next(BACKOFF_START), Duration::from_secs(10));
+        assert_eq!(next(Duration::from_secs(200)), BACKOFF_MAX);
+        assert_eq!(next(BACKOFF_MAX), BACKOFF_MAX);
     }
 
     fn token_file(dir: &Path, content: &str) -> std::path::PathBuf {
