@@ -125,7 +125,19 @@ dinobot은 Discord를 interactions 웹훅으로만 받습니다. 이 방식은 �
 **Slack은 이렇게 붙습니다(slice 2).** `src/slack.rs`가 Socket Mode로 연결합니다. 공개 HTTP 주소가 필요 없습니다. 고정 설정(scope, event)은 `docs/guides/slack.md`에만 적습니다. 알아 둘 점 두 가지입니다.
 
 - Slack 이벤트는 저장소에 들어가기 전에 ack합니다. 그래서 ack와 `admit` 사이에 죽으면 그 메시지는 사라집니다. Discord와 같은 위험입니다.
-- Slack의 `file_share` 메시지는 조용히 버립니다. Discord처럼 `N_UNSUPPORTED_INPUT` 알림을 보내지 않습니다. 이번 단계에서는 받아들인 차이입니다.
+- Slack의 `file_share` 메시지는 slice 3부터 일반 메시지처럼 받습니다. 첨부 파일 정보가 함께 들어오고, 아래 파일 흐름을 탑니다.
+
+**파일 흐름(slice 3).** 받는 쪽과 보내는 쪽이 따로 있습니다. 코드는 `src/files.rs`(메신저와 무관한 부분)와 `src/dispatch.rs`에 있습니다.
+
+- **받기**: 주인 확인 → `admit`(저장 먼저) → 스레드 열기 → `fetch_attachment`로 내려받기 → `<work_dir>/.moraebot-inbox/<대화>/<메시지>/`에 저장 → 프롬프트 앞에 저장 경로 목록(prompt block)을 붙여 omp에 넘깁니다. 파일이 다 저장될 때까지 그 메시지는 대기열(FIFO)에 들어가지 않습니다.
+  - 첨부가 `MAX_FILES`(10)개보다 많으면 저장도 내려받기도 하지 않고 `N_FILE_NOT_RECEIVED`를 보냅니다(`E_FILE_TOO_MANY`).
+  - 내려받기는 `STALL_TIMEOUT`(2분) 동안 데이터가 없을 때만 실패합니다(`E_FILE_FETCH`). 허용되지 않은 호스트는 `E_FILE_HOST`, 메신저가 없다고 하면 `E_FILE_REMOTE`, 디스크 쓰기 실패는 `E_FILE_WRITE`입니다. 하나라도 실패하면 메시지는 `failed`(`E_FILE_INCOMPLETE`)가 되고 `N_FILE_NOT_RECEIVED` 알림이 한 번 갑니다.
+  - 권한이 없어 거절되면 `E_FILE_DENIED`이고 알림은 `N_FILE_NOT_ALLOWED`입니다.
+- **보내기**: omp가 호스트 도구 `send_file`을 부름 → 경로 검사(`E_FILE_PATH`: 작업 폴더 밖, moraebot 홈 안, 일반 파일 아님) → 답과 함께 `out_files`에 저장(`reply_pending`) → 답 텍스트를 보낸 뒤 파일마다 업로드합니다. 파일마다 보냄/건너뜀을 따로 기록해서 다시 보낼 때는 빠진 것만 보냅니다.
+  - 업로드 한 번이 `UPLOAD_TIMEOUT`(30분)을 넘으면 `E_FILE_UPLOAD_TIMEOUT`으로 건너뛰고 다시 시도하지 않습니다. 메신저가 거절하면(`E_ADAPTER_UPLOAD_DENIED`) 역시 건너뜁니다.
+  - 그 밖의 실패(`E_ADAPTER_UPLOAD`)는 재연결 때 다시 시도하며, 재시작을 포함해 파일당 `MAX_UPLOAD_ATTEMPTS`(3)번까지입니다. 업로드 도중 멈추거나 죽은 파일은 두 번 보내지 않도록 건너뜁니다.
+  - 건너뛴 파일이 있으면 답 하나당 `N_FILE_NOT_SENT` 알림을 한 번 보냅니다.
+- **경로 검사의 한계**: 보낼 경로는 도구를 부를 때와 업로드 직전에 두 번 검사하지만, 업로드할 때는 경로로 파일을 다시 엽니다. 그 사이에 파일이 바뀌어 들어갈 수 있습니다. 에이전트가 이미 파일 전체에 접근할 수 있으므로 받아들인 한계이고, 단단한 보안 경계가 아닙니다.
 
 ### 2.2 무엇을 "대화 하나"로 볼까
 

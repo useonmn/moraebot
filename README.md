@@ -4,7 +4,7 @@ moraebot lets you talk to a coding agent on your Mac from a chat app. You send a
 
 ## Status
 
-This is slice 2. It adds Slack next to Discord.
+This is slice 3. It adds files: you can attach files to a message, and omp can send files back.
 
 - Discord or Slack, one at a time. Other messengers come later.
 - macOS only. It runs as a per-user LaunchAgent.
@@ -193,9 +193,13 @@ moraebot gives omp a short built-in note about the messenger it's answering in, 
 - An empty file turns the hints off.
 - Restart moraebot to apply a change.
 
+The built-in hints also tell omp how files work here: where received files are saved and how to send one back. An override file replaces all of that text, so keep those file sentences in your own file if you write one.
+
 ## Logs
 
 Logs live in `~/.moraebot/logs/`. moraebot writes `moraebot.log` files there, plus the stdout and stderr files that launchd captures. Message text is never written to the logs.
+
+Warnings and errors from the libraries moraebot uses (for Discord, Slack and the network) appear in the log only as a short line naming the library (libraries that write through the common `log` interface, such as the network library, are named `log`), without their details, so message text, file names, file links and tokens never reach the log.
 
 ```sh
 ls ~/.moraebot/logs/
@@ -209,6 +213,8 @@ After installing, check these by hand once:
 - [ ] **Real round trip.** Send a short message in the bot's channel. A reply comes back.
 - [ ] **Strangers get nothing.** Send a message from a second Discord account. The bot doesn't reply and doesn't store it.
 - [ ] **Restart notice.** Send something long, then restart moraebot mid-task (`launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway`). After it comes back you get one notice saying the task was interrupted.
+- [ ] **Send a file.** Attach a small file to a message. omp's answer shows it read the file.
+- [ ] **Get a file back.** Ask omp to send you a file from the work folder. It shows up in the same thread, after the reply text.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -219,6 +225,49 @@ If you use Slack, also check these:
 - [ ] **DM.** Send the bot a direct message. A reply comes back in the DM.
 - [ ] **Strangers get nothing.** Post from a second Slack account. The bot doesn't reply and doesn't store it.
 - [ ] **Reconnect (optional).** For a quick test, add `&debug_reconnects=true` to the end of the Socket Mode `wss` URL (for example in a debug build). Slack then drops the connection on purpose, and the logs show moraebot reconnecting within 360 seconds.
+
+## Files
+
+You can attach files to a message, and omp can send files back to you.
+
+**Files you send.** When a message from you has attachments, moraebot first stores the message, then downloads each file into the work folder:
+
+```text
+<work_dir>/.moraebot-inbox/<conversation>/<message>/<file name>
+```
+
+The file name is cleaned up first, so it can't point outside that folder. moraebot then hands omp your text plus a short list of the saved paths. A message with only files and no text works too.
+
+- At most 10 files per message. A message with more gets one notice and isn't run.
+- moraebot sets no size limit. The messenger's own upload limit still applies.
+- Received files are written to disk in small pieces, so a large download doesn't need much memory.
+- While a file downloads, your other incoming messages wait. They wait for as long as the file keeps arriving. A download fails only after 2 minutes with no data at all, so a large, slow file holds later messages until it's done.
+- If any file of a message can't be received (a dropped download, a full disk, a missing permission), the message isn't run and you get one notice. Its folder under `.moraebot-inbox` can be deleted by hand.
+- `.moraebot-inbox` is never cleaned up automatically. Delete old folders yourself when you no longer need them.
+- If the work folder is a git repository, add `.moraebot-inbox/` to its `.gitignore` so received files don't end up in a commit.
+
+**Files omp sends back.** omp has a `send_file` tool. When it calls it with a path, the file is sent to the same thread after the reply text.
+
+- Only files inside the work folder can be sent, and never anything inside the moraebot home. If `work_dir` is set somewhere under the moraebot home, every `send_file` is refused.
+- A file to send is read whole into memory and sent in one go, the way other chat bots do it. Sending it uses extra memory about equal to its size on Slack, and about twice its size on Discord, because the Discord library keeps a second copy while it sends.
+- Later incoming messages also wait while files are sent.
+- One file's upload may take up to 30 minutes. After that it's skipped with one notice and not tried again.
+- Other short failures, such as a dropped connection, are retried at the next reconnect. Each file gets at most 3 attempts in total, restarts included. After that it's skipped with one notice. A file can still arrive after that notice, if a later attempt went through.
+- If a stop or crash (running out of memory included) cut an upload short, that file is skipped with one notice instead of being sent twice.
+- If the messenger refuses a file, for example because it's over the upload limit, the file is skipped with one notice.
+
+**Privacy.** The log never holds file contents, file names or tokens. Detailed logs from other libraries are always off; only their warnings and errors are kept, as described under Logs.
+
+**Missing permission.** If the bot lacks the file permission, every file you send or ask for shows up as a file notice. Do the upgrade steps below to fix it.
+
+## Upgrading from an earlier version
+
+Files need one more permission than earlier versions asked for. If you set up the bot before this version:
+
+- Discord: invite the bot again with the invite link from [docs/guides/discord.md](docs/guides/discord.md), or give its role the Attach Files permission in the channel.
+- Slack: update the app from the manifest in [docs/guides/slack.md](docs/guides/slack.md), then reinstall it to your workspace.
+
+The guides hold the exact settings. Restart moraebot afterwards.
 
 ## Stop and uninstall
 
