@@ -8,7 +8,7 @@ use moraebot::access::DropReason;
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig};
 use moraebot::dispatch::{
-    Dispatcher, Handled, MAX_REPLY_MESSAGES, MESSAGE_LIMIT, N_FAILED, N_INTERRUPTED,
+    Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, MESSAGE_LIMIT, N_FAILED, N_INTERRUPTED,
     N_REPLY_TRUNCATED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
@@ -319,6 +319,46 @@ async fn queued_behind_interrupted_is_held_under_one_notice() {
     assert!(held.notice_sent);
     assert_eq!(h.prompts().len(), 1, "the held message never reaches omp");
     assert_eq!(h.sends(), vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn hold_behind_announced_interruption_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let thread = "1300000000000000055";
+    let other = "1300000000000000056";
+    let (first, other_id, second) = {
+        let h = Harness::open_with(dir.path(), "hang", exit1_wrapper(dir.path()));
+        let first = queued(h.handle(channel_msg(thread, "first")).await);
+        let other_id = queued(h.handle(channel_msg(other, "other")).await);
+        let second =
+            queued(h.handle(event("1300000000000000057", OWNER, Some(thread), "second")).await);
+        assert!(h.step().await);
+        assert_eq!(h.row(first).state, State::NeedsCheck);
+        assert_eq!(h.sends(), vec![(thread.to_owned(), notice_text(N_INTERRUPTED).to_owned())]);
+        // The process stops while the other conversation's turn is in flight.
+        h.store.lock().unwrap().mark(other_id, State::Processing, None).unwrap();
+        h.close().await;
+        (first, other_id, second)
+    };
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    h.drain().await;
+
+    let prompted: Vec<Value> = h.prompts().iter().map(|p| p["message"].clone()).collect();
+    assert_eq!(prompted, ["first"], "the held message never reaches omp");
+    let held = h.row(second);
+    assert_eq!(held.state, State::NeedsCheck);
+    assert_eq!(held.error.as_deref(), Some(E_DISPATCH_HELD));
+    assert!(held.notice_sent);
+    assert!(h.row(first).notice_sent);
+    assert_eq!(h.row(other_id).state, State::NeedsCheck);
+    assert_eq!(
+        h.sends(),
+        vec![(other.to_owned(), notice_text(N_INTERRUPTED).to_owned())],
+        "no second notice for the already announced thread"
+    );
     h.close().await;
 }
 

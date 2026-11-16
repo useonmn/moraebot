@@ -9,9 +9,10 @@
 //! (`reply_pending`) before it is sent and the row becomes `done` only after every chunk
 //! was accepted; a failed send is retried after the adapter reconnects and at startup.
 //! Interrupted work (`needs_check`) is never re-prompted; its conversation gets one
-//! notice, also across restarts (`notice_sent`), and its older queued rows are held.
+//! notice, also across restarts (`notice_sent`), and its older queued rows are held: they
+//! are marked `needs_check` / [`E_DISPATCH_HELD`] in the same store transaction as the
+//! interruption, so the hold survives a restart.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -20,6 +21,7 @@ use crate::access::{self, Decision, DropReason, E_ACCESS_NOT_OWNER};
 use crate::adapter::{ConversationKey, InboundEvent, MessengerAdapter, split_reply};
 use crate::config::Config;
 use crate::omp::{E_COST_CAP, OmpManager, Outcome};
+pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, State, Store, StoreError};
 
 /// Empty, attachment-only or `/` message: not forwarded to omp.
@@ -39,8 +41,6 @@ pub const N_REPLY_TRUNCATED: &str = "N_REPLY_TRUNCATED";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
-/// Stored row error: held behind an interrupted message of the same conversation.
-pub const E_DISPATCH_HELD: &str = "E_DISPATCH_HELD";
 
 /// Discord's per-message character limit.
 pub const MESSAGE_LIMIT: usize = 2000;
@@ -126,9 +126,6 @@ pub struct Dispatcher {
     /// Held while a row is admitted and its thread opened, and while the worker dequeues,
     /// so the worker never picks a row whose thread does not exist yet.
     admission: tokio::sync::Mutex<()>,
-    /// Conversations interrupted in this process -> id of the first row admitted after
-    /// the interruption (`None`: none yet). Queued rows before it are held.
-    held: Mutex<HashMap<String, Option<i64>>>,
     /// Rows whose reply send failed in this process; re-sent by [`Self::resend_pending`].
     pending: Mutex<Vec<i64>>,
     wake: Notify,
@@ -148,7 +145,6 @@ impl Dispatcher {
             store,
             omp,
             admission: tokio::sync::Mutex::new(()),
-            held: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
         }
@@ -158,19 +154,12 @@ impl Dispatcher {
         self.store.lock().expect("store mutex poisoned")
     }
 
-    /// Startup recovery: interrupted rows become `needs_check` (never re-prompted), each
-    /// conversation with an unannounced one gets one notice and its queued rows are held
-    /// under that notice, stored replies are re-sent. A row cut off by a crash and one
+    /// Startup recovery: interrupted rows become `needs_check` (never re-prompted) and the
+    /// queued rows of their conversations are held, each conversation with unannounced
+    /// rows gets one notice, stored replies are re-sent. A row cut off by a crash and one
     /// marked by a graceful shutdown are treated the same.
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
-        let unannounced = self.store().needs_check_notices()?;
-        {
-            let mut held = self.held.lock().expect("held lock");
-            for row in &unannounced {
-                held.insert(row.conversation_key.clone(), None);
-            }
-        }
         self.post_needs_check_notices().await?;
         for row in recovered.reply_pending {
             self.send_reply(row.id, &row.conversation_key, row.reply.as_deref().unwrap_or_default())
@@ -284,15 +273,6 @@ impl Dispatcher {
             }
             Admitted::New(id) => id,
         };
-        if let Some(first_new) = self
-            .held
-            .lock()
-            .expect("held lock")
-            .get_mut(key.as_str())
-            .filter(|first_new| first_new.is_none())
-        {
-            *first_new = Some(id);
-        }
 
         if new_thread {
             match self
@@ -334,13 +314,6 @@ impl Dispatcher {
             self.store().mark(row.id, State::Failed, Some(E_DISPATCH_KEY))?;
             return Ok(true);
         };
-        if self.is_held(key, row.id) {
-            // Covered by the conversation's interrupted notice.
-            let store = self.store();
-            store.mark(row.id, State::NeedsCheck, Some(E_DISPATCH_HELD))?;
-            store.mark_notice_sent(row.id)?;
-            return Ok(true);
-        }
 
         self.store().mark(row.id, State::Processing, None)?;
         let typing = match self.adapter.start_typing(target).await {
@@ -371,23 +344,11 @@ impl Dispatcher {
             }
             Outcome::NeedsCheck { code, .. } => {
                 tracing::warn!(row = row.id, code, "turn interrupted");
-                self.store().mark(row.id, State::NeedsCheck, Some(code))?;
-                self.held
-                    .lock()
-                    .expect("held lock")
-                    .insert(key.to_owned(), None);
+                self.store().mark_interrupted(row.id, code)?;
                 self.post_needs_check_notices().await?;
             }
         }
         Ok(true)
-    }
-
-    fn is_held(&self, key: &str, id: i64) -> bool {
-        self.held
-            .lock()
-            .expect("held lock")
-            .get(key)
-            .is_some_and(|first_new| first_new.is_none_or(|first_new| id < first_new))
     }
 
     /// Re-sends replies whose earlier send failed (call after a reconnect).

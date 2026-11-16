@@ -16,6 +16,8 @@ pub const E_ALREADY_RUNNING: &str = "E_ALREADY_RUNNING";
 pub const E_STORE_WAL: &str = "E_STORE_WAL";
 pub const E_STORE_INVALID: &str = "E_STORE_INVALID";
 pub const E_STORE: &str = "E_STORE";
+/// Stored row error: held behind an interrupted message of the same conversation.
+pub const E_DISPATCH_HELD: &str = "E_DISPATCH_HELD";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -151,6 +153,15 @@ CREATE TABLE IF NOT EXISTS known_threads(
 ";
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+/// Holds the queued rows of the conversations selected by the appended subquery: they
+/// become `needs_check` / [`E_DISPATCH_HELD`] with their notice still to be posted.
+fn hold_queued_sql(conversations: &str) -> String {
+    format!(
+        "UPDATE inbox SET state = 'needs_check', error = '{E_DISPATCH_HELD}', updated_at = {NOW}
+         WHERE state = 'queued' AND conversation_key IN ({conversations})"
+    )
+}
 const COLS: &str =
     "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error";
 
@@ -299,6 +310,27 @@ impl Store {
         Ok(())
     }
 
+    /// Marks an interrupted row `needs_check` with `code` and, in the same transaction,
+    /// holds every queued row of its conversation, so the hold survives a restart.
+    pub fn mark_interrupted(&mut self, id: i64, code: &str) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            &format!("UPDATE inbox SET state = 'needs_check', error = ?2, updated_at = {NOW} WHERE id = ?1"),
+            params![id, code],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Invalid("no such inbox row"));
+        }
+        tx.execute(
+            &hold_queued_sql("SELECT conversation_key FROM inbox WHERE id = ?1"),
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn mark_done(&self, id: i64) -> Result<(), StoreError> {
         self.mark(id, State::Done, None)
     }
@@ -314,7 +346,8 @@ impl Store {
         Ok(())
     }
 
-    /// Startup recovery: `processing` becomes `needs_check` (never re-queued);
+    /// Startup recovery: `processing` becomes `needs_check` (never re-queued) and the
+    /// queued rows of its conversation are held, both in one transaction;
     /// `reply_pending` rows stay as they are and are returned for re-sending.
     pub fn recover_on_start(&mut self) -> Result<Recovered, StoreError> {
         let tx = self
@@ -326,6 +359,10 @@ impl Store {
             stmt.query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
+        tx.execute(
+            &hold_queued_sql("SELECT conversation_key FROM inbox WHERE state = 'processing'"),
+            [],
+        )?;
         tx.execute(
             &format!(
                 "UPDATE inbox SET state = 'needs_check', error = 'interrupted', updated_at = {NOW}
@@ -512,6 +549,36 @@ mod tests {
     fn journal_mode_is_wal() {
         let (_d, _p, s) = open_tmp();
         assert_eq!(s.journal_mode().unwrap(), "wal");
+    }
+
+    #[test]
+    fn interruption_holds_queued_rows_of_its_conversation_only() {
+        let (_d, path, mut s) = open_tmp();
+        let a = new_id(admit(&mut s, "m1", "k1"));
+        let b = new_id(admit(&mut s, "m2", "k1"));
+        let c = new_id(admit(&mut s, "m3", "k2"));
+        let d = new_id(admit(&mut s, "m4", "k2"));
+        let e = new_id(admit(&mut s, "m5", "k3"));
+        s.mark(a, State::Processing, None).unwrap();
+        s.mark_interrupted(a, "E_TEST").unwrap();
+        s.mark(c, State::Processing, None).unwrap();
+        drop(s);
+
+        let mut s = Store::open(&path).unwrap();
+        s.recover_on_start().unwrap();
+        for (id, error) in [
+            (a, "E_TEST"),
+            (b, E_DISPATCH_HELD),
+            (c, "interrupted"),
+            (d, E_DISPATCH_HELD),
+        ] {
+            let row = s.get(id).unwrap().unwrap();
+            assert_eq!(row.state, State::NeedsCheck);
+            assert_eq!(row.error.as_deref(), Some(error));
+            assert!(!row.notice_sent);
+        }
+        assert_eq!(s.next_queued().unwrap().unwrap().id, e);
+        assert_eq!(s.needs_check_notices().unwrap().len(), 4);
     }
 
     #[test]
