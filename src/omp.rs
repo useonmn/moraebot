@@ -316,6 +316,12 @@ fn child_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString,
     .collect()
 }
 
+/// The environment of an omp child or a Done check command: the process environment plus
+/// `extra_env`, filtered by `child_env`.
+pub(crate) fn check_env(extra_env: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+    child_env(std::env::vars_os().chain(extra_env.iter().cloned()))
+}
+
 /// Creates `path` and its parents, readable by the owner only.
 pub(crate) fn private_dir(path: &Path) -> std::io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
@@ -342,9 +348,7 @@ pub(crate) fn child_command(
     command
         .args(args)
         .env_clear()
-        .envs(child_env(
-            std::env::vars_os().chain(extra_env.iter().cloned()),
-        ))
+        .envs(check_env(extra_env))
         .stderr(Stdio::from(stderr));
     Ok(command)
 }
@@ -356,7 +360,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// SIGKILLs the child's process group (the RPC client starts the child as its own
 /// group leader). Best effort: the group may already be gone.
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     let _ = Command::new(KILL_BIN)
         .args(["-s", "KILL", "--"])
         .arg(format!("-{pid}"))
@@ -1164,6 +1168,20 @@ mod tests {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PATH", "HOME", "PROVIDER_API_KEY"]);
+    }
+
+    #[test]
+    fn check_env_drops_messenger_names() {
+        let names: Vec<String> =
+            check_env(&[("SLACK_X".into(), "1".into()), ("OTHER".into(), "1".into())])
+                .into_iter()
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect();
+        assert!(names.iter().any(|name| name == "OTHER"));
+        assert!(!names.iter().any(|name| {
+            let name = name.to_ascii_uppercase();
+            name.contains("SLACK") || name.contains("DISCORD")
+        }));
     }
 
     #[test]
