@@ -648,12 +648,6 @@ impl Store {
         update_out_file(&self.conn, id, index, "$e || '.attempting', json('false')")
     }
 
-    /// Marks an interrupted row `needs_check` with `code` and holds every queued owner row
-    /// of its conversation (see [`Store::interrupt_group`]).
-    pub fn mark_interrupted(&mut self, id: i64, code: &str) -> Result<(), StoreError> {
-        self.interrupt_group(&[id], code)
-    }
-
     /// Marks every row of an interrupted group `needs_check` with `code` and, in the same
     /// transaction, holds the queued owner rows of their conversations, so the hold survives
     /// a restart.
@@ -1201,7 +1195,7 @@ mod tests {
         let d = new_id(admit(&mut s, "m4", "k2"));
         let e = new_id(admit(&mut s, "m5", "k3"));
         s.mark(a, State::Processing, None).unwrap();
-        s.mark_interrupted(a, "E_TEST").unwrap();
+        s.interrupt_group(&[a], "E_TEST").unwrap();
         s.mark(c, State::Processing, None).unwrap();
         drop(s);
 
@@ -1524,7 +1518,7 @@ mod tests {
         let a = new_id(admit(&mut s, "m1", "k1"));
         let b = admit_files(&mut s, "m2", "k1");
         s.mark(a, State::Processing, None).unwrap();
-        s.mark_interrupted(a, "E_TEST").unwrap();
+        s.interrupt_group(&[a], "E_TEST").unwrap();
         assert!(!s.files_failed(b, crate::files::E_FILE_FETCH).unwrap());
         let row = s.get(b).unwrap().unwrap();
         assert_eq!(row.state, State::NeedsCheck);
@@ -1537,7 +1531,7 @@ mod tests {
         let a = new_id(admit(&mut s, "m1", "k1"));
         let b = admit_files(&mut s, "m2", "k1");
         s.mark(a, State::Processing, None).unwrap();
-        s.mark_interrupted(a, "E_TEST").unwrap();
+        s.interrupt_group(&[a], "E_TEST").unwrap();
         let before = s.get(b).unwrap().unwrap();
         assert!(!s.files_saved(b, "[]").unwrap());
         assert_eq!(s.get(b).unwrap().unwrap(), before);

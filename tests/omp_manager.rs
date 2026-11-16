@@ -1035,6 +1035,25 @@ async fn shutdown_all_does_not_wait_for_the_running_turn() {
     assert!(!alive(h.start_pids()[0]));
 }
 
+/// The dispatcher drops the running `prompt` at shutdown. `shutdown_all` must then still
+/// join the lead worker promptly, not after the `ABORT_JOIN_BOUND` fallback.
+#[tokio::test]
+async fn shutdown_all_after_a_cancelled_turn_joins_the_lead_promptly() {
+    let h = Harness::new();
+    let manager = h.steer_manager("hold");
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    turn.abort();
+    assert!(bounded(turn).await.expect_err("aborted").is_cancelled());
+
+    tokio::time::timeout(omp::ABORT_JOIN_BOUND / 10, manager.shutdown_all())
+        .await
+        .expect("shutdown_all joins the lead worker well before ABORT_JOIN_BOUND");
+    assert_eq!(manager.child_pid().await, None);
+    assert!(!alive(h.start_pids()[0]));
+}
+
 #[tokio::test]
 async fn second_steer_in_one_turn_is_refused() {
     let h = Harness::new();

@@ -524,6 +524,17 @@ struct OpenTurn {
 
 type SteerGate = Arc<Mutex<Option<OpenTurn>>>;
 
+/// Closes the steer gate when dropped. A `prompt` cancelled mid-turn (the dispatcher drops
+/// it at shutdown) would otherwise leave the gate holding a clone of the lead's request
+/// sender, so the lead worker never sees its channel close and cannot be joined.
+struct GateClose<'a>(&'a SteerGate);
+
+impl Drop for GateClose<'_> {
+    fn drop(&mut self) {
+        lock(self.0).take();
+    }
+}
+
 /// Opens the steer gate on the first `agent_start` of the open turn.
 fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, event: &Event) {
     if !matches!(
@@ -725,6 +736,7 @@ impl OmpManager {
             behavior: StreamingBehavior::FollowUp,
             done,
         };
+        let _gate_close = GateClose(&self.gate);
         let sent = {
             let mut gate = lock(&self.gate);
             *gate = Some(OpenTurn {
