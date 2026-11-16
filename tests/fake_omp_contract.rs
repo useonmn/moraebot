@@ -1,12 +1,14 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use omp_rpc::{
-    Client, ClientOptions, Error, GetSessionLeaseCommand, HostTool, HostToolError,
-    OpenSessionCommand, PromptCommand, PromptStatus, DEFAULT_PROMPT_TIMEOUT,
+    Client, ClientOptions, Error, Event, GetSessionLeaseCommand, HostTool, HostToolError,
+    OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent, RpcNotification,
+    StreamingBehavior, DEFAULT_PROMPT_TIMEOUT,
 };
 use serde_json::{json, Map, Value};
 
@@ -317,4 +319,383 @@ fn log_records_startup_argv_env_names_and_received_frames() {
     assert!(names.contains(&"FAKE_OMP_MODE"));
     assert!(!env.contains('='));
     assert!(lines.iter().any(|line| line.contains(r#""type":"prompt""#)));
+}
+
+/// Spawns fake-omp with extra arguments and environment and keeps the event
+/// receiver.
+fn spawn_env(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    tools: Vec<HostTool>,
+) -> (Client, mpsc::Receiver<Event>) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fake-omp"));
+    command.args(["--mode", "rpc", "--no-ui"]).args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let options = ClientOptions {
+        tools,
+        ..ClientOptions::default()
+    };
+    Client::spawn(command, options).expect("spawn fake-omp")
+}
+
+#[derive(Debug, PartialEq)]
+struct RecordedCall {
+    tool: String,
+    arguments: Value,
+    tool_call_id: String,
+}
+
+/// Host tools named `names` that report every call, in call order, on the
+/// returned channel.
+fn recording_tools(names: &[&str]) -> (Vec<HostTool>, mpsc::Receiver<RecordedCall>) {
+    let (tx, rx) = mpsc::channel();
+    let tx = Arc::new(Mutex::new(tx));
+    let parameters: Map<String, Value> =
+        serde_json::from_value(json!({"type": "object"})).expect("schema object");
+    let tools = names
+        .iter()
+        .map(|name| {
+            let tx = Arc::clone(&tx);
+            let tool = (*name).to_owned();
+            HostTool::new(
+                *name,
+                "Records the call.",
+                parameters.clone(),
+                move |arguments, context| {
+                    tx.lock()
+                        .expect("sender lock")
+                        .send(RecordedCall {
+                            tool: tool.clone(),
+                            arguments: Value::Object(arguments),
+                            tool_call_id: context.tool_call_id().to_owned(),
+                        })
+                        .expect("report call");
+                    Ok("done".to_owned().into())
+                },
+            )
+        })
+        .collect();
+    (tools, rx)
+}
+
+/// Waits for the first event `matches` accepts, bounded by `WAIT` overall.
+fn wait_event(events: &mpsc::Receiver<Event>, matches: impl Fn(&Event) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = events.recv_timeout(left).expect("expected event arrived");
+        if matches(&event) {
+            return;
+        }
+    }
+}
+
+fn is_agent_start(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
+    )
+}
+
+fn is_held(command: &'static str) -> impl Fn(&Event) -> bool {
+    move |event| match event {
+        Event::Notification(RpcNotification::Unknown(raw)) => {
+            raw["type"] == "fake_held" && raw["command"] == command
+        }
+        _ => false,
+    }
+}
+
+fn steer(message: &str) -> PromptCommand {
+    PromptCommand {
+        message: message.to_owned(),
+        images: None,
+        streaming_behavior: Some(StreamingBehavior::Steer),
+    }
+}
+
+type Outcome = (&'static str, Result<PromptTurn, Error>);
+
+/// Runs `command` on its own thread and reports its result, labelled, on `tx`.
+fn prompt_on_thread(
+    client: &Arc<Client>,
+    label: &'static str,
+    command: PromptCommand,
+    tx: &mpsc::Sender<Outcome>,
+) {
+    let client = Arc::clone(client);
+    let tx = tx.clone();
+    thread::spawn(move || {
+        let result = client.prompt_and_wait(&command, DEFAULT_PROMPT_TIMEOUT);
+        let _ = tx.send((label, result));
+    });
+}
+
+/// Collects one result per label from `rx`, each bounded by `WAIT`.
+fn collect(rx: &mpsc::Receiver<Outcome>, count: usize) -> Vec<Outcome> {
+    let mut results: Vec<Outcome> = (0..count)
+        .map(|_| rx.recv_timeout(WAIT).expect("prompt finished within bound"))
+        .collect();
+    results.sort_by_key(|(label, _)| *label);
+    results
+}
+
+fn kill_group(pid: u32) {
+    let group = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    // SAFETY: killpg only sends a signal to the fake's own process group.
+    let sent = unsafe { libc::killpg(group, libc::SIGKILL) };
+    assert_eq!(sent, 0, "process group killed");
+}
+
+fn assistant_text(outcome: &Outcome) -> &str {
+    let turn = outcome.1.as_ref().expect("prompt completed");
+    assert!(matches!(
+        turn.result.as_ref().expect("prompt result").status,
+        PromptStatus::Completed
+    ));
+    turn.assistant_text.as_deref().expect("assistant text")
+}
+
+fn steer_run(case: &str) -> Vec<Outcome> {
+    let (client, events) = spawn_env(
+        &[],
+        &[("FAKE_OMP_MODE", "steer"), ("FAKE_OMP_STEER_CASE", case)],
+        Vec::new(),
+    );
+    let client = Arc::new(client);
+    let (tx, rx) = mpsc::channel();
+    prompt_on_thread(&client, "1-main", prompt("m1"), &tx);
+    wait_event(&events, is_agent_start);
+    prompt_on_thread(&client, "2-steer", steer("m2"), &tx);
+    collect(&rx, 2)
+}
+
+#[test]
+fn lane_session_dir_selects_lane_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let modes = [("FAKE_OMP_MODE", "hang"), ("FAKE_OMP_LANE_MODE", "ok")];
+
+    let lane_dir = dir.path().join("lanes/1/session");
+    let lane_dir = lane_dir.to_str().expect("utf-8 path");
+    let (lane, _events) = spawn_env(&["--session-dir", lane_dir], &modes, Vec::new());
+    let turn = lane
+        .prompt_and_wait(&prompt("task"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("lane prompt");
+    assert_eq!(turn.assistant_text.as_deref(), Some("echo: task"));
+
+    let lead_dir = dir.path().join("lead/session");
+    let lead_dir = lead_dir.to_str().expect("utf-8 path");
+    let (lead, _events) = spawn_env(&["--session-dir", lead_dir], &modes, Vec::new());
+    // The lead runs `hang`, which never answers: the 2 s limit is the behavior
+    // under test.
+    match lead.prompt_and_wait(&prompt("task"), Duration::from_secs(2)) {
+        Err(Error::Timeout { command }) => assert_eq!(command, "prompt"),
+        other => panic!("expected the lead to hang, got {other:?}"),
+    }
+}
+
+#[test]
+fn tools_mode_calls_each_tool_after_previous_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("fake-omp.log");
+    let log_value = log.to_str().expect("utf-8 path");
+    let script = concat!(
+        r#"{"tool":"lane_start","arguments":{"task":"build it"}}"#,
+        "\n",
+        r#"{"tool":"lane_status","arguments":{"lane_id":1}}"#,
+    );
+    let (tools, calls) = recording_tools(&["lane_start", "lane_status"]);
+    let (client, _events) = spawn_env(
+        &[],
+        &[
+            ("FAKE_OMP_MODE", "tools"),
+            ("FAKE_OMP_TOOL_CALLS", script),
+            ("FAKE_OMP_LOG", log_value),
+        ],
+        tools,
+    );
+    let turn = client
+        .prompt_and_wait(&prompt("run-tools x"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("prompt");
+    assert_eq!(turn.assistant_text.as_deref(), Some("echo: run-tools x"));
+
+    let first = calls.recv_timeout(WAIT).expect("first call");
+    let second = calls.recv_timeout(WAIT).expect("second call");
+    assert!(calls.try_recv().is_err(), "exactly two calls");
+    assert_eq!(first.tool, "lane_start");
+    assert_eq!(first.arguments, json!({"task": "build it"}));
+    assert_eq!(second.tool, "lane_status");
+    assert_eq!(second.arguments, json!({"lane_id": 1}));
+
+    let order: Vec<String> = log_frames(&log)
+        .iter()
+        .filter_map(|line| {
+            if let Some(call) = line.strip_prefix("CALL ") {
+                return Some(format!("call {call}"));
+            }
+            let frame = serde_json::from_str::<Value>(line).ok()?;
+            (frame["type"] == "host_tool_result")
+                .then(|| format!("result {}", frame["id"].as_str().unwrap_or_default()))
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "call host_1",
+            "result host_1",
+            "call host_2",
+            "result host_2"
+        ]
+    );
+}
+
+#[test]
+fn tools_mode_without_trigger_answers_plain() {
+    let script = r#"{"tool":"lane_start","arguments":{"task":"build it"}}"#;
+    let (tools, calls) = recording_tools(&["lane_start", "lane_status"]);
+    let (client, _events) = spawn_env(
+        &[],
+        &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", script)],
+        tools,
+    );
+    let turn = client
+        .prompt_and_wait(&prompt("lane done"), DEFAULT_PROMPT_TIMEOUT)
+        .expect("prompt");
+    assert_eq!(turn.assistant_text.as_deref(), Some("echo: lane done"));
+    // The fake writes every call before its final reply, so an empty channel
+    // after the reply is conclusive.
+    assert!(
+        calls.try_recv().is_err(),
+        "no tool call without the trigger"
+    );
+}
+
+#[test]
+fn steer_hold_keeps_both_prompts_open() {
+    let (client, events) = spawn_env(
+        &[],
+        &[("FAKE_OMP_MODE", "steer"), ("FAKE_OMP_STEER_CASE", "hold")],
+        Vec::new(),
+    );
+    let pid = client.pid().expect("child pid");
+    let client = Arc::new(client);
+    let (tx, rx) = mpsc::channel();
+    prompt_on_thread(&client, "1-main", prompt("m1"), &tx);
+    wait_event(&events, is_agent_start);
+    prompt_on_thread(&client, "2-steer", steer("m2"), &tx);
+    wait_event(&events, is_held("prompt"));
+    assert!(rx.try_recv().is_err(), "both prompts still open");
+
+    kill_group(pid);
+    for (label, result) in collect(&rx, 2) {
+        assert!(
+            matches!(result, Err(Error::Closed)),
+            "{label} ended by the kill, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn lane_hold_open_never_answers_open_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lane_dir = dir.path().join("lanes/1/session");
+    let lane_dir = lane_dir.to_str().expect("utf-8 path");
+    let (client, events) = spawn_env(
+        &["--session-dir", lane_dir],
+        &[("FAKE_OMP_LANE_MODE", "hold_open")],
+        Vec::new(),
+    );
+    let pid = client.pid().expect("child pid");
+    let lease = client
+        .call(&GetSessionLeaseCommand {
+            session_ids: vec!["111".to_owned()],
+        })
+        .expect("get_session_lease is answered");
+    assert!(lease.held.is_empty());
+
+    let client = Arc::new(client);
+    let (tx, rx) = mpsc::channel();
+    let opener = Arc::clone(&client);
+    thread::spawn(move || {
+        let _ = tx.send(opener.call(&open_session_command()));
+    });
+    wait_event(&events, is_held("open_session"));
+    assert!(rx.try_recv().is_err(), "open_session still open");
+
+    kill_group(pid);
+    let result = rx.recv_timeout(WAIT).expect("open_session finished");
+    assert!(
+        matches!(result, Err(Error::Closed)),
+        "open_session ended by the kill, got {result:?}"
+    );
+}
+
+#[test]
+fn steer_merged_reports_both_on_one_run() {
+    let results = steer_run("merged");
+    assert_eq!(assistant_text(&results[0]), "echo: m1 + m2");
+    assert_eq!(assistant_text(&results[1]), "echo: m1 + m2");
+}
+
+#[test]
+fn steer_separate_reports_two_runs() {
+    let results = steer_run("separate");
+    assert_eq!(assistant_text(&results[0]), "echo: m1");
+    assert_eq!(assistant_text(&results[1]), "echo: m2");
+}
+
+#[test]
+fn tools_mode_uses_script_id_as_tool_call_id() {
+    let script = concat!(
+        r#"{"tool":"t","arguments":{},"id":"dup"}"#,
+        "\n",
+        r#"{"tool":"t","arguments":{},"id":"dup"}"#,
+        "\n",
+        r#"{"tool":"t","arguments":{}}"#,
+    );
+    let (tools, calls) = recording_tools(&["t"]);
+    let (client, _events) = spawn_env(
+        &[],
+        &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", script)],
+        tools,
+    );
+    let mut ids = Vec::new();
+    for text in ["run-tools x", "run-tools y"] {
+        client
+            .prompt_and_wait(&prompt(text), DEFAULT_PROMPT_TIMEOUT)
+            .expect("prompt");
+        let turn: Vec<String> = (0..3)
+            .map(|_| calls.recv_timeout(WAIT).expect("tool call").tool_call_id)
+            .collect();
+        assert_eq!(turn[..2], ["dup", "dup"]);
+        assert!(turn[2].starts_with("toolu_"), "default id: {}", turn[2]);
+        ids.push(turn[2].clone());
+    }
+    assert_ne!(ids[0], ids[1], "default ids never repeat");
+}
+
+#[test]
+fn envelope_line_is_not_echoed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("fake-omp.log");
+    let client = spawn_fake("ok", Some(&log));
+    let envelope = "[moraebot conversation=discord:th:111 message=7]\nhello";
+    for (message, reply) in [
+        (envelope, "echo: hello"),
+        ("[note]\nhello", "echo: [note]\nhello"),
+        ("hello", "echo: hello"),
+    ] {
+        let turn = client
+            .prompt_and_wait(&prompt(message), DEFAULT_PROMPT_TIMEOUT)
+            .expect("prompt");
+        assert_eq!(turn.assistant_text.as_deref(), Some(reply));
+    }
+    let first = log_frames(&log)
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|frame| frame["type"] == "prompt")
+        .expect("logged prompt frame");
+    assert_eq!(first["message"], envelope);
 }
