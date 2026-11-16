@@ -28,10 +28,11 @@ use omp_rpc::{
     RpcNotification, StreamingBehavior, ToolLoadMode,
 };
 use serde_json::{Map, Value};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::config::Config;
 use crate::files;
+use crate::lane::LaneManager;
 use crate::lead;
 use crate::store::Store;
 
@@ -349,7 +350,7 @@ pub(crate) fn child_command(
 }
 
 /// Locks a std mutex, taking the data even when a holder panicked.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -369,6 +370,11 @@ fn kill_group(pid: u32) {
 pub(crate) struct GroupKill(Option<u32>);
 
 impl GroupKill {
+    /// The group leader's pid while armed.
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.0
+    }
+
     /// Kills the group now; stays armed until the child is reaped.
     pub(crate) fn kill(&self) {
         if let Some(pid) = self.0 {
@@ -585,6 +591,7 @@ pub struct OmpManager {
     gate: SteerGate,
     running: Arc<watch::Sender<Option<String>>>,
     turn: Arc<Mutex<Option<TurnContext>>>,
+    lanes: Arc<LaneManager>,
 }
 
 impl OmpManager {
@@ -596,6 +603,13 @@ impl OmpManager {
             .map_or(UNLIMITED, |minutes| {
                 Duration::from_secs(minutes.saturating_mul(60))
             });
+        let turn: Arc<Mutex<Option<TurnContext>>> = Default::default();
+        let lanes = Arc::new(LaneManager::new(
+            config.clone(),
+            Arc::clone(&store),
+            Arc::clone(&turn),
+            turn_timeout,
+        ));
         Self {
             config,
             store,
@@ -607,7 +621,8 @@ impl OmpManager {
             lead_kill: Default::default(),
             gate: Default::default(),
             running: Arc::new(watch::channel(None).0),
-            turn: Default::default(),
+            turn,
+            lanes,
         }
     }
 
@@ -617,14 +632,23 @@ impl OmpManager {
         self
     }
 
-    /// Extra variables for the omp child, subject to the same filter as the inherited ones.
+    /// Extra variables for the lead and every lane child, subject to the same filter as
+    /// the inherited ones.
     pub fn with_extra_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<OsString>,
         V: Into<OsString>,
     {
-        self.extra_env
-            .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
+        let vars: Vec<(OsString, OsString)> = vars
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        // The lane manager is first shared when the lead child starts.
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .extra_env
+            .extend(vars.iter().cloned());
+        self.extra_env.extend(vars);
         self
     }
 
@@ -650,6 +674,15 @@ impl OmpManager {
     /// turn's group ends; a same-conversation message can be steered in meanwhile.
     pub fn running_turn(&self) -> watch::Receiver<Option<String>> {
         self.running.subscribe()
+    }
+
+    /// Notified after a lane result row was stored; the dispatcher then looks for work.
+    pub fn lane_wake(&self) -> Arc<Notify> {
+        self.lanes.wake()
+    }
+
+    pub fn lanes(&self) -> &LaneManager {
+        &self.lanes
     }
 
     pub async fn child_pid(&self) -> Option<u32> {
@@ -801,9 +834,12 @@ impl OmpManager {
 
     /// Stops the lead child even in the middle of a turn, without waiting for the turn:
     /// the kill makes a running `prompt` report `NeedsCheck(E_CHILD_LOST)` and release
-    /// the child, and whatever is left is aborted. Rows are left for the caller to mark.
+    /// the child, and whatever is left is aborted. Lanes stop accepting first and every
+    /// lane child is killed too. Rows and lanes are left for the caller to mark.
     pub async fn shutdown_all(&self) {
+        self.lanes.stop_accepting();
         self.kill_lead();
+        self.lanes.shutdown_all().await;
         if let Some(live) = self.live.lock().await.take() {
             live.abort(&self.lead_kill).await;
         }
@@ -841,6 +877,7 @@ impl OmpManager {
             Arc::clone(&sent_files),
         )];
         tools.extend(self.host_tools.iter().cloned());
+        tools.extend(self.lanes.host_tools());
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
