@@ -220,6 +220,17 @@ pub struct MemoryCommitRow {
     pub applied: bool,
 }
 
+/// One path of one memory commit, for notices: whether a text existed before the commit
+/// and whether one exists after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryChangeRow {
+    pub commit_id: i64,
+    pub writer: String,
+    pub path: String,
+    pub existed: bool,
+    pub present: bool,
+}
+
 /// One changed memory path: the path and its new full text, `None` when deleted.
 pub type MemoryChange = (String, Option<String>);
 

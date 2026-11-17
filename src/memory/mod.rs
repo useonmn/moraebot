@@ -9,11 +9,15 @@
 //! Guards (`read_only`, `expires`, the secret table) live in `guard`.
 //!
 //! Where a write's words came from (claims, the provenance stamp) lives in `provenance`.
+//!
+//! What changed since the lead's block was pinned, and the notice lines that say so, live in
+//! `notice`.
 
 pub mod frontmatter;
 pub mod guard;
 pub mod history;
 pub mod home;
+pub mod notice;
 pub mod provenance;
 pub mod render;
 pub mod tools;
@@ -115,6 +119,19 @@ pub const APPROVALS: [&str; 17] = [
     "delete it",
     "yes delete it",
 ];
+
+/// The line that opens the memory notice in an owner input.
+pub const NOTICE_BEGIN: &str = "[moraebot memory-notice]";
+/// The line that closes the memory notice in an owner input.
+pub const NOTICE_END: &str = "[moraebot memory-notice end]";
+/// The most changed paths named in one notice.
+pub const MAX_NOTICE_PATHS: usize = 20;
+/// Owner turns without a lead memory save between two nudges.
+pub const NUDGE_EVERY: i64 = 10;
+/// Files that shape who the lead is.
+pub const SOUL_PATHS: [&str; 2] = [PERSONA, IDENTITY];
+/// The file under the memory root that requests a re-pin at the next owner turn.
+pub const REFRESH_FILE: &str = ".refresh";
 
 /// The memory folders or seeds could not be made.
 pub const E_MEMORY_LAYOUT: &str = "E_MEMORY_LAYOUT";
