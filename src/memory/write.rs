@@ -12,7 +12,7 @@ use super::{
     E_MEMORY_HISTORY, E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN,
     E_MEMORY_PATH, E_MEMORY_PROTECTED, E_MEMORY_READ_ONLY, END, MAX_DIRTY_LISTED, MAX_FILE_BYTES,
     MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL,
-    MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, WRITER_LEAD,
+    MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, SOUL_PATHS, WRITER_LEAD,
 };
 use crate::omp::{TurnContext, lock};
 use crate::store::{MemoryChange, MemoryCommit, Store};
@@ -75,8 +75,8 @@ impl Edit {
 }
 
 /// A recorded write: its commit, the tool, the path, for a rename the new path, the tool
-/// arguments that were split back out of a mis-closed parameter, and the checked claim when
-/// the write named a `source`.
+/// arguments that were split back out of a mis-closed parameter, the checked claim when
+/// the write named a `source`, and whether the commit changed the persona or identity.
 #[derive(Debug, PartialEq)]
 pub struct Applied {
     pub commit: i64,
@@ -85,12 +85,14 @@ pub struct Applied {
     pub to: Option<String>,
     pub repaired: Vec<String>,
     pub claim: Option<Claim>,
+    pub soul_edit: bool,
 }
 
 impl Applied {
     /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename,
     /// `"repaired"` when arguments were repaired, and `"source"`, `"downgraded"` and (when set)
-    /// `"code"` when the write carried a claim.
+    /// `"code"` when the write carried a claim, and `"soul_edit"` (only when true) when the
+    /// commit changed a soul file.
     pub fn to_json(&self) -> String {
         let mut value = serde_json::json!({
             "committed": self.commit,
@@ -109,6 +111,9 @@ impl Applied {
             if let Some(code) = claim.code {
                 value["code"] = serde_json::json!(code);
             }
+        }
+        if self.soul_edit {
+            value["soul_edit"] = serde_json::json!(true);
         }
         value.to_string()
     }
@@ -242,6 +247,9 @@ fn run(
         claim_json: claim.as_ref().map(Claim::to_json),
     };
     let id = history::record(&mut store, home, &commit, &changes)?;
+    let soul_edit = changes
+        .iter()
+        .any(|(path, _)| SOUL_PATHS.contains(&path.as_str()));
     let tool = edit.tool();
     let (path, to) = match edit {
         Edit::Rename { old_path, new_path } => (old_path, Some(new_path)),
@@ -254,6 +262,7 @@ fn run(
         to,
         repaired: Vec::new(),
         claim,
+        soul_edit,
     })
 }
 
@@ -537,7 +546,7 @@ mod tests {
     use crate::memory::provenance::{Kind, Source};
     use crate::memory::{
         E_MEMORY_PROVENANCE, E_MEMORY_QUOTE_APPROVAL, E_MEMORY_QUOTE_MISSING, E_MEMORY_SECRET,
-        HUMAN, MAX_REASON_CHARS, PERSONA, PROVENANCE_KEY,
+        HUMAN, IDENTITY, MAX_REASON_CHARS, PERSONA, PROVENANCE_KEY,
     };
     use crate::store::{Admitted, LaneStart, LaneState, MemoryCommitRow};
 
@@ -826,6 +835,7 @@ mod tests {
                     to: to.map(str::to_string),
                     repaired: vec![],
                     claim: None,
+                    soul_edit: false,
                 }
             );
             let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -845,6 +855,46 @@ mod tests {
         }
     }
 
+    fn soul_fx() -> Fx {
+        fx_with(&[(PERSONA, A), (IDENTITY, A), ("notes/x.md", A)])
+    }
+
+    #[test]
+    fn soul_edit_is_flagged_for_persona_and_identity() {
+        for (edit, flagged) in [
+            (replace(PERSONA, "line1", "changed"), true),
+            (replace(IDENTITY, "line1", "changed"), true),
+            (delete(IDENTITY), true),
+            (replace("notes/x.md", "line1", "changed"), false),
+        ] {
+            let fx = soul_fx();
+            let applied = fx.apply(edit.clone()).expect("apply");
+            assert_eq!(applied.soul_edit, flagged, "{edit:?}");
+            let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+            if flagged {
+                assert_eq!(json["soul_edit"], true, "{edit:?}");
+            } else {
+                assert!(json.get("soul_edit").is_none(), "{json}");
+            }
+        }
+        let fx = fx();
+        let created = fx.apply(create(IDENTITY, "body")).expect("create identity");
+        assert!(created.soul_edit);
+        let json: serde_json::Value = serde_json::from_str(&created.to_json()).expect("json");
+        assert_eq!(json["soul_edit"], true);
+        let plain = fx.apply(create("notes/y.md", "body")).expect("create note");
+        assert!(!plain.soul_edit);
+        let json: serde_json::Value = serde_json::from_str(&plain.to_json()).expect("json");
+        assert!(json.get("soul_edit").is_none(), "{json}");
+    }
+
+    #[test]
+    fn rename_onto_identity_is_a_soul_edit() {
+        let fx = fx_with(&[("notes/x.md", A)]);
+        let applied = fx.apply(rename("notes/x.md", IDENTITY)).expect("rename");
+        assert!(applied.soul_edit);
+    }
+
     #[test]
     fn applied_json_lists_repaired_only_when_set() {
         let mut applied = Applied {
@@ -854,10 +904,12 @@ mod tests {
             to: None,
             repaired: vec![],
             claim: None,
+            soul_edit: false,
         };
         let plain: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
         assert!(plain.get("repaired").is_none(), "{plain}");
         assert!(plain.get("source").is_none(), "{plain}");
+        assert!(plain.get("soul_edit").is_none(), "{plain}");
 
         applied.repaired = vec!["new_string".to_string()];
         let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -880,6 +932,11 @@ mod tests {
         assert_eq!(json["downgraded"], true);
         assert_eq!(json["code"], E_MEMORY_QUOTE_MISSING);
         assert_eq!(json.as_object().expect("object").len(), 7, "{json}");
+
+        applied.soul_edit = true;
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["soul_edit"], true);
+        assert_eq!(json.as_object().expect("object").len(), 8, "{json}");
     }
 
     #[test]
