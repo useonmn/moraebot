@@ -72,17 +72,20 @@ impl Edit {
     }
 }
 
-/// A recorded write: its commit, the tool, the path and, for a rename, the new path.
+/// A recorded write: its commit, the tool, the path, for a rename the new path, and the
+/// tool arguments that were split back out of a mis-closed parameter.
 #[derive(Debug, PartialEq)]
 pub struct Applied {
     pub commit: i64,
     pub tool: &'static str,
     pub path: String,
     pub to: Option<String>,
+    pub repaired: Vec<String>,
 }
 
 impl Applied {
-    /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename.
+    /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename and
+    /// `"repaired"` when arguments were repaired.
     pub fn to_json(&self) -> String {
         let mut value = serde_json::json!({
             "committed": self.commit,
@@ -91,6 +94,9 @@ impl Applied {
         });
         if let Some(to) = &self.to {
             value["to"] = serde_json::json!(to);
+        }
+        if !self.repaired.is_empty() {
+            value["repaired"] = serde_json::json!(self.repaired);
         }
         value.to_string()
     }
@@ -201,6 +207,7 @@ fn run(
         tool,
         path,
         to,
+        repaired: Vec::new(),
     })
 }
 
@@ -684,6 +691,7 @@ mod tests {
                     tool: edit.tool(),
                     path: path.to_string(),
                     to: to.map(str::to_string),
+                    repaired: vec![],
                 }
             );
             let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -701,6 +709,27 @@ mod tests {
             }
             assert!(fx.dirty().is_empty(), "{edit:?}");
         }
+    }
+
+    #[test]
+    fn applied_json_lists_repaired_only_when_set() {
+        let mut applied = Applied {
+            commit: 7,
+            tool: MEMORY_STR_REPLACE_TOOL,
+            path: "notes/a.md".to_string(),
+            to: None,
+            repaired: vec![],
+        };
+        let plain: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert!(plain.get("repaired").is_none(), "{plain}");
+
+        applied.repaired = vec!["new_string".to_string()];
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["repaired"], serde_json::json!(["new_string"]));
+        assert_eq!(json["committed"], plain["committed"]);
+        assert_eq!(json["command"], plain["command"]);
+        assert_eq!(json["path"], plain["path"]);
+        assert_eq!(json.as_object().expect("object").len(), 4, "{json}");
     }
 
     #[test]

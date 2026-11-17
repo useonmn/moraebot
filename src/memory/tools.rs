@@ -243,63 +243,110 @@ fn memory_refusal(tool: &str, path: &str, e: &MemoryError) -> HostToolError {
     refused(e.code, &e.detail)
 }
 
+/// The allowed properties of each write tool, in schema order.
+fn properties(tool: &str) -> Option<&'static [&'static str]> {
+    Some(match tool {
+        MEMORY_CREATE_TOOL => &["path", "description", "body", "reason"],
+        MEMORY_STR_REPLACE_TOOL => &["path", "old_string", "new_string", "reason"],
+        MEMORY_INSERT_TOOL => &["path", "insert_line", "insert_text", "reason"],
+        MEMORY_DELETE_TOOL => &["path", "reason"],
+        MEMORY_RENAME_TOOL => &["old_path", "new_path", "reason"],
+        MEMORY_UPDATE_DESCRIPTION_TOOL => &["path", "description", "reason"],
+        _ => return None,
+    })
+}
+
+/// Splits mis-closed parameters back out: while some key of `keys` is absent and a present
+/// string value holds the exact marker `<parameter name="KEY">`, the text after the marker
+/// becomes that key. Present keys are never overwritten. Returns the filled keys in order.
+fn repair(args: &mut Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut repaired = Vec::new();
+    loop {
+        let found = keys
+            .iter()
+            .filter(|key| !args.contains_key(**key))
+            .find_map(|missing| {
+                let marker = format!("<parameter name=\"{missing}\">");
+                keys.iter().find_map(|source| match args.get(*source) {
+                    Some(Value::String(value)) => value
+                        .find(&marker)
+                        .map(|at| (*missing, *source, value.clone(), at, marker.len())),
+                    _ => None,
+                })
+            });
+        let Some((missing, source, value, at, marker_len)) = found else {
+            return repaired;
+        };
+        let head = value[..at].strip_suffix('\n').unwrap_or(&value[..at]);
+        let head = strip_closing_tag(head).to_owned();
+        let tail = &value[at + marker_len..];
+        let tail = tail.strip_suffix("</parameter>").unwrap_or(tail);
+        let digits = tail.trim();
+        let filled = if missing == "insert_line"
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = digits.parse::<u64>()
+        {
+            Value::from(n)
+        } else {
+            Value::String(tail.to_owned())
+        };
+        args.insert(source.to_owned(), Value::String(head));
+        args.insert(missing.to_owned(), filled);
+        repaired.push(missing.to_owned());
+    }
+}
+
+/// `text` without one trailing closing tag `</NAME>` (`NAME` of `[A-Za-z0-9_]`), if present.
+fn strip_closing_tag(text: &str) -> &str {
+    let Some(open) = text.rfind("</") else {
+        return text;
+    };
+    match text[open + 2..].strip_suffix('>') {
+        Some(name)
+            if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+        {
+            &text[..open]
+        }
+        _ => text,
+    }
+}
+
 /// The edit and the reason a write tool's arguments ask for.
 fn edit(tool: &str, args: &Value) -> Result<(Edit, String), HostToolError> {
-    let owned = |s: &str| s.to_owned();
-    let (edit, fields) = match tool {
-        MEMORY_CREATE_TOOL => {
-            let f = fields(args, &["path", "description", "body", "reason"])?;
-            let edit = Edit::Create {
-                path: owned(string(f, "path")?),
-                description: owned(string(f, "description")?),
-                body: owned(string(f, "body")?),
-            };
-            (edit, f)
-        }
-        MEMORY_STR_REPLACE_TOOL => {
-            let f = fields(args, &["path", "old_string", "new_string", "reason"])?;
-            let edit = Edit::StrReplace {
-                path: owned(string(f, "path")?),
-                old_string: owned(string(f, "old_string")?),
-                new_string: owned(string(f, "new_string")?),
-            };
-            (edit, f)
-        }
-        MEMORY_INSERT_TOOL => {
-            let f = fields(args, &["path", "insert_line", "insert_text", "reason"])?;
-            let edit = Edit::Insert {
-                path: owned(string(f, "path")?),
-                insert_line: line(f, "insert_line")?,
-                insert_text: owned(string(f, "insert_text")?),
-            };
-            (edit, f)
-        }
-        MEMORY_DELETE_TOOL => {
-            let f = fields(args, &["path", "reason"])?;
-            let edit = Edit::Delete {
-                path: owned(string(f, "path")?),
-            };
-            (edit, f)
-        }
-        MEMORY_RENAME_TOOL => {
-            let f = fields(args, &["old_path", "new_path", "reason"])?;
-            let edit = Edit::Rename {
-                old_path: owned(string(f, "old_path")?),
-                new_path: owned(string(f, "new_path")?),
-            };
-            (edit, f)
-        }
-        MEMORY_UPDATE_DESCRIPTION_TOOL => {
-            let f = fields(args, &["path", "description", "reason"])?;
-            let edit = Edit::UpdateDescription {
-                path: owned(string(f, "path")?),
-                description: owned(string(f, "description")?),
-            };
-            (edit, f)
-        }
-        _ => return Err(refused(E_MEMORY_ARGS, "unknown memory tool")),
+    let unknown = || refused(E_MEMORY_ARGS, "unknown memory tool");
+    let f = fields(args, properties(tool).ok_or_else(unknown)?)?;
+    let owned = |key: &str| string(f, key).map(str::to_owned);
+    let edit = match tool {
+        MEMORY_CREATE_TOOL => Edit::Create {
+            path: owned("path")?,
+            description: owned("description")?,
+            body: owned("body")?,
+        },
+        MEMORY_STR_REPLACE_TOOL => Edit::StrReplace {
+            path: owned("path")?,
+            old_string: owned("old_string")?,
+            new_string: owned("new_string")?,
+        },
+        MEMORY_INSERT_TOOL => Edit::Insert {
+            path: owned("path")?,
+            insert_line: line(f, "insert_line")?,
+            insert_text: owned("insert_text")?,
+        },
+        MEMORY_DELETE_TOOL => Edit::Delete {
+            path: owned("path")?,
+        },
+        MEMORY_RENAME_TOOL => Edit::Rename {
+            old_path: owned("old_path")?,
+            new_path: owned("new_path")?,
+        },
+        MEMORY_UPDATE_DESCRIPTION_TOOL => Edit::UpdateDescription {
+            path: owned("path")?,
+            description: owned("description")?,
+        },
+        _ => return Err(unknown()),
     };
-    Ok((edit, owned(string(fields, "reason")?)))
+    Ok((edit, owned("reason")?))
 }
 
 /// A write tool call: parses `args` for `tool`, applies the edit as one lead commit for
@@ -311,9 +358,24 @@ pub fn write(
     tool: &str,
     args: &Value,
 ) -> Result<String, HostToolError> {
-    let (edit, reason) = edit(tool, args).inspect_err(args_refused(tool))?;
+    let mut args = args.clone();
+    let repaired = match (args.as_object_mut(), properties(tool)) {
+        (Some(object), Some(keys)) => repair(object, keys),
+        _ => Vec::new(),
+    };
+    if !repaired.is_empty() {
+        tracing::info!(
+            tool,
+            repaired = repaired.len(),
+            "memory tool arguments repaired"
+        );
+    }
+    let (edit, reason) = edit(tool, &args).inspect_err(args_refused(tool))?;
     apply(store, home, turn.as_ref(), edit, &reason)
-        .map(|applied| applied.to_json())
+        .map(|mut applied| {
+            applied.repaired = repaired;
+            applied.to_json()
+        })
         .map_err(|e| refused(e.code, &e.detail))
 }
 
@@ -384,8 +446,10 @@ pub fn read(home: &MemoryHome, args: &Value) -> Result<String, HostToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::frontmatter::{Frontmatter, render_frontmatter};
+    use crate::memory::history;
     use crate::memory::{E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH, MAX_FILE_BYTES};
-    use crate::store::Admitted;
+    use crate::store::{Admitted, MemoryCommitRow};
 
     const WRITE_TOOLS: [&str; 6] = [
         MEMORY_CREATE_TOOL,
@@ -650,5 +714,174 @@ mod tests {
             renamed["committed"].as_i64().unwrap() > created["committed"].as_i64().unwrap(),
             "{renamed}"
         );
+    }
+
+    const SEED_BODY: &str = "seed-word\nline two\n";
+
+    /// The store fixture after one `history::prepare`, with `notes/a.md` (description `d`,
+    /// body `SEED_BODY`) committed by a lead write.
+    fn seeded() -> (tempfile::TempDir, MemoryHome, Mutex<Store>, TurnContext) {
+        let (dir, memory, store, turn) = store_fixture();
+        history::prepare(&mut lock(&store), &memory).expect("import");
+        let args =
+            json!({"path": "notes/a.md", "description": "d", "body": SEED_BODY, "reason": "seed"});
+        write(
+            &memory,
+            &store,
+            Some(turn.clone()),
+            MEMORY_CREATE_TOOL,
+            &args,
+        )
+        .expect("seed");
+        (dir, memory, store, turn)
+    }
+
+    fn with_frontmatter(body: &str) -> String {
+        render_frontmatter(&Frontmatter::with_description("d")) + body
+    }
+
+    fn commit_rows(store: &Mutex<Store>) -> Vec<MemoryCommitRow> {
+        lock(store).memory_commits().expect("commits")
+    }
+
+    fn file(memory: &MemoryHome, rel: &str) -> String {
+        std::fs::read_to_string(memory.root().join(rel)).expect("file")
+    }
+
+    fn result_json(result: Result<String, HostToolError>) -> Value {
+        serde_json::from_str(&result.expect("write")).expect("json")
+    }
+
+    #[test]
+    fn split_parameter_is_repaired() {
+        let (_dir, memory, store, turn) = seeded();
+        let args = json!({
+            "path": "notes/a.md",
+            "old_string": "seed-word</old_string>\n<parameter name=\"new_string\">new-word",
+            "reason": "r"
+        });
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_STR_REPLACE_TOOL,
+            &args,
+        ));
+        assert_eq!(out["repaired"], json!(["new_string"]), "{out}");
+        assert_eq!(
+            file(&memory, "notes/a.md"),
+            with_frontmatter("new-word\nline two\n")
+        );
+    }
+
+    #[test]
+    fn two_merged_parameters_are_repaired_in_order() {
+        let (_dir, memory, store, turn) = seeded();
+        let args = json!({
+            "path": "notes/m.md",
+            "description": "d</description>\n<parameter name=\"body\">b\n</body>\n<parameter name=\"reason\">r"
+        });
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_CREATE_TOOL,
+            &args,
+        ));
+        assert_eq!(out["repaired"], json!(["body", "reason"]), "{out}");
+        assert_eq!(file(&memory, "notes/m.md"), with_frontmatter("b\n"));
+        let last = commit_rows(&store).pop().expect("commit");
+        assert_eq!(out["committed"], json!(last.id));
+        assert_eq!(last.commit.reason, "r");
+    }
+
+    #[test]
+    fn insert_line_split_out_is_a_number() {
+        let (_dir, memory, store, turn) = seeded();
+        let args = |line: &str| {
+            json!({
+                "path": format!("notes/a.md</path>\n<parameter name=\"insert_line\">{line}"),
+                "insert_text": "mid",
+                "reason": "r"
+            })
+        };
+        let before = commit_rows(&store).len();
+        let refused_line = write(
+            &memory,
+            &store,
+            Some(turn.clone()),
+            MEMORY_INSERT_TOOL,
+            &args("two"),
+        );
+        assert_eq!(code_of(refused_line), E_MEMORY_ARGS);
+        assert_eq!(commit_rows(&store).len(), before);
+
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_INSERT_TOOL,
+            &args("2"),
+        ));
+        assert_eq!(out["repaired"], json!(["insert_line"]), "{out}");
+        assert_eq!(out["path"], "notes/a.md");
+        assert_eq!(
+            file(&memory, "notes/a.md"),
+            with_frontmatter("seed-word\nmid\nline two\n")
+        );
+    }
+
+    #[test]
+    fn repair_never_touches_complete_calls() {
+        let (_dir, memory, store, turn) = seeded();
+        let new_string = "kept <parameter name=\"reason\">x";
+        let args = json!({
+            "path": "notes/a.md",
+            "old_string": "seed-word",
+            "new_string": new_string,
+            "reason": "r"
+        });
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_STR_REPLACE_TOOL,
+            &args,
+        ));
+        assert!(out.get("repaired").is_none(), "{out}");
+        assert_eq!(
+            file(&memory, "notes/a.md"),
+            with_frontmatter(&format!("{new_string}\nline two\n"))
+        );
+        assert_eq!(
+            commit_rows(&store).pop().expect("commit").commit.reason,
+            "r"
+        );
+    }
+
+    #[test]
+    fn repair_needs_the_exact_marker() {
+        let (_dir, memory, store, turn) = seeded();
+        let before = commit_rows(&store).len();
+        for marker in [
+            "<parameter name='new_string'>",
+            "<parameter  name=\"new_string\">",
+        ] {
+            let args = json!({
+                "path": "notes/a.md",
+                "old_string": format!("seed-word</old_string>\n{marker}new-word"),
+                "reason": "r"
+            });
+            let result = write(
+                &memory,
+                &store,
+                Some(turn.clone()),
+                MEMORY_STR_REPLACE_TOOL,
+                &args,
+            );
+            assert_eq!(code_of(result), E_MEMORY_ARGS, "{marker}");
+            assert_eq!(commit_rows(&store).len(), before, "{marker}");
+            assert_eq!(file(&memory, "notes/a.md"), with_frontmatter(SEED_BODY));
+        }
     }
 }
