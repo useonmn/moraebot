@@ -1,19 +1,24 @@
 //! The memory write engine: validation, the origin gate, recording and applying changes.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use super::frontmatter::{self, Frontmatter, render_frontmatter};
 use super::guard;
 use super::history::{self, Committed};
 use super::home::{MemoryError, MemoryHome};
+use super::patch::{self, FileOp};
+use super::people::{self, Problem};
 use super::provenance::{self, Claim, ClaimArgs, Kind};
 use super::{
-    AGREEMENTS_FILE, BEGIN, BOUNDARIES, E_MEMORY_AGREEMENT, E_MEMORY_ARGS, E_MEMORY_DIRTY,
-    E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY, E_MEMORY_NO_MATCH,
-    E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH, E_MEMORY_PROTECTED,
-    E_MEMORY_QUOTE, E_MEMORY_READ_ONLY, END, MAX_DIRTY_LISTED, MAX_FILE_BYTES, MEMORY_CREATE_TOOL,
-    MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
-    MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, SOUL_PATHS, WRITER_LEAD,
+    AGREEMENTS_FILE, BEGIN, BOUNDARIES, CARD_FILE, E_MEMORY_AGREEMENT, E_MEMORY_ARGS,
+    E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY,
+    E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATCH,
+    E_MEMORY_PATH, E_MEMORY_PERSON, E_MEMORY_PROTECTED, E_MEMORY_QUOTE, E_MEMORY_READ_ONLY, END,
+    HUMAN, HUMAN_SLUG, MAX_DIRTY_LISTED, MAX_FILE_BYTES, MEMORY_APPLY_PATCH_TOOL,
+    MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_OBSERVE_TOOL,
+    MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL, OBSERVATIONS_FILE,
+    PEOPLE_DIR, PROTECTED, SOUL_PATHS, WRITER_LEAD,
 };
 use crate::omp::{TurnContext, lock};
 use crate::store::{MemoryChange, MemoryCommit, Store};
@@ -47,6 +52,18 @@ pub enum Edit {
         path: String,
         description: String,
     },
+    /// A multi-file patch, applied all or nothing.
+    Patch {
+        ops: Vec<FileOp>,
+    },
+    /// One dated fact about a person (`HUMAN_SLUG` means the owner).
+    Observe {
+        slug: String,
+        name: Option<String>,
+        aliases: Option<String>,
+        fact: String,
+        date: String,
+    },
 }
 
 impl Edit {
@@ -59,25 +76,51 @@ impl Edit {
             Self::Delete { .. } => MEMORY_DELETE_TOOL,
             Self::Rename { .. } => MEMORY_RENAME_TOOL,
             Self::UpdateDescription { .. } => MEMORY_UPDATE_DESCRIPTION_TOOL,
+            Self::Patch { .. } => MEMORY_APPLY_PATCH_TOOL,
+            Self::Observe { .. } => MEMORY_OBSERVE_TOOL,
         }
     }
 
-    /// The path the edit works on (the source of a rename).
-    fn path(&self) -> &str {
+    /// The path the edit works on (the source of a rename, the first file of a patch, the
+    /// observations file of an observation).
+    fn path(&self) -> Cow<'_, str> {
         match self {
             Self::Create { path, .. }
             | Self::StrReplace { path, .. }
             | Self::Insert { path, .. }
             | Self::Delete { path }
-            | Self::UpdateDescription { path, .. } => path,
-            Self::Rename { old_path, .. } => old_path,
+            | Self::UpdateDescription { path, .. } => Cow::Borrowed(path),
+            Self::Rename { old_path, .. } => Cow::Borrowed(old_path),
+            Self::Patch { ops } => Cow::Borrowed(ops.first().map_or("", op_path)),
+            Self::Observe { slug, .. } if slug == HUMAN_SLUG => Cow::Borrowed(HUMAN),
+            Self::Observe { slug, .. } => Cow::Owned(person_path(slug, OBSERVATIONS_FILE)),
         }
     }
 }
 
+/// The path a patch operation names first (the source of an update).
+fn op_path(op: &FileOp) -> &str {
+    match op {
+        FileOp::Add { path, .. } | FileOp::Update { path, .. } | FileOp::Delete { path } => path,
+    }
+}
+
+/// `people/<slug>/<file>`.
+fn person_path(slug: &str, file: &str) -> String {
+    format!("{PEOPLE_DIR}/{slug}/{file}")
+}
+
+fn person_refused(path: &str, problem: Problem) -> MemoryError {
+    refused(
+        E_MEMORY_PERSON,
+        format!("{path}: line {}: {}", problem.line, problem.kind.name()),
+    )
+}
+
 /// A recorded write: its commit, the tool, the path, for a rename the new path, the tool
 /// arguments that were split back out of a mis-closed parameter, the checked claim when
-/// the write named a `source`, and whether the commit changed the persona or identity.
+/// the write named a `source`, whether the commit changed the persona or identity, for a
+/// patch every changed path (sorted), and for an observation the entry's count.
 #[derive(Debug, PartialEq)]
 pub struct Applied {
     pub commit: i64,
@@ -87,13 +130,15 @@ pub struct Applied {
     pub repaired: Vec<String>,
     pub claim: Option<Claim>,
     pub soul_edit: bool,
+    pub paths: Vec<String>,
+    pub count: Option<i64>,
 }
 
 impl Applied {
     /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename,
     /// `"repaired"` when arguments were repaired, and `"source"`, `"downgraded"` and (when set)
-    /// `"code"` when the write carried a claim, and `"soul_edit"` (only when true) when the
-    /// commit changed a soul file.
+    /// `"code"` when the write carried a claim, `"soul_edit"` (only when true) when the
+    /// commit changed a soul file, `"paths"` for a patch and `"n"` for an observation.
     pub fn to_json(&self) -> String {
         let mut value = serde_json::json!({
             "committed": self.commit,
@@ -102,6 +147,12 @@ impl Applied {
         });
         if let Some(to) = &self.to {
             value["to"] = serde_json::json!(to);
+        }
+        if !self.paths.is_empty() {
+            value["paths"] = serde_json::json!(self.paths);
+        }
+        if let Some(count) = self.count {
+            value["n"] = serde_json::json!(count);
         }
         if !self.repaired.is_empty() {
             value["repaired"] = serde_json::json!(self.repaired);
@@ -140,9 +191,9 @@ pub fn apply(
     claim: &ClaimArgs,
 ) -> Result<Applied, MemoryError> {
     let tool = edit.tool();
-    let path = match guard::find_secret(edit.path()) {
+    let path = match guard::find_secret(&edit.path()) {
         Some(_) => "-".to_string(),
-        None => edit.path().to_string(),
+        None => edit.path().into_owned(),
     };
     let result = run(store, home, turn, edit, reason, claim);
     match &result {
@@ -190,12 +241,15 @@ fn run(
     check_existence(home, &committed, &edit)?;
     check_read_only(&committed, &edit)?;
 
-    let (mut changes, previous): (Vec<MemoryChange>, Vec<Option<String>>) =
-        new_texts(&committed, &edit)?.into_iter().unzip();
-    for ((_, text), previous) in changes.iter().zip(&previous) {
-        if let Some(text) = text {
+    let (texts, count) = new_texts(&committed, &edit)?;
+    let mut changes: Vec<MemoryChange> = Vec::with_capacity(texts.len());
+    let mut stamps = Vec::with_capacity(texts.len());
+    for (change, previous, stamp) in texts {
+        if let Some(text) = &change.1 {
             history::check_text(text, previous.as_deref())?;
         }
+        changes.push(change);
+        stamps.push(stamp);
     }
     let noop = changes.iter().all(|(path, text)| match text {
         Some(text) => committed.files.get(path) == Some(text),
@@ -218,22 +272,28 @@ fn run(
         };
         return Err(refused(E_MEMORY_QUOTE, detail));
     }
-    let stamped = !matches!(
-        (&claim, &edit),
-        (_, Edit::Rename { .. } | Edit::Delete { .. }) | (None, Edit::Create { .. })
-    );
-    if stamped {
-        for (_, text) in &mut changes {
-            if let Some(text) = text {
-                let new = match &claim {
-                    Some(claim) => provenance::stamp(text, claim)?,
-                    None => provenance::stamp_unclaimed(text)?,
-                };
-                if claim.is_some() || new != *text {
-                    check_stamped(&new)?;
-                }
-                *text = new;
+    for ((_, text), stamp) in changes.iter_mut().zip(&stamps) {
+        let stamped = match stamp {
+            Stamp::Always => true,
+            Stamp::Claimed => claim.is_some(),
+            Stamp::Never => false,
+        };
+        if let (true, Some(text)) = (stamped, text) {
+            let new = match &claim {
+                Some(claim) => provenance::stamp(text, claim)?,
+                None => provenance::stamp_unclaimed(text)?,
+            };
+            if claim.is_some() || new != *text {
+                check_stamped(&new)?;
             }
+            *text = new;
+        }
+    }
+    for (path, text) in &changes {
+        if let (Some(text), Some((_, file))) = (text, people::classify(path))
+            && let Some(problem) = people::check(file, text).first()
+        {
+            return Err(person_refused(path, *problem));
         }
     }
 
@@ -249,9 +309,14 @@ fn run(
         .iter()
         .any(|(path, _)| SOUL_PATHS.contains(&path.as_str()));
     let tool = edit.tool();
+    let mut paths = Vec::new();
+    if let Edit::Patch { .. } = edit {
+        paths = changes.iter().map(|(path, _)| path.clone()).collect();
+        paths.sort();
+    }
     let (path, to) = match edit {
         Edit::Rename { old_path, new_path } => (old_path, Some(new_path)),
-        other => (other.path().to_string(), None),
+        other => (other.path().into_owned(), None),
     };
     Ok(Applied {
         commit: id,
@@ -261,6 +326,8 @@ fn run(
         repaired: Vec::new(),
         claim,
         soul_edit,
+        paths,
+        count,
     })
 }
 
@@ -303,20 +370,35 @@ fn check_stamped(text: &str) -> Result<(), MemoryError> {
 /// Step 3: every named path is plain ASCII and passes the path rules, a path that would newly
 /// hold text (the `Create` path, the `Rename` target) does not look like a secret, a rename
 /// moves the file somewhere else, the persona and the owner card are neither deleted nor
-/// renamed, and no named path is the reserved agreements path.
+/// renamed, no named path is the reserved agreements path, and no path that would newly hold
+/// text is under `people/human/`. A patch and an observation are checked per file.
 fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
-    let files: Vec<&str> = match edit {
+    match edit {
+        Edit::Patch { ops } => return check_patch_paths(home, ops),
+        Edit::Observe { slug, .. } => {
+            people::check_slug(slug).map_err(|problem| person_refused("slug", problem))?;
+            for path in observe_paths(slug) {
+                plain_ascii(&path)?;
+                home.resolve(&path)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    let files: Vec<Cow<'_, str>> = match edit {
         Edit::Delete { path } if !path.ends_with(".md") => {
             plain_ascii(path)?;
             home.resolve_dir(path)?;
             Vec::new()
         }
-        Edit::Rename { old_path, new_path } => vec![old_path, new_path],
+        Edit::Rename { old_path, new_path } => {
+            vec![Cow::Borrowed(old_path.as_str()), Cow::Borrowed(new_path)]
+        }
         other => vec![other.path()],
     };
     for path in files {
-        plain_ascii(path)?;
-        home.resolve(path)?;
+        plain_ascii(&path)?;
+        home.resolve(&path)?;
     }
     match edit {
         Edit::Create { path, .. } => guard::refuse_secret("path", path)?,
@@ -350,10 +432,124 @@ fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
         other => other.path() == AGREEMENTS_FILE,
     };
     if reserved {
-        return Err(refused(
-            E_MEMORY_AGREEMENT,
-            format!("{AGREEMENTS_FILE} is reserved for the agreements ledger"),
-        ));
+        return Err(agreement_refused());
+    }
+    match edit {
+        Edit::Create { path, .. } => refuse_reserved_person(path),
+        Edit::Rename { new_path, .. } => refuse_reserved_person(new_path),
+        _ => Ok(()),
+    }
+}
+
+fn agreement_refused() -> MemoryError {
+    refused(
+        E_MEMORY_AGREEMENT,
+        format!("{AGREEMENTS_FILE} is reserved for the agreements ledger"),
+    )
+}
+
+/// A path that would newly hold text is not under `people/human/` (the owner's card is `HUMAN`).
+fn refuse_reserved_person(path: &str) -> Result<(), MemoryError> {
+    if people::is_reserved(path) {
+        Err(refused(
+            E_MEMORY_PERSON,
+            format!("{path}: the owner's card is {HUMAN}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The files an observation of `slug` may write: `HUMAN` for the owner, else the card and the
+/// observations file.
+fn observe_paths(slug: &str) -> Vec<String> {
+    if slug == HUMAN_SLUG {
+        vec![HUMAN.to_string()]
+    } else {
+        vec![
+            person_path(slug, CARD_FILE),
+            person_path(slug, OBSERVATIONS_FILE),
+        ]
+    }
+}
+
+/// Step 3 for a patch, per operation as the single-file tool doing the same thing: path rules
+/// for every source and target, the secret rule for every new path, a move that goes
+/// somewhere, no path named twice in any letter case, no delete or move of a protected file,
+/// no agreements path, and no new text under `people/human/`.
+fn check_patch_paths(home: &MemoryHome, ops: &[FileOp]) -> Result<(), MemoryError> {
+    let mut named: Vec<&str> = Vec::new();
+    for op in ops {
+        named.push(op_path(op));
+        if let FileOp::Update {
+            move_to: Some(to), ..
+        } = op
+        {
+            named.push(to);
+        }
+    }
+    for path in &named {
+        plain_ascii(path)?;
+        home.resolve(path)?;
+    }
+    for op in ops {
+        match op {
+            FileOp::Add { path, .. } => guard::refuse_secret("path", path)?,
+            FileOp::Update {
+                move_to: Some(to), ..
+            } => guard::refuse_secret("path", to)?,
+            _ => {}
+        }
+    }
+    for op in ops {
+        if let FileOp::Update {
+            path,
+            move_to: Some(to),
+            ..
+        } = op
+            && path == to
+        {
+            return Err(refused(E_MEMORY_NOOP, "the new path is the old path"));
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for path in &named {
+        let lower = path.to_lowercase();
+        if seen.contains(&lower) {
+            return Err(refused(E_MEMORY_PATCH, format!("{path}: path named twice")));
+        }
+        seen.push(lower);
+    }
+    for op in ops {
+        let removed = match op {
+            FileOp::Delete { path }
+            | FileOp::Update {
+                path,
+                move_to: Some(_),
+                ..
+            } => Some(path),
+            _ => None,
+        };
+        if let Some(path) = removed
+            && PROTECTED.contains(&path.as_str())
+        {
+            return Err(refused(
+                E_MEMORY_PROTECTED,
+                format!("{path}: cannot be deleted or renamed"),
+            ));
+        }
+    }
+    if named.contains(&AGREEMENTS_FILE) {
+        return Err(agreement_refused());
+    }
+    for op in ops {
+        match op {
+            FileOp::Add { path, .. } => refuse_reserved_person(path)?,
+            FileOp::Update {
+                move_to: Some(to), ..
+            } => refuse_reserved_person(to)?,
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -402,7 +598,31 @@ fn check_existence(
                 Ok(())
             }
         }
-        other => check_committed(committed, other.path()),
+        Edit::Patch { ops } => {
+            for op in ops {
+                match op {
+                    FileOp::Add { path, .. } => check_absent(home, committed, path)?,
+                    FileOp::Update { path, move_to, .. } => {
+                        check_committed(committed, path)?;
+                        if let Some(to) = move_to {
+                            check_absent(home, committed, to)?;
+                        }
+                    }
+                    FileOp::Delete { path } => check_committed(committed, path)?,
+                }
+            }
+            Ok(())
+        }
+        Edit::Observe { slug, .. } if slug == HUMAN_SLUG => check_committed(committed, HUMAN),
+        Edit::Observe { slug, .. } => {
+            for path in observe_paths(slug) {
+                if !committed.files.contains_key(&path) {
+                    check_absent(home, committed, &path)?;
+                }
+            }
+            Ok(())
+        }
+        other => check_committed(committed, &other.path()),
     }
 }
 
@@ -441,20 +661,26 @@ fn check_absent(home: &MemoryHome, committed: &Committed, target: &str) -> Resul
 }
 
 /// Step 7: no committed path the edit would change or remove is marked `read_only` in its
-/// committed text. `Create` and the `Rename` target name uncommitted paths.
+/// committed text. `Create`, the `Rename` target and a patch's new paths name uncommitted
+/// paths; a new person card is uncommitted too.
 fn check_read_only(committed: &Committed, edit: &Edit) -> Result<(), MemoryError> {
-    let paths: Vec<&str> = match edit {
+    let paths: Vec<Cow<'_, str>> = match edit {
         Edit::Create { .. } => Vec::new(),
         Edit::Delete { path } if !path.ends_with(".md") => under(committed, path)
             .into_iter()
-            .map(String::as_str)
+            .map(|path| Cow::Borrowed(path.as_str()))
+            .collect(),
+        Edit::Patch { ops } => ops
+            .iter()
+            .filter(|op| !matches!(op, FileOp::Add { .. }))
+            .map(|op| Cow::Borrowed(op_path(op)))
             .collect(),
         other => vec![other.path()],
     };
     match paths.into_iter().find(|path| {
         committed
             .files
-            .get(*path)
+            .get(path.as_ref())
             .is_some_and(|text| guard::is_read_only(text))
     }) {
         Some(path) => Err(refused(E_MEMORY_READ_ONLY, format!("{path}: read_only"))),
@@ -472,15 +698,32 @@ fn under<'a>(committed: &'a Committed, dir: &str) -> Vec<&'a String> {
         .collect()
 }
 
-/// Step 8: every change of `edit`, each with the text its `provenance` is compared against.
+/// When a change's new text gets the `provenance` stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stamp {
+    /// Always, claimed or not (a change of an existing text).
+    Always,
+    /// Only with a claim (a new file).
+    Claimed,
+    /// Never (a move or a removal).
+    Never,
+}
+
+/// One change, the text its `provenance` is compared against, and when it is stamped.
+type NewText = (MemoryChange, Option<String>, Stamp);
+
+/// Step 8: every change of `edit`, each with the text its `provenance` is compared against and
+/// its stamp rule, plus for an observation the entry's count.
 fn new_texts(
     committed: &Committed,
     edit: &Edit,
-) -> Result<Vec<(MemoryChange, Option<String>)>, MemoryError> {
+) -> Result<(Vec<NewText>, Option<i64>), MemoryError> {
     let current = |path: &str| committed.files.get(path).cloned();
     let text_of = |path: &str| committed.files.get(path).map_or("", String::as_str);
-    let changed = |path: &str, text: String| vec![((path.to_string(), Some(text)), current(path))];
-    Ok(match edit {
+    let changed = |path: &str, text: String, stamp: Stamp| {
+        vec![((path.to_string(), Some(text)), current(path), stamp)]
+    };
+    let changes = match edit {
         Edit::Create {
             path,
             description,
@@ -491,7 +734,7 @@ fn new_texts(
             if !body.is_empty() && !body.ends_with('\n') {
                 text.push('\n');
             }
-            changed(path, text)
+            changed(path, text, Stamp::Claimed)
         }
         Edit::StrReplace {
             path,
@@ -505,34 +748,117 @@ fn new_texts(
             if !text.contains(old_string.as_str()) {
                 return Err(refused(E_MEMORY_NO_MATCH, path.as_str()));
             }
-            changed(path, text.replacen(old_string.as_str(), new_string, 1))
+            changed(
+                path,
+                text.replacen(old_string.as_str(), new_string, 1),
+                Stamp::Always,
+            )
         }
         Edit::Insert {
             path,
             insert_line,
             insert_text,
-        } => changed(path, insert(text_of(path), *insert_line, insert_text)?),
+        } => changed(
+            path,
+            insert(text_of(path), *insert_line, insert_text)?,
+            Stamp::Always,
+        ),
         Edit::UpdateDescription { path, description } => {
             let parsed = parse(text_of(path))?;
             let mut frontmatter = parsed.frontmatter;
             frontmatter.set("description", description);
-            changed(path, render_frontmatter(&frontmatter) + parsed.body)
+            changed(
+                path,
+                render_frontmatter(&frontmatter) + parsed.body,
+                Stamp::Always,
+            )
         }
         Edit::Rename { old_path, new_path } => {
             let text = current(old_path);
             vec![
-                ((old_path.clone(), None), text.clone()),
-                ((new_path.clone(), text.clone()), text),
+                ((old_path.clone(), None), text.clone(), Stamp::Never),
+                ((new_path.clone(), text.clone()), text, Stamp::Never),
             ]
         }
         Edit::Delete { path } if path.ends_with(".md") => {
-            vec![((path.clone(), None), current(path))]
+            vec![((path.clone(), None), current(path), Stamp::Never)]
         }
         Edit::Delete { path } => under(committed, path)
             .into_iter()
-            .map(|path| ((path.clone(), None), current(path)))
+            .map(|path| ((path.clone(), None), current(path), Stamp::Never))
             .collect(),
-    })
+        Edit::Patch { ops } => {
+            let mut changes = Vec::new();
+            for op in ops {
+                match op {
+                    FileOp::Add { path, text } => {
+                        changes.push(((path.clone(), Some(text.clone())), None, Stamp::Claimed));
+                    }
+                    FileOp::Update {
+                        path,
+                        move_to,
+                        hunks,
+                    } => {
+                        let source = current(path);
+                        let text = if hunks.is_empty() {
+                            source.clone()
+                        } else {
+                            let applied =
+                                patch::apply_hunks(text_of(path), hunks).map_err(|k| {
+                                    refused(
+                                        E_MEMORY_PATCH,
+                                        format!("{path}: hunk {k} does not match"),
+                                    )
+                                })?;
+                            Some(applied)
+                        };
+                        let stamp = if hunks.is_empty() {
+                            Stamp::Never
+                        } else {
+                            Stamp::Always
+                        };
+                        match move_to {
+                            Some(to) => {
+                                changes.push(((path.clone(), None), source.clone(), Stamp::Never));
+                                changes.push(((to.clone(), text), source, stamp));
+                            }
+                            None => changes.push(((path.clone(), text), source, stamp)),
+                        }
+                    }
+                    FileOp::Delete { path } => {
+                        changes.push(((path.clone(), None), current(path), Stamp::Never));
+                    }
+                }
+            }
+            changes
+        }
+        Edit::Observe {
+            slug,
+            name,
+            aliases,
+            fact,
+            date,
+        } => {
+            let observations = edit.path();
+            let mut changes = Vec::new();
+            let base = match current(&observations) {
+                Some(text) => text,
+                None => people::new_observations(slug, name.as_deref()),
+            };
+            let (text, count) = people::observe(&base, fact, date)
+                .map_err(|problem| person_refused(&observations, problem))?;
+            if slug != HUMAN_SLUG {
+                let card = person_path(slug, CARD_FILE);
+                if !committed.files.contains_key(&card) {
+                    let text = people::new_card(slug, name.as_deref(), aliases.as_deref());
+                    changes.extend(changed(&card, text, Stamp::Claimed));
+                }
+            }
+            changes.extend(changed(&observations, text, Stamp::Always));
+            return Ok((changes, Some(count)));
+        }
+    };
+    Ok((changes, None))
 }
 
 fn parse(text: &str) -> Result<frontmatter::Parsed<'_>, MemoryError> {
@@ -575,7 +901,7 @@ mod tests {
     use crate::memory::provenance::{Kind, Source};
     use crate::memory::{
         E_MEMORY_PROVENANCE, E_MEMORY_QUOTE_APPROVAL, E_MEMORY_QUOTE_MISSING, E_MEMORY_SECRET,
-        HUMAN, IDENTITY, MAX_REASON_CHARS, PERSONA, PROVENANCE_KEY,
+        IDENTITY, MAX_PERSON_ENTRIES, MAX_REASON_CHARS, PERSONA, PROVENANCE_KEY,
     };
     use crate::store::{Admitted, LaneStart, LaneState, MemoryCommitRow};
 
@@ -865,6 +1191,8 @@ mod tests {
                     repaired: vec![],
                     claim: None,
                     soul_edit: false,
+                    paths: vec![],
+                    count: None,
                 }
             );
             let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -934,6 +1262,8 @@ mod tests {
             repaired: vec![],
             claim: None,
             soul_edit: false,
+            paths: vec![],
+            count: None,
         };
         let plain: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
         assert!(plain.get("repaired").is_none(), "{plain}");
@@ -2012,5 +2342,493 @@ mod tests {
         assert_eq!(committed, 1);
         assert_eq!(codes, [E_MEMORY_EXISTS]);
         assert_eq!(fx.commits().len(), before + 1);
+    }
+
+    fn patch(text: &str) -> Edit {
+        Edit::Patch {
+            ops: patch::parse(text).expect("patch"),
+        }
+    }
+
+    fn observe(slug: &str, fact: &str, date: &str) -> Edit {
+        Edit::Observe {
+            slug: slug.to_string(),
+            name: None,
+            aliases: None,
+            fact: fact.to_string(),
+            date: date.to_string(),
+        }
+    }
+
+    const CARD: &str = "---\ndescription: About Kim\nkind: person\n---\nIDENTITY: Kim\n";
+    const U: &str = "---\ndescription: u\n---\na\nb\n";
+
+    /// A whole patch text around `ops`.
+    fn wrap(ops: &[String]) -> String {
+        format!("*** Begin Patch\n{}*** End Patch\n", ops.concat())
+    }
+
+    /// An Add operation of `path` holding `text`.
+    fn add_op(path: &str, text: &str) -> String {
+        let mut op = format!("*** Add File: {path}\n");
+        for line in text.lines() {
+            op.push_str(&format!("+{line}\n"));
+        }
+        op
+    }
+
+    /// An Update operation of `path`, optionally moved, with `hunks` (each already holding its
+    /// `@@` line).
+    fn update_op(path: &str, move_to: Option<&str>, hunks: &str) -> String {
+        let mut op = format!("*** Update File: {path}\n");
+        if let Some(to) = move_to {
+            op.push_str(&format!("*** Move to: {to}\n"));
+        }
+        op.push_str(hunks);
+        op
+    }
+
+    fn delete_op(path: &str) -> String {
+        format!("*** Delete File: {path}\n")
+    }
+
+    #[test]
+    fn patch_is_one_commit() {
+        let d = "---\ndescription: d\n---\nx\n";
+        let n = "---\ndescription: n\n---\nnew\n";
+        let fx = fx_with(&[("notes/u.md", U), ("notes/d.md", d)]);
+        let mut want = bytes_under(fx.home.root());
+        let before = fx.commits().len();
+        let applied = fx
+            .apply(patch(&wrap(&[
+                add_op("notes/n.md", n),
+                update_op("notes/u.md", None, "@@\n-a\n+A\n@@\n-b\n+B\n"),
+                delete_op("notes/d.md"),
+            ])))
+            .expect("patch");
+        let rows = fx.commits();
+        assert_eq!(rows.len(), before + 1);
+        let row = rows.last().expect("row");
+        assert_eq!(row.commit.writer, WRITER_LEAD);
+        assert_eq!(row.commit.turn_row, Some(OWNER_ROW));
+        assert_eq!(applied.commit, row.id);
+        want.insert("notes/n.md".to_string(), n.as_bytes().to_vec());
+        want.insert(
+            "notes/u.md".to_string(),
+            b"---\ndescription: u\n---\nA\nB\n".to_vec(),
+        );
+        want.remove("notes/d.md");
+        assert_eq!(bytes_under(fx.home.root()), want);
+        let paths = ["notes/d.md", "notes/n.md", "notes/u.md"];
+        assert_eq!(applied.paths, paths);
+        assert_eq!(applied.path, "notes/n.md");
+        assert_eq!(applied.tool, MEMORY_APPLY_PATCH_TOOL);
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["paths"], serde_json::json!(paths));
+        assert!(json.get("n").is_none(), "{json}");
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn patch_move_with_and_without_hunks() {
+        let pa = "---\ndescription: pa\nprovenance: agent\n---\na\n";
+        let fx = fx_with(&[("notes/u.md", U), ("notes/pa.md", pa)]);
+        let before = fx.commits().len();
+        fx.apply(patch(&wrap(&[update_op(
+            "notes/u.md",
+            Some("notes/v.md"),
+            "",
+        )])))
+        .expect("move");
+        assert_eq!(fx.commits().len(), before + 1);
+        assert_eq!(fx.file("notes/v.md").as_deref(), Some(U));
+        assert_eq!(fx.file("notes/u.md"), None);
+
+        fx.apply(patch(&wrap(&[update_op(
+            "notes/v.md",
+            Some("notes/w.md"),
+            "@@\n-a\n+A\n",
+        )])))
+        .expect("move with a hunk");
+        assert_eq!(fx.commits().len(), before + 2);
+        assert_eq!(
+            fx.file("notes/w.md").as_deref(),
+            Some("---\ndescription: u\n---\nA\nb\n")
+        );
+        assert_eq!(fx.file("notes/v.md"), None);
+
+        fx.apply(patch(&wrap(&[update_op(
+            "notes/pa.md",
+            Some("notes/pb.md"),
+            "@@\n-a\n+b\n",
+        )])))
+        .expect("move a file with provenance");
+        assert_eq!(fx.commits().len(), before + 3);
+        assert_eq!(
+            fx.file("notes/pb.md").as_deref(),
+            Some("---\ndescription: pa\nprovenance: agent\n---\nb\n")
+        );
+        assert_eq!(fx.file("notes/pa.md"), None);
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn patch_stamps_like_the_single_tools() {
+        let m = "---\ndescription: m\n---\nm\n";
+        let d = "---\ndescription: d\n---\nx\n";
+        let s = "---\ndescription: s\n---\nnew\n";
+        let files = [("notes/u.md", U), ("notes/m.md", m), ("notes/d.md", d)];
+        let text = wrap(&[
+            add_op("notes/s.md", s),
+            update_op("notes/u.md", None, "@@\n-a\n+A\n"),
+            update_op("notes/m.md", Some("notes/m2.md"), ""),
+            delete_op("notes/d.md"),
+        ]);
+        let fx = fx_with(&files);
+        let before = fx.commits().len();
+        fx.claimed(patch(&text), source(Source::Agent))
+            .expect("claimed patch");
+        assert_eq!(fx.commits().len(), before + 1);
+        assert_eq!(kind_of(fx.provenance("notes/s.md")), "agent");
+        assert_eq!(kind_of(fx.provenance("notes/u.md")), "agent");
+        assert_eq!(fx.file("notes/m2.md").as_deref(), Some(m));
+        assert_eq!(fx.file("notes/d.md"), None);
+        assert_eq!(fx.last_claim().expect("claim")["source"], "agent");
+        assert!(fx.dirty().is_empty());
+
+        let fx = fx_with(&files);
+        fx.apply(patch(&text)).expect("unclaimed patch");
+        assert_eq!(fx.provenance("notes/s.md"), None);
+        assert_eq!(fx.file("notes/s.md").as_deref(), Some(s));
+        assert_eq!(fx.last_claim(), None);
+    }
+
+    #[test]
+    fn patch_guards_apply_per_file() {
+        type Setup = fn(&Fx);
+        fn none(_: &Fx) {}
+        fn boundaries(fx: &Fx) {
+            verified_boundaries(fx);
+        }
+        fn hand_edit(fx: &Fx) {
+            put(&fx.home, "notes/u.md", "---\ndescription: by hand\n---\n");
+        }
+        let ok = add_op("notes/ok.md", "---\ndescription: ok\n---\nok\n");
+        let with_ok = |op: String| wrap(&[ok.clone(), op]);
+        let note = |body: &str| format!("---\ndescription: x\n---\n{body}\n");
+        let sk_path = format!(
+            "notes/{}.md",
+            fake(&["sk", "-", "learn-pipeline-experiments"], 'x', 0)
+        );
+        assert!(guard::find_secret(&sk_path).is_some());
+        let owner = Some(OWNER_ROW);
+        let cases: Vec<(Setup, Option<i64>, String, &str)> = vec![
+            (
+                none,
+                owner,
+                with_ok(update_op("notes/ro.md", None, "@@\n-body\n+changed\n")),
+                E_MEMORY_READ_ONLY,
+            ),
+            (
+                none,
+                owner,
+                with_ok(delete_op("notes/ro.md")),
+                E_MEMORY_READ_ONLY,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op("notes/s.md", &note(&format!("key {}", sk_key())))),
+                E_MEMORY_SECRET,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op(&sk_path, &note("x"))),
+                E_MEMORY_SECRET,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op(
+                    "notes/pv.md",
+                    "---\ndescription: pv\nprovenance: owner\n---\nx\n",
+                )),
+                E_MEMORY_PROVENANCE,
+            ),
+            (
+                boundaries,
+                owner,
+                with_ok(update_op(
+                    BOUNDARIES,
+                    None,
+                    "@@\n-- never force push\n+- always force push\n",
+                )),
+                E_MEMORY_QUOTE,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op(AGREEMENTS_FILE, &note("- never force push"))),
+                E_MEMORY_AGREEMENT,
+            ),
+            (none, owner, with_ok(delete_op(PERSONA)), E_MEMORY_PROTECTED),
+            (
+                none,
+                owner,
+                with_ok(update_op(HUMAN, Some("notes/h.md"), "")),
+                E_MEMORY_PROTECTED,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op("notes/A.md", &note("x"))),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op("notes/caf\u{e9}.md", &note("x"))),
+                E_MEMORY_PATH,
+            ),
+            (
+                none,
+                owner,
+                with_ok(update_op("notes/missing.md", None, "@@\n-a\n+b\n")),
+                E_MEMORY_NOT_FOUND,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op(
+                    "people/kim/card.md",
+                    "---\ndescription: k\nkind: person\n---\nKim\n",
+                )),
+                E_MEMORY_PERSON,
+            ),
+            (
+                none,
+                owner,
+                with_ok(add_op("people/human/card.md", CARD)),
+                E_MEMORY_PERSON,
+            ),
+            (
+                none,
+                owner,
+                with_ok(update_op("notes/u.md", None, "@@\n-zzz\n+y\n")),
+                E_MEMORY_PATCH,
+            ),
+            (none, owner, with_ok(ok.clone()), E_MEMORY_PATCH),
+            (
+                none,
+                owner,
+                wrap(&[
+                    ok.clone(),
+                    add_op("notes/Ok2.md", &note("x")),
+                    delete_op("notes/ok2.md"),
+                ]),
+                E_MEMORY_PATCH,
+            ),
+            (
+                none,
+                owner,
+                with_ok(update_op("notes/u.md", Some("notes/u.md"), "")),
+                E_MEMORY_NOOP,
+            ),
+            (
+                none,
+                owner,
+                wrap(&[update_op("notes/u.md", None, "@@\n-a\n+a\n")]),
+                E_MEMORY_NOOP,
+            ),
+            (
+                hand_edit,
+                owner,
+                with_ok(update_op("notes/u.md", None, "@@\n-a\n+A\n")),
+                E_MEMORY_DIRTY,
+            ),
+            (
+                none,
+                None,
+                with_ok(update_op("notes/u.md", None, "@@\n-a\n+A\n")),
+                E_MEMORY_ORIGIN,
+            ),
+        ];
+        for (setup, row, text, code) in cases {
+            let fx = fx_with(&[("notes/ro.md", RO), ("notes/u.md", U)]);
+            setup(&fx);
+            assert_refused(&fx, row, patch(&text), REASON, code);
+            assert_eq!(fx.file("notes/ok.md"), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn patch_soul_edit() {
+        let fx = fx_with(&[(PERSONA, A)]);
+        let applied = fx
+            .apply(patch(&wrap(&[update_op(
+                PERSONA,
+                None,
+                "@@\n-line1\n+changed\n",
+            )])))
+            .expect("patch persona");
+        assert!(applied.soul_edit);
+    }
+
+    /// The entry lines of an observations text.
+    fn entries(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.starts_with("- [")).collect()
+    }
+
+    #[test]
+    fn observe_creates_card_and_entry() {
+        let fx = fx();
+        let before = fx.commits().len();
+        let applied = fx
+            .apply(observe("kim", "likes tea", "2026-01-02"))
+            .expect("observe");
+        assert_eq!(fx.commits().len(), before + 1);
+        let card = people::new_card("kim", None, None);
+        let (want, _) = people::observe(
+            &people::new_observations("kim", None),
+            "likes tea",
+            "2026-01-02",
+        )
+        .expect("observe text");
+        assert_eq!(
+            fx.file("people/kim/card.md").as_deref(),
+            Some(card.as_str())
+        );
+        assert_eq!(
+            fx.file("people/kim/observations.md").as_deref(),
+            Some(want.as_str())
+        );
+        assert_eq!(applied.count, Some(1));
+        assert_eq!(applied.path, "people/kim/observations.md");
+        assert_eq!(applied.tool, MEMORY_OBSERVE_TOOL);
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["n"], 1);
+        assert!(json.get("paths").is_none(), "{json}");
+
+        let again = fx
+            .apply(observe("kim", "Likes tea", "2026-01-03"))
+            .expect("observe again");
+        assert_eq!(again.count, Some(2));
+        assert_eq!(fx.commits().len(), before + 2);
+        assert_eq!(
+            fx.file("people/kim/card.md").as_deref(),
+            Some(card.as_str())
+        );
+        let text = fx.file("people/kim/observations.md").expect("observations");
+        let lines = entries(&text);
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].ends_with("likes tea <!-- n=2 -->"), "{text}");
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn observe_the_owner() {
+        let fx = fx();
+        let mut want = bytes_under(fx.home.root());
+        let applied = fx
+            .apply(observe("human", "prefers short replies", "2026-01-02"))
+            .expect("observe owner");
+        let (text, count) = people::observe(HUMAN_SEED, "prefers short replies", "2026-01-02")
+            .expect("observe text");
+        assert_eq!(count, 1);
+        assert_eq!(applied.count, Some(1));
+        assert_eq!(applied.path, HUMAN);
+        want.insert(HUMAN.to_string(), text.into_bytes());
+        let got = bytes_under(fx.home.root());
+        assert_eq!(got, want);
+        assert!(!got.keys().any(|rel| rel.starts_with("people/")), "{got:?}");
+    }
+
+    #[test]
+    fn observe_refusals_change_nothing() {
+        let owner = Some(OWNER_ROW);
+        let obs = "people/kim/observations.md";
+        let fx = fx();
+        assert_refused(
+            &fx,
+            owner,
+            observe("Kim", "likes tea", "2026-01-02"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+        assert_refused(
+            &fx,
+            owner,
+            observe("kim", "likes\ntea", "2026-01-02"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+        assert_refused(
+            &fx,
+            owner,
+            observe("kim", &format!("key {}", sk_key()), "2026-01-02"),
+            REASON,
+            E_MEMORY_SECRET,
+        );
+
+        let mut full = people::new_observations("kim", None);
+        for i in 0..MAX_PERSON_ENTRIES {
+            full = people::observe(&full, &format!("fact {i}"), "2026-01-02")
+                .expect("entry")
+                .0;
+        }
+        assert_eq!(entries(&full).len(), MAX_PERSON_ENTRIES);
+        let fx = fx_with(&[(obs, &full)]);
+        assert_refused(
+            &fx,
+            owner,
+            observe("kim", "one more", "2026-01-02"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+
+        let locked = "---\ndescription: f\nread_only: \"true\"\n---\n## Explicit\n";
+        let fx = fx_with(&[(obs, locked)]);
+        assert_refused(
+            &fx,
+            owner,
+            observe("kim", "likes tea", "2026-01-02"),
+            REASON,
+            E_MEMORY_READ_ONLY,
+        );
+    }
+
+    #[test]
+    fn single_tools_check_person_files() {
+        let owner = Some(OWNER_ROW);
+        let fx = fx();
+        assert_refused(
+            &fx,
+            owner,
+            create("people/kim/card.md", "Kim"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+        assert_eq!(fx.file("people/kim/card.md"), None);
+        fx.apply(patch(&wrap(&[add_op("people/kim/card.md", CARD)])))
+            .expect("valid card");
+        assert_eq!(fx.file("people/kim/card.md").as_deref(), Some(CARD));
+        assert_refused(
+            &fx,
+            owner,
+            replace("people/kim/card.md", "IDENTITY: Kim", "Kim"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+        assert_refused(
+            &fx,
+            owner,
+            rename("notes/a.md", "people/human/a.md"),
+            REASON,
+            E_MEMORY_PERSON,
+        );
+        fx.apply(create("people/bob/c.md", "c"))
+            .expect("other names are free");
+        assert!(fx.file("people/bob/c.md").is_some());
     }
 }
