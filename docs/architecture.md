@@ -534,6 +534,24 @@ expired more=<n>
 
 **이후 단계.** M15는 대화가 끝난 뒤 따로 돌면서 같은 `break_agreement`로 어긴 횟수를 셉니다. M17은 주인 명령 `list/ack/drop`을 더하고, 보호 트리거를 주인 명령만 쓰는 길로 바꿉니다.
 
+### 3.15 첫 만남 (slice 7)
+
+설치하고 처음 켜면 봇이 먼저 인사하고, 자기를 뭐라고 부를지, 어떤 말투로 말할지, 주인은 어떤 사람인지 묻습니다. 답은 기억 파일에 남습니다.
+
+**요청 파일.** `moraebot init`이 설정을 새로 쓰면 `~/.moraebot/onboarding.request`(권한 600)를 남깁니다. 이미 쓰던 사람은 `moraebot onboarding`으로 같은 파일을 만듭니다. 이 파일이 없으면 아무 일도 일어나지 않습니다(D1). 설치 스크립트는 처음 설치할 때만, `init`은 설정 점검이 통과했을 때만 "Next steps:" 안내를 보여 줍니다(D9, D10).
+
+**인사는 한 번.** 게이트웨이가 켜질 때 요청 파일이 있으면, 먼저 데이터베이스에 "진행 중"을 적고, 파일을 지운 다음, 설정된 채널(`channel_id`)에 정해진 영어 인사(`N_ONBOARDING_HELLO`)를 한 번 올립니다(D2, D3). 파일을 지우지 못하면 인사하지 않고 `E_ONBOARDING_REQUEST`만 로그에 남깁니다. 인사 전송이 실패해도 다시 보내지 않습니다(D4).
+
+**상태 한 줄.** `inbox.sqlite`의 `onboarding` 표에 한 줄만 둡니다. 상태는 `active`/`done`/`skipped`이고, 시작할 때의 마지막 메시지 번호를 함께 적습니다. 새 요청이 오면 같은 줄을 `active`로 되돌리고 그때부터 다시 셉니다(D5).
+
+**알림 줄.** 진행 중이면 주인 메시지마다 lead 입력의 알림 칸 끝에 `onboarding turn=<n>`이 붙습니다. 끼어든 메시지(steer)에는 붙지 않고, 10번(`MAX_ONBOARDING_TURNS`)이 지나면 멈춥니다(D7). lead 안내문은 이 줄을 보면 한 번에 하나씩 묻고, 답을 받은 턴에 바로 저장하라고 합니다. 이름은 `system/identity.md`에 `Name: <이름>` 한 줄로(D11), 말투는 `system/persona.md`에, 주인 이야기는 `system/human.md`에 넣습니다. 저장은 기존 기억 도구로 하고 `source: user`, 주인 말 그대로의 `user_quote`, 메시지 번호 `quote_message`를 붙입니다. 쓰기 규칙은 새로 만들지 않았습니다(D6).
+
+**끝내기 도구.** `onboarding_finish {outcome: done|skipped, reason}`입니다. 주인 메시지에 답하는 턴에서만 쓸 수 있고, 진행 중이 아니면 `E_ONBOARDING_STATE`로 거절합니다. 결과는 `{"onboarding": ..., "refresh": ...}` JSON입니다(D8).
+
+**다시 고정.** `done`이면 `memory/.refresh` 파일을 남깁니다. `moraebot memory refresh`와 같은 파일이라서, 다음 주인 메시지 전에 lead가 새 기억으로 다시 켜지고 새 이름과 말투가 블록에 들어갑니다. `skipped`는 바뀐 게 없으므로 남기지 않습니다.
+
+**하지 않은 것.** DM 인사, lead가 쓰는 인사, 실패한 인사 다시 보내기는 없습니다. 브랜치는 `slice7-onboarding`이고, 주인이 "합쳐"라고 할 때만 합칩니다(D12).
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -614,6 +632,7 @@ launchd는 macOS가 프로그램을 자동으로 켜고, 죽으면 다시 켜 �
    - dori-mode와 달리 화면을 읽지 않고 omp RPC의 결과를 씁니다.
 
    자세한 설계는 이 단계에 들어갈 때 합니다.
+5. **slice 7: 첫 만남과 다음 단계 안내.** 설치와 `init` 뒤에 할 일을 보여 주고, 첫 시작 때 봇이 한 번 인사한 뒤 이름, 말투, 주인 정보를 물어 기억에 저장합니다(3.15절).
 
 ## 6. 열린 질문
 

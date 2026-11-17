@@ -37,6 +37,8 @@ curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.
 
 This downloads the latest release for Apple Silicon Macs, checks it against the release's SHA-256 checksum, makes sure it runs, and only then puts it at `~/.local/bin/moraebot`. If anything fails, your existing moraebot stays as it was. When `~/.local/bin` isn't on your `PATH` yet, the script prints the line to add to your shell startup file.
 
+On a fresh install (no `config.toml` in `${MORAEBOT_HOME:-~/.moraebot}` yet), it ends with "Next steps:": `moraebot init`, `moraebot check-config`, `moraebot install-launchd`, then a line telling you to message the bot. If `moraebot` isn't on your `PATH`, those lines use its full path. An upgrade prints no next steps.
+
 Two settings change what it does. Put them right before `sh`, not before `curl`:
 
 - `MORAEBOT_VERSION` picks a release instead of the latest one.
@@ -109,6 +111,8 @@ It asks a few questions, in order:
 3. The path to `omp` (found on your `PATH`, you confirm it) and the work folder. Press Enter to accept the default `~/moraebot-work`.
 
 Then it creates `~/.moraebot` (mode `700`), writes `~/.moraebot/config.toml`, and runs the same checks as `check-config`. If a config already exists, it asks before overwriting it. The default answer is No.
+
+When it writes a new config, it also leaves `~/.moraebot/onboarding.request`, so the bot says hello at its next start (see First conversation). If every check passed, it then prints the next steps: `moraebot check-config`, `moraebot install-launchd`, or `moraebot run` to run it in the terminal instead. Keeping the existing config leaves no request, and neither does `moraebot setup`.
 
 ### 6. Change or add a messenger
 
@@ -318,6 +322,20 @@ autolearn:
 
 If your environment already sets `PI_CONFIG_FILES`, moraebot replaces it for its omp children. Your own `~/.omp` folder and the work folder get no file, so omp you run yourself is unchanged.
 
+## First conversation
+
+After `moraebot init` writes a new config, the bot starts with a short first meeting. It asks what to call it, how it should talk to you, and what it should know about you.
+
+- **The greeting.** At the next start, moraebot finds `~/.moraebot/onboarding.request`, removes it, and posts one fixed hello in the configured channel (`channel_id`). The lead doesn't write it. It's sent once: a restart doesn't repeat it, and a greeting that fails to send isn't tried again. If the request file can't be removed, no greeting is sent and the log gets `E_ONBOARDING_REQUEST`.
+- **The questions.** Reply in the channel (a thread opens as usual) or in a DM. While the first meeting runs, each of your messages carries a notice line `onboarding turn=<n>` for the lead. The lead says hello at turn 1, then asks one question per message.
+- **Where answers go.** The lead saves each answer with the normal memory tools, quoting your exact words: the name as one line `Name: <name>` in `system/identity.md`, the way of talking in `system/persona.md`, and facts about you in `system/human.md`. Because it quotes you, the file's `provenance:` line starts with `quoted:`. It tells you what it changed.
+- **Skip.** Reply `skip` and the lead stops asking.
+- **Ending.** When the answers are saved, or you skipped, the lead calls `onboarding_finish` with `done` or `skipped`. Outside a running first meeting that's refused with `E_ONBOARDING_STATE`. `done` also leaves the memory refresh request, so the lead re-pins its memory before your next message, and the new name and tone show from then on. `skipped` changes nothing.
+- **The 10-turn limit.** The notice line stops after your 10th message, even if the lead never ended the meeting. It can still end it later.
+- **An existing home.** A home you already use has no request file, so nothing happens after an upgrade. To get the first meeting anyway, run `moraebot onboarding` once and restart moraebot. It prints `{"onboarding":"requested"}`. Running it again later starts a fresh meeting.
+
+The state lives in one row of the `onboarding` table in `~/.moraebot/inbox.sqlite`: `active`, `done` or `skipped`.
+
 ## Behavior hints
 
 moraebot gives omp a short built-in note about the messenger it's answering in, for example how long a reply may be and which formatting renders. To replace it, write your own text to:
@@ -364,6 +382,7 @@ After installing, check these by hand once:
 - [ ] **Memory guards.** A file with `read_only: "true"` is refused when the lead tries to change it; a note outside `system/` shows by name at the end of the lead's block.
 - [ ] **Memory re-pin.** After a long conversation, check the log for `omp lead re-pinned by restart` and its `restart_ms`; run `moraebot memory refresh` once and see the next reply arrive normally.
 - [ ] **Agreements.** Tell the lead a lasting rule, approve its proposal, and check that the reply's tool result shows `author` `human`; after `moraebot memory refresh`, the next reply's block lists it under `<agreements>`.
+- [ ] **First conversation.** After the first start, reply to the bot's greeting (or reply skip).
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -416,6 +435,8 @@ The file name is cleaned up first, so it can't point outside that folder. moraeb
 ```
 
 The first two are the lead's memory (see Memory). The last one turns omp's own memory off and is rewritten whenever its text differs. `~/.moraebot/memory/.refresh` may also show up for a moment: it's the request file `moraebot memory refresh` leaves, removed at the next lead start.
+
+**First conversation files.** `~/.moraebot/onboarding.request` is the request `moraebot init` or `moraebot onboarding` leaves; the next start removes it and greets. The first meeting's state is one row in the `onboarding` table of `~/.moraebot/inbox.sqlite`.
 
 **Missing permission.** If the bot lacks the file permission, every file you send or ask for shows up as a file notice. Do the upgrade steps below to fix it.
 
