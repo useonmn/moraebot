@@ -466,6 +466,43 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **이후 단계.** M6은 boundaries처럼 주인의 정확한 말이 꼭 필요한 파일에 인용이 확인되지 않으면 쓰기를 거절하는 규칙을 붙이고, M12 이후의 뒤에서 도는 쓰기 작업도 같은 주장 기록을 씁니다. 그 밖의 일은 기억 로드맵의 이후 단계에서 다룹니다.
 
+### 3.13 기억 고정과 알림 (slice 6 M5)
+
+**고정(pin).** 기억이 켜진 lead 프로세스 하나는 켤 때 만든 안내문(힌트와 기억 블록)을 `Pin`에 담아 계속 씁니다. 기억이 바뀌어도 이 글은 바이트까지 그대로라서 모델의 프롬프트 캐시가 깨지지 않습니다. 기억이 바뀐 것만으로는 lead를 다시 켜지 않고, 바뀐 내용은 알림 줄로 알립니다. 기억이 없는 lead는 예전과 같아서 고정도, 알림도, 재시작도 없습니다.
+
+**`LeadState`.** lead의 이벤트 흐름을 보며 값 세 개를 셉니다. `results`는 받은 `prompt_result` 수입니다. `settled`는 lead가 쉬고 있는지입니다. `agent_start`가 오면 거짓, `sessionSettled: true`인 `prompt_result`나 `session_settled` 프레임이 오면 참, 자식이 막 켜졌을 때도 참입니다. `compactions`는 성공한 압축 수입니다. `auto_compaction_end`와 `manual_compaction_end` 중 취소되지 않았고(`aborted: false`), 건너뛰지 않았고(`skipped`가 `true`가 아님), 결과가 있는 것만 셉니다. 값은 `tokio::sync::watch`로 나눕니다.
+
+**`repin_action`.** 다시 고정할지는 이 함수 하나가 정합니다. `.refresh` 파일이 없고 압축 수가 고정 때보다 늘지 않았으면 `Keep`입니다. 다시 고정할 일이 있어도 이벤트가 따라잡지 못했거나 lead가 쉬지 않으면 `Defer`이고, 다음 메시지 때 다시 봅니다. 그 밖에는 `.refresh`가 있으면 `Refresh`, 없으면 `Compaction`입니다. `Compaction`은 블록을 다시 만들어 고정된 글과 같으면 재시작 없이 그 압축만 센 것으로 치고, 다르면 다시 켭니다. `Refresh`는 글이 같아도 다시 켭니다.
+
+**게이트의 자리.** 재시작은 `OmpManager::prompt` 맨 앞, `live` 잠금을 잡고 턴 게이트를 열기 전에만 합니다. 먼저 매니저가 받은 `prompt_result` 수만큼 이벤트 흐름이 따라잡기를 `LEAD_STATE_BOUND`(5초)까지만 기다리고, 넘으면 경고 로그를 남기고 미룹니다. 다시 켤 때는 옛 자식을 `Live::close`로 정상 종료하고, 같은 세션 폴더로 기존 `start` 길을 타므로 호스트 도구도 다시 보내고 대화 기록도 남습니다. 로그 `omp lead re-pinned by restart`에는 `reason`과 `restart_ms`만 들어갑니다. `try_steer`, 이벤트 처리, 타이머, 쓰기 경로에서는 다시 켜지 않습니다.
+
+**`moraebot memory refresh`.** 데이터베이스를 열지 않고 `<home>/memory/.refresh`(모드 600)만 만든 뒤 `{"refresh":"requested"}`를 출력합니다. 그래서 gateway가 켜져 있어도 됩니다. lead가 켜질 때마다 이 파일을 지웁니다. 숨김 파일이라 기억 목록과 블록에는 나오지 않습니다.
+
+**알림을 보낼 때 만드는 이유.** 알림은 `dispatch.rs`가 아니라 lead에게 프레임을 실제로 보내는 순간(`prompt`와 `try_steer`)에 `with_notices`가 만듭니다. 그래서 끼어들기가 실패하면 알림도 사라지지 않고 다음 메시지에 실립니다. 머리줄에 `message=`가 있는 주인 입력에만 붙고 lane 결과에는 붙지 않습니다. 저장 독촉 줄은 본 메시지에만 붙고 끼어든 메시지에는 붙지 않습니다.
+
+**워터마크.** `notice::Watermarks`는 이미 알린 지점 세 개를 기억합니다. 마지막으로 본 기억 커밋 번호, 기한 지남을 본 마지막 시각, 이미 알린 압축 수입니다. lead가 켜질 때 처음 값을 정하고, 다시 켜질 때는 커밋 번호와 시각만 앞으로 옮깁니다. 알림을 만들 때마다 세 값이 앞으로만 움직이므로 같은 사실은 한 번만 알립니다. 저장소를 읽다 실패하면 워터마크는 그대로 두고 알림 없이 보냅니다. 시각은 주입한 시계(`notice::Clock`)에서 옵니다.
+
+**알림 형식.** `notice::block`이 만들고 `notice::insert`가 머리줄 바로 다음에 끼웁니다. 할 말이 없으면 블록도 없습니다. 줄 순서는 다음과 같고 경로는 JSON 문자열입니다.
+
+```text
+[moraebot memory-notice]
+compaction count=<n>
+nudge owner_turns=<n>
+soul path=<path> writer=<w> commit=<id>
+changed kind=<added|updated|removed> path=<path> writer=<w> commit=<id>
+changed more=<n>
+expired path=<path>
+expired more=<n>
+[moraebot memory-notice end]
+```
+
+- `changed`와 `soul`은 `lead`가 아닌 기록자의 커밋만 셉니다. 경로마다 창 안의 첫 행에서 "전에 있었는지", 마지막 행에서 "지금 있는지"를 보고 종류를 정합니다. 창 안에서 생겼다 지워진 경로는 빠집니다. `soul`은 `system/persona.md`와 `system/identity.md`(`SOUL_PATHS`)입니다.
+- `changed`와 `expired`는 각각 20개(`MAX_NOTICE_PATHS`)까지 쓰고 나머지는 `more` 한 줄로 셉니다.
+- `nudge`는 lead가 마지막으로 기억을 저장한 메시지 다음부터 처리한 주인 메시지 수(`Store::owner_turns_since_save`)가 10의 배수일 때 붙습니다. 데이터베이스로 세므로 재시작해도 수가 이어집니다.
+- lead가 `system/persona.md`나 `system/identity.md`를 고치면 도구 결과 JSON에 `"soul_edit": true`가 붙습니다.
+
+**이후 단계.** M6은 약속(agreements)과 boundaries 줄을, M7은 기억이 커졌다는 경고 줄을 알림에 더합니다. M10은 lead를 다시 켜지 않고 omp 확장으로 그 자리에서 블록을 바꿉니다. 그 밖의 일은 기억 로드맵의 이후 단계에서 다룹니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더

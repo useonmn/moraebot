@@ -252,6 +252,35 @@ moraebot memory accept [--config PATH] [--reason TEXT] [PATH...]
 - **The `provenance:` line.** When a write names a `source`, moraebot writes the file's `provenance:` frontmatter line itself. The lead can't set or change it (`E_MEMORY_PROVENANCE`). The line starts with one of five words: `user:`, `quoted:`, `agent:`, `inferred:` or `mixed:`. Changing a `user:` or `quoted:` file with a different kind, or a line of any other shape, gives `mixed:`. `agent:` and `inferred:` simply replace each other. Writing the line rewrites the whole frontmatter in a standard form, for example `read_only: "true"` becomes `read_only: true`, which means the same. Renames and deletes keep the text as it is, so the claim goes only into the history. The lead's memory block shows the line as a `provenance="..."` attribute.
 - **Limits of claims.** If you edit a message in the messenger later, moraebot still compares against the text it first stored. A reply the lead sent before this version can't be a proposal, so the first approval after upgrading is stored as `quoted`. A `provenance:` line is a record of where words came from, not a permission for anything.
 - **What M4 doesn't do.** No recall, no automatic learning, lanes still get no memory, and no file needs a quote yet. Later slices of the memory roadmap add those.
+- **The pinned block.** One lead process keeps the memory block it started with, byte for byte, even when memory changes under it. That keeps the system prompt identical from message to message, so the model's prompt cache stays valid. A memory change alone never restarts the lead; it's announced in a notice instead (below).
+- **Re-pinning.** The block is rebuilt at only two points. After omp compacts the conversation (a finished automatic or manual compaction, not an aborted or skipped one), the next message renders the block again and restarts the lead only if the new block differs from the pinned one. After `moraebot memory refresh`, the next message always restarts the lead, even when the block is the same. A restart happens only right before moraebot sends the lead its next message, when omp's last turn has finished and omp has said it's idle. If it isn't idle yet, the restart waits for a later message. The new lead uses the same session folder, so the conversation history is kept. The log line `omp lead re-pinned by restart` carries the `reason` (`compaction` or `refresh`) and `restart_ms`.
+- **`moraebot memory refresh`.** This works while the gateway runs. It doesn't open the inbox database; it only creates `~/.moraebot/memory/.refresh` (mode 600) and prints `{"refresh":"requested"}`. Every lead start removes that file. If the memory folder doesn't exist yet, it prints `E_MEMORY_LAYOUT` and exits 1.
+
+```sh
+moraebot memory refresh [--config PATH]
+```
+
+- **Notices.** When one of your messages reaches the lead and there's something to report, a notice block goes right after the message's tag line, before your text. Lane results never get one. The block is built when the message is actually sent, and each fact is reported once. Its lines:
+  - `compaction count=<n>`: the conversation was compacted `n` times since the last notice.
+  - `nudge owner_turns=<n>`: the lead has handled `n` of your messages since it last saved memory. It appears when `n` is 10, 20, 30 and so on. It isn't added to a follow-up folded into a running answer.
+  - `soul path=<path> writer=<w> commit=<id>`: `system/persona.md` or `system/identity.md` was changed by someone other than the lead.
+  - `changed kind=<added|updated|removed> path=<path> writer=<w> commit=<id>`: a memory file changed by someone other than the lead, one line per path in path order, at most 20, then `changed more=<n>`.
+  - `expired path=<path>`: a file's `expires` time passed since the last notice, at most 20, then `expired more=<n>`.
+
+  Paths are written as JSON strings. An example:
+
+```text
+[moraebot conversation=<key> message=<id>]
+[moraebot memory-notice]
+compaction count=1
+changed kind=updated path="notes/plan.md" writer=human commit=7
+expired path="notes/trip.md"
+[moraebot memory-notice end]
+your message text
+```
+
+- **Lead writes aren't announced.** The lead already sees its own writes in the tool results, so they never show up as `changed` or `soul` lines. `moraebot memory accept` can't run while the gateway runs, so for now there's no other writer and those two lines stay empty in normal use. Later slices add other writers.
+- **`soul_edit`.** When a lead write changes `system/persona.md` or `system/identity.md`, its result JSON carries `"soul_edit": true`, and the lead is told to tell you about the change. Other writes' results are unchanged.
 
 **omp's own memory is off.** omp has a memory feature of its own. moraebot turns it off for every omp it starts (the lead and every lane): before each start it writes `~/.moraebot/omp/config-overlay.yml` (mode 600) with exactly this text, and points omp at it with the `PI_CONFIG_FILES` environment variable:
 
@@ -308,6 +337,7 @@ After installing, check these by hand once:
 - [ ] **Memory.** After a hand edit of a memory file, the lead's block shows it as dirty until `moraebot memory accept`; after accept and a restart the edit is in the block.
 - [ ] **Memory claims.** Answer a lead proposal with `ok`; when the lead saves it with `source: user`, the file's `provenance:` line starts with `user:`.
 - [ ] **Memory guards.** A file with `read_only: "true"` is refused when the lead tries to change it; a note outside `system/` shows by name at the end of the lead's block.
+- [ ] **Memory re-pin.** After a long conversation, check the log for `omp lead re-pinned by restart` and its `restart_ms`; run `moraebot memory refresh` once and see the next reply arrive normally.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -359,7 +389,7 @@ The file name is cleaned up first, so it can't point outside that folder. moraeb
 ~/.moraebot/omp/config-overlay.yml
 ```
 
-The first two are the lead's memory (see Memory). The last one turns omp's own memory off and is rewritten whenever its text differs.
+The first two are the lead's memory (see Memory). The last one turns omp's own memory off and is rewritten whenever its text differs. `~/.moraebot/memory/.refresh` may also show up for a moment: it's the request file `moraebot memory refresh` leaves, removed at the next lead start.
 
 **Missing permission.** If the bot lacks the file permission, every file you send or ask for shows up as a file notice. Do the upgrade steps below to fix it.
 
