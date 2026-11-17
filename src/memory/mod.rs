@@ -24,8 +24,12 @@
 //!
 //! The size estimate of the system files and its line in the block live in `render`; the
 //! over-budget notice lives in `notice`.
+//!
+//! The omp extension that refreshes the block in place, delivers notices and refuses direct
+//! edits of the memory folder, and its files under `<home>/omp`, live in `extension`.
 
 pub mod agreements;
+pub mod extension;
 pub mod frontmatter;
 pub mod guard;
 pub mod history;
@@ -294,3 +298,7 @@ pub const MAX_PATCH_FILES: usize = 20;
 pub const E_MEMORY_PERSON: &str = "E_MEMORY_PERSON";
 /// A patch that cannot be read or does not apply.
 pub const E_MEMORY_PATCH: &str = "E_MEMORY_PATCH";
+/// The lead started without a working memory extension; it refreshes by restart.
+pub const E_MEMORY_EXT_MISSING: &str = "E_MEMORY_EXT_MISSING";
+/// The extension refused a file tool aimed at the memory folder or moraebot's omp folder.
+pub const E_MEMORY_DIRECT_EDIT: &str = "E_MEMORY_DIRECT_EDIT";
