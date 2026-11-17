@@ -34,6 +34,22 @@ impl Frontmatter {
     pub fn entries(&self) -> &[(String, String)] {
         &self.entries
     }
+
+    /// A frontmatter holding only `description`. It is not validated here: writers parse the
+    /// full text again.
+    pub fn with_description(description: &str) -> Self {
+        Self {
+            entries: vec![("description".to_string(), description.to_string())],
+        }
+    }
+
+    /// Set `key` to `value`: in place when the key exists, appended otherwise.
+    pub fn set(&mut self, key: &str, value: &str) {
+        match self.entries.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = value.to_string(),
+            None => self.entries.push((key.to_string(), value.to_string())),
+        }
+    }
 }
 
 /// A successfully parsed memory file: its frontmatter and everything after it.
@@ -351,6 +367,45 @@ mod tests {
             assert_eq!(again.frontmatter, parsed.frontmatter);
             assert_eq!(again.body, parsed.body);
         }
+    }
+
+    #[test]
+    fn set_replaces_in_place_and_appends_new_keys() {
+        let mut fm = parse("---\nkind: person\ndescription: d\nlimit: 5\n---\n")
+            .unwrap()
+            .frontmatter;
+        fm.set("description", "x");
+        let pairs = |fm: &Frontmatter| -> Vec<(String, String)> { fm.entries().to_vec() };
+        let owned = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            pairs(&fm),
+            [
+                owned("kind", "person"),
+                owned("description", "x"),
+                owned("limit", "5")
+            ]
+        );
+        fm.set("expires", "2027-01-01");
+        assert_eq!(
+            pairs(&fm),
+            [
+                owned("kind", "person"),
+                owned("description", "x"),
+                owned("limit", "5"),
+                owned("expires", "2027-01-01")
+            ]
+        );
+    }
+
+    #[test]
+    fn with_description_renders_and_parses() {
+        let text = format!(
+            "{}body\n",
+            render_frontmatter(&Frontmatter::with_description("a: b"))
+        );
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.frontmatter.description(), "a: b");
+        assert_eq!(parsed.body, "body\n");
     }
 
     #[test]
