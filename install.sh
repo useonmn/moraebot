@@ -101,8 +101,9 @@ main() {
     printf 'Installed %s to %s\n' "$installed" "$install_dir/moraebot"
 
     case ":${PATH:-}:" in
-        *":$install_dir:"*) ;;
+        *":$install_dir:"*) cmd="moraebot" ;;
         *)
+            cmd="$install_dir/moraebot"
             case "${SHELL:-}" in
                 */zsh) rc="~/.zshrc" ;;
                 */bash) rc="~/.bash_profile" ;;
@@ -115,6 +116,11 @@ main() {
 
     if [ -e "${MORAEBOT_HOME:-$HOME/.moraebot}/bin/moraebot" ]; then
         printf 'A background copy exists: run "moraebot install-launchd" to update it.\n'
+    fi
+
+    if [ ! -e "${MORAEBOT_HOME:-$HOME/.moraebot}/config.toml" ]; then
+        printf 'Next steps:\n  %s init\n  %s check-config\n  %s install-launchd\nThen send the bot a message in its channel or a DM.\n' \
+            "$cmd" "$cmd" "$cmd"
     fi
 }
 
