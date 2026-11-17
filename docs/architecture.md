@@ -472,9 +472,9 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **`LeadState`.** lead의 이벤트 흐름을 보며 값 세 개를 셉니다. `results`는 받은 `prompt_result` 수입니다. `settled`는 lead가 쉬고 있는지입니다. `agent_start`가 오면 거짓, `sessionSettled: true`인 `prompt_result`나 `session_settled` 프레임이 오면 참, 자식이 막 켜졌을 때도 참입니다. `compactions`는 성공한 압축 수입니다. `auto_compaction_end`와 `manual_compaction_end` 중 취소되지 않았고(`aborted: false`), 건너뛰지 않았고(`skipped`가 `true`가 아님), 결과가 있는 것만 셉니다. 값은 `tokio::sync::watch`로 나눕니다.
 
-**`repin_action`.** 다시 고정할지는 이 함수 하나가 정합니다. `.refresh` 파일이 없고 압축 수가 고정 때보다 늘지 않았으면 `Keep`입니다. 다시 고정할 일이 있어도 이벤트가 따라잡지 못했거나 lead가 쉬지 않으면 `Defer`이고, 다음 메시지 때 다시 봅니다. 그 밖에는 `.refresh`가 있으면 `Refresh`, 없으면 `Compaction`입니다. `Compaction`은 블록을 다시 만들어 고정된 글과 같으면 재시작 없이 그 압축만 센 것으로 치고, 다르면 다시 켭니다. `Refresh`는 글이 같아도 다시 켭니다.
+**`repin_action`.** 다시 고정할지는 이 함수 하나가 정합니다. `.refresh` 파일이 없고 압축 수가 고정 때보다 늘지 않았으면 `Keep`입니다. 다시 고정할 일이 있어도 이벤트가 따라잡지 못했거나 lead가 쉬지 않으면 `Defer`이고, 다음 메시지 때 다시 봅니다. 그 밖에는 `.refresh`가 있으면 `Refresh`, 없으면 `Compaction`입니다. `Compaction`은 블록을 다시 만들어 고정된 글과 같으면 재시작 없이 그 압축만 센 것으로 치고, 다르면 다시 켭니다. `Refresh`는 글이 같아도 다시 켭니다. 확장이 붙은 lead는 다시 켜는 대신 그 자리에서 블록을 바꿉니다(3.19).
 
-**게이트의 자리.** 재시작은 `OmpManager::prompt` 맨 앞, `live` 잠금을 잡고 턴 게이트를 열기 전에만 합니다. 먼저 매니저가 받은 `prompt_result` 수만큼 이벤트 흐름이 따라잡기를 `LEAD_STATE_BOUND`(5초)까지만 기다리고, 넘으면 경고 로그를 남기고 미룹니다. 다시 켤 때는 옛 자식을 `Live::close`로 정상 종료하고, 같은 세션 폴더로 기존 `start` 길을 타므로 호스트 도구도 다시 보내고 대화 기록도 남습니다. 로그 `omp lead re-pinned by restart`에는 `reason`과 `restart_ms`만 들어갑니다. `try_steer`, 이벤트 처리, 타이머, 쓰기 경로에서는 다시 켜지 않습니다.
+**게이트의 자리.** 재시작은 `OmpManager::prompt` 맨 앞, `live` 잠금을 잡고 턴 게이트를 열기 전에만 합니다. 먼저 매니저가 받은 `prompt_result` 수만큼 이벤트 흐름이 따라잡기를 `LEAD_STATE_BOUND`(5초)까지만 기다리고, 넘으면 경고 로그를 남기고 미룹니다. 다시 켤 때는 옛 자식을 `Live::close`로 정상 종료하고, 같은 세션 폴더로 기존 `start` 길을 타므로 호스트 도구도 다시 보내고 대화 기록도 남습니다. 로그 `omp lead re-pinned by restart`에는 `reason`과 `restart_ms`만 들어갑니다. 확장이 붙은 lead는 같은 자리에서 다시 켜지 않고 블록 파일만 바꾸며, 로그는 `omp lead re-pinned in place`입니다(3.19). `try_steer`, 이벤트 처리, 타이머, 쓰기 경로에서는 다시 켜지 않습니다.
 
 **`moraebot memory refresh`.** 데이터베이스를 열지 않고 `<home>/memory/.refresh`(모드 600)만 만든 뒤 `{"refresh":"requested"}`를 출력합니다. 그래서 gateway가 켜져 있어도 됩니다. lead가 켜질 때마다 이 파일을 지웁니다. 숨김 파일이라 기억 목록과 블록에는 나오지 않습니다.
 
@@ -548,7 +548,7 @@ expired more=<n>
 
 **끝내기 도구.** `onboarding_finish {outcome: done|skipped, reason}`입니다. 주인 메시지에 답하는 턴에서만 쓸 수 있고, 진행 중이 아니면 `E_ONBOARDING_STATE`로 거절합니다. 결과는 `{"onboarding": ..., "refresh": ...}` JSON입니다(D8).
 
-**다시 고정.** `done`이면 `memory/.refresh` 파일을 남깁니다. `moraebot memory refresh`와 같은 파일이라서, 다음 주인 메시지 전에 lead가 새 기억으로 다시 켜지고 새 이름과 말투가 블록에 들어갑니다. `skipped`는 바뀐 게 없으므로 남기지 않습니다.
+**다시 고정.** `done`이면 `memory/.refresh` 파일을 남깁니다. `moraebot memory refresh`와 같은 파일이라서, 다음 주인 메시지 전에 lead가 새 기억으로 다시 켜지거나(확장이 붙었으면 그 자리에서 블록만 바뀌고, 3.19) 새 이름과 말투가 블록에 들어갑니다. `skipped`는 바뀐 게 없으므로 남기지 않습니다.
 
 **하지 않은 것.** DM 인사, lead가 쓰는 인사, 실패한 인사 다시 보내기는 없습니다. 브랜치는 `slice7-onboarding`이고, 주인이 "합쳐"라고 할 때만 합칩니다(D12).
 
@@ -624,6 +624,61 @@ lead용 문장에는 lane이 쓸 수 없는 도구 이름(`memory_read`, `memory
 **lane이 남길 것을 찾으면 (M9-D6).** lane은 마지막 답에 적습니다. lane 결과를 처리하는 lead 차례에서는 기억 쓰기가 `E_MEMORY_ORIGIN`으로 거절되므로, lead 안내문(`DEFAULT_GUIDANCE`)에 확인한 뒤 주인 메시지에 답하는 다음 차례에 저장하거나 주인에게 물으라는 줄이 있습니다.
 
 **남은 빈틈 (M9-D7).** lane도 yolo 모드라서 기억 파일을 도구 없이 직접 고칠 수 있습니다. 이 수정은 블록에 쓰이지 않고, 손으로 고친 파일로 표시되어 주인이 `moraebot memory accept`로 받아들이기 전까지 lead의 기억 쓰기를 막습니다. 직접 수정 자체를 막는 일은 이번 단계에서 하지 않습니다.
+
+### 3.19 lead의 기억 확장 (slice 6 M10)
+
+lead에만 작은 omp 확장 하나를 붙여서, 다시 켜지 않고 블록을 바꾸고, 알림을 따로 보내고, 기억 파일 직접 수정을 막습니다. 확장은 `assets/omp/moraebot-memory.ts`(TypeScript)이고, `src/memory/extension.rs`가 그 내용을 `extension::SOURCE`로 담아 둡니다. 붙이고 확인하는 코드는 `src/omp.rs`에 있습니다.
+
+**파일 (M10-D2).** 모두 `<home>/omp/` 아래에 있습니다.
+
+- `moraebot-memory.ts`: 확장 파일. lead가 켜질 때마다 들어 있는 사본과 다르면 다시 씁니다(M10-D8).
+- `moraebot-memory.ack.json`: 확장이 붙었다는 확인 파일. `{"pid": <omp 프로세스 번호>, "version": "moraebot-memory-1"}`.
+- `memory-block.md`: 지금 고정된 기억 블록.
+- `memory-outbox/`: 보낼 알림. 항목 하나가 `.md` 파일 하나이고 이름 순서대로 나갑니다.
+
+폴더는 모드 700, 파일은 600이고, 임시 파일에 쓴 뒤 이름을 바꿉니다.
+
+**켜는 순서.** 기억이 켜진 lead가 켜질 때마다 `start`가 이렇게 합니다.
+
+1. `extension::prepare`가 확장 파일을 쓰고, 옛 확인 파일을 지우고, 알림 상자를 비우고, 새 블록을 블록 파일에 씁니다.
+2. 명령줄 끝에 `-e <확장 절대 경로>`를 붙이고, 환경 변수 `MORAEBOT_EXT_HOME`에 moraebot 홈의 절대 경로를 넣습니다. 준비에 실패하면 `-e` 없이 켜고 `E_MEMORY_EXT_MISSING` 경고를 남깁니다.
+3. `open_session` 응답을 받은 뒤 `extension::check_ack`로 확인 파일을 봅니다. 프로세스 번호와 버전이 둘 다 맞으면 "붙음"(`extension_loaded`)이고 로그는 `memory extension loaded`입니다. 아니면 `E_MEMORY_EXT_MISSING` 경고를 한 번 남기고, 그 lead 프로세스는 M5 방식 그대로 갑니다(M10-D7).
+
+확인 파일은 늦지 않습니다. omp는 `ready`를 쓴 다음 확장을 초기화하고 `session_start`가 끝나기를 기다리며, 그동안 들어온 프레임은 시작이 끝날 때까지 미뤄 둡니다. 그래서 `open_session` 응답이 올 때는 확장이 이미 확인 파일을 썼습니다(`RPC`, `RI`).
+
+lane과 기억이 없는 `OmpManager`에는 `-e`도 환경 변수도 없습니다. `--trusted-extension`은 쓰지 않습니다(M10-D1).
+
+**그 자리에서 다시 고정 vs 재시작.** 언제 다시 고정할지는 M5의 `repin_action` 그대로입니다(M10-D3). 확장이 붙었으면 새 블록을 `memory-block.md`에 쓰고, 고정·알림 표시·refresh 요청은 재시작 때와 똑같이 옮기고, 자식은 그대로 둡니다. 로그는 `omp lead re-pinned in place`입니다. 확장은 `before_agent_start`(메시지 하나마다)에서 안내문 안의 `BEGIN`부터 `END`까지를 블록 파일 내용으로 바꿉니다. 같으면 손대지 않습니다. 블록 파일은 다시 고정할 때만 바뀌므로 그 사이 안내문은 바이트까지 같습니다. 블록 파일을 쓰지 못하면 `E_MEMORY_WRITE` 경고를 남기고 M5처럼 다시 켭니다.
+
+**알림 상자 (M10-D4).** 확장이 붙었으면 `with_notices`가 알림 블록을 주인 메시지에 끼우지 않고 `extension::queue`로 알림 상자에 넣습니다. 메시지 글은 받은 그대로 갑니다. 확장은 두 곳 중 먼저 오는 곳에서 상자를 비우고 한 번만 보냅니다.
+
+- `before_agent_start`: 주인 메시지(또는 끼어든 메시지) 바로 뒤에 `customType: "moraebot-memory"`, `display: false`인 메시지로.
+- `tool_result`: lead가 일하는 도중이면 다음 도구 결과 옆에 `additionalContext`로.
+
+알림은 세션 기록(JSONL)에 남고, 기억 블록은 남지 않습니다. 알림 상자에 쓰지 못하면 `E_MEMORY_WRITE` 경고를 남기고 예전처럼 메시지 안에 끼웁니다. lead가 다시 켜질 때 남은 항목은 지웁니다. 알림은 lead 본 세션에만 가고 하위 작업에는 가지 않습니다.
+
+**막는 도구 (M10-D5).** lead와 그 하위 작업에서 `write`, `edit`, `ast_edit`의 `path`나 `paths`가 `<home>/memory`나 `<home>/omp` 안(심볼릭 링크를 따라간 실제 경로 기준)이면 `tool_call`에서 막고, 이유는 `E_MEMORY_DIRECT_EDIT`로 시작합니다. 읽기 도구는 막지 않습니다. `bash`는 명령에 두 폴더의 절대 경로가 들어 있으면 "기억 도구를 쓰라"는 안내만 붙이고 실행합니다. moraebot의 기억 도구는 이 목록에 없으므로 막히지 않습니다.
+
+**프로젝트 힌트 (M10-D6).** lead 본 세션에서 `read`, `write`, `edit`, `ast_edit`, `grep`, `glob`이 성공했고 그 경로가 작업 폴더 안 `<이름>/...`이며 `memory/notes/projects/<이름>.md`가 있으면, 도구 결과에 그 노트 경로를 알리는 한 줄을 붙입니다. 이름은 영문자나 숫자로 시작하고 `.`, `_`, `-`를 쓸 수 있습니다. lead 프로세스 하나에서 이름마다 한 번입니다. 노트 내용은 붙이지 않습니다.
+
+**확장이 없을 때.**
+
+| 상황 | 결과 |
+| --- | --- |
+| 확장 파일을 쓰지 못함 | `-e` 없이 켬, `E_MEMORY_EXT_MISSING`, M5 방식 |
+| 확인 파일이 없거나 번호·버전이 다름(깨진 확장, 옛 확장) | `E_MEMORY_EXT_MISSING`, 그 lead 프로세스는 M5 방식 |
+| 다시 고정 때 블록 파일을 쓰지 못함 | `E_MEMORY_WRITE`, 다시 켬 |
+| 알림 상자에 쓰지 못함 | `E_MEMORY_WRITE`, 알림을 메시지 안에 끼움 |
+
+확장을 끄는 설정은 없습니다(M10-D11). omp는 확장을 처음 읽을 때 자기 캐시를 omp 설정 폴더(주인의 `~/.omp/cache/`)에 씁니다. moraebot은 그 폴더에 아무것도 쓰지 않습니다(M10-D10).
+
+**실제 omp로 확인한 것 (U6, U7, U17).** `tests/real_omp.rs`의 `#[ignore]` 테스트 세 개를 설치된 omp 18.22.1에서, 비운 환경과 임시 HOME, 소켓을 열지 않는 가짜 모델(`tests/fixtures/omp/fake-provider.ts`)로 세 번 돌렸고 세 번 모두 통과했습니다. 계획은 18.22.0을 예상했습니다.
+
+- U6 확인됨: 첫 메시지 때 `extension_loaded()`가 참이었습니다. 깨진 확장으로 바꾸면 붙지 않은 것으로 잡고 재시작으로 다시 고정했습니다.
+- U7 확인됨: 모델이 받은 안내문에 `BEGIN`이 정확히 하나였습니다. refresh 뒤 같은 프로세스 번호에서 새 블록이 보였고, 세션 기록에는 `BEGIN`이 없었습니다.
+- U17 확인됨: omp 18.22.1에서 네 테스트(새 셋과 기존 하나)가 모두 통과했습니다. omp를 올리기 전에 README의 명령으로 다시 돌립니다.
+
+`write`, `edit`, `ast_edit` 각각이 막혔고 파일은 그대로였으며, 프로젝트 힌트와 도구 사이에 넣은 알림이 다음 요청에 보였습니다.
 
 ## 4. 상태, 설정, 운영
 
