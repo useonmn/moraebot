@@ -40,6 +40,9 @@
 //! missing. A file the messenger refuses, that cannot be read, that ran past
 //! [`files::UPLOAD_TIMEOUT`] or that reached [`files::MAX_UPLOAD_ATTEMPTS`] is skipped;
 //! the owner gets one notice per reply.
+//!
+//! At startup, an onboarding request left by `moraebot init` or `moraebot onboarding` starts
+//! the first meeting and posts one fixed greeting in the configured channel.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -54,6 +57,7 @@ use crate::adapter::{
 use crate::config::Config;
 use crate::files::{self, OutFile, SavedFile};
 use crate::lead;
+use crate::memory::{E_ONBOARDING_REQUEST, onboarding};
 use crate::omp::{E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
@@ -80,6 +84,8 @@ pub const N_FILE_NOT_ALLOWED: &str = "N_FILE_NOT_ALLOWED";
 pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
 /// A lane was running when the gateway stopped; it was not resumed.
 pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
+/// The one greeting after an onboarding request, posted in the configured channel.
+pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -118,6 +124,11 @@ pub fn notice_text(code: &str) -> &'static str {
         N_LANE_INTERRUPTED => {
             "A background task was interrupted by a restart and was not resumed. Ask again if it \
              is still needed."
+        }
+        N_ONBOARDING_HELLO => {
+            "Hi! I'm your moraebot agent, and this is our first chat. When you reply, I'll ask \
+             what to call me, how I should talk to you, and a little about you. Reply skip if \
+             you'd rather not."
         }
         _ => "Something went wrong.",
     }
@@ -257,6 +268,8 @@ pub struct Dispatcher {
     work_dir: PathBuf,
     /// The moraebot home: never a source of sent files.
     home: PathBuf,
+    /// The configured channel: the onboarding greeting goes there.
+    channel_id: String,
     /// Held while a row is admitted and its thread opened, and while the worker dequeues,
     /// so the worker never picks a row whose thread does not exist yet.
     admission: tokio::sync::Mutex<()>,
@@ -280,6 +293,7 @@ impl Dispatcher {
             work_dir: std::path::absolute(&config.work_dir)
                 .unwrap_or_else(|_| config.work_dir.clone()),
             home: config.home.clone(),
+            channel_id: config.channel_id(),
             admission: tokio::sync::Mutex::new(()),
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
@@ -296,7 +310,7 @@ impl Dispatcher {
     /// reply whose file upload was cut gets one file notice (the file is skipped), stored
     /// replies are re-sent. A row cut off by a crash and one marked by a graceful shutdown
     /// are treated the same. A lane a restart interrupted gets one notice in its
-    /// conversation.
+    /// conversation. Last, an onboarding request gets its one greeting.
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
         self.post_needs_check_notices().await?;
@@ -323,6 +337,28 @@ impl Dispatcher {
         }
         for row in recovered.reply_pending {
             self.send_reply(row.id).await?;
+        }
+        self.greet_if_requested().await
+    }
+
+    /// Starts the onboarding and posts [`N_ONBOARDING_HELLO`] once when a request file is
+    /// present. The file is removed before the greeting; when it cannot be removed nothing
+    /// is sent (no greeting at every start). A failed greeting is not retried.
+    async fn greet_if_requested(&self) -> Result<(), StoreError> {
+        let path = onboarding::request_file(&self.home);
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(());
+        }
+        self.store().start_onboarding()?;
+        if std::fs::remove_file(&path).is_err() {
+            tracing::warn!(
+                code = E_ONBOARDING_REQUEST,
+                "onboarding request not removed; no greeting"
+            );
+            return Ok(());
+        }
+        if self.notify(&self.channel_id, N_ONBOARDING_HELLO).await {
+            tracing::info!("onboarding greeting sent");
         }
         Ok(())
     }

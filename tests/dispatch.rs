@@ -13,8 +13,8 @@ use moraebot::adapter::{
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
-    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_REPLY_TRUNCATED,
-    N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
+    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_ONBOARDING_HELLO,
+    N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
 use moraebot::files::{self, OutFile, SavedFile};
 use moraebot::gateway::Gateway;
@@ -22,8 +22,11 @@ use moraebot::hints;
 use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lead::{self, LaneResult};
 use moraebot::memory;
+use moraebot::memory::onboarding;
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
-use moraebot::store::{Admitted, LaneStart, LaneState, State, Store};
+use moraebot::store::{
+    Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
+};
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -2339,4 +2342,116 @@ async fn gateway_appends_lead_guidance_then_messenger_hints() {
 
     let empty = before_memory(lead_system_prompt_flags(&dir.path().join("empty"), Some("")).await);
     assert_eq!(empty, [format!("{flag}{hints_text}")]);
+}
+
+fn onboarding_row(h: &Harness) -> Option<OnboardingRow> {
+    h.store.lock().unwrap().onboarding().unwrap()
+}
+
+fn greeting() -> (String, String) {
+    (
+        CHANNEL.to_owned(),
+        notice_text(N_ONBOARDING_HELLO).to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn onboarding_request_greets_once_in_the_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![greeting()]);
+    assert!(
+        std::fs::symlink_metadata(onboarding::request_file(&h.config.home)).is_err(),
+        "request file removed"
+    );
+    assert_eq!(
+        onboarding_row(&h),
+        Some(OnboardingRow {
+            state: OnboardingState::Active,
+            after_row: 0
+        })
+    );
+
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.sends().len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn no_request_means_no_greeting() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert!(h.sends().is_empty());
+    assert_eq!(onboarding_row(&h), None);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn failed_greeting_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home).unwrap();
+    h.adapter.fail_next_send();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![greeting()]);
+    assert!(std::fs::symlink_metadata(onboarding::request_file(&h.config.home)).is_err());
+    assert_eq!(
+        onboarding_row(&h).map(|row| row.state),
+        Some(OnboardingState::Active)
+    );
+
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.sends().len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn new_request_restarts_onboarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(h.handle(channel_msg("1300000000000000081", "hello")).await);
+    assert_eq!(id, 1);
+    h.drain().await;
+    assert_eq!(h.sends().len(), 1);
+    {
+        let store = h.store.lock().unwrap();
+        store.start_onboarding().unwrap();
+        assert!(store.finish_onboarding(OnboardingState::Done).unwrap());
+    }
+
+    onboarding::request(&h.config.home).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(
+        onboarding_row(&h),
+        Some(OnboardingRow {
+            state: OnboardingState::Active,
+            after_row: 1
+        })
+    );
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends.last(), Some(&greeting()));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn unremovable_request_sends_no_greeting() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    std::fs::create_dir(onboarding::request_file(&h.config.home)).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert!(h.sends().is_empty());
+    assert_eq!(
+        onboarding_row(&h).map(|row| row.state),
+        Some(OnboardingState::Active)
+    );
+    h.close().await;
 }
