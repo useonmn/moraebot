@@ -17,7 +17,7 @@ use super::{
     E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_AGREEMENT_BREAK_TOOL,
     MEMORY_AGREEMENT_RECORD_TOOL, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL,
     MEMORY_LIST_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
-    MEMORY_UPDATE_DESCRIPTION_TOOL, ONBOARDING_FINISH_TOOL,
+    MEMORY_UPDATE_DESCRIPTION_TOOL, ONBOARDING_FINISH_TOOL, ONBOARDING_OUTCOMES,
 };
 use crate::lane::refused;
 use crate::omp::{TurnContext, lock};
@@ -211,7 +211,7 @@ fn finish_schema() -> Map<String, Value> {
         "properties": {
             "outcome": {
                 "type": "string",
-                "enum": ["done", "skipped"],
+                "enum": ONBOARDING_OUTCOMES,
                 "description": "done when the answers are saved, skipped when the owner did not want this."
             },
             "reason": {"type": "string", "description": "One line saying why."}
