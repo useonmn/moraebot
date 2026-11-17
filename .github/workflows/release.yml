@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag matches the Cargo.toml version
+        run: |
+          v="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="moraebot") | .version')"
+          test "v$v" = "$GITHUB_REF_NAME"
+
+      - name: Build
+        run: cargo build --release --locked --bin moraebot
+
+      - name: Smoke test
+        run: test "$(target/release/moraebot --version)" = "moraebot ${GITHUB_REF_NAME#v}"
+
+      - name: Package
+        run: |
+          tar -czf moraebot-aarch64-apple-darwin.tar.gz -C target/release moraebot
+          test "$(tar -tzf moraebot-aarch64-apple-darwin.tar.gz)" = moraebot
+          shasum -a 256 moraebot-aarch64-apple-darwin.tar.gz > SHA256SUMS.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            moraebot-aarch64-apple-darwin.tar.gz SHA256SUMS.txt install.sh \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
