@@ -574,6 +574,32 @@ lead의 "항상 보이는 기억"(`system/` 파일과 약속 칸)이 너무 커�
 
 **하지 않은 것.** 메신저로 주인에게 직접 보내는 메시지는 없습니다(M7-D5). 기억을 스스로 줄이는 일과 구조 점검은 이후 단계(M14)에서 다룹니다.
 
+### 3.17 사람 기록과 여러 파일 패치 (slice 6 M8)
+
+주인 말고 다른 사람에 대한 기억을 정해진 모양으로 두고, 기억 파일 여러 개를 한 번에 고칠 수 있게 합니다. 코드는 `src/memory/people.rs`, `src/memory/patch.rs`, `src/memory/write.rs`, `src/memory/tools.rs`에 있습니다.
+
+**사람 폴더.** 사람마다 `people/<이름표>/card.md`와 `people/<이름표>/observations.md` 두 파일을 둡니다. 카드는 앞머리에 `kind: person`이 있고, 비어 있지 않은 본문 줄은 `IDENTITY: `, `ATTRIBUTE: `, `RELATIONSHIP: <관계>: <다른 이름표>`, `INSTRUCTION: ` 넷 중 하나로 시작합니다. 사실 목록은 `## Explicit` 제목 아래에 `- [YYYY-MM-DD] <사실> <!-- n=<횟수> -->` 줄을 둡니다(횟수는 1 이상). 파일마다 최대 40줄(`MAX_PERSON_ENTRIES`), 한 줄 최대 200글자(`MAX_PERSON_LINE_CHARS`)입니다. 이름표는 영어 소문자, 숫자, `-`만 쓰고 첫 글자는 영문자나 숫자이며 최대 40글자(`MAX_SLUG_CHARS`)입니다(M8-D3). 한글 이름은 카드 안에 씁니다.
+
+**모양 검사 (M8-D2, D10).** 쓰기 결과가 위 두 파일에 글을 남기면 `people::check`가 모양을 봅니다. 틀리면 `E_MEMORY_PERSON`으로 거절하고 아무것도 바뀌지 않습니다. `people/human/` 아래에 새 글을 두는 쓰기도 같은 코드로 거절합니다. 주인 카드는 `system/human.md` 하나뿐이고, 이 파일은 모양 검사를 하지 않습니다. `people/` 아래 다른 이름의 파일도 자유입니다. `moraebot memory accept`도 모양을 검사하지 않습니다.
+
+**`memory_observe`.** lead가 이름표, 사실, `reason`(그리고 선택으로 이름, 별칭, 출처 인자)을 넘기면, 한 번의 lead 커밋으로 그 사람의 `## Explicit` 칸 끝에 `- [<UTC 날짜>] <사실> <!-- n=1 -->`를 붙입니다. 대소문자와 공백만 다른 같은 사실이 이미 있으면(`agreements::normalize`) 새 줄 대신 그 줄의 날짜를 오늘로, 횟수를 하나 올립니다. 카드나 사실 목록 파일이 없으면 함께 만듭니다. 이름표가 `human`이면 `system/human.md`의 `## Explicit` 칸에 씁니다(칸이 없으면 본문 끝에 만듭니다). 결과 JSON에 `"n"`이 붙습니다.
+
+**`memory_apply_patch`.** 공개된 Codex 패치 모양(`*** Begin Patch`, `*** Add File:`, `*** Update File:`과 `*** Move to:`, `@@` 고칠 곳, `*** Delete File:`, `*** End Patch`)을 받습니다. 최대 64 KiB(`MAX_PATCH_BYTES`), 파일 20개(`MAX_PATCH_FILES`)입니다. 고칠 곳은 정확히 맞는 곳을 먼저 찾고, 없으면 줄 끝 공백만 무시하고 한 번 더 찾습니다(M8-D6). 한 패치에서 같은 파일을 두 번(대소문자만 달라도) 다루면 거절합니다. 읽을 수 없거나 맞지 않는 패치는 `E_MEMORY_PATCH`이고, 거절 내용에는 파일 이름, 패치의 줄 번호, 고칠 곳 번호만 들어갑니다(M8-D7). 파일 내용이나 패치 글은 돌려주지 않습니다. 파일 추가는 `memory_create`처럼, 내용 고치기는 `memory_str_replace`처럼, 옮기기만 하는 것은 `memory_rename`처럼, 지우기는 `memory_delete`처럼 출처 표시를 받습니다(M8-D8).
+
+**패치가 엔진을 지나는 순서.** `write::run`이 패치 하나를 다음 순서로 봅니다. 하나라도 걸리면 그 코드를 돌려주고, 파일은 하나도 바뀌지 않고 커밋 기록도 생기지 않습니다.
+
+1. `reason`과 인용문 검사, 그리고 주인 입력에 답하는 차례인지(`E_MEMORY_ORIGIN`).
+2. 파일마다 경로 검사: ASCII 경로 규칙, 새 경로의 비밀 같은 글자, 같은 파일 두 번, 지우거나 옮길 수 없는 파일, 약속 파일 자리, `people/human/` 아래 새 글.
+3. 손으로 고친 파일이 있는지(`E_MEMORY_DIRTY`), 파일이 있어야 하거나 없어야 하는지(대소문자 무시), 읽기 전용 표시.
+4. 고칠 곳을 적용한 새 글마다 내용 검사(크기, NUL, 블록 표시, 앞머리, 출처 줄 바뀜 없음, 비밀 표). 바뀌는 것이 없으면 `E_MEMORY_NOOP`.
+5. 출처 확인, 경계 파일이 포함되면 주인 인용(`E_MEMORY_QUOTE`), 출처 표시 찍기.
+6. 사람 카드와 사실 목록 모양(`E_MEMORY_PERSON`).
+7. 모든 변경을 lead 커밋 하나로 기록합니다. 결과 JSON에는 바뀐 경로 목록이 붙습니다.
+
+**U8 확인 결과.** omp 18.22.0 실행 파일 안에 `skills.customDirectories`(배열)라는 설정 이름이 있는 것은 문자열 검색으로 봤습니다. 할 일 1의 실험(`.omo/evidence/task-1-moraebot-memory-m8-u8.txt`)에서는 임시 폴더와 임시 HOME으로 실제 omp에 `get_state`만 보냈습니다. 덧씌우기 파일에 `skills.customDirectories`로 스킬 폴더를 넣은 실행(B)에서는 시스템 프롬프트에 실험 스킬 `probe-skill-m8`이 나타났고, 넣지 않은 실행(A)에서는 나타나지 않았습니다(`B_HAS=true A_HAS=false`). 그래서 omp가 덧씌우기 파일의 이 값을 읽는 것은 **확인됨**입니다. 하지만 이번 단계는 이 설정을 쓰지 않습니다. `OMP_OVERLAY`는 그대로이고, `skills/` 아래 파일은 여전히 메모일 뿐입니다. 비교표 5번 줄(기억 스킬)은 스킬을 따로 다루는 단계까지 WEAKER로 남습니다(M8-D9).
+
+**하지 않은 것.** 대화에서 사실을 자동으로 뽑아 사람별로 넣는 일(M15), 사람 목록을 보여 주는 명령(M17), 사실 목록의 다른 칸(M14)은 이후 단계입니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
