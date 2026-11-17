@@ -231,6 +231,49 @@ pub struct MemoryChangeRow {
     pub present: bool,
 }
 
+/// One standing agreement as the lead sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgreementRow {
+    pub id: i64,
+    pub scope: String,
+    pub author: String,
+    pub text: String,
+    pub broken: i64,
+    pub needs_human: bool,
+}
+
+/// A new agreement: the checked fields, the turn that recorded it and its claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgreement<'a> {
+    pub scope: &'a str,
+    pub author: &'a str,
+    pub text: &'a str,
+    pub norm: &'a str,
+    pub turn_row: i64,
+    pub reason: &'a str,
+    pub claim_json: Option<&'a str>,
+}
+
+/// What adding an agreement did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreementAdded {
+    Added(i64),
+    Exists(i64),
+    Full,
+}
+
+/// What reporting a break did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreementBreak {
+    Counted {
+        broken: i64,
+        needs_human: bool,
+        flagged: bool,
+    },
+    Unknown,
+    Repeat,
+}
+
 /// One changed memory path: the path and its new full text, `None` when deleted.
 pub type MemoryChange = (String, Option<String>);
 
@@ -317,6 +360,41 @@ CREATE TABLE IF NOT EXISTS memory_snapshots(
     PRIMARY KEY(commit_id, path)
 );
 CREATE INDEX IF NOT EXISTS memory_snapshots_by_path ON memory_snapshots(path, commit_id);
+CREATE TABLE IF NOT EXISTS memory_agreements(
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK(scope IN ('global','project')),
+    author TEXT NOT NULL CHECK(author IN ('human','agent')),
+    text TEXT NOT NULL,
+    norm TEXT NOT NULL UNIQUE,
+    broken INTEGER NOT NULL DEFAULT 0 CHECK(broken >= 0),
+    needs_human INTEGER NOT NULL DEFAULT 0 CHECK(needs_human IN (0,1)),
+    noticed INTEGER NOT NULL DEFAULT 0 CHECK(noticed IN (0,1)),
+    created_at TEXT NOT NULL,
+    turn_row INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    claim_json TEXT,
+    last_broken_at TEXT
+);
+CREATE TABLE IF NOT EXISTS memory_agreement_breaks(
+    agreement_id INTEGER NOT NULL REFERENCES memory_agreements(id),
+    turn_row INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(agreement_id, turn_row)
+);
+CREATE TRIGGER IF NOT EXISTS memory_agreements_guard BEFORE UPDATE ON memory_agreements
+WHEN NEW.id IS NOT OLD.id OR NEW.scope IS NOT OLD.scope OR NEW.author IS NOT OLD.author
+  OR NEW.text IS NOT OLD.text OR NEW.norm IS NOT OLD.norm OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.turn_row IS NOT OLD.turn_row OR NEW.reason IS NOT OLD.reason
+  OR NEW.claim_json IS NOT OLD.claim_json OR NEW.broken < OLD.broken
+  OR NEW.needs_human < OLD.needs_human OR NEW.noticed < OLD.noticed
+BEGIN SELECT RAISE(ABORT, 'E_MEMORY_AGREEMENT'); END;
+CREATE TRIGGER IF NOT EXISTS memory_agreements_no_delete BEFORE DELETE ON memory_agreements
+BEGIN SELECT RAISE(ABORT, 'E_MEMORY_AGREEMENT'); END;
+CREATE TRIGGER IF NOT EXISTS memory_agreement_breaks_no_update BEFORE UPDATE ON memory_agreement_breaks
+BEGIN SELECT RAISE(ABORT, 'E_MEMORY_AGREEMENT'); END;
+CREATE TRIGGER IF NOT EXISTS memory_agreement_breaks_no_delete BEFORE DELETE ON memory_agreement_breaks
+BEGIN SELECT RAISE(ABORT, 'E_MEMORY_AGREEMENT'); END;
 ";
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
@@ -449,6 +527,18 @@ fn map_row(r: &SqlRow<'_>) -> rusqlite::Result<InboxRow> {
         text_sent: r.get::<_, i64>(13)? != 0,
         origin: r.get(14)?,
         steered_into: r.get(15)?,
+    })
+}
+
+/// Maps `id, scope, author, text, broken, needs_human` to an [`AgreementRow`].
+fn agreement_row(r: &SqlRow<'_>) -> rusqlite::Result<AgreementRow> {
+    Ok(AgreementRow {
+        id: r.get(0)?,
+        scope: r.get(1)?,
+        author: r.get(2)?,
+        text: r.get(3)?,
+        broken: r.get(4)?,
+        needs_human: r.get(5)?,
     })
 }
 
@@ -1330,6 +1420,141 @@ impl Store {
             [turn_row],
             |r| r.get(0),
         )?)
+    }
+
+    /// Every agreement, the owner's (`human`) first, then by id.
+    pub fn agreements(&self) -> Result<Vec<AgreementRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, author, text, broken, needs_human FROM memory_agreements
+             ORDER BY author = 'human' DESC, id",
+        )?;
+        let rows = stmt.query_map([], agreement_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Adds one agreement in one transaction: `Exists` when its `norm` is already stored,
+    /// `Full` when the ledger holds `max` rows or the stored texts plus this one would pass
+    /// `max_bytes` (UTF-8 bytes).
+    pub fn add_agreement(
+        &mut self,
+        new: &NewAgreement<'_>,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<AgreementAdded, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM memory_agreements WHERE norm = ?1",
+                [new.norm],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(AgreementAdded::Exists(id));
+        }
+        let (count, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM memory_agreements",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (count, bytes) = (count as usize, bytes as usize);
+        if count >= max || bytes + new.text.len() > max_bytes {
+            return Ok(AgreementAdded::Full);
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO memory_agreements(scope, author, text, norm, created_at, turn_row, reason, claim_json)
+                 VALUES (?1, ?2, ?3, ?4, {NOW}, ?5, ?6, ?7)"
+            ),
+            params![
+                new.scope,
+                new.author,
+                new.text,
+                new.norm,
+                new.turn_row,
+                new.reason,
+                new.claim_json
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(AgreementAdded::Added(id))
+    }
+
+    /// Counts one break of agreement `id` in owner turn `turn_row`, in one transaction: one
+    /// receipt per agreement and turn, and the NEEDS-HUMAN flag once `broken` reaches
+    /// `needs_human_at`. `flagged` is whether this break set the flag.
+    pub fn break_agreement(
+        &mut self,
+        id: i64,
+        turn_row: i64,
+        reason: &str,
+        needs_human_at: i64,
+    ) -> Result<AgreementBreak, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: Option<(i64, bool)> = tx
+            .query_row(
+                "SELECT broken, needs_human FROM memory_agreements WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_broken, old_flag)) = old else {
+            return Ok(AgreementBreak::Unknown);
+        };
+        let inserted = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO memory_agreement_breaks(agreement_id, turn_row, at, reason)
+                 VALUES (?1, ?2, {NOW}, ?3)"
+            ),
+            params![id, turn_row, reason],
+        )?;
+        if inserted == 0 {
+            return Ok(AgreementBreak::Repeat);
+        }
+        let broken = old_broken + 1;
+        let needs_human = old_flag || broken >= needs_human_at;
+        tx.execute(
+            &format!(
+                "UPDATE memory_agreements SET broken = ?2, last_broken_at = {NOW}, needs_human = ?3
+                 WHERE id = ?1"
+            ),
+            params![id, broken, needs_human],
+        )?;
+        tx.commit()?;
+        Ok(AgreementBreak::Counted {
+            broken,
+            needs_human,
+            flagged: !old_flag && needs_human,
+        })
+    }
+
+    /// Flagged agreements whose NEEDS-HUMAN notice was not shown yet, by id.
+    pub fn unnoticed_flags(&self) -> Result<Vec<AgreementRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, author, text, broken, needs_human FROM memory_agreements
+             WHERE needs_human = 1 AND noticed = 0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], agreement_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Marks the NEEDS-HUMAN notice of each id as shown (one statement; empty is a no-op).
+    pub fn mark_flags_noticed(&self, ids: &[i64]) -> Result<(), StoreError> {
+        let ids = format!(
+            "[{}]",
+            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+        );
+        self.conn.execute(
+            "UPDATE memory_agreements SET noticed = 1
+             WHERE id IN (SELECT value FROM json_each(?1))",
+            [ids],
+        )?;
+        Ok(())
     }
 
     /// Runs raw SQL on the store's connection (tests break the database with it).
@@ -2291,7 +2516,13 @@ mod tests {
             .unwrap()
     }
 
-    const MEMORY_OBJECTS: [&str; 3] = [
+    const MEMORY_OBJECTS: [&str; 9] = [
+        "memory_agreement_breaks",
+        "memory_agreement_breaks_no_delete",
+        "memory_agreement_breaks_no_update",
+        "memory_agreements",
+        "memory_agreements_guard",
+        "memory_agreements_no_delete",
         "memory_commits",
         "memory_snapshots",
         "memory_snapshots_by_path",
@@ -2320,6 +2551,218 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(memory_objects(&s.conn), MEMORY_OBJECTS);
         assert_eq!(s.count().unwrap(), 1);
+    }
+
+    const LEDGER_BYTES: usize = 12288;
+
+    fn agreement<'a>(
+        scope: &'a str,
+        author: &'a str,
+        text: &'a str,
+        norm: &'a str,
+        turn_row: i64,
+        claim_json: Option<&'a str>,
+    ) -> NewAgreement<'a> {
+        NewAgreement {
+            scope,
+            author,
+            text,
+            norm,
+            turn_row,
+            reason: "why",
+            claim_json,
+        }
+    }
+
+    fn add(s: &mut Store, author: &str, text: &str, max: usize, max_bytes: usize) -> AgreementAdded {
+        s.add_agreement(
+            &agreement("project", author, text, text, 1, None),
+            max,
+            max_bytes,
+        )
+        .unwrap()
+    }
+
+    fn agreement_rows(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM memory_agreements", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn receipts(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM memory_agreement_breaks", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn row(id: i64, scope: &str, author: &str, text: &str, broken: i64, needs_human: bool) -> AgreementRow {
+        AgreementRow {
+            id,
+            scope: scope.to_string(),
+            author: author.to_string(),
+            text: text.to_string(),
+            broken,
+            needs_human,
+        }
+    }
+
+    fn counted(broken: i64, needs_human: bool, flagged: bool) -> AgreementBreak {
+        AgreementBreak::Counted {
+            broken,
+            needs_human,
+            flagged,
+        }
+    }
+
+    /// A store holding agreements #1 agent b, #2 human a and #3 agent c.
+    fn three_agreements() -> (TempDir, Store) {
+        let (d, _p, mut s) = open_tmp();
+        let added = [
+            s.add_agreement(&agreement("project", "agent", "b", "b", 1, Some("{}")), 64, LEDGER_BYTES),
+            s.add_agreement(&agreement("global", "human", "a", "a", 2, None), 64, LEDGER_BYTES),
+            s.add_agreement(&agreement("project", "agent", "c", "c", 3, None), 64, LEDGER_BYTES),
+        ];
+        assert_eq!(
+            added.map(Result::unwrap),
+            [AgreementAdded::Added(1), AgreementAdded::Added(2), AgreementAdded::Added(3)]
+        );
+        (d, s)
+    }
+
+    #[test]
+    fn agreements_add_and_list_in_order() {
+        let (_d, s) = three_agreements();
+        let claim = |id: i64| -> Option<String> {
+            s.conn
+                .query_row("SELECT claim_json FROM memory_agreements WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(claim(1).as_deref(), Some("{}"));
+        assert_eq!(claim(2), None);
+        assert_eq!(
+            s.agreements().unwrap(),
+            [
+                row(2, "global", "human", "a", 0, false),
+                row(1, "project", "agent", "b", 0, false),
+                row(3, "project", "agent", "c", 0, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn agreement_text_is_unique_by_norm() {
+        let (_d, mut s) = three_agreements();
+        let again = s
+            .add_agreement(&agreement("global", "human", "B", "b", 4, None), 64, LEDGER_BYTES)
+            .unwrap();
+        assert_eq!(again, AgreementAdded::Exists(1));
+        assert_eq!(agreement_rows(&s), 3);
+    }
+
+    #[test]
+    fn agreements_are_capped() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(add(&mut s, "agent", "one", 2, 64), AgreementAdded::Added(1));
+        assert_eq!(add(&mut s, "agent", "two", 2, 64), AgreementAdded::Added(2));
+        assert_eq!(add(&mut s, "agent", "three", 2, 64), AgreementAdded::Full);
+        assert_eq!(add(&mut s, "agent", "one", 2, 64), AgreementAdded::Exists(1));
+        assert_eq!(agreement_rows(&s), 2);
+    }
+
+    #[test]
+    fn agreements_are_capped_by_bytes() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(add(&mut s, "agent", "abcdef", 64, 10), AgreementAdded::Added(1));
+        assert_eq!(add(&mut s, "agent", "ghij", 64, 10), AgreementAdded::Added(2));
+        assert_eq!(add(&mut s, "agent", "k", 64, 10), AgreementAdded::Full);
+        assert_eq!(agreement_rows(&s), 2);
+    }
+
+    #[test]
+    fn break_counts_once_per_turn_and_flags_at_threshold() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(add(&mut s, "agent", "never force push", 64, LEDGER_BYTES), AgreementAdded::Added(1));
+        assert_eq!(s.break_agreement(1, 10, "slip", 3).unwrap(), counted(1, false, false));
+        assert_eq!(s.break_agreement(1, 10, "slip", 3).unwrap(), AgreementBreak::Repeat);
+        assert_eq!(s.agreements().unwrap()[0].broken, 1);
+        assert_eq!(receipts(&s), 1);
+        assert_eq!(s.break_agreement(1, 11, "slip", 3).unwrap(), counted(2, false, false));
+        assert_eq!(s.break_agreement(1, 12, "slip", 3).unwrap(), counted(3, true, true));
+        assert_eq!(s.break_agreement(1, 13, "slip", 3).unwrap(), counted(4, true, false));
+        assert_eq!(s.break_agreement(99, 14, "slip", 3).unwrap(), AgreementBreak::Unknown);
+        assert_eq!(receipts(&s), 4);
+        assert_eq!(
+            s.agreements().unwrap(),
+            [row(1, "project", "agent", "never force push", 4, true)]
+        );
+    }
+
+    #[test]
+    fn flags_are_noticed_once() {
+        let (_d, _p, mut s) = open_tmp();
+        add(&mut s, "agent", "ask before merging", 64, LEDGER_BYTES);
+        for turn in [10, 11, 12] {
+            s.break_agreement(1, turn, "slip", 3).unwrap();
+        }
+        assert_eq!(
+            s.unnoticed_flags().unwrap(),
+            [row(1, "project", "agent", "ask before merging", 3, true)]
+        );
+        s.mark_flags_noticed(&[1]).unwrap();
+        assert!(s.unnoticed_flags().unwrap().is_empty());
+        assert_eq!(s.break_agreement(1, 13, "slip", 3).unwrap(), counted(4, true, false));
+        assert!(s.unnoticed_flags().unwrap().is_empty());
+        s.mark_flags_noticed(&[]).unwrap();
+    }
+
+    #[test]
+    fn agreement_guard_refuses_lowering_and_removal() {
+        let (_d, _p, mut s) = open_tmp();
+        let new = agreement("global", "agent", "never force push", "never force push", 1, None);
+        assert_eq!(s.add_agreement(&new, 64, LEDGER_BYTES).unwrap(), AgreementAdded::Added(1));
+        for turn in [10, 11, 12] {
+            s.break_agreement(1, turn, "slip", 3).unwrap();
+        }
+        s.mark_flags_noticed(&[1]).unwrap();
+        let before = s.agreements().unwrap();
+        assert_eq!(before, [row(1, "global", "agent", "never force push", 3, true)]);
+        for sql in [
+            "UPDATE memory_agreements SET broken = 0",
+            "UPDATE memory_agreements SET needs_human = 0",
+            "UPDATE memory_agreements SET noticed = 0",
+            "UPDATE memory_agreements SET text = 'x'",
+            "UPDATE memory_agreements SET author = 'human'",
+            "UPDATE memory_agreements SET scope = 'project'",
+            "DELETE FROM memory_agreements",
+            "UPDATE memory_agreement_breaks SET reason = 'x'",
+            "DELETE FROM memory_agreement_breaks",
+        ] {
+            let err = s.exec_for_test(sql).expect_err(sql);
+            assert_eq!(err.to_string(), crate::memory::E_MEMORY_AGREEMENT, "{sql}");
+        }
+        assert_eq!(s.agreements().unwrap(), before);
+        assert_eq!(receipts(&s), 3);
+        let noticed: i64 = s
+            .conn
+            .query_row("SELECT noticed FROM memory_agreements WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(noticed, 1);
+        assert_eq!(s.break_agreement(1, 13, "slip", 3).unwrap(), counted(4, true, false));
+    }
+
+    #[test]
+    fn old_database_gets_the_agreement_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        drop(conn);
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(memory_objects(&s.conn), MEMORY_OBJECTS);
+        assert_eq!(
+            add(&mut s, "agent", "keep commits small", 64, LEDGER_BYTES),
+            AgreementAdded::Added(1)
+        );
     }
 
     #[test]
