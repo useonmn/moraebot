@@ -713,3 +713,114 @@ async fn old_m1_home_is_imported_on_first_start() {
         expected
     );
 }
+
+#[tokio::test]
+async fn guards_and_index_through_the_gateway() {
+    const RO: &str = "notes/ro.md";
+    const RO_TEXT: &str = "---\ndescription: locked note\nread_only: \"true\"\n---\nro-marker\n";
+    const GONE: &str = "system/gone.md";
+    const GONE_TEXT: &str = "---\ndescription: old fact\nexpires: 2000-01-01\n---\ngone-marker\n";
+    const DM_ID: &str = "1300000000000000031";
+    let mut rig = Rig::new();
+    for (rel, text) in [(RO, RO_TEXT), (GONE, GONE_TEXT)] {
+        let path = rig.memory_file(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("memory dirs");
+        std::fs::write(&path, text).expect("memory file");
+    }
+    let calls = [
+        json!({
+            "tool": memory::MEMORY_CREATE_TOOL,
+            "arguments": {
+                "path": "notes/kept.md",
+                "description": "kept note",
+                "body": "kept-marker\n",
+                "reason": "e2e create"
+            }
+        }),
+        json!({
+            "tool": memory::MEMORY_STR_REPLACE_TOOL,
+            "arguments": {
+                "path": RO,
+                "old_string": "ro-marker",
+                "new_string": "changed",
+                "reason": "e2e locked edit"
+            }
+        }),
+    ]
+    .map(|call| call.to_string())
+    .join("\n");
+
+    let before = rig.tap.seen.len();
+    let first = lead_block_after_dm(
+        &mut rig,
+        DM_ID,
+        "run-tools please",
+        &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &calls)],
+    )
+    .await;
+    assert!(
+        !first.contains("gone-marker"),
+        "the expired file is left out"
+    );
+    let results: Vec<(bool, String)> = rig.tap.seen[before..]
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "host_tool_result")
+        .map(|frame| {
+            let text = frame["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            (frame["isError"] == true, text)
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    assert!(results[1].0, "{results:?}");
+    assert!(
+        results[1]
+            .1
+            .starts_with(&format!("{}:", memory::E_MEMORY_READ_ONLY)),
+        "{results:?}"
+    );
+
+    let store = open_store(&rig);
+    let row = inbox_row(&store, DM_ID);
+    let commits = store.memory_commits().expect("commits");
+    assert_eq!(commits.len(), 2, "the import and one lead write");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    assert_eq!(commits[1].commit.writer, memory::WRITER_LEAD);
+    assert_eq!(commits[1].commit.turn_row, Some(row.id));
+    let snapshots = store.memory_snapshots(commits[1].id).expect("snapshots");
+    let paths: Vec<&str> = snapshots.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(paths, ["notes/kept.md"]);
+    assert_eq!(
+        std::fs::read(rig.memory_file(RO)).expect("locked note"),
+        RO_TEXT.as_bytes(),
+        "the locked note is unchanged"
+    );
+    drop(store);
+
+    let second = lead_block_after_dm(&mut rig, "1300000000000000032", "hello lead", &[]).await;
+    let index_of = |block: &str| -> String {
+        const CLOSE: &str = "</external_projection>\n";
+        let at = block
+            .find("<external_projection>\n")
+            .expect("the notes index is in the block");
+        let end = block[at..].find(CLOSE).expect("the notes index is closed") + at;
+        block[at..end + CLOSE.len()].to_owned()
+    };
+    let index = index_of(&second);
+    // QA evidence (shown with --nocapture): the notes index of each run, names only.
+    println!("gateway 1 index:\n{}", index_of(&first));
+    println!("gateway 2 index:\n{index}");
+    assert!(
+        index.lines().any(|line| line == "notes/: kept, ro"),
+        "{index}"
+    );
+    assert!(
+        !second.contains("gone-marker"),
+        "the expired file stays out"
+    );
+    assert!(!second.contains(DIRTY_MARK), "nothing is dirty");
+}
