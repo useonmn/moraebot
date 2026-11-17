@@ -37,7 +37,7 @@ use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory::home::MemoryHome;
-use crate::memory::{self, history, render};
+use crate::memory::{self, guard, history, render};
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -950,7 +950,7 @@ impl OmpManager {
                     let mut store = lock(&self.store);
                     match history::prepare(&mut store, home).and_then(|committed| {
                         history::dirty(home, &committed)
-                            .map(|dirty| render::render(&committed, &dirty))
+                            .map(|dirty| render::render(&committed, &dirty, guard::unix_now()))
                     }) {
                         Ok(rendered) => rendered,
                         Err(e) => {

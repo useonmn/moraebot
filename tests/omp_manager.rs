@@ -964,6 +964,39 @@ async fn lead_argv_ends_with_memory_block() {
 }
 
 #[tokio::test]
+async fn expired_file_and_notes_index_reach_the_lead() {
+    let h = Harness::new();
+    let home = h.memory();
+    for (rel, text) in [
+        (
+            "system/old.md",
+            "---\ndescription: d\nexpires: 2000-01-01\n---\nold-marker\n",
+        ),
+        (
+            "system/new.md",
+            "---\ndescription: d\nexpires: 2999-01-01\n---\nnew-marker\n",
+        ),
+        ("notes/n1.md", "---\ndescription: d\n---\nnote body\n"),
+    ] {
+        let path = h.memory_file(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("memory folder");
+        std::fs::write(path, text).expect("write memory file");
+    }
+    let manager = h.manager("ok").with_memory(home);
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 1);
+    let flag = &flags[0][0];
+    assert!(flag.contains("new-marker"));
+    assert!(flag.contains("<external_projection>"));
+    assert!(flag.contains("\nnotes/: n1\n"));
+    assert!(!flag.contains("old-marker"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn memory_block_is_rendered_at_each_start() {
     let h = Harness::new();
     let manager = h.manager("ok").with_memory(h.memory());
