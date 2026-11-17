@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::history::Committed;
+use super::history::{self, Committed};
+use super::home::MemoryError;
 use super::{
-    EXPIRES_KEY, MAX_NOTICE_PATHS, MEMORY_DIR, NOTICE_BEGIN, NOTICE_END, NUDGE_EVERY, REFRESH_FILE,
-    SOUL_PATHS, WRITER_LEAD, frontmatter, guard,
+    E_MEMORY_HISTORY, EXPIRES_KEY, MAX_NOTICE_PATHS, MEMORY_DIR, NOTICE_BEGIN, NOTICE_END,
+    NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD, frontmatter, guard,
 };
-use crate::store::MemoryChangeRow;
+use crate::store::{MemoryChangeRow, Store, StoreError};
 
 /// Unix seconds now; tests inject a fixed or stepped clock.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -54,6 +55,72 @@ pub struct Notices {
     pub owner_turns: Option<i64>,
     pub changed: Vec<Changed>,
     pub expired: Vec<String>,
+}
+
+/// What the lead was last told: the newest commit id, the expiry instant and the compaction count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Watermarks {
+    pub commit: i64,
+    pub expiry: i64,
+    pub compactions: u64,
+}
+
+impl Watermarks {
+    /// The marks of a fresh pin: everything up to `head` and `now` is in the block.
+    pub fn at_pin(head: i64, now: i64, compactions: u64) -> Self {
+        Self {
+            commit: head,
+            expiry: now,
+            compactions,
+        }
+    }
+
+    /// After a re-pin: `commit = max(commit, head)`, `expiry = max(expiry, now)`; `compactions`
+    /// is kept (the compaction still gets its line).
+    pub fn repin(&mut self, head: i64, now: i64) {
+        self.commit = self.commit.max(head);
+        self.expiry = self.expiry.max(now);
+    }
+}
+
+/// The notices since `marks`, advancing them. `owner_row` is the main owner turn's row (nudge
+/// counted) or `None` for a steer.
+pub fn collect(
+    store: &Store,
+    marks: &mut Watermarks,
+    compactions: u64,
+    now: i64,
+    owner_row: Option<i64>,
+) -> Result<Notices, MemoryError> {
+    let head = store.memory_head().map_err(history_error)?;
+    let rows = store
+        .memory_changes_since(marks.commit)
+        .map_err(history_error)?;
+    let committed = history::committed(store)?;
+    let expired = expired_between(&committed, marks.expiry, now);
+    let owner_turns = owner_row
+        .map(|row| store.owner_turns_since_save(row))
+        .transpose()
+        .map_err(history_error)?;
+    let notices = Notices {
+        compactions: compactions.saturating_sub(marks.compactions),
+        owner_turns,
+        changed: changed(&rows),
+        expired,
+    };
+    *marks = Watermarks {
+        commit: marks.commit.max(head),
+        expiry: marks.expiry.max(now),
+        compactions: marks.compactions.max(compactions),
+    };
+    Ok(notices)
+}
+
+fn history_error(e: StoreError) -> MemoryError {
+    MemoryError {
+        code: E_MEMORY_HISTORY,
+        detail: e.code().to_string(),
+    }
 }
 
 /// `<home>/memory/.refresh`: the explicit refresh request, `home` being the moraebot home.
@@ -187,7 +254,58 @@ fn quoted(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::lead;
+    use crate::memory::home::MemoryHome;
     use crate::memory::{IDENTITY, PERSONA, WRITER_HUMAN};
+    use crate::store::{Admitted, MemoryCommit};
+
+    /// `notes/n.md` expires at unix second 150.
+    const EXPIRING: &str = "---\ndescription: a note\nexpires: 1970-01-01T00:02:30Z\n---\nbody\n";
+
+    fn store_fixture() -> (tempfile::TempDir, Store, MemoryHome) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        let home = MemoryHome::new(dir.path());
+        home.ensure_layout().expect("layout");
+        (dir, store, home)
+    }
+
+    fn commit_by(
+        store: &mut Store,
+        home: &MemoryHome,
+        writer: &str,
+        changes: &[(&str, Option<&str>)],
+    ) -> i64 {
+        let commit = MemoryCommit {
+            writer: writer.to_string(),
+            reason: "r".to_string(),
+            turn_row: None,
+            conversation_key: None,
+            claim_json: None,
+        };
+        let changes: Vec<_> = changes
+            .iter()
+            .map(|(path, body)| (path.to_string(), body.map(str::to_string)))
+            .collect();
+        history::record(store, home, &commit, &changes).expect("record")
+    }
+
+    fn owner_turn(store: &mut Store) -> i64 {
+        let admitted = store
+            .admit(
+                "slack",
+                "1300000000000000001",
+                "slack:C111",
+                "C111",
+                "111",
+                "hi",
+            )
+            .expect("admit");
+        let Admitted::New(row) = admitted else {
+            panic!("duplicate");
+        };
+        assert!(store.claim(row).expect("claim"));
+        row
+    }
 
     fn row(
         commit_id: i64,
@@ -344,6 +462,116 @@ mod tests {
         let parsed = lead::parse_tag(&out).expect("tag");
         assert_eq!(parsed.message, Some(1));
         assert_eq!(insert("tag", b), format!("tag\n{b}"));
+    }
+
+    #[test]
+    fn collect_reports_once_and_advances() {
+        let (_dir, mut store, home) = store_fixture();
+        commit_by(&mut store, &home, WRITER_HUMAN, &[(PERSONA, Some("v1\n"))]);
+        let head = store.memory_head().expect("head");
+        let mut marks = Watermarks::at_pin(head, 100, 0);
+        let human = commit_by(
+            &mut store,
+            &home,
+            WRITER_HUMAN,
+            &[(PERSONA, Some("v2\n")), ("notes/n.md", Some(EXPIRING))],
+        );
+        let row = owner_turn(&mut store);
+
+        let first = collect(&store, &mut marks, 1, 200, Some(row)).expect("collect");
+        assert_eq!(
+            first,
+            Notices {
+                compactions: 1,
+                owner_turns: Some(1),
+                changed: vec![
+                    change("notes/n.md", ChangeKind::Added, human),
+                    change(PERSONA, ChangeKind::Updated, human),
+                ],
+                expired: vec!["notes/n.md".to_string()],
+            }
+        );
+        assert_eq!(
+            marks,
+            Watermarks {
+                commit: human,
+                expiry: 200,
+                compactions: 1
+            }
+        );
+
+        let second = collect(&store, &mut marks, 1, 200, Some(row)).expect("collect");
+        assert_eq!(
+            second,
+            Notices {
+                owner_turns: Some(1),
+                ..Notices::default()
+            }
+        );
+        assert_eq!(
+            marks,
+            Watermarks {
+                commit: human,
+                expiry: 200,
+                compactions: 1
+            }
+        );
+    }
+
+    #[test]
+    fn collect_skips_lead_commits() {
+        let (_dir, mut store, home) = store_fixture();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let lead = commit_by(
+            &mut store,
+            &home,
+            WRITER_LEAD,
+            &[("notes/l.md", Some("l\n"))],
+        );
+        let notices = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(notices, Notices::default());
+        assert_eq!(marks.commit, lead);
+    }
+
+    #[test]
+    fn repin_keeps_compactions() {
+        let mut marks = Watermarks::at_pin(5, 100, 2);
+        marks.repin(9, 300);
+        let expected = Watermarks {
+            commit: 9,
+            expiry: 300,
+            compactions: 2,
+        };
+        assert_eq!(marks, expected);
+        marks.repin(3, 50);
+        assert_eq!(marks, expected);
+    }
+
+    #[test]
+    fn collect_error_leaves_marks() {
+        let (_dir, mut store, home) = store_fixture();
+        commit_by(
+            &mut store,
+            &home,
+            WRITER_HUMAN,
+            &[("notes/a.md", Some("a\n"))],
+        );
+        let mut marks = Watermarks::at_pin(0, 100, 0);
+        store
+            .exec_for_test("DROP TABLE memory_snapshots")
+            .expect("drop");
+        let err = collect(&store, &mut marks, 3, 500, None).expect_err("broken store");
+        assert_eq!(err.code, E_MEMORY_HISTORY);
+        assert_eq!(marks, Watermarks::at_pin(0, 100, 0));
+    }
+
+    #[test]
+    fn steer_collect_has_no_turn_count() {
+        let (_dir, mut store, _home) = store_fixture();
+        owner_turn(&mut store);
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let notices = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(notices.owner_turns, None);
     }
 
     #[test]
