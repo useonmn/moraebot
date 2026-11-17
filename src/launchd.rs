@@ -186,8 +186,18 @@ fn install_binary(source: &Path, binary: &Path) -> Result<(), ConfigError> {
 /// Boots out an already loaded job (ignoring "not loaded"), waits until launchd has
 /// really dropped it, then bootstraps the new plist, so a re-run upgrades and restarts.
 fn reload(domain: &str, label: &str, plist_text: &str) -> Result<(), ConfigError> {
-    let target = format!("{domain}/{label}");
     let retry = format!("run `moraebot uninstall-launchd --label {label}` and retry");
+    bootout_and_wait(domain, label, &retry)?;
+    run_command("launchctl", &["bootstrap", domain, plist_text], E_LAUNCHCTL)
+        .map_err(|e| ConfigError::new(E_LAUNCHCTL, format!("{}; {retry}", e.message)))?;
+    Ok(())
+}
+
+/// Boots out `domain/label`, ignoring the exit status (a job that is not loaded is
+/// fine), then waits until `launchctl print` no longer finds it, bounded by the
+/// plist `ExitTimeOut` plus a margin.
+fn bootout_and_wait(domain: &str, label: &str, hint: &str) -> Result<(), ConfigError> {
+    let target = format!("{domain}/{label}");
     Command::new("launchctl")
         .args(["bootout", target.as_str()])
         .output()
@@ -207,28 +217,36 @@ fn reload(domain: &str, label: &str, plist_text: &str) -> Result<(), ConfigError
             return Err(ConfigError::new(
                 E_LAUNCHCTL,
                 format!(
-                    "{target} is still loaded after {}s; {retry}",
+                    "{target} is still loaded after {}s; {hint}",
                     EXIT_TIMEOUT_SECS + 5
                 ),
             ));
         }
         thread::sleep(Duration::from_millis(500));
     }
-    run_command("launchctl", &["bootstrap", domain, plist_text], E_LAUNCHCTL)
-        .map_err(|e| ConfigError::new(E_LAUNCHCTL, format!("{}; {retry}", e.message)))?;
     Ok(())
 }
 
+/// Unloads the job (fine when it is not loaded) and removes its plist (fine when
+/// it is already gone); returns only after launchd has really dropped the job.
 pub fn uninstall(env: &Env, label: &str, out: &mut impl Write) -> Result<(), ConfigError> {
     check_label(label)?;
-    let target = format!("gui/{}/{label}", current_uid()?);
-    run_command("launchctl", &["bootout", target.as_str()], E_LAUNCHCTL)?;
-    let plist_file = launch_agents_dir(env)?.join(format!("{label}.plist"));
-    fs::remove_file(&plist_file).map_err(|e| {
-        ConfigError::io(E_IO, &format!("cannot remove {}", plist_file.display()), &e)
-    })?;
+    let domain = format!("gui/{}", current_uid()?);
+    bootout_and_wait(&domain, label, "retry `moraebot uninstall-launchd`")?;
+    remove_plist(&launch_agents_dir(env)?.join(format!("{label}.plist")))?;
     writeln!(out, "removed {label}")?;
     Ok(())
+}
+
+fn remove_plist(plist_file: &Path) -> Result<(), ConfigError> {
+    match fs::remove_file(plist_file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ConfigError::io(
+            E_IO,
+            &format!("cannot remove {}", plist_file.display()),
+            &e,
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn check_label(label: &str) -> Result<(), ConfigError> {
@@ -515,6 +533,30 @@ mod tests {
         assert_eq!(mode_of(&out), 0o600);
         assert_eq!(fs::read_to_string(&out).expect("read out log"), "kept\n");
         assert_eq!(mode_of(&logs.join("moraebot.err.log")), 0o600);
+    }
+
+    #[test]
+    fn remove_plist_deletes_an_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plist = dir.path().join("dev.moraebot.gateway.test.plist");
+        fs::write(&plist, "<plist/>").expect("write plist");
+        remove_plist(&plist).expect("removes");
+        assert!(!plist.exists());
+    }
+
+    #[test]
+    fn remove_plist_accepts_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        remove_plist(&dir.path().join("missing.plist")).expect("missing plist is fine");
+    }
+
+    #[test]
+    fn remove_plist_reports_other_errors_as_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_file = dir.path().join("folder.plist");
+        fs::create_dir(&not_a_file).expect("mkdir");
+        let err = remove_plist(&not_a_file).expect_err("a folder is not removable as a file");
+        assert_eq!(err.code, E_IO);
     }
 
     #[test]
