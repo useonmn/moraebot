@@ -1271,6 +1271,130 @@ async fn memory_write_round_trip_through_the_lead() {
     manager.shutdown_all().await;
 }
 
+/// Stores a lead reply `proposal-text` in `KEY_A`, then the owner's answer `text`; returns both row ids.
+fn proposal_then_answer(h: &Harness, text: &str) -> (i64, i64) {
+    let mut store = h.store.lock().unwrap();
+    let admit = |store: &mut Store, message_id: &str, text: &str| match store
+        .admit("discord", message_id, KEY_A, "222", "111", text)
+        .expect("admit")
+    {
+        moraebot::store::Admitted::New(id) => id,
+        other => panic!("expected a new row, got {other:?}"),
+    };
+    let p = admit(&mut store, "p1", "please remember tea");
+    assert!(store.claim(p).expect("claim"));
+    store
+        .finish_group(p, "proposal-text", None, None)
+        .expect("finish group");
+    let r = admit(&mut store, "r1", text);
+    (p, r)
+}
+
+fn approved_create_call(r: i64) -> Value {
+    tool_call(
+        memory::MEMORY_CREATE_TOOL,
+        serde_json::json!({
+            "path": "system/approved.md",
+            "description": "approved",
+            "body": "green tea\n",
+            "reason": "r",
+            "source": "user",
+            "user_quote": "yes",
+            "quote_message": r,
+        }),
+    )
+}
+
+fn file_provenance(h: &Harness, rel: &str) -> String {
+    let text = std::fs::read_to_string(h.memory_file(rel)).expect("memory file");
+    let parsed = frontmatter::parse(&text).expect("file parses");
+    parsed
+        .frontmatter
+        .get(memory::PROVENANCE_KEY)
+        .expect("provenance")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn owner_approval_is_recorded_through_the_lead() {
+    let h = Harness::new();
+    let (p, r) = proposal_then_answer(&h, "yes");
+    let manager = h.memory_tools_manager(&[approved_create_call(r)]);
+    bounded(manager.prompt(KEY_A, r, "run-tools")).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let value: Value = serde_json::from_str(&results[0].1).expect("write result json");
+    assert_eq!(value["source"], "user", "{value}");
+    assert_eq!(value["downgraded"], false, "{value}");
+
+    let commits = h.memory_commits();
+    let last = commits.last().expect("a commit");
+    assert_eq!(last.commit.writer, memory::WRITER_LEAD);
+    let claim: Value = serde_json::from_str(last.commit.claim_json.as_deref().expect("claim json"))
+        .expect("claim parses");
+    assert_eq!(claim["source"], "user", "{claim}");
+    assert_eq!(claim["message"], r, "{claim}");
+    assert_eq!(claim["proposal_row"], p, "{claim}");
+    assert_eq!(
+        claim["proposal_hash"],
+        memory::provenance::proposal_hash("proposal-text"),
+        "{claim}"
+    );
+    assert_eq!(claim["platform"], "discord", "{claim}");
+    assert_eq!(claim["message_id"], "r1", "{claim}");
+    assert!(file_provenance(&h, "system/approved.md").starts_with("user:"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn unverified_claim_is_downgraded_through_the_lead() {
+    let h = Harness::new();
+    let (_, r) = proposal_then_answer(&h, "maybe later");
+    let manager = h.memory_tools_manager(&[approved_create_call(r)]);
+    bounded(manager.prompt(KEY_A, r, "run-tools")).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let value: Value = serde_json::from_str(&results[0].1).expect("write result json");
+    assert_eq!(value["source"], "agent", "{value}");
+    assert_eq!(value["downgraded"], true, "{value}");
+    assert_eq!(value["code"], memory::E_MEMORY_QUOTE_TEXT, "{value}");
+    assert!(h.memory_file("system/approved.md").exists());
+    assert!(file_provenance(&h, "system/approved.md").starts_with("agent:"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn bad_claim_arguments_are_refused_through_the_lead() {
+    let h = Harness::new();
+    let calls = [
+        tool_call(
+            memory::MEMORY_CREATE_TOOL,
+            serde_json::json!({"path": "notes/a.md", "description": "about a", "body": "line one\n", "reason": "r", "source": "owner"}),
+        ),
+        tool_call(
+            memory::MEMORY_CREATE_TOOL,
+            serde_json::json!({"path": "notes/a.md", "description": "about a", "body": "line one\n", "reason": "r", "quote_message": 3}),
+        ),
+    ];
+    let manager = h.memory_tools_manager(&calls);
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    for result in &results {
+        assert!(refused_with(result, memory::E_MEMORY_ARGS), "{results:?}");
+    }
+    let commits = h.memory_commits();
+    assert_eq!(commits.len(), 1, "the import only");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    assert!(!h.memory_file("notes/a.md").exists());
+    manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn write_during_lane_result_turn_is_refused() {
     let h = Harness::new();
