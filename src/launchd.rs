@@ -3,6 +3,8 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigError, E_HOME_UNKNOWN, E_IO, E_OMP_MISSING, Env};
 
@@ -12,6 +14,9 @@ pub const E_LABEL_INVALID: &str = "E_LABEL_INVALID";
 pub const E_PATH_NOT_UTF8: &str = "E_PATH_NOT_UTF8";
 pub const E_PLIST_LINT: &str = "E_PLIST_LINT";
 pub const E_LAUNCHCTL: &str = "E_LAUNCHCTL";
+
+/// The plist `ExitTimeOut`; the reload wait is bounded by it so the two cannot drift apart.
+const EXIT_TIMEOUT_SECS: u64 = 30;
 
 pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String, ConfigError> {
     check_label(label)?;
@@ -50,7 +55,7 @@ pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String,
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>ExitTimeOut</key>
-  <integer>30</integer>
+  <integer>{exit_timeout}</integer>
   <key>Umask</key>
   <integer>63</integer>
   <key>StandardOutPath</key>
@@ -73,6 +78,7 @@ pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String,
         home = xml(utf8(home)?),
         logs = xml(utf8(&home.join("logs"))?),
         path_env = xml(&path_env),
+        exit_timeout = EXIT_TIMEOUT_SECS,
     ))
 }
 
@@ -113,8 +119,8 @@ pub fn install(
     let plist_text = utf8(&plist_file)?;
     if dry_run {
         write!(out, "{plist}")?;
-        writeln!(out, "launchctl bootstrap {domain} {plist_text}")?;
         writeln!(out, "launchctl bootout {domain}/{label}")?;
+        writeln!(out, "launchctl bootstrap {domain} {plist_text}")?;
         return Ok(());
     }
 
@@ -124,10 +130,7 @@ pub fn install(
         .map_err(|e| ConfigError::io(E_IO, "cannot find the running moraebot binary", &e))?;
     fs::create_dir_all(&bin_dir)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", bin_dir.display()), &e))?;
-    fs::copy(&source, &binary)
-        .map_err(|e| ConfigError::io(E_IO, &format!("cannot copy to {}", binary.display()), &e))?;
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-        .map_err(|e| ConfigError::io(E_IO, "cannot make the binary executable", &e))?;
+    install_binary(&source, &binary)?;
     fs::create_dir_all(launch_agents_dir(env)?)
         .map_err(|e| ConfigError::io(E_IO, "cannot create the LaunchAgents folder", &e))?;
     prepare_log_files(&config.home)?;
@@ -135,12 +138,84 @@ pub fn install(
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot write {plist_text}"), &e))?;
 
     run_command("plutil", &["-lint", plist_text], E_PLIST_LINT)?;
-    run_command(
-        "launchctl",
-        &["bootstrap", domain.as_str(), plist_text],
-        E_LAUNCHCTL,
-    )?;
+    reload(&domain, label, plist_text)?;
     writeln!(out, "installed {label} at {plist_text}")?;
+    Ok(())
+}
+
+/// Puts `source` at `binary` without ever copying a file onto itself (that truncates it)
+/// and without leaving a half-written `binary`: copy to a temp file in the same folder,
+/// then rename over the target.
+fn install_binary(source: &Path, binary: &Path) -> Result<(), ConfigError> {
+    let source = fs::canonicalize(source)
+        .map_err(|e| ConfigError::io(E_IO, &format!("cannot resolve {}", source.display()), &e))?;
+    let executable = fs::Permissions::from_mode(0o755);
+    if fs::canonicalize(binary).is_ok_and(|existing| existing == source) {
+        return fs::set_permissions(binary, executable)
+            .map_err(|e| ConfigError::io(E_IO, &format!("cannot chmod {}", binary.display()), &e));
+    }
+    let bin_dir = binary
+        .parent()
+        .ok_or_else(|| ConfigError::new(E_IO, format!("{} has no folder", binary.display())))?;
+    let temp = bin_dir.join(format!(".moraebot.new.{}", std::process::id()));
+    let replaced = fs::copy(&source, &temp)
+        .and_then(|_| fs::set_permissions(&temp, executable))
+        .and_then(|()| fs::rename(&temp, binary));
+    if let Err(e) = replaced {
+        if let Err(cleanup) = fs::remove_file(&temp)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(ConfigError::new(
+                E_IO,
+                format!(
+                    "cannot replace {}: {e}; also cannot remove {}: {cleanup}",
+                    binary.display(),
+                    temp.display()
+                ),
+            ));
+        }
+        return Err(ConfigError::io(
+            E_IO,
+            &format!("cannot replace {}", binary.display()),
+            &e,
+        ));
+    }
+    Ok(())
+}
+
+/// Boots out an already loaded job (ignoring "not loaded"), waits until launchd has
+/// really dropped it, then bootstraps the new plist, so a re-run upgrades and restarts.
+fn reload(domain: &str, label: &str, plist_text: &str) -> Result<(), ConfigError> {
+    let target = format!("{domain}/{label}");
+    let retry = format!("run `moraebot uninstall-launchd --label {label}` and retry");
+    Command::new("launchctl")
+        .args(["bootout", target.as_str()])
+        .output()
+        .map_err(|e| ConfigError::io(E_LAUNCHCTL, "cannot run launchctl", &e))?;
+    let deadline = Instant::now() + Duration::from_secs(EXIT_TIMEOUT_SECS + 5);
+    loop {
+        let loaded = Command::new("launchctl")
+            .args(["print", target.as_str()])
+            .output()
+            .map_err(|e| ConfigError::io(E_LAUNCHCTL, "cannot run launchctl", &e))?
+            .status
+            .success();
+        if !loaded {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(ConfigError::new(
+                E_LAUNCHCTL,
+                format!(
+                    "{target} is still loaded after {}s; {retry}",
+                    EXIT_TIMEOUT_SECS + 5
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    run_command("launchctl", &["bootstrap", domain, plist_text], E_LAUNCHCTL)
+        .map_err(|e| ConfigError::new(E_LAUNCHCTL, format!("{}; {retry}", e.message)))?;
     Ok(())
 }
 
@@ -341,8 +416,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dry_run_prints_bootout_before_bootstrap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, env) = fixture(&dir);
+        let mut out = Vec::new();
+        install(&config, &env, DEFAULT_LABEL, true, &mut out).expect("dry run");
+        let text = String::from_utf8(out).expect("utf-8 output");
+        let bootout = text.find("launchctl bootout ").expect("bootout line");
+        let bootstrap = text.find("launchctl bootstrap ").expect("bootstrap line");
+        assert!(bootout < bootstrap, "bootout must come first:\n{text}");
+    }
+
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".moraebot.new."))
+            .collect()
+    }
+
+    fn write_file(path: &Path, bytes: &[u8], mode: u32) {
+        fs::write(path, bytes).expect("write file");
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod file");
+    }
+
+    #[test]
+    fn install_binary_creates_a_missing_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        write_file(&source, b"new binary", 0o700);
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("mkdir bin");
+        let binary = bin_dir.join("moraebot");
+        install_binary(&source, &binary).expect("installs");
+        assert_eq!(fs::read(&binary).expect("read binary"), b"new binary");
+        assert_eq!(mode_of(&binary), 0o755);
+        assert_eq!(leftover_temp_files(&bin_dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn install_binary_replaces_a_different_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        write_file(&source, b"new binary", 0o755);
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("mkdir bin");
+        let binary = bin_dir.join("moraebot");
+        write_file(&binary, b"old binary, longer than the new one", 0o755);
+        install_binary(&source, &binary).expect("replaces");
+        assert_eq!(fs::read(&binary).expect("read binary"), b"new binary");
+        assert_eq!(mode_of(&binary), 0o755);
+        assert_eq!(leftover_temp_files(&bin_dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn install_binary_keeps_the_running_binary_when_source_is_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("mkdir bin");
+        let binary = bin_dir.join("moraebot");
+        write_file(&binary, b"running binary", 0o644);
+        install_binary(&binary, &binary).expect("keeps");
+        assert_eq!(fs::read(&binary).expect("read binary"), b"running binary");
+        assert_eq!(mode_of(&binary), 0o755);
+        assert_eq!(leftover_temp_files(&bin_dir), Vec::<String>::new());
     }
 
     #[test]
