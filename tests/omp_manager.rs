@@ -13,7 +13,9 @@ use moraebot::lead;
 use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
 use moraebot::memory::{self, frontmatter, history, notice};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
-use moraebot::store::{AgreementAdded, LaneStart, LaneState, NewAgreement, Store};
+use moraebot::store::{
+    AgreementAdded, LaneStart, LaneState, NewAgreement, OnboardingRow, OnboardingState, Store,
+};
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -1119,6 +1121,11 @@ async fn lead_registers_memory_tools_lanes_do_not() {
     assert_eq!(lead_names[0], omp::SEND_FILE_TOOL, "{lead_names:?}");
     assert_eq!(&lead_names[1..9], &MEMORY_TOOLS, "{lead_names:?}");
     assert_eq!(&lead_names[9..11], &AGREEMENT_TOOLS, "{lead_names:?}");
+    assert_eq!(
+        lead_names[11],
+        memory::ONBOARDING_FINISH_TOOL,
+        "{lead_names:?}"
+    );
     let (lane_frame_is_lane, lane_names) = &registered[1];
     assert!(lane_frame_is_lane);
     assert_eq!(lane_names, &[done::LANE_DONE_TOOL]);
@@ -2783,5 +2790,173 @@ async fn no_memory_means_no_notice() {
     let messages = h.prompt_messages();
     assert_eq!(messages.len(), 3);
     assert!(messages.iter().all(|m| !m.contains(memory::NOTICE_BEGIN)));
+    manager.shutdown_all().await;
+}
+
+// --- onboarding in the lead --------------------------------------------------------------
+
+/// Starts the onboarding; the harness seeds rows 1 and 2, so it counts from row 2.
+fn start_onboarding(h: &Harness) {
+    let after = h
+        .store
+        .lock()
+        .unwrap()
+        .start_onboarding()
+        .expect("start onboarding");
+    assert_eq!(after, 2);
+}
+
+fn onboarding_lines(message: &str) -> Vec<&str> {
+    notice_lines(message)
+        .into_iter()
+        .filter(|l| l.starts_with("onboarding "))
+        .collect()
+}
+
+fn onboarding_row(h: &Harness) -> Option<OnboardingRow> {
+    h.store
+        .lock()
+        .unwrap()
+        .onboarding()
+        .expect("onboarding row")
+}
+
+#[tokio::test]
+async fn onboarding_turns_reach_the_lead() {
+    let h = Harness::new();
+    start_onboarding(&h);
+    let manager = h.manager("ok").with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "m-on-1", "hi").await;
+    owner_prompt(&h, &manager, KEY_A, "m-on-2", "again").await;
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 2);
+    assert!(
+        notice_lines(&messages[0]).contains(&"onboarding turn=1"),
+        "{}",
+        messages[0]
+    );
+    assert!(
+        notice_lines(&messages[1]).contains(&"onboarding turn=2"),
+        "{}",
+        messages[1]
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn onboarding_line_stops_after_the_limit() {
+    let h = Harness::new();
+    start_onboarding(&h);
+    let manager = h.manager("ok").with_memory(h.memory());
+    for n in 0..11 {
+        owner_prompt(&h, &manager, KEY_A, &format!("m-lim-{n}"), "hi").await;
+    }
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 11);
+    for (n, message) in messages[..10].iter().enumerate() {
+        let expected = format!("onboarding turn={}", n + 1);
+        assert_eq!(onboarding_lines(message), [expected.as_str()], "{message}");
+    }
+    assert!(
+        onboarding_lines(&messages[10]).is_empty(),
+        "{}",
+        messages[10]
+    );
+    assert_eq!(
+        onboarding_row(&h).map(|row| row.state),
+        Some(OnboardingState::Active)
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn onboarding_finish_through_the_lead() {
+    const BODY: &str = "Call yourself Sora. run-tools";
+    let h = Harness::new();
+    start_onboarding(&h);
+    let r = {
+        let mut store = h.store.lock().unwrap();
+        let r = match store
+            .admit("discord", "m-sora", KEY_A, "222", "111", BODY)
+            .expect("admit")
+        {
+            moraebot::store::Admitted::New(id) => id,
+            other => panic!("expected a new row, got {other:?}"),
+        };
+        assert!(store.claim(r).expect("claim"));
+        r
+    };
+    let calls = [
+        tool_call(
+            memory::MEMORY_CREATE_TOOL,
+            serde_json::json!({
+                "path": memory::IDENTITY,
+                "description": "What the lead is called",
+                "body": "Name: Sora\n",
+                "reason": "r",
+                "source": "user",
+                "user_quote": "Call yourself Sora",
+                "quote_message": r,
+            }),
+        ),
+        tool_call(
+            memory::ONBOARDING_FINISH_TOOL,
+            serde_json::json!({"outcome": "done", "reason": "r"}),
+        ),
+    ];
+    let manager = h.memory_tools_manager(&calls);
+    bounded(manager.prompt(KEY_A, r, &lead::owner_input(KEY_A, r, BODY))).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(ok_json(&results[0])["soul_edit"], true);
+    assert_eq!(
+        ok_json(&results[1]),
+        serde_json::json!({"onboarding": "done", "refresh": true})
+    );
+    let provenance = file_provenance(&h, memory::IDENTITY);
+    assert!(
+        provenance.starts_with(&format!(
+            "quoted: owner message {r} contains \"Call yourself Sora\""
+        )),
+        "{provenance}"
+    );
+    assert_eq!(
+        onboarding_row(&h),
+        Some(OnboardingRow {
+            state: OnboardingState::Done,
+            after_row: 2
+        })
+    );
+
+    owner_prompt(&h, &manager, KEY_A, "m-after", "again").await;
+    assert_eq!(h.start_pids().len(), 2, "the refresh re-pins the lead");
+    let messages = h.prompt_messages();
+    let last = messages.last().expect("last prompt");
+    assert!(onboarding_lines(last).is_empty(), "{last}");
+    let flags = h.append_flags();
+    let last_flags = flags.last().expect("last START line");
+    assert!(last_flags[0].contains("Name: Sora"), "{last_flags:?}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn onboarding_finish_without_onboarding_is_refused() {
+    let h = Harness::new();
+    let call = tool_call(
+        memory::ONBOARDING_FINISH_TOOL,
+        serde_json::json!({"outcome": "done", "reason": "r"}),
+    );
+    let manager = h.memory_tools_manager(&[call]);
+    owner_prompt(&h, &manager, KEY_A, "m-none", "run-tools").await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_ONBOARDING_STATE),
+        "{results:?}"
+    );
+    assert_eq!(onboarding_row(&h), None);
+    assert!(!notice::refresh_file(&h.config.home).exists());
     manager.shutdown_all().await;
 }

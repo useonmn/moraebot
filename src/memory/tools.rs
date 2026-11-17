@@ -1,5 +1,6 @@
 //! The lead's memory host tools: two read tools over the working files, six write
-//! tools that go through the write engine, and the two agreement tools.
+//! tools that go through the write engine, the two agreement tools and the onboarding finish
+//! tool.
 
 use std::sync::{Arc, Mutex};
 
@@ -9,13 +10,14 @@ use serde_json::{Map, Value, json};
 use super::agreements::{self, Record};
 use super::frontmatter;
 use super::home::{MemoryError, MemoryHome};
+use super::onboarding;
 use super::provenance::{ClaimArgs, Source};
 use super::write::{Edit, apply};
 use super::{
     E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_AGREEMENT_BREAK_TOOL,
     MEMORY_AGREEMENT_RECORD_TOOL, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL,
     MEMORY_LIST_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
-    MEMORY_UPDATE_DESCRIPTION_TOOL,
+    MEMORY_UPDATE_DESCRIPTION_TOOL, ONBOARDING_FINISH_TOOL,
 };
 use crate::lane::refused;
 use crate::omp::{TurnContext, lock};
@@ -200,9 +202,28 @@ fn break_schema() -> Map<String, Value> {
     }))
 }
 
-/// The lead's memory tools: `memory_list` and `memory_read`, the six write tools, then
-/// `memory_agreement_record` and `memory_agreement_break`. A write or agreement handler reads
-/// `turn` when it is called, so it sees the running turn.
+/// The allowed properties of `onboarding_finish`.
+const FINISH_KEYS: [&str; 2] = ["outcome", "reason"];
+
+fn finish_schema() -> Map<String, Value> {
+    schema(json!({
+        "type": "object",
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "enum": ["done", "skipped"],
+                "description": "done when the answers are saved, skipped when the owner did not want this."
+            },
+            "reason": {"type": "string", "description": "One line saying why."}
+        },
+        "required": ["outcome", "reason"],
+        "additionalProperties": false
+    }))
+}
+
+/// The lead's memory tools: `memory_list` and `memory_read`, the six write tools,
+/// `memory_agreement_record` and `memory_agreement_break`, then `onboarding_finish`. A write,
+/// agreement or onboarding handler reads `turn` when it is called, so it sees the running turn.
 pub fn host_tools(
     home: MemoryHome,
     store: Arc<Mutex<Store>>,
@@ -273,6 +294,7 @@ pub fn host_tools(
         )
         .load_mode(ToolLoadMode::Essential),
     );
+    let (finish_store, finish_turn) = (Arc::clone(&store), Arc::clone(&turn));
     tools.push(
         HostTool::new(
             MEMORY_AGREEMENT_BREAK_TOOL,
@@ -283,6 +305,21 @@ pub fn host_tools(
             move |arguments, _| {
                 let context = lock(&turn).clone();
                 break_agreement(&store, context, &Value::Object(arguments)).map(Into::into)
+            },
+        )
+        .load_mode(ToolLoadMode::Essential),
+    );
+    tools.push(
+        HostTool::new(
+            ONBOARDING_FINISH_TOOL,
+            "End the first meeting with a new owner: outcome done once you saved what they told \
+             you, skipped when they did not want it. Works only while you answer an owner \
+             message.",
+            finish_schema(),
+            move |arguments, _| {
+                let context = lock(&finish_turn).clone();
+                finish_onboarding(&finish_store, &home, context, &Value::Object(arguments))
+                    .map(Into::into)
             },
         )
         .load_mode(ToolLoadMode::Essential),
@@ -557,6 +594,21 @@ pub fn break_agreement(
     agreements::break_one(store, turn.as_ref(), id, &reason).map_err(|e| refused(e.code, &e.detail))
 }
 
+/// `onboarding_finish`: parses `args` and ends the running onboarding for `turn`; the result
+/// JSON or a `<CODE>: <detail>` refusal.
+pub fn finish_onboarding(
+    store: &Mutex<Store>,
+    home: &MemoryHome,
+    turn: Option<TurnContext>,
+    args: &Value,
+) -> Result<String, HostToolError> {
+    let (outcome, reason) = fields(args, &FINISH_KEYS)
+        .and_then(|f| Ok((string(f, "outcome")?, string(f, "reason")?)))
+        .inspect_err(args_refused(ONBOARDING_FINISH_TOOL))?;
+    onboarding::finish(store, home, turn.as_ref(), outcome, reason)
+        .map_err(|e| refused(e.code, &e.detail))
+}
+
 /// `memory_list`: a JSON array of `{path, description, bytes}` or `{path, code}`.
 pub fn list(home: &MemoryHome, args: &Value) -> Result<String, HostToolError> {
     let dir = fields(args, &["dir"])
@@ -805,8 +857,10 @@ mod tests {
                 MEMORY_UPDATE_DESCRIPTION_TOOL,
                 MEMORY_AGREEMENT_RECORD_TOOL,
                 MEMORY_AGREEMENT_BREAK_TOOL,
+                ONBOARDING_FINISH_TOOL,
             ]
         );
+        assert_eq!(tools.len(), 11);
         for tool in &tools {
             assert_eq!(tool.definition().load_mode, Some(ToolLoadMode::Essential));
             assert_eq!(
@@ -1252,6 +1306,38 @@ mod tests {
             assert_eq!(code_of(result), E_MEMORY_ARGS, "{args}");
         }
         assert!(lock(&store).agreements().expect("agreements").is_empty());
+    }
+
+    #[test]
+    fn onboarding_schema_is_strict() {
+        let finish = finish_schema();
+        assert_eq!(required(&finish), ["outcome", "reason"]);
+        assert_eq!(
+            finish["properties"]["outcome"]["enum"],
+            json!(["done", "skipped"])
+        );
+        assert_eq!(finish["additionalProperties"], Value::Bool(false));
+    }
+
+    #[test]
+    fn onboarding_args_are_checked() {
+        let (_dir, memory, store, turn) = store_fixture();
+        // No onboarding is running, so arguments that pass the parser are refused with
+        // E_ONBOARDING_STATE; every E_MEMORY_ARGS below comes from the parser.
+        let valid = json!({"outcome": "done", "reason": "r"});
+        let mut extra = valid.clone();
+        extra["extra"] = json!("x");
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("outcome");
+        let mut number = valid.clone();
+        number["reason"] = json!(1);
+        for args in [extra, missing, number] {
+            let result = finish_onboarding(&store, &memory, Some(turn.clone()), &args);
+            assert_eq!(code_of(result), E_MEMORY_ARGS, "{args}");
+        }
+        let result = finish_onboarding(&store, &memory, Some(turn), &valid);
+        assert_eq!(code_of(result), crate::memory::E_ONBOARDING_STATE);
+        assert_eq!(lock(&store).onboarding().expect("onboarding"), None);
     }
 
     #[test]
