@@ -10,7 +10,7 @@ use super::{
     E_MEMORY_HISTORY, EXPIRES_KEY, MAX_NOTICE_PATHS, MEMORY_DIR, NOTICE_BEGIN, NOTICE_END,
     NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD, frontmatter, guard,
 };
-use crate::store::{MemoryChangeRow, Store, StoreError};
+use crate::store::{AgreementRow, MemoryChangeRow, Store, StoreError};
 
 /// Unix seconds now; tests inject a fixed or stepped clock.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -55,6 +55,8 @@ pub struct Notices {
     pub owner_turns: Option<i64>,
     pub changed: Vec<Changed>,
     pub expired: Vec<String>,
+    /// Agreements flagged NEEDS-HUMAN whose notice was not shown yet.
+    pub agreements: Vec<AgreementRow>,
 }
 
 /// What the lead was last told: the newest commit id, the expiry instant and the compaction count.
@@ -84,7 +86,8 @@ impl Watermarks {
 }
 
 /// The notices since `marks`, advancing them. `owner_row` is the main owner turn's row (nudge
-/// counted) or `None` for a steer.
+/// counted) or `None` for a steer. Newly flagged agreements are marked as noticed in the database
+/// after every read succeeded, so each flag is told once, across restarts.
 pub fn collect(
     store: &Store,
     marks: &mut Watermarks,
@@ -102,11 +105,15 @@ pub fn collect(
         .map(|row| store.owner_turns_since_save(row))
         .transpose()
         .map_err(history_error)?;
+    let agreements = store.unnoticed_flags().map_err(history_error)?;
+    let ids: Vec<i64> = agreements.iter().map(|a| a.id).collect();
+    store.mark_flags_noticed(&ids).map_err(history_error)?;
     let notices = Notices {
         compactions: compactions.saturating_sub(marks.compactions),
         owner_turns,
         changed: changed(&rows),
         expired,
+        agreements,
     };
     *marks = Watermarks {
         commit: marks.commit.max(head),
@@ -225,6 +232,20 @@ pub fn block(notices: &Notices) -> Option<String> {
             notices.expired.len() - MAX_NOTICE_PATHS
         ));
     }
+    for a in notices.agreements.iter().take(MAX_NOTICE_PATHS) {
+        lines.push(format!(
+            "agreement needs-human id={} broken={} text={}",
+            a.id,
+            a.broken,
+            quoted(&a.text)
+        ));
+    }
+    if notices.agreements.len() > MAX_NOTICE_PATHS {
+        lines.push(format!(
+            "agreement more={}",
+            notices.agreements.len() - MAX_NOTICE_PATHS
+        ));
+    }
     if lines.is_empty() {
         return None;
     }
@@ -255,7 +276,7 @@ mod tests {
     use super::*;
     use crate::lead;
     use crate::memory::home::MemoryHome;
-    use crate::memory::{IDENTITY, PERSONA, WRITER_HUMAN};
+    use crate::memory::{IDENTITY, NEEDS_HUMAN_AT, PERSONA, WRITER_HUMAN};
     use crate::store::{Admitted, MemoryCommit};
 
     /// `notes/n.md` expires at unix second 150.
@@ -413,6 +434,7 @@ mod tests {
                 change(PERSONA, ChangeKind::Updated, 7),
             ],
             expired: vec!["notes/x y.md".to_string()],
+            agreements: Vec::new(),
         };
         let expected = concat!(
             "[moraebot memory-notice]\n",
@@ -489,6 +511,7 @@ mod tests {
                     change(PERSONA, ChangeKind::Updated, human),
                 ],
                 expired: vec!["notes/n.md".to_string()],
+                agreements: Vec::new(),
             }
         );
         assert_eq!(
@@ -563,6 +586,124 @@ mod tests {
         let err = collect(&store, &mut marks, 3, 500, None).expect_err("broken store");
         assert_eq!(err.code, E_MEMORY_HISTORY);
         assert_eq!(marks, Watermarks::at_pin(0, 100, 0));
+    }
+
+    fn flagged(id: i64, broken: i64, text: &str) -> AgreementRow {
+        AgreementRow {
+            id,
+            scope: "project".to_string(),
+            author: "agent".to_string(),
+            text: text.to_string(),
+            broken,
+            needs_human: true,
+        }
+    }
+
+    fn add_flagged(store: &mut Store, text: &str) -> i64 {
+        let new = crate::store::NewAgreement {
+            scope: "project",
+            author: "agent",
+            text,
+            norm: text,
+            turn_row: 1,
+            reason: "why",
+            claim_json: None,
+        };
+        let crate::store::AgreementAdded::Added(id) =
+            store.add_agreement(&new, 64, 12288).expect("add")
+        else {
+            panic!("not added");
+        };
+        for turn in 10..10 + NEEDS_HUMAN_AT {
+            store
+                .break_agreement(id, turn, "slip", NEEDS_HUMAN_AT)
+                .expect("break");
+        }
+        id
+    }
+
+    #[test]
+    fn agreement_lines_follow_expired() {
+        let notices = Notices {
+            expired: vec!["notes/x.md".to_string()],
+            agreements: vec![
+                flagged(3, 3, "never force push"),
+                flagged(5, 4, "ask \"first\""),
+            ],
+            ..Notices::default()
+        };
+        let expected = concat!(
+            "[moraebot memory-notice]\n",
+            "expired path=\"notes/x.md\"\n",
+            "agreement needs-human id=3 broken=3 text=\"never force push\"\n",
+            "agreement needs-human id=5 broken=4 text=\"ask \\\"first\\\"\"\n",
+            "[moraebot memory-notice end]\n",
+        );
+        assert_eq!(block(&notices).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn agreement_lines_cap_at_twenty() {
+        let notices = Notices {
+            agreements: (1..=21).map(|i| flagged(i, 3, "t")).collect(),
+            ..Notices::default()
+        };
+        let text = block(&notices).expect("block");
+        let lines: Vec<&str> = text.lines().collect();
+        let count = |prefix: &str| lines.iter().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(count("agreement needs-human "), 20);
+        assert!(lines.contains(&"agreement more=1"));
+        assert!(!lines.iter().any(|l| l.contains("id=21 ")));
+    }
+
+    #[test]
+    fn block_with_only_agreements_is_some() {
+        let notices = Notices {
+            agreements: vec![flagged(1, 3, "t")],
+            ..Notices::default()
+        };
+        assert!(block(&notices).is_some());
+    }
+
+    #[test]
+    fn collect_tells_each_flag_once() {
+        let (_dir, mut store, _home) = store_fixture();
+        let id = add_flagged(&mut store, "never force push");
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let first = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(first.agreements, vec![flagged(id, 3, "never force push")]);
+        let second = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert!(second.agreements.is_empty());
+        let fourth = store
+            .break_agreement(id, 99, "slip", NEEDS_HUMAN_AT)
+            .expect("break");
+        assert!(matches!(
+            fourth,
+            crate::store::AgreementBreak::Counted {
+                broken: 4,
+                flagged: false,
+                ..
+            }
+        ));
+        let third = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert!(third.agreements.is_empty());
+    }
+
+    #[test]
+    fn collect_error_marks_no_flag() {
+        let (_dir, mut store, _home) = store_fixture();
+        let id = add_flagged(&mut store, "never force push");
+        let mut marks = Watermarks::at_pin(0, 100, 0);
+        store
+            .exec_for_test("DROP TABLE memory_snapshots")
+            .expect("drop");
+        let err = collect(&store, &mut marks, 0, 100, None).expect_err("broken store");
+        assert_eq!(err.code, E_MEMORY_HISTORY);
+        assert_eq!(marks, Watermarks::at_pin(0, 100, 0));
+        assert_eq!(
+            store.unnoticed_flags().expect("flags"),
+            vec![flagged(id, 3, "never force push")]
+        );
     }
 
     #[test]
