@@ -7,8 +7,9 @@ use std::sync::Arc;
 use super::history::{self, Committed};
 use super::home::MemoryError;
 use super::{
-    E_MEMORY_HISTORY, EXPIRES_KEY, MAX_NOTICE_PATHS, MEMORY_DIR, NOTICE_BEGIN, NOTICE_END,
-    NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD, frontmatter, guard,
+    E_MEMORY_HISTORY, EXPIRES_KEY, MAX_NOTICE_PATHS, MAX_ONBOARDING_TURNS, MEMORY_DIR,
+    NOTICE_BEGIN, NOTICE_END, NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD, frontmatter,
+    guard,
 };
 use crate::store::{AgreementRow, MemoryChangeRow, Store, StoreError};
 
@@ -57,6 +58,8 @@ pub struct Notices {
     pub expired: Vec<String>,
     /// Agreements flagged NEEDS-HUMAN whose notice was not shown yet.
     pub agreements: Vec<AgreementRow>,
+    /// The owner turn number of a running onboarding, within `MAX_ONBOARDING_TURNS`.
+    pub onboarding: Option<i64>,
 }
 
 /// What the lead was last told: the newest commit id, the expiry instant and the compaction count.
@@ -105,6 +108,12 @@ pub fn collect(
         .map(|row| store.owner_turns_since_save(row))
         .transpose()
         .map_err(history_error)?;
+    let onboarding = owner_row
+        .map(|row| store.onboarding_turn(row))
+        .transpose()
+        .map_err(history_error)?
+        .flatten()
+        .filter(|n| (1..=MAX_ONBOARDING_TURNS).contains(n));
     let agreements = store.unnoticed_flags().map_err(history_error)?;
     let ids: Vec<i64> = agreements.iter().map(|a| a.id).collect();
     store.mark_flags_noticed(&ids).map_err(history_error)?;
@@ -114,6 +123,7 @@ pub fn collect(
         changed: changed(&rows),
         expired,
         agreements,
+        onboarding,
     };
     *marks = Watermarks {
         commit: marks.commit.max(head),
@@ -246,6 +256,9 @@ pub fn block(notices: &Notices) -> Option<String> {
             notices.agreements.len() - MAX_NOTICE_PATHS
         ));
     }
+    if let Some(n) = notices.onboarding {
+        lines.push(format!("onboarding turn={n}"));
+    }
     if lines.is_empty() {
         return None;
     }
@@ -277,7 +290,7 @@ mod tests {
     use crate::lead;
     use crate::memory::home::MemoryHome;
     use crate::memory::{IDENTITY, NEEDS_HUMAN_AT, PERSONA, WRITER_HUMAN};
-    use crate::store::{Admitted, MemoryCommit};
+    use crate::store::{Admitted, MemoryCommit, OnboardingState};
 
     /// `notes/n.md` expires at unix second 150.
     const EXPIRING: &str = "---\ndescription: a note\nexpires: 1970-01-01T00:02:30Z\n---\nbody\n";
@@ -315,6 +328,25 @@ mod tests {
             .admit(
                 "slack",
                 "1300000000000000001",
+                "slack:C111",
+                "C111",
+                "111",
+                "hi",
+            )
+            .expect("admit");
+        let Admitted::New(row) = admitted else {
+            panic!("duplicate");
+        };
+        assert!(store.claim(row).expect("claim"));
+        row
+    }
+
+    /// Like `owner_turn` with the message id numbered `n` (callers pass `n` from 2 upward).
+    fn owner_turn_n(store: &mut Store, n: u32) -> i64 {
+        let admitted = store
+            .admit(
+                "slack",
+                &format!("13000000000000000{n:02}"),
                 "slack:C111",
                 "C111",
                 "111",
@@ -435,6 +467,7 @@ mod tests {
             ],
             expired: vec!["notes/x y.md".to_string()],
             agreements: Vec::new(),
+            onboarding: None,
         };
         let expected = concat!(
             "[moraebot memory-notice]\n",
@@ -512,6 +545,7 @@ mod tests {
                 ],
                 expired: vec!["notes/n.md".to_string()],
                 agreements: Vec::new(),
+                onboarding: None,
             }
         );
         assert_eq!(
@@ -713,6 +747,93 @@ mod tests {
         let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
         let notices = collect(&store, &mut marks, 0, 100, None).expect("collect");
         assert_eq!(notices.owner_turns, None);
+    }
+
+    #[test]
+    fn onboarding_line_comes_last() {
+        let notices = Notices {
+            changed: vec![change("notes/a.md", ChangeKind::Added, 4)],
+            expired: vec!["notes/x.md".to_string()],
+            agreements: vec![flagged(1, 3, "t")],
+            onboarding: Some(2),
+            ..Notices::default()
+        };
+        let text = block(&notices).expect("block");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &lines[lines.len() - 2..],
+            ["onboarding turn=2", NOTICE_END].as_slice()
+        );
+    }
+
+    #[test]
+    fn block_with_only_onboarding_is_some() {
+        let notices = Notices {
+            onboarding: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            block(&notices),
+            Some(format!("{NOTICE_BEGIN}\nonboarding turn=1\n{NOTICE_END}\n"))
+        );
+    }
+
+    #[test]
+    fn collect_counts_onboarding_turns() {
+        let (_dir, mut store, _home) = store_fixture();
+        store.start_onboarding().expect("start");
+        let a = owner_turn(&mut store);
+        let b = owner_turn_n(&mut store, 2);
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let first = collect(&store, &mut marks, 0, 100, Some(a)).expect("collect");
+        assert_eq!(first.onboarding, Some(1));
+        let second = collect(&store, &mut marks, 0, 100, Some(b)).expect("collect");
+        assert_eq!(second.onboarding, Some(2));
+    }
+
+    #[test]
+    fn collect_stops_after_the_limit() {
+        let (_dir, mut store, _home) = store_fixture();
+        store.start_onboarding().expect("start");
+        let rows: Vec<i64> = (2..=MAX_ONBOARDING_TURNS as u32 + 2)
+            .map(|n| owner_turn_n(&mut store, n))
+            .collect();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let tenth = rows[MAX_ONBOARDING_TURNS as usize - 1];
+        let eleventh = rows[MAX_ONBOARDING_TURNS as usize];
+        let at_limit = collect(&store, &mut marks, 0, 100, Some(tenth)).expect("collect");
+        assert_eq!(at_limit.onboarding, Some(MAX_ONBOARDING_TURNS));
+        let past = collect(&store, &mut marks, 0, 100, Some(eleventh)).expect("collect");
+        assert_eq!(past.onboarding, None);
+    }
+
+    #[test]
+    fn steer_collect_has_no_onboarding() {
+        let (_dir, mut store, _home) = store_fixture();
+        store.start_onboarding().expect("start");
+        let a = owner_turn(&mut store);
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let steer = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(steer.onboarding, None);
+        let turn = collect(&store, &mut marks, 0, 100, Some(a)).expect("collect");
+        assert_eq!(turn.onboarding, Some(1));
+    }
+
+    #[test]
+    fn collect_without_onboarding_is_none() {
+        let (_dir, mut store, _home) = store_fixture();
+        let a = owner_turn(&mut store);
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        let none = collect(&store, &mut marks, 0, 100, Some(a)).expect("collect");
+        assert_eq!(none.onboarding, None);
+        store.start_onboarding().expect("start");
+        assert!(
+            store
+                .finish_onboarding(OnboardingState::Done)
+                .expect("finish")
+        );
+        let done = collect(&store, &mut marks, 0, 100, Some(a)).expect("collect");
+        assert_eq!(done.onboarding, None);
     }
 
     #[test]
