@@ -18,6 +18,7 @@ use moraebot::dispatch::{N_ONBOARDING_HELLO, notice_text};
 use moraebot::done;
 use moraebot::gateway::STORE_FILE;
 use moraebot::gateway::{Gateway, GatewayError};
+use moraebot::memory::extension;
 use moraebot::memory::home::MemoryHome;
 use moraebot::memory::{
     self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, notice, onboarding,
@@ -490,6 +491,14 @@ async fn lane_gets_overlay_and_read_only_memory() {
     assert_eq!(
         std::fs::read(&overlay).expect("overlay"),
         omp::OMP_OVERLAY.as_bytes()
+    );
+    assert!(
+        lead_argv.iter().any(|arg| arg == "-e"),
+        "the lead gets the extension"
+    );
+    assert!(
+        !lane_argv.iter().any(|arg| arg == "-e"),
+        "lanes get no extension"
     );
 }
 
@@ -1081,6 +1090,132 @@ async fn memory_repin_and_notices_through_the_gateway() {
         "the compaction is told once"
     );
     assert!(!refresh.exists(), "the restart removed the refresh request");
+}
+
+#[tokio::test]
+async fn memory_extension_through_the_gateway() {
+    const MARKER: &str = "tool-marker";
+    let mut rig = Rig::new();
+    let seed_body = frontmatter::parse(PERSONA_SEED).expect("seed parses").body;
+    let call = json!({
+        "tool": memory::MEMORY_STR_REPLACE_TOOL,
+        "arguments": {
+            "path": memory::PERSONA,
+            "old_string": seed_body,
+            "new_string": format!("{MARKER}\n"),
+            "reason": "r",
+            "source": "agent"
+        }
+    })
+    .to_string();
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[
+                ("FAKE_OMP_MODE", "tools"),
+                ("FAKE_OMP_TOOL_CALLS", &call),
+                ("FAKE_OMP_COMPACT_TRIGGER", "compact-now"),
+                ("FAKE_OMP_EXT_ACK", extension::VERSION),
+            ],
+        )
+        .expect("open gateway"),
+    );
+    // Turn 1: the lead writes its persona and the conversation is compacted.
+    adapter
+        .inject(dm("1300000000000000041", "run-tools compact-now"))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    // Turn 2: the compaction changed the block; the extension is loaded, so in place.
+    adapter.inject(dm("1300000000000000042", "hi")).await;
+    bounded(adapter.wait_for_send(2)).await;
+    // Turn 3: the owner's refresh request, again in place.
+    let refresh = notice::refresh_file(&rig.config.home);
+    std::fs::write(&refresh, "").expect("refresh request");
+    adapter.inject(dm("1300000000000000043", "again")).await;
+    bounded(adapter.wait_for_send(3)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(
+        leads.len(),
+        1,
+        "no restart at the compaction or the refresh"
+    );
+    let argv = &leads[0].2;
+    let at = argv
+        .iter()
+        .position(|arg| arg == "-e")
+        .expect("the lead gets -e");
+    let ext_path = &argv[at + 1];
+    assert!(Path::new(ext_path).is_absolute(), "absolute extension path");
+    assert!(ext_path.ends_with(&format!("/omp/{}", extension::EXT_FILE)));
+    let flags = append_flags(argv);
+    assert_eq!(flags.len(), 1, "one append element");
+    assert!(!flags[0].contains(MARKER), "the argv kept the first pin");
+
+    let ext_dir = extension::dir(&rig.config.home);
+    let block = std::fs::read_to_string(ext_dir.join(extension::BLOCK_FILE)).expect("block");
+    assert!(block.contains(MARKER), "the block file has the write");
+    let ext_file = ext_dir.join(extension::EXT_FILE);
+    assert_eq!(
+        std::fs::read(&ext_file).expect("extension file"),
+        extension::SOURCE.as_bytes()
+    );
+    assert_eq!(mode(&ext_file), 0o600);
+
+    let prompts: Vec<(usize, String)> = rig
+        .tap
+        .seen
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| Some((at, serde_json::from_str::<Value>(line).ok()?)))
+        .filter(|(_, frame)| frame["type"] == "prompt")
+        .map(|(at, frame)| {
+            let message = frame["message"].as_str().expect("prompt message");
+            (at, message.to_owned())
+        })
+        .collect();
+    assert_eq!(prompts.len(), 3, "three lead prompts");
+    for (_, message) in &prompts {
+        assert!(
+            !message.contains(memory::NOTICE_BEGIN),
+            "no notice inside a prompt"
+        );
+    }
+
+    let outbox: Vec<(usize, String)> = rig
+        .tap
+        .seen
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| Some((at, line.strip_prefix("OUTBOX ")?)))
+        .map(|(at, value)| {
+            let text: String = serde_json::from_str(value).expect("OUTBOX value is a JSON string");
+            (at, text)
+        })
+        .collect();
+    assert_eq!(outbox.len(), 1, "one hidden notice");
+    let (outbox_at, text) = &outbox[0];
+    assert!(prompts[1].0 < *outbox_at && *outbox_at < prompts[2].0);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.contains(&memory::NOTICE_BEGIN), "{lines:?}");
+    assert!(lines.contains(&"compaction count=1"), "{lines:?}");
+    assert!(lines.contains(&memory::NOTICE_END), "{lines:?}");
+    assert!(
+        !lines.iter().any(|line| line.starts_with("changed kind=")),
+        "the lead's own write is not announced: {lines:?}"
+    );
+    assert!(
+        !refresh.exists(),
+        "the in-place re-pin removed the refresh request"
+    );
 }
 
 #[tokio::test]
