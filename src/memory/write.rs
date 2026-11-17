@@ -1,1 +1,1107 @@
 //! The memory write engine: validation, the origin gate, recording and applying changes.
+
+use std::sync::Mutex;
+
+use super::frontmatter::{self, Frontmatter, render_frontmatter};
+use super::history::{self, Committed};
+use super::home::{MemoryError, MemoryHome};
+use super::{
+    E_MEMORY_ARGS, E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY,
+    E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH,
+    E_MEMORY_PROTECTED, MAX_DIRTY_LISTED, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL,
+    MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
+    MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, WRITER_LEAD,
+};
+use crate::omp::{TurnContext, lock};
+use crate::store::{MemoryChange, MemoryCommit, Store};
+
+/// One write the lead asked for through a memory tool.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    Create {
+        path: String,
+        description: String,
+        body: String,
+    },
+    StrReplace {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
+    Insert {
+        path: String,
+        insert_line: usize,
+        insert_text: String,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        old_path: String,
+        new_path: String,
+    },
+    UpdateDescription {
+        path: String,
+        description: String,
+    },
+}
+
+impl Edit {
+    /// The memory tool that makes this edit.
+    pub fn tool(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => MEMORY_CREATE_TOOL,
+            Self::StrReplace { .. } => MEMORY_STR_REPLACE_TOOL,
+            Self::Insert { .. } => MEMORY_INSERT_TOOL,
+            Self::Delete { .. } => MEMORY_DELETE_TOOL,
+            Self::Rename { .. } => MEMORY_RENAME_TOOL,
+            Self::UpdateDescription { .. } => MEMORY_UPDATE_DESCRIPTION_TOOL,
+        }
+    }
+
+    /// The path the edit works on (the source of a rename).
+    fn path(&self) -> &str {
+        match self {
+            Self::Create { path, .. }
+            | Self::StrReplace { path, .. }
+            | Self::Insert { path, .. }
+            | Self::Delete { path }
+            | Self::UpdateDescription { path, .. } => path,
+            Self::Rename { old_path, .. } => old_path,
+        }
+    }
+}
+
+/// A recorded write: its commit, the tool, the path and, for a rename, the new path.
+#[derive(Debug, PartialEq)]
+pub struct Applied {
+    pub commit: i64,
+    pub tool: &'static str,
+    pub path: String,
+    pub to: Option<String>,
+}
+
+impl Applied {
+    /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename.
+    pub fn to_json(&self) -> String {
+        let mut value = serde_json::json!({
+            "committed": self.commit,
+            "command": self.tool,
+            "path": self.path,
+        });
+        if let Some(to) = &self.to {
+            value["to"] = serde_json::json!(to);
+        }
+        value.to_string()
+    }
+}
+
+fn refused(code: &'static str, detail: impl Into<String>) -> MemoryError {
+    MemoryError {
+        code,
+        detail: detail.into(),
+    }
+}
+
+/// Checks `edit` against the running turn, the paths, the history and the new text, then
+/// records it as one lead commit and applies it to the working files. The store stays locked
+/// from the origin check to the end, so writers never interleave.
+pub fn apply(
+    store: &Mutex<Store>,
+    home: &MemoryHome,
+    turn: Option<&TurnContext>,
+    edit: Edit,
+    reason: &str,
+) -> Result<Applied, MemoryError> {
+    let tool = edit.tool();
+    let path = edit.path().to_string();
+    let result = run(store, home, turn, edit, reason);
+    match &result {
+        Ok(applied) => {
+            tracing::info!(tool, path = %path, commit = applied.commit, "memory write committed");
+        }
+        Err(e) => tracing::info!(tool, path = %path, code = e.code, "memory write refused"),
+    }
+    result
+}
+
+fn run(
+    store: &Mutex<Store>,
+    home: &MemoryHome,
+    turn: Option<&TurnContext>,
+    edit: Edit,
+    reason: &str,
+) -> Result<Applied, MemoryError> {
+    history::check_reason(reason)?;
+
+    let Some(turn) = turn else {
+        return Err(refused(E_MEMORY_ORIGIN, "no lead turn is running"));
+    };
+    let mut store = lock(store);
+    match store.get(turn.row_id) {
+        Ok(Some(row)) if row.origin == "owner" => {}
+        Ok(_) => {
+            return Err(refused(
+                E_MEMORY_ORIGIN,
+                "the running turn does not answer an owner message",
+            ));
+        }
+        Err(e) => return Err(refused(E_MEMORY_HISTORY, e.code())),
+    }
+
+    check_paths(home, &edit)?;
+
+    let committed = history::prepare(&mut store, home)?;
+    let dirty = history::dirty(home, &committed)?;
+    if !dirty.is_empty() {
+        let mut detail = dirty
+            .iter()
+            .take(MAX_DIRTY_LISTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if dirty.len() > MAX_DIRTY_LISTED {
+            detail.push_str(&format!(" and {} more", dirty.len() - MAX_DIRTY_LISTED));
+        }
+        return Err(refused(E_MEMORY_DIRTY, detail));
+    }
+
+    check_existence(home, &committed, &edit)?;
+
+    let (changes, previous): (Vec<MemoryChange>, Vec<Option<String>>) =
+        new_texts(&committed, &edit)?.into_iter().unzip();
+    for ((_, text), previous) in changes.iter().zip(&previous) {
+        if let Some(text) = text {
+            history::check_text(text, previous.as_deref())?;
+        }
+    }
+    let noop = changes.iter().all(|(path, text)| match text {
+        Some(text) => committed.files.get(path) == Some(text),
+        None => !committed.files.contains_key(path),
+    });
+    if noop {
+        return Err(refused(E_MEMORY_NOOP, "nothing would change"));
+    }
+
+    let commit = MemoryCommit {
+        writer: WRITER_LEAD.to_string(),
+        reason: reason.to_string(),
+        turn_row: Some(turn.row_id),
+        conversation_key: Some(turn.conversation_key.clone()),
+        claim_json: None,
+    };
+    let id = history::record(&mut store, home, &commit, &changes)?;
+    let tool = edit.tool();
+    let (path, to) = match edit {
+        Edit::Rename { old_path, new_path } => (old_path, Some(new_path)),
+        other => (other.path().to_string(), None),
+    };
+    Ok(Applied {
+        commit: id,
+        tool,
+        path,
+        to,
+    })
+}
+
+/// Step 3: every named path is plain ASCII and passes the path rules, a rename moves the file
+/// somewhere else, and the persona and the owner card are neither deleted nor renamed.
+fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
+    let files: Vec<&str> = match edit {
+        Edit::Delete { path } if !path.ends_with(".md") => {
+            plain_ascii(path)?;
+            home.resolve_dir(path)?;
+            Vec::new()
+        }
+        Edit::Rename { old_path, new_path } => vec![old_path, new_path],
+        other => vec![other.path()],
+    };
+    for path in files {
+        plain_ascii(path)?;
+        home.resolve(path)?;
+    }
+    if let Edit::Rename { old_path, new_path } = edit
+        && old_path == new_path
+    {
+        return Err(refused(E_MEMORY_NOOP, "the new path is the old path"));
+    }
+    let protected = match edit {
+        Edit::Delete { path } if path.ends_with(".md") => PROTECTED.contains(&path.as_str()),
+        Edit::Delete { path } => {
+            let prefix = format!("{path}/");
+            PROTECTED.iter().any(|p| p.starts_with(&prefix))
+        }
+        Edit::Rename { old_path, .. } => PROTECTED.contains(&old_path.as_str()),
+        _ => false,
+    };
+    if protected {
+        return Err(refused(
+            E_MEMORY_PROTECTED,
+            format!("{}: cannot be deleted or renamed", edit.path()),
+        ));
+    }
+    Ok(())
+}
+
+/// Write paths use only ASCII letters, digits, '.', '_' and '-' in each non-empty component
+/// (M2-D-ascii), so letter case is the only spelling difference a file system can fold, and
+/// every path has one spelling in the history.
+fn plain_ascii(path: &str) -> Result<(), MemoryError> {
+    let plain = path.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    });
+    if plain {
+        Ok(())
+    } else {
+        Err(refused(
+            E_MEMORY_PATH,
+            "path components must be ASCII letters, digits, '.', '_' or '-'",
+        ))
+    }
+}
+
+/// Step 6: a new path is absent in any letter case, and every source is committed.
+fn check_existence(
+    home: &MemoryHome,
+    committed: &Committed,
+    edit: &Edit,
+) -> Result<(), MemoryError> {
+    match edit {
+        Edit::Create { path, .. } => check_absent(home, committed, path),
+        Edit::Rename { old_path, new_path } => {
+            check_absent(home, committed, new_path)?;
+            check_committed(committed, old_path)
+        }
+        Edit::Delete { path } if !path.ends_with(".md") => {
+            if under(committed, path).is_empty() {
+                Err(refused(
+                    E_MEMORY_NOT_FOUND,
+                    format!("{path}: no memory file in this folder"),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        other => check_committed(committed, other.path()),
+    }
+}
+
+fn check_committed(committed: &Committed, path: &str) -> Result<(), MemoryError> {
+    if committed.files.contains_key(path) {
+        Ok(())
+    } else {
+        Err(refused(E_MEMORY_NOT_FOUND, path))
+    }
+}
+
+/// Refuses a new path that names a committed file, a committed folder or a folder on disk in
+/// another letter case: on a case-folding file system it would overwrite or split that entry.
+fn check_absent(home: &MemoryHome, committed: &Committed, target: &str) -> Result<(), MemoryError> {
+    let lower = target.to_lowercase();
+    if let Some(existing) = committed.files.keys().find(|c| c.to_lowercase() == lower) {
+        return Err(refused(
+            E_MEMORY_EXISTS,
+            format!("{target}: already a memory file as {existing}"),
+        ));
+    }
+    let parts: Vec<&str> = target.split('/').collect();
+    for committed_path in committed.files.keys() {
+        let other: Vec<&str> = committed_path.split('/').collect();
+        for depth in 1..parts.len().min(other.len()) {
+            let (mine, theirs) = (parts[..depth].join("/"), other[..depth].join("/"));
+            if mine != theirs && mine.to_lowercase() == theirs.to_lowercase() {
+                return Err(refused(
+                    E_MEMORY_EXISTS,
+                    format!("{target}: folder committed as {theirs}"),
+                ));
+            }
+        }
+    }
+    home.exact_spelling(target)
+}
+
+/// The committed paths inside the folder `dir`.
+fn under<'a>(committed: &'a Committed, dir: &str) -> Vec<&'a String> {
+    let prefix = format!("{dir}/");
+    committed
+        .files
+        .keys()
+        .filter(|path| path.starts_with(&prefix))
+        .collect()
+}
+
+/// Step 7: every change of `edit`, each with the text its `provenance` is compared against.
+fn new_texts(
+    committed: &Committed,
+    edit: &Edit,
+) -> Result<Vec<(MemoryChange, Option<String>)>, MemoryError> {
+    let current = |path: &str| committed.files.get(path).cloned();
+    let text_of = |path: &str| committed.files.get(path).map_or("", String::as_str);
+    let changed = |path: &str, text: String| vec![((path.to_string(), Some(text)), current(path))];
+    Ok(match edit {
+        Edit::Create {
+            path,
+            description,
+            body,
+        } => {
+            let mut text = render_frontmatter(&Frontmatter::with_description(description));
+            text.push_str(body);
+            if !body.is_empty() && !body.ends_with('\n') {
+                text.push('\n');
+            }
+            changed(path, text)
+        }
+        Edit::StrReplace {
+            path,
+            old_string,
+            new_string,
+        } => {
+            if old_string.is_empty() {
+                return Err(refused(E_MEMORY_ARGS, "old_string is empty"));
+            }
+            let text = text_of(path);
+            if !text.contains(old_string.as_str()) {
+                return Err(refused(E_MEMORY_NO_MATCH, path.as_str()));
+            }
+            changed(path, text.replacen(old_string.as_str(), new_string, 1))
+        }
+        Edit::Insert {
+            path,
+            insert_line,
+            insert_text,
+        } => changed(path, insert(text_of(path), *insert_line, insert_text)?),
+        Edit::UpdateDescription { path, description } => {
+            let parsed = parse(text_of(path))?;
+            let mut frontmatter = parsed.frontmatter;
+            frontmatter.set("description", description);
+            changed(path, render_frontmatter(&frontmatter) + parsed.body)
+        }
+        Edit::Rename { old_path, new_path } => {
+            let text = current(old_path);
+            vec![
+                ((old_path.clone(), None), text.clone()),
+                ((new_path.clone(), text.clone()), text),
+            ]
+        }
+        Edit::Delete { path } if path.ends_with(".md") => {
+            vec![((path.clone(), None), current(path))]
+        }
+        Edit::Delete { path } => under(committed, path)
+            .into_iter()
+            .map(|path| ((path.clone(), None), current(path)))
+            .collect(),
+    })
+}
+
+fn parse(text: &str) -> Result<frontmatter::Parsed<'_>, MemoryError> {
+    frontmatter::parse(text).map_err(|e| refused(E_MEMORY_FRONTMATTER, e.to_string()))
+}
+
+/// `text` with `insert_text` starting at body line `line` (1 = top, line count + 1 = append);
+/// the frontmatter is kept byte for byte.
+fn insert(text: &str, line: usize, insert_text: &str) -> Result<String, MemoryError> {
+    let body = parse(text)?.body;
+    let head = &text[..text.len() - body.len()];
+    let mut lines: Vec<String> = body.split_inclusive('\n').map(str::to_string).collect();
+    if let Some(last) = lines.last_mut()
+        && !last.ends_with('\n')
+    {
+        last.push('\n');
+    }
+    if line == 0 || line > lines.len() + 1 {
+        return Err(refused(
+            E_MEMORY_ARGS,
+            format!("insert_line must be between 1 and {}", lines.len() + 1),
+        ));
+    }
+    let mut added = insert_text.to_string();
+    if !added.ends_with('\n') {
+        added.push('\n');
+    }
+    lines.insert(line - 1, added);
+    Ok(format!("{head}{}", lines.concat()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+    use crate::memory::home::HUMAN_SEED;
+    use crate::memory::{
+        E_MEMORY_FILE, E_MEMORY_PROVENANCE, END, HUMAN, MAX_FILE_BYTES, MAX_REASON_CHARS, PERSONA,
+    };
+    use crate::store::{Admitted, LaneStart, LaneState, MemoryCommitRow};
+
+    const A: &str = "---\ndescription: a note\n---\nline1\nline2\nline3\n";
+    const B: &str = "---\ndescription: b note\n---\nno newline";
+    const P: &str = "---\ndescription: kept\nprovenance: owner\n---\nbody\n";
+    const REASON: &str = "test write";
+    const OWNER_ROW: i64 = 1;
+    const LANE_ROW: i64 = 2;
+    const MISSING_ROW: i64 = 999;
+
+    struct Fx {
+        _dir: tempfile::TempDir,
+        store: Arc<Mutex<Store>>,
+        home: MemoryHome,
+    }
+
+    impl Fx {
+        fn apply(&self, edit: Edit) -> Result<Applied, MemoryError> {
+            apply(
+                &self.store,
+                &self.home,
+                Some(&turn(OWNER_ROW)),
+                edit,
+                REASON,
+            )
+        }
+
+        fn commits(&self) -> Vec<MemoryCommitRow> {
+            lock(&self.store).memory_commits().expect("commits")
+        }
+
+        fn file(&self, rel: &str) -> Option<String> {
+            std::fs::read_to_string(self.home.root().join(rel)).ok()
+        }
+
+        fn dirty(&self) -> Vec<String> {
+            let committed = history::committed(&lock(&self.store)).expect("committed");
+            history::dirty(&self.home, &committed).expect("dirty")
+        }
+    }
+
+    /// A home with the seeds and the notes a, b and p, imported, plus an owner row (id 1) and
+    /// a lane-result row (id 2) in the inbox.
+    fn fx() -> Fx {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        assert_eq!(
+            store
+                .admit("test", "m1", "k1", "chan1", "111", "hi")
+                .expect("admit"),
+            Admitted::New(OWNER_ROW)
+        );
+        let LaneStart::New(lane) = store
+            .start_lane("call-1", "k1", "task", None, 3)
+            .expect("lane")
+        else {
+            panic!("lane not started");
+        };
+        assert!(
+            store
+                .finish_lane(lane, 1, "result", LaneState::Idle, None)
+                .expect("finish")
+        );
+        let lane_row = store.get(LANE_ROW).expect("get").expect("lane row");
+        assert_eq!(lane_row.origin, "lane");
+        let home = MemoryHome::new(dir.path());
+        home.ensure_layout().expect("layout");
+        for (rel, text) in [("notes/a.md", A), ("notes/b.md", B), ("notes/p.md", P)] {
+            put(&home, rel, text);
+        }
+        history::prepare(&mut store, &home).expect("import");
+        Fx {
+            _dir: dir,
+            store: Arc::new(Mutex::new(store)),
+            home,
+        }
+    }
+
+    fn turn(row_id: i64) -> TurnContext {
+        TurnContext {
+            row_id,
+            conversation_key: "k1".to_string(),
+        }
+    }
+
+    fn put(home: &MemoryHome, rel: &str, text: &str) {
+        let path = home.root().join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, text).expect("write");
+    }
+
+    fn create(path: &str, body: &str) -> Edit {
+        Edit::Create {
+            path: path.to_string(),
+            description: "new note".to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn replace(path: &str, old: &str, new: &str) -> Edit {
+        Edit::StrReplace {
+            path: path.to_string(),
+            old_string: old.to_string(),
+            new_string: new.to_string(),
+        }
+    }
+
+    fn insert_at(path: &str, line: usize, text: &str) -> Edit {
+        Edit::Insert {
+            path: path.to_string(),
+            insert_line: line,
+            insert_text: text.to_string(),
+        }
+    }
+
+    fn delete(path: &str) -> Edit {
+        Edit::Delete {
+            path: path.to_string(),
+        }
+    }
+
+    fn rename(old: &str, new: &str) -> Edit {
+        Edit::Rename {
+            old_path: old.to_string(),
+            new_path: new.to_string(),
+        }
+    }
+
+    fn describe(path: &str, description: &str) -> Edit {
+        Edit::UpdateDescription {
+            path: path.to_string(),
+            description: description.to_string(),
+        }
+    }
+
+    /// Every file under `root` with its bytes.
+    fn bytes_under(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).expect("prefix");
+                let rel = rel.to_string_lossy().into_owned();
+                if entry.file_type().expect("type").is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).expect("read"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    type Expected = Vec<(&'static str, Option<String>)>;
+
+    /// One case per edit kind: the edit, the resulting text of every changed path (`None` =
+    /// gone), and the `path` and `to` of the result.
+    fn cases() -> Vec<(Edit, Expected, &'static str, Option<&'static str>)> {
+        let a = |body: &str| Some(format!("---\ndescription: a note\n---\n{body}"));
+        vec![
+            (
+                create("notes/c.md", "hello"),
+                vec![(
+                    "notes/c.md",
+                    Some("---\ndescription: new note\n---\nhello\n".to_string()),
+                )],
+                "notes/c.md",
+                None,
+            ),
+            (
+                replace("notes/a.md", "line2", "LINE2"),
+                vec![("notes/a.md", a("line1\nLINE2\nline3\n"))],
+                "notes/a.md",
+                None,
+            ),
+            (
+                insert_at("notes/a.md", 1, "top"),
+                vec![("notes/a.md", a("top\nline1\nline2\nline3\n"))],
+                "notes/a.md",
+                None,
+            ),
+            (
+                insert_at("notes/a.md", 2, "mid\n"),
+                vec![("notes/a.md", a("line1\nmid\nline2\nline3\n"))],
+                "notes/a.md",
+                None,
+            ),
+            (
+                insert_at("notes/a.md", 3, "before last"),
+                vec![("notes/a.md", a("line1\nline2\nbefore last\nline3\n"))],
+                "notes/a.md",
+                None,
+            ),
+            (
+                insert_at("notes/a.md", 4, "end"),
+                vec![("notes/a.md", a("line1\nline2\nline3\nend\n"))],
+                "notes/a.md",
+                None,
+            ),
+            (
+                insert_at("notes/b.md", 2, "end"),
+                vec![(
+                    "notes/b.md",
+                    Some("---\ndescription: b note\n---\nno newline\nend\n".to_string()),
+                )],
+                "notes/b.md",
+                None,
+            ),
+            (
+                delete("notes/a.md"),
+                vec![("notes/a.md", None)],
+                "notes/a.md",
+                None,
+            ),
+            (
+                rename("notes/p.md", "notes/q.md"),
+                vec![("notes/p.md", None), ("notes/q.md", Some(P.to_string()))],
+                "notes/p.md",
+                Some("notes/q.md"),
+            ),
+            (
+                describe("notes/a.md", "changed"),
+                vec![(
+                    "notes/a.md",
+                    Some("---\ndescription: changed\n---\nline1\nline2\nline3\n".to_string()),
+                )],
+                "notes/a.md",
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn each_edit_produces_expected_bytes() {
+        for (edit, expected, path, to) in cases() {
+            let fx = fx();
+            let applied = fx.apply(edit.clone()).expect("apply");
+            let last = fx.commits().pop().expect("commit");
+            assert_eq!(
+                applied,
+                Applied {
+                    commit: last.id,
+                    tool: edit.tool(),
+                    path: path.to_string(),
+                    to: to.map(str::to_string),
+                }
+            );
+            let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+            let mut want = serde_json::json!({
+                "committed": last.id,
+                "command": edit.tool(),
+                "path": path,
+            });
+            if let Some(to) = to {
+                want["to"] = serde_json::json!(to);
+            }
+            assert_eq!(json, want, "{edit:?}");
+            for (rel, text) in expected {
+                assert_eq!(fx.file(rel), text, "{edit:?} {rel}");
+            }
+            assert!(fx.dirty().is_empty(), "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn each_write_records_one_commit_with_turn_fields() {
+        for (edit, expected, _, _) in cases() {
+            let fx = fx();
+            let before = fx.commits().len();
+            fx.apply(edit.clone()).expect("apply");
+            let rows = fx.commits();
+            assert_eq!(rows.len(), before + 1, "{edit:?}");
+            let row = rows.last().expect("row");
+            assert_eq!(
+                row.commit,
+                MemoryCommit {
+                    writer: WRITER_LEAD.to_string(),
+                    reason: REASON.to_string(),
+                    turn_row: Some(OWNER_ROW),
+                    conversation_key: Some("k1".to_string()),
+                    claim_json: None,
+                },
+                "{edit:?}"
+            );
+            assert!(row.applied, "{edit:?}");
+            let mut want: Vec<MemoryChange> = expected
+                .into_iter()
+                .map(|(rel, text)| (rel.to_string(), text))
+                .collect();
+            want.sort();
+            let snapshots = lock(&fx.store).memory_snapshots(row.id).expect("snapshots");
+            assert_eq!(snapshots, want, "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn str_replace_changes_first_match_only() {
+        let fx = fx();
+        fx.apply(Edit::Create {
+            path: "notes/t.md".to_string(),
+            description: "t".to_string(),
+            body: "a a".to_string(),
+        })
+        .expect("create");
+        fx.apply(replace("notes/t.md", "a", "b")).expect("replace");
+        assert_eq!(
+            fx.file("notes/t.md").as_deref(),
+            Some("---\ndescription: t\n---\nb a\n")
+        );
+    }
+
+    #[test]
+    fn update_description_keeps_other_keys_and_body() {
+        let fx = fx();
+        fx.apply(describe(HUMAN, "the owner")).expect("describe");
+        let text = fx.file(HUMAN).expect("human");
+        let parsed = frontmatter::parse(&text).expect("parse");
+        let seed = frontmatter::parse(HUMAN_SEED).expect("seed");
+        assert_eq!(
+            seed.frontmatter.entries()[1],
+            ("kind".to_string(), "person".to_string())
+        );
+        assert_eq!(
+            parsed.frontmatter.entries(),
+            [
+                ("description".to_string(), "the owner".to_string()),
+                ("kind".to_string(), "person".to_string()),
+            ]
+        );
+        assert_eq!(parsed.body, seed.body);
+    }
+
+    #[test]
+    fn delete_folder_removes_every_tracked_file_in_one_commit() {
+        let fx = fx();
+        fx.apply(create("notes/x/1.md", "one")).expect("one");
+        fx.apply(create("notes/x/2.md", "two")).expect("two");
+        let before = fx.commits().len();
+        let applied = fx.apply(delete("notes/x")).expect("delete folder");
+        let rows = fx.commits();
+        assert_eq!(rows.len(), before + 1);
+        assert_eq!(applied.commit, rows[before].id);
+        assert_eq!(applied.path, "notes/x");
+        assert_eq!(
+            lock(&fx.store)
+                .memory_snapshots(applied.commit)
+                .expect("snapshots"),
+            vec![
+                ("notes/x/1.md".to_string(), None),
+                ("notes/x/2.md".to_string(), None),
+            ]
+        );
+        assert_eq!(fx.file("notes/x/1.md"), None);
+        assert_eq!(fx.file("notes/x/2.md"), None);
+        assert!(fx.dirty().is_empty());
+    }
+
+    /// Asserts that the edit is refused with `code` and that neither a memory file nor the
+    /// commit count changed.
+    fn assert_refused(fx: &Fx, row: Option<i64>, edit: Edit, reason: &str, code: &str) {
+        let before = (bytes_under(fx.home.root()), fx.commits().len());
+        let turn = row.map(turn);
+        let err = apply(&fx.store, &fx.home, turn.as_ref(), edit.clone(), reason).expect_err(code);
+        assert_eq!(err.code, code, "{edit:?}");
+        let after = (bytes_under(fx.home.root()), fx.commits().len());
+        assert_eq!(after, before, "{code} {edit:?}");
+    }
+
+    #[test]
+    fn refusals_carry_codes_and_change_nothing() {
+        type Setup = fn(&Fx);
+        fn none(_: &Fx) {}
+        fn hand_edit(fx: &Fx) {
+            put(&fx.home, "notes/a.md", "---\ndescription: by hand\n---\n");
+        }
+        fn committed_x(fx: &Fx) {
+            fx.apply(create("notes/x/1.md", "one")).expect("x/1");
+        }
+        fn empty_bob(fx: &Fx) {
+            fx.apply(create("people/bob/c.md", "c")).expect("bob");
+            fx.apply(delete("people/bob/c.md")).expect("delete bob");
+            assert!(fx.home.root().join("people/bob").is_dir());
+        }
+        fn empty_folder(fx: &Fx) {
+            std::fs::create_dir_all(fx.home.root().join("notes/empty")).expect("mkdir");
+        }
+        let owner = Some(OWNER_ROW);
+        let ok = || REASON.to_string();
+        let big = "a".repeat(MAX_FILE_BYTES as usize);
+        let provenance = replace(
+            "notes/a.md",
+            "description: a note\n",
+            "description: a note\nprovenance: x\n",
+        );
+        let unfenced = replace("notes/a.md", "---\nline1", "line1");
+        let cases: Vec<(Setup, Option<i64>, Edit, String, &str)> = vec![
+            (
+                none,
+                owner,
+                create("notes/c.md", "x"),
+                String::new(),
+                E_MEMORY_ARGS,
+            ),
+            (
+                none,
+                owner,
+                create("notes/c.md", "x"),
+                "a\nb".to_string(),
+                E_MEMORY_ARGS,
+            ),
+            (
+                none,
+                owner,
+                create("notes/c.md", "x"),
+                "a".repeat(MAX_REASON_CHARS + 1),
+                E_MEMORY_ARGS,
+            ),
+            (
+                none,
+                owner,
+                replace("notes/a.md", "", "x"),
+                ok(),
+                E_MEMORY_ARGS,
+            ),
+            (
+                none,
+                owner,
+                insert_at("notes/a.md", 5, "x"),
+                ok(),
+                E_MEMORY_ARGS,
+            ),
+            (none, None, create("notes/c.md", "x"), ok(), E_MEMORY_ORIGIN),
+            (
+                none,
+                Some(LANE_ROW),
+                create("notes/c.md", "x"),
+                ok(),
+                E_MEMORY_ORIGIN,
+            ),
+            (
+                none,
+                Some(MISSING_ROW),
+                create("notes/c.md", "x"),
+                ok(),
+                E_MEMORY_ORIGIN,
+            ),
+            (none, owner, create("../x.md", "x"), ok(), E_MEMORY_PATH),
+            (none, owner, create("other/x.md", "x"), ok(), E_MEMORY_PATH),
+            (
+                none,
+                owner,
+                create("notes/caf\u{e9}.md", "x"),
+                ok(),
+                E_MEMORY_PATH,
+            ),
+            (
+                none,
+                owner,
+                create("notes/a b.md", "x"),
+                ok(),
+                E_MEMORY_PATH,
+            ),
+            (
+                none,
+                owner,
+                rename("notes/a.md", "notes/\u{e9}.md"),
+                ok(),
+                E_MEMORY_PATH,
+            ),
+            (none, owner, delete(PERSONA), ok(), E_MEMORY_PROTECTED),
+            (
+                none,
+                owner,
+                rename(HUMAN, "system/h2.md"),
+                ok(),
+                E_MEMORY_PROTECTED,
+            ),
+            (none, owner, delete("system"), ok(), E_MEMORY_PROTECTED),
+            (
+                hand_edit,
+                owner,
+                create("notes/c.md", "x"),
+                ok(),
+                E_MEMORY_DIRTY,
+            ),
+            (
+                none,
+                owner,
+                create("notes/a.md", "x"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                rename("notes/b.md", "notes/a.md"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                create("notes/A.md", "x"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                rename("notes/a.md", "notes/A.md"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                rename("notes/b.md", "notes/A.md"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                committed_x,
+                owner,
+                create("notes/X/2.md", "x"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                committed_x,
+                owner,
+                rename("notes/a.md", "notes/X/2.md"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                empty_bob,
+                owner,
+                create("people/Bob/c.md", "x"),
+                ok(),
+                E_MEMORY_EXISTS,
+            ),
+            (
+                none,
+                owner,
+                replace("notes/missing.md", "a", "b"),
+                ok(),
+                E_MEMORY_NOT_FOUND,
+            ),
+            (
+                empty_folder,
+                owner,
+                delete("notes/empty"),
+                ok(),
+                E_MEMORY_NOT_FOUND,
+            ),
+            (
+                none,
+                owner,
+                replace("notes/a.md", "zzz", "y"),
+                ok(),
+                E_MEMORY_NO_MATCH,
+            ),
+            (none, owner, unfenced, ok(), E_MEMORY_FRONTMATTER),
+            (none, owner, provenance, ok(), E_MEMORY_PROVENANCE),
+            (none, owner, create("notes/c.md", &big), ok(), E_MEMORY_FILE),
+            (none, owner, create("notes/c.md", END), ok(), E_MEMORY_FILE),
+            (
+                none,
+                owner,
+                create("notes/c.md", "a\0b"),
+                ok(),
+                E_MEMORY_FILE,
+            ),
+            (
+                none,
+                owner,
+                replace("notes/a.md", "line1", "line1"),
+                ok(),
+                E_MEMORY_NOOP,
+            ),
+            (
+                none,
+                owner,
+                rename("notes/a.md", "notes/a.md"),
+                ok(),
+                E_MEMORY_NOOP,
+            ),
+        ];
+        for (setup, row, edit, reason, code) in cases {
+            let fx = fx();
+            setup(&fx);
+            assert_refused(&fx, row, edit, &reason, code);
+        }
+    }
+
+    #[test]
+    fn refusal_order_is_fixed() {
+        let fx = fx();
+        assert_refused(
+            &fx,
+            Some(LANE_ROW),
+            create("other/x.md", "x"),
+            REASON,
+            E_MEMORY_ORIGIN,
+        );
+        put(&fx.home, "notes/a.md", "---\ndescription: by hand\n---\n");
+        assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            replace("notes/missing.md", "a", "b"),
+            REASON,
+            E_MEMORY_DIRTY,
+        );
+        assert_refused(&fx, None, create("notes/c.md", "x"), "", E_MEMORY_ARGS);
+    }
+
+    /// Two owner-turn writers released together by a barrier, each creating one of `paths`.
+    fn race(fx: &Fx, paths: [&str; 2]) -> Vec<Result<Applied, MemoryError>> {
+        let barrier = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let (store, home) = (Arc::clone(&fx.store), fx.home.clone());
+                let (barrier, edit) = (Arc::clone(&barrier), create(path, "x"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply(&store, &home, Some(&turn(OWNER_ROW)), edit, REASON)
+                })
+            })
+            .collect();
+        writers
+            .into_iter()
+            .map(|writer| writer.join().expect("writer"))
+            .collect()
+    }
+
+    #[test]
+    fn two_writers_at_a_barrier_make_two_commits() {
+        let fx = fx();
+        let before = fx.commits().len();
+        let ids: Vec<i64> = race(&fx, ["notes/r1.md", "notes/r2.md"])
+            .into_iter()
+            .map(|result| result.expect("both commit").commit)
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(fx.commits().len(), before + 2);
+        assert!(fx.file("notes/r1.md").is_some());
+        assert!(fx.file("notes/r2.md").is_some());
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn same_path_race_commits_once() {
+        let fx = fx();
+        let before = fx.commits().len();
+        let results = race(&fx, ["notes/same.md", "notes/same.md"]);
+        let committed = results.iter().filter(|result| result.is_ok()).count();
+        let codes: Vec<&str> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err().map(|e| e.code))
+            .collect();
+        assert_eq!(committed, 1);
+        assert_eq!(codes, [E_MEMORY_EXISTS]);
+        assert_eq!(fx.commits().len(), before + 1);
+    }
+}
