@@ -214,6 +214,36 @@ One omp, the lead, answers every thread and DM of the active messenger. It knows
 
 The lead controls lanes only through three tools moraebot gives it: `lane_start`, `lane_message` and `lane_status`. Each lane runs a full omp, so three busy lanes cost about as much as four omp sessions.
 
+## Memory
+
+The lead has a small memory: plain markdown files in `~/.moraebot/memory/`. They tell it who it is and who you are.
+
+```text
+~/.moraebot/memory/
+  system/persona.md     who the lead is and how it works
+  system/human.md       what the lead knows about you
+  system/identity.md    optional; you create it
+```
+
+- **Seeds.** On start, moraebot creates `memory/` and `memory/system/` (mode 700) and writes `persona.md` and `human.md` (mode 600) from short built-in texts, but only when they're missing. A file that's already there is never overwritten, so your edits stay.
+- **File format.** Every file starts with a frontmatter block: a `---` line, `key: value` lines, and a closing `---` line. `description` is required (one line, at most 1024 characters). Other allowed keys are `read_only`, `limit`, `kind`, `aliases`, `provenance` and `expires`; they're read and kept, but don't change anything yet.
+- **When it's read.** Every time the lead starts, every `.md` file under `memory/system/` is put into one memory block at the end of the lead's system prompt: the persona first, then `identity.md` if it exists, then the other files sorted by path. A change takes effect at the next lead start, for example after a restart.
+- **Bad files don't stop the lead.** Symlinks and hidden files are skipped. A file that's bigger than 16 KiB, not UTF-8, or has broken frontmatter shows up as a one-line marker with its path and an error code (such as `E_MEMORY_FRONTMATTER` or `E_MEMORY_FILE`) instead of its text. The whole block is kept under 64 KiB; files past that are left out with `E_MEMORY_BUDGET`. The log gets only the path and the code, never the content.
+- **Read tools.** The lead (not the lanes) gets two tools. `memory_list` lists every memory file with its description and size. `memory_read` returns one file's frontmatter and body. Paths are relative to `memory/` and must start with `system/`, `reference/`, `notes/`, `people/` or `skills/`; anything else is refused with `E_MEMORY_PATH`.
+- **What M1 doesn't do.** There's no tool to write memory, no history, no recall and no automatic learning yet. Lanes get no memory. Later slices (M2 onward in the memory roadmap) add those.
+- **Direct edits.** omp runs in yolo mode, so the lead can still change these files with its normal file tools if you ask it to. Nothing checks those edits. Treat the folder like any other file you care about, and back it up.
+
+**omp's own memory is off.** omp has a memory feature of its own. moraebot turns it off for every omp it starts (the lead and every lane): before each start it writes `~/.moraebot/omp/config-overlay.yml` (mode 600) with exactly this text, and points omp at it with the `PI_CONFIG_FILES` environment variable:
+
+```yaml
+memory:
+  backend: "off"
+autolearn:
+  enabled: false
+```
+
+If your environment already sets `PI_CONFIG_FILES`, moraebot replaces it for its omp children. Your own `~/.omp` folder and the work folder get no file, so omp you run yourself is unchanged.
+
 ## Behavior hints
 
 moraebot gives omp a short built-in note about the messenger it's answering in, for example how long a reply may be and which formatting renders. To replace it, write your own text to:
@@ -255,6 +285,7 @@ After installing, check these by hand once:
 - [ ] **Lane result in the same thread.** In a thread, ask for something long, such as a task with several steps. The lead says it started a lane, and later the lane's result is answered in that same thread.
 - [ ] **A lane claims done, a failing Done check is refused, and the lead reports the outcome.** Ask for long work whose Done line can't pass at first, for example a file the lane still has to create. The lane's first claim is refused, it keeps working, and the lead's answer in that thread says whether the lane's checks passed.
 - [ ] **Follow-up while it works.** While the lead is still answering in a thread, send a second message in that thread. You get one reply that covers both.
+- [ ] **Memory.** The lead's reply reflects `memory/system/persona.md` after a restart, and omp started by moraebot shows no `retain`/`recall` tools.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -297,6 +328,16 @@ The file name is cleaned up first, so it can't point outside that folder. moraeb
 - If the messenger refuses a file, for example because it's over the upload limit, the file is skipped with one notice.
 
 **Privacy.** The log never holds file contents, file names or tokens. Detailed logs from other libraries are always off; only their warnings and errors are kept, as described under Logs.
+
+**Memory files.** moraebot keeps its own files in its home too:
+
+```text
+~/.moraebot/memory/system/persona.md
+~/.moraebot/memory/system/human.md
+~/.moraebot/omp/config-overlay.yml
+```
+
+The first two are the lead's memory (see Memory). The last one turns omp's own memory off and is rewritten whenever its text differs.
 
 **Missing permission.** If the bot lacks the file permission, every file you send or ask for shows up as a file notice. Do the upgrade steps below to fix it.
 

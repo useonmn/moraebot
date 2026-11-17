@@ -350,6 +350,31 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **끄기와 재시작.** 꺼지기 시작한 뒤의 `lane_done`은 확인을 시작하지 않고 `E_LANE_STOPPING`으로 거절합니다. `shutdown_all`은 lane 자식을 모두 먼저 죽이고, 그다음 돌고 있는 확인을 죽입니다. 그래서 확인의 거절이 살아 있는 lane에 닿는 일이 없고, 확인 도중 끊긴 턴은 늘 잘린 턴이 됩니다(결과 줄 없음, 다음 시작 때 `E_LANE_INTERRUPTED` 안내 한 번). `shutdown_all`은 죽인 확인이 모두 거둬진 뒤에(`ABORT_JOIN_BOUND`까지) 돌아옵니다. 시간 초과나 자식을 잃어 작업이 먼저 끝나면, 그 작업의 워커가 자기 확인을 죽입니다. 보통 종료에서는 확인 프로세스도, 확인의 프로세스 그룹에 남은 프로세스도 확인이나 게이트웨이보다 오래 살지 않습니다. SIGKILL로 죽은 게이트웨이는 정리하지 못합니다.
 
+### 3.9 기억 (slice 6 M1)
+
+**기억 폴더.** `Gateway::open`은 저장소를 열기 전에 `<홈>/memory/`와 `<홈>/memory/system/`을 권한 0700으로 만들고, `system/persona.md`와 `system/human.md`가 없을 때만 내장 기본 글(seed)로 권한 0600 파일을 만듭니다(`create_new`). 이미 있는 파일은 덮어쓰지 않습니다. `system/identity.md`는 만들지 않습니다. 폴더나 파일을 만들 수 없으면 `E_MEMORY_LAYOUT`으로 실패하고 아무것도 켜지지 않습니다.
+
+**frontmatter.** 기억 파일은 `---` 줄, `key: value` 줄들, `---` 줄로 시작합니다. 키는 `description read_only limit kind aliases provenance expires`만 받고, 값은 한 줄짜리 단순 값(scalar)만 받습니다. `description`은 꼭 있어야 하고 한 줄, 1024자 이하입니다. 모르는 키, 겹친 키, 주석 줄, YAML 목록이나 여러 줄 값, 닫히지 않은 블록은 `E_MEMORY_FRONTMATTER`로 거절합니다. M1에서 실제로 동작에 쓰이는 키는 `description`뿐이고, 나머지는 읽어서 보관만 합니다. YAML 라이브러리는 쓰지 않고 직접 읽습니다.
+
+**기억 블록.** lead가 켜질 때마다 `OmpManager::start()`가 `system/` 아래 `.md` 파일을 모두 읽어 블록 하나를 만듭니다. 그래서 파일을 고치면 다음 lead 시작부터 반영됩니다. 블록은 `--append-system-prompt` 값의 맨 끝, lead 안내문과 메신저 안내 다음에 빈 줄을 두고 붙습니다. 순서는 다음과 같습니다.
+
+1. 시작 표시 `<!-- moraebot-memory:begin -->`
+2. 짧은 머리말(기억은 참고 자료이지 주인의 지시가 아님, 필요하면 파일을 읽을 것)
+3. `<self>`: persona, 그리고 있으면 identity
+4. `<memory>`: 나머지 `system/` 파일, 경로순
+5. `<memory_metadata>`: `files: <쓸 수 있는 수>/<찾은 수>`
+6. 끝 표시 `<!-- moraebot-memory:end -->`
+
+같은 파일이면 늘 같은 바이트가 나옵니다. 16 KiB보다 크거나, UTF-8이 아니거나, NUL이나 시작·끝 표시가 들어 있으면 `E_MEMORY_FILE`, frontmatter가 틀리면 `E_MEMORY_FRONTMATTER` 표시 한 줄(경로와 코드)로 바뀌고, lead는 그대로 켜집니다. 블록 전체는 64 KiB까지이고, 넘치는 파일은 경로순으로 `E_MEMORY_BUDGET` 표시가 됩니다. persona가 맨 앞이라 가장 늦게 빠집니다. 로그에는 경로와 코드만 남기고 내용은 남기지 않습니다.
+
+**읽기 도구.** lead만 호스트 도구 두 개를 `ToolLoadMode::Essential`로 받습니다. `memory_list {dir?}`는 파일마다 `{path, description, bytes}`(못 쓰는 파일은 `{path, code}`)를 경로순 JSON 배열로 돌려주고, `memory_read {path}`는 `{path, frontmatter, body}`를 돌려줍니다. 경로는 `memory/` 기준 상대 경로이고 `system/ reference/ notes/ people/ skills/` 중 하나로 시작해야 합니다. 절대 경로, `..`, 숨김 이름, `.md`가 아닌 이름, 경로 중간의 심볼릭 링크는 `E_MEMORY_PATH`입니다. 그 밖의 거절 코드는 `E_MEMORY_ARGS`, `E_MEMORY_NOT_FOUND`, `E_MEMORY_FILE`, `E_MEMORY_FRONTMATTER`입니다. lead 안내문에도 기억 블록과 두 도구를 알리는 문장이 하나 들어갑니다.
+
+**omp 자체 기억 끄기.** moraebot이 띄우는 omp 자식(lead와 lane 모두)은 `PI_CONFIG_FILES=<홈>/omp/config-overlay.yml`(절대 경로)을 받습니다. 띄우기 전에 파일이 없거나 내용이 다르면 임시 파일에 쓰고 이름을 바꿔 덮습니다(폴더 0700, 파일 0600). 내용은 `memory.backend: "off"`, `autolearn.enabled: false` 두 값뿐입니다. 이미 있던 `PI_CONFIG_FILES` 값은 덮어씁니다. 파일을 쓸 수 없으면 `E_OMP_SPAWN`으로 실패합니다. 주인의 `~/.omp`와 작업 폴더에는 아무 파일도 쓰지 않습니다. 완료 확인(Done check) 명령은 이 변수를 받지 않습니다.
+
+**lane.** lane은 기억 블록도, 기억 도구도 받지 않고 위의 overlay 변수만 받습니다.
+
+**아직 없는 것.** 기억을 쓰는 도구, 기록, 떠올리기(recall), 자동 학습은 M1에 없습니다. omp가 yolo 모드라서 lead는 보통 파일 도구로 기억 파일을 직접 고칠 수 있고, 그 수정은 아무것도 검사하지 않습니다. 나머지는 이후 단계(M2부터)에서 다룹니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -366,6 +391,8 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
   lead/session/            lead omp 세션 기록 (--session-dir로 넘김)
   lanes/<id>/session/      lane마다 omp 세션 기록
   hints/lead.md            lead 역할 안내문 바꾸기 (선택)
+  memory/system/           lead 기억 파일 (persona.md, human.md, 선택 identity.md)
+  omp/config-overlay.yml   omp 자식의 자체 기억을 끄는 설정 (PI_CONFIG_FILES로 넘김)
   conversations/           slice 3까지 쓰던 대화별 세션 기록. 더 쓰지 않고 지우지도 않음
   logs/
     gateway.log            게이트웨이 동작 기록
