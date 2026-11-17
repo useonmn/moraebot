@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use moraebot::files;
 use moraebot::lane;
 use moraebot::lead;
 use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
-use moraebot::memory::{self, frontmatter, history};
+use moraebot::memory::{self, frontmatter, history, notice};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
 use moraebot::store::{LaneStart, LaneState, Store};
 use serde_json::Value;
@@ -1954,4 +1955,273 @@ async fn turn_timeout_with_steer_kills_lead_before_waiting() {
     assert_eq!(pids.len(), 1);
     assert!(!alive(pids[0]), "the lead child is gone");
     assert_eq!(manager.child_pid().await, None);
+}
+
+// --- memory pin and the restart gate ----------------------------------------------------
+
+const COMPACT: (&str, &str) = ("FAKE_OMP_COMPACT_TRIGGER", "compact-now");
+
+impl Harness {
+    /// A shared memory `steer`-mode manager whose fake answers a steer by `case`.
+    fn steer_memory_manager(&self, case: &str) -> Arc<OmpManager> {
+        Arc::new(
+            self.manager("steer")
+                .with_extra_env([("FAKE_OMP_STEER_CASE", case)])
+                .with_memory(self.memory()),
+        )
+    }
+
+    /// Commits a hand edit of the persona whose body is `marker`.
+    fn change_persona(&self, marker: &str) {
+        self.write_persona(&format!("---\ndescription: d\n---\n{marker}\n"));
+        history::accept(&mut self.store.lock().unwrap(), &self.memory(), &[], "test")
+            .expect("accept the hand edit");
+    }
+
+    /// The `--session-dir` value of every `START` line, in order.
+    fn session_dirs(&self) -> Vec<String> {
+        self.log_lines()
+            .iter()
+            .filter(|l| l.starts_with("START pid="))
+            .map(|l| {
+                let argv = start_argv(l);
+                let at = argv.iter().position(|a| a == "--session-dir").unwrap();
+                argv[at + 1].clone()
+            })
+            .collect()
+    }
+}
+
+/// A clock the test steps by hand.
+fn stepped_clock(start: i64) -> (Arc<AtomicI64>, notice::Clock) {
+    let now = Arc::new(AtomicI64::new(start));
+    let read = Arc::clone(&now);
+    (now, Arc::new(move || read.load(Ordering::SeqCst)))
+}
+
+#[tokio::test]
+async fn write_alone_does_not_restart_the_lead() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    h.change_persona("v2-marker");
+    let outcome = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: second".into()));
+    assert_eq!(h.append_flags().len(), 1);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn compaction_with_changed_memory_restarts_before_next_prompt() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT])
+        .with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "compact-now")).await;
+    h.change_persona("v2-marker");
+    let outcome = bounded(manager.prompt(KEY_A, 2, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2);
+    assert!(!flags[0][0].contains("v2-marker"));
+    assert!(flags[1][0].contains("v2-marker"));
+    let dirs = h.session_dirs();
+    assert_eq!(dirs[0], dirs[1]);
+    let tools = h.registered_tools();
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().all(|(lane, _)| !lane));
+    assert_eq!(tools[0].1, tools[1].1);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn compaction_without_change_keeps_the_child() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT])
+        .with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "compact-now")).await;
+    bounded(manager.prompt(KEY_A, 2, "hi")).await;
+    h.change_persona("v2-marker");
+    let outcome = bounded(manager.prompt(KEY_A, 3, "again"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: again".into()));
+    assert_eq!(h.append_flags().len(), 1);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn no_restart_before_session_settled() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT, ("FAKE_OMP_UNSETTLED_TRIGGER", "hold-settle")])
+        .with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "compact-now hold-settle")).await;
+    h.change_persona("v2-marker");
+    bounded(manager.prompt(KEY_A, 2, "hi")).await;
+    assert_eq!(
+        h.append_flags().len(),
+        1,
+        "deferred: the lead was not settled"
+    );
+    bounded(manager.prompt(KEY_A, 3, "again")).await;
+    assert_eq!(h.append_flags().len(), 2, "prompt 2 settled the lead");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn session_settled_frame_allows_the_restart() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([
+            COMPACT,
+            ("FAKE_OMP_UNSETTLED_TRIGGER", "hold-settle"),
+            ("FAKE_OMP_SETTLE_FRAME", "1"),
+        ])
+        .with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "compact-now hold-settle")).await;
+    let mut state = manager.lead_state();
+    bounded(state.wait_for(|s| s.results >= 1 && s.settled))
+        .await
+        .expect("lead-state watch open");
+    h.change_persona("v2-marker");
+    bounded(manager.prompt(KEY_A, 2, "hi")).await;
+    assert_eq!(h.append_flags().len(), 2);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn aborted_or_skipped_compaction_is_not_counted() {
+    for (kind, starts) in [("aborted", 1), ("skipped", 1), ("manual", 2)] {
+        let h = Harness::new();
+        let manager = h
+            .manager("ok")
+            .with_extra_env([COMPACT, ("FAKE_OMP_COMPACT", kind)])
+            .with_memory(h.memory());
+        bounded(manager.prompt(KEY_A, 1, "compact-now")).await;
+        h.change_persona("v2-marker");
+        bounded(manager.prompt(KEY_A, 2, "hi")).await;
+        assert_eq!(h.append_flags().len(), starts, "FAKE_OMP_COMPACT={kind}");
+        manager.shutdown_all().await;
+    }
+}
+
+#[tokio::test]
+async fn refresh_request_restarts_without_change() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    let refresh = notice::refresh_file(&h.config.home);
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    std::fs::write(&refresh, "").expect("refresh request");
+    let outcome = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: second".into()));
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2);
+    assert_eq!(flags[0], flags[1]);
+    assert!(!refresh.exists());
+    manager.shutdown_all().await;
+
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    let refresh = notice::refresh_file(&h.config.home);
+    std::fs::write(&refresh, "").expect("refresh request");
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    assert_eq!(h.append_flags().len(), 1);
+    assert!(!refresh.exists());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn refresh_waits_for_the_running_turn_and_its_steer() {
+    let h = Harness::new();
+    let manager = h.steer_memory_manager("separate");
+    let refresh = notice::refresh_file(&h.config.home);
+    let main = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    std::fs::write(&refresh, "").expect("refresh request");
+    let s = h.admit("refresh-s", "m2");
+    assert!(manager.try_steer(KEY_STEER, s, "m2", |_| true));
+    let report = bounded(main).await.expect("prompt task");
+    assert_eq!(codes(&report), (None, Some((s, None))));
+    assert_eq!(h.append_flags().len(), 1);
+    assert!(refresh.exists(), "no restart inside the running turn");
+
+    let next = spawn_prompt(&manager, KEY_STEER, 3, "m3");
+    turn_running(&manager, KEY_STEER).await;
+    assert_eq!(h.append_flags().len(), 2);
+    assert!(!refresh.exists());
+    let lines = h.log_lines();
+    let second_start = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("START pid="))
+        .nth(1)
+        .map(|(at, _)| at)
+        .expect("second START");
+    let steer_frame = lines
+        .iter()
+        .position(|l| {
+            serde_json::from_str::<Value>(l)
+                .is_ok_and(|f| f["type"] == "prompt" && f["streamingBehavior"] == "steer")
+        })
+        .expect("steer prompt frame");
+    assert!(steer_frame < second_start);
+    manager.shutdown_all().await;
+    let _ = bounded(next).await;
+}
+
+#[tokio::test]
+async fn expired_file_counts_as_a_change_on_compaction() {
+    const EXPIRES: &str = "2030-01-01T00:00:00Z";
+    let h = Harness::new();
+    let home = h.memory();
+    let trip = h.memory_file("system/trip.md");
+    std::fs::write(
+        &trip,
+        format!("---\ndescription: d\nexpires: {EXPIRES}\n---\ntrip-marker\n"),
+    )
+    .expect("write trip");
+    let at = memory::guard::expires_at(EXPIRES).expect("instant");
+    let (now, clock) = stepped_clock(at - 10);
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT])
+        .with_memory(home)
+        .with_clock(clock);
+    bounded(manager.prompt(KEY_A, 1, "compact-now")).await;
+    now.store(at + 10, Ordering::SeqCst);
+    bounded(manager.prompt(KEY_A, 2, "hi")).await;
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2);
+    assert!(flags[0][0].contains("trip-marker"));
+    assert!(!flags[1][0].contains("trip-marker"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn no_memory_never_restarts() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_extra_env([COMPACT]);
+    let refresh = notice::refresh_file(&h.config.home);
+    std::fs::create_dir_all(refresh.parent().expect("parent")).expect("memory folder");
+    std::fs::write(&refresh, "").expect("refresh request");
+    for (row, text) in [(1, "compact-now"), (2, "hi"), (3, "again")] {
+        bounded(manager.prompt(KEY_A, row, text)).await;
+    }
+    assert_eq!(h.append_flags().len(), 1);
+    assert!(refresh.exists());
+    manager.shutdown_all().await;
 }

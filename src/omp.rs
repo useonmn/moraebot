@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omp_rpc::{
     Client, ClientOptions, Error as RpcError, Event, GetSessionLeaseCommand, HostTool,
@@ -37,7 +37,7 @@ use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory::home::MemoryHome;
-use crate::memory::{self, guard, history, render};
+use crate::memory::{self, history, notice, render};
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -96,6 +96,9 @@ const KILL_BIN: &str = "/bin/kill";
 pub const ABORT_JOIN_BOUND: Duration = Duration::from_secs(10);
 /// "No limit": `prompt_and_wait` needs a deadline, so use one that never matters.
 const UNLIMITED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+/// How long the restart gate waits for the lead's event stream to catch up with the
+/// results `prompt` received.
+const LEAD_STATE_BOUND: Duration = Duration::from_secs(5);
 
 /// Result of one prompt. The caller maps it to the inbox state and at most one notice.
 #[derive(Debug, Clone, PartialEq)]
@@ -606,6 +609,88 @@ fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, e
     }
 }
 
+/// What the lead's event stream has shown so far, across every lead child of this manager.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeadState {
+    /// `prompt_result` frames seen.
+    pub results: u64,
+    /// The lead is idle: started, or settled with no `agent_start` since.
+    pub settled: bool,
+    /// Successful compactions seen.
+    pub compactions: u64,
+}
+
+/// A compaction counts only when it committed: not aborted, not skipped, with a result.
+fn compacted(aborted: bool, skipped: Option<bool>, has_result: bool) -> bool {
+    !aborted && skipped != Some(true) && has_result
+}
+
+/// Updates the lead state from one event, in stream order.
+fn note_lead_state(state: &watch::Sender<LeadState>, event: &Event) {
+    let Event::Notification(notification) = event else {
+        return;
+    };
+    match notification {
+        RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)) => {
+            state.send_modify(|s| s.settled = false);
+        }
+        RpcNotification::PromptResult(result) => state.send_modify(|s| {
+            s.results += 1;
+            if result.session_settled {
+                s.settled = true;
+            }
+        }),
+        RpcNotification::SessionSettled(_) => state.send_modify(|s| s.settled = true),
+        RpcNotification::RpcAgentEvent(RpcAgentEvent::AutoCompactionEnd(e))
+            if compacted(e.aborted, e.skipped, e.result.is_some()) =>
+        {
+            state.send_modify(|s| s.compactions += 1);
+        }
+        RpcNotification::RpcAgentEvent(RpcAgentEvent::ManualCompactionEnd(e))
+            if compacted(e.aborted, e.skipped, e.result.is_some()) =>
+        {
+            state.send_modify(|s| s.compactions += 1);
+        }
+        _ => {}
+    }
+}
+
+/// The append text the live lead child was started with, and the compaction count it covers.
+struct Pin {
+    text: String,
+    compactions: u64,
+}
+
+/// What the restart gate does before a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repin {
+    /// Nothing asks for a re-pin.
+    Keep,
+    /// A re-pin is due but the lead is not idle yet; a later prompt looks again.
+    Defer,
+    /// The owner asked for a re-pin: restart even when the text is unchanged.
+    Refresh,
+    /// The conversation was compacted: re-render, and restart only when the text changed.
+    Compaction,
+}
+
+fn repin_action(
+    state: &LeadState,
+    caught_up: bool,
+    pinned_compactions: u64,
+    refresh: bool,
+) -> Repin {
+    if !refresh && state.compactions <= pinned_compactions {
+        Repin::Keep
+    } else if !caught_up || !state.settled {
+        Repin::Defer
+    } else if refresh {
+        Repin::Refresh
+    } else {
+        Repin::Compaction
+    }
+}
+
 /// The lead child and the thread that owns its client.
 struct Live {
     requests: mpsc::Sender<PromptRequest>,
@@ -653,6 +738,12 @@ pub struct OmpManager {
     hints: String,
     host_tools: Vec<HostTool>,
     memory: Option<MemoryHome>,
+    clock: notice::Clock,
+    lead_state: Arc<watch::Sender<LeadState>>,
+    /// `prompt_result`s the manager received; the event stream has caught up when its
+    /// `results` reaches this.
+    results_expected: AtomicU64,
+    pin: Mutex<Option<Pin>>,
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
     gate: SteerGate,
@@ -685,6 +776,10 @@ impl OmpManager {
             hints: String::new(),
             host_tools: Vec::new(),
             memory: None,
+            clock: notice::system_clock(),
+            lead_state: Arc::new(watch::channel(LeadState::default()).0),
+            results_expected: AtomicU64::new(0),
+            pin: Mutex::new(None),
             live: Default::default(),
             lead_kill: Default::default(),
             gate: Default::default(),
@@ -751,6 +846,17 @@ impl OmpManager {
         self
     }
 
+    /// Replaces the clock used for rendering and notices (tests inject one).
+    pub fn with_clock(mut self, clock: notice::Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Watches the lead state (tests wait on it; nothing else reads it outside this module).
+    pub fn lead_state(&self) -> watch::Receiver<LeadState> {
+        self.lead_state.subscribe()
+    }
+
     /// The running turn's main row and conversation, for host-tool handlers; `None`
     /// between turns.
     pub fn turn_context(&self) -> Arc<Mutex<Option<TurnContext>>> {
@@ -784,8 +890,14 @@ impl OmpManager {
     /// only when an outcome is `NeedsCheck` (timeout or lost child).
     pub async fn prompt(&self, key: &str, row_id: i64, text: &str) -> GroupReport {
         let mut live = self.live.lock().await;
+        if let Err(outcome) = self.repin(&mut live).await {
+            return GroupReport {
+                main: TurnReport::without_files(outcome),
+                steered: None,
+            };
+        }
         if live.is_none() {
-            match self.start().await {
+            match self.start(self.render_append()).await {
                 Ok(started) => *live = Some(started),
                 Err(outcome) => {
                     return GroupReport {
@@ -829,6 +941,7 @@ impl OmpManager {
         } else {
             Err(RpcError::Closed)
         };
+        self.expect_result(&main);
         // Close the gate: no steer joins this turn from here on.
         let steer = lock(&self.gate).take().and_then(|turn| turn.steer);
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
@@ -845,10 +958,16 @@ impl OmpManager {
                     // Never let the child outlive the turn limit by waiting for the steer.
                     self.kill_lead();
                     killed = true;
-                    map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                    let turn = result.await.unwrap_or(Err(RpcError::Closed));
+                    self.expect_result(&turn);
+                    map_result(turn)
                 } else {
                     match tokio::time::timeout(self.turn_timeout, &mut result).await {
-                        Ok(turn) => map_result(turn.unwrap_or(Err(RpcError::Closed))),
+                        Ok(turn) => {
+                            let turn = turn.unwrap_or(Err(RpcError::Closed));
+                            self.expect_result(&turn);
+                            map_result(turn)
+                        }
                         Err(_) => {
                             self.kill_lead();
                             killed = true;
@@ -939,33 +1058,93 @@ impl OmpManager {
         }
     }
 
-    async fn start(&self) -> Result<Live, Outcome> {
+    /// One more `prompt_result` the event stream must show before the gate may decide.
+    fn expect_result(&self, turn: &Result<PromptTurn, RpcError>) {
+        if matches!(turn, Ok(turn) if turn.result.is_some()) {
+            self.results_expected.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The restart gate: with memory and a live child, re-pins the lead when a compaction
+    /// changed its block or the owner asked for a refresh, but only while it is idle.
+    /// Runs under the `live` mutex before the turn's gate opens; a failed start is returned.
+    async fn repin(&self, live: &mut Option<Live>) -> Result<(), Outcome> {
+        if self.memory.is_none() || live.is_none() {
+            return Ok(());
+        }
+        let expected = self.results_expected.load(Ordering::SeqCst);
+        let mut state = self.lead_state.subscribe();
+        let caught_up = matches!(
+            tokio::time::timeout(LEAD_STATE_BOUND, state.wait_for(|s| s.results >= expected)).await,
+            Ok(Ok(_))
+        );
+        if !caught_up {
+            tracing::warn!(
+                expected,
+                "omp lead events did not catch up; re-pin deferred"
+            );
+        }
+        let state = *self.lead_state.borrow();
+        let refresh = notice::refresh_file(&self.config.home).exists();
+        let pinned = lock(&self.pin)
+            .as_ref()
+            .map_or(state.compactions, |pin| pin.compactions);
+        let (reason, text) = match repin_action(&state, caught_up, pinned, refresh) {
+            Repin::Keep | Repin::Defer => return Ok(()),
+            Repin::Refresh => ("refresh", self.render_append()),
+            Repin::Compaction => {
+                let fresh = self.render_append();
+                if let Some(pin) = lock(&self.pin).as_mut()
+                    && pin.text == fresh
+                {
+                    pin.compactions = state.compactions;
+                    return Ok(());
+                }
+                ("compaction", fresh)
+            }
+        };
+        let began = Instant::now();
+        if let Some(old) = live.take() {
+            old.close(&self.lead_kill).await;
+        }
+        *live = Some(self.start(text).await?);
+        let restart_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(reason, restart_ms, "omp lead re-pinned by restart");
+        Ok(())
+    }
+
+    /// The lead's append text: the hints, plus the memory block rendered now when memory
+    /// is set.
+    fn render_append(&self) -> String {
+        let Some(home) = &self.memory else {
+            return self.hints.clone();
+        };
+        let rendered = {
+            let mut store = lock(&self.store);
+            match history::prepare(&mut store, home).and_then(|committed| {
+                history::dirty(home, &committed)
+                    .map(|dirty| render::render(&committed, &dirty, (self.clock)()))
+            }) {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    tracing::warn!(code = e.code, "memory history unavailable");
+                    render::unavailable(e.code)
+                }
+            }
+        };
+        for (path, code) in &rendered.problems {
+            tracing::warn!(path = %path, code, "memory file not rendered");
+        }
+        render::append(&self.hints, &rendered.text)
+    }
+
+    /// Starts the lead child with `append` as its appended system prompt. With memory,
+    /// `append` becomes the pin and a pending refresh request is removed.
+    async fn start(&self, append: String) -> Result<Live, Outcome> {
         let previous_session = lock(&self.store)
             .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
         let session_dir = lead_session_dir(&self.config);
-        let append = match &self.memory {
-            Some(home) => {
-                let rendered = {
-                    let mut store = lock(&self.store);
-                    match history::prepare(&mut store, home).and_then(|committed| {
-                        history::dirty(home, &committed)
-                            .map(|dirty| render::render(&committed, &dirty, guard::unix_now()))
-                    }) {
-                        Ok(rendered) => rendered,
-                        Err(e) => {
-                            tracing::warn!(code = e.code, "memory history unavailable");
-                            render::unavailable(e.code)
-                        }
-                    }
-                };
-                for (path, code) in &rendered.problems {
-                    tracing::warn!(path = %path, code, "memory file not rendered");
-                }
-                render::append(&self.hints, &rendered.text)
-            }
-            None => self.hints.clone(),
-        };
         let command = private_dir(&session_dir)
             .and_then(|()| {
                 child_command(
@@ -998,6 +1177,7 @@ impl OmpManager {
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
+        let lead_state = Arc::clone(&self.lead_state);
         let worker = std::thread::Builder::new()
             .name("omp-lead".to_owned())
             .spawn(move || {
@@ -1011,7 +1191,10 @@ impl OmpManager {
                         *lock(&lead_kill) = Some(group);
                         true
                     },
-                    move |event| note_agent_start(&gate, &running, event),
+                    move |event| {
+                        note_agent_start(&gate, &running, event);
+                        note_lead_state(&lead_state, event);
+                    },
                 );
                 match opened {
                     Err(outcome) => {
@@ -1048,6 +1231,23 @@ impl OmpManager {
             tracing::warn!(code = e.code(), "could not store the lead's omp session id");
         }
         tracing::info!(pid = started.pid, "omp lead child ready");
+        self.lead_state.send_modify(|s| s.settled = true);
+        if self.memory.is_some() {
+            let compactions = self.lead_state.borrow().compactions;
+            *lock(&self.pin) = Some(Pin {
+                text: append,
+                compactions,
+            });
+            match std::fs::remove_file(notice::refresh_file(&self.config.home)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    code = memory::E_MEMORY_WRITE,
+                    error = %e.kind(),
+                    "could not remove the memory refresh request"
+                ),
+            }
+        }
         Ok(Live {
             requests,
             worker,
@@ -1299,5 +1499,41 @@ mod tests {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PATH", "PI_CODING_AGENT_DIR"]);
+    }
+
+    #[test]
+    fn repin_action_table() {
+        let state = |settled, compactions| LeadState {
+            results: 0,
+            settled,
+            compactions,
+        };
+        for settled in [false, true] {
+            for caught_up in [false, true] {
+                for (compactions, pinned) in [(0, 0), (1, 1), (1, 2)] {
+                    assert_eq!(
+                        repin_action(&state(settled, compactions), caught_up, pinned, false),
+                        Repin::Keep
+                    );
+                }
+            }
+        }
+        for refresh in [false, true] {
+            assert_eq!(
+                repin_action(&state(true, 2), false, 1, refresh),
+                Repin::Defer
+            );
+            assert_eq!(
+                repin_action(&state(false, 2), true, 1, refresh),
+                Repin::Defer
+            );
+        }
+        assert_eq!(repin_action(&state(false, 0), true, 0, true), Repin::Defer);
+        assert_eq!(repin_action(&state(true, 0), true, 0, true), Repin::Refresh);
+        assert_eq!(repin_action(&state(true, 2), true, 1, true), Repin::Refresh);
+        assert_eq!(
+            repin_action(&state(true, 2), true, 1, false),
+            Repin::Compaction
+        );
     }
 }
