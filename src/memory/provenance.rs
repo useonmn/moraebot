@@ -2,7 +2,13 @@
 
 use super::frontmatter::{self, render_frontmatter};
 use super::home::MemoryError;
-use super::{APPROVALS, E_MEMORY_FRONTMATTER, E_MEMORY_QUOTE_MISSING, PROVENANCE_KEY};
+use super::{
+    APPROVALS, E_MEMORY_ARGS, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY, E_MEMORY_QUOTE_APPROVAL,
+    E_MEMORY_QUOTE_LONG, E_MEMORY_QUOTE_MISSING, E_MEMORY_QUOTE_PROPOSAL, E_MEMORY_QUOTE_ROW,
+    E_MEMORY_QUOTE_TEXT, E_MEMORY_QUOTE_TURN, MAX_QUOTE_CHARS, PROVENANCE_KEY,
+};
+use crate::omp::TurnContext;
+use crate::store::{Store, StoreError};
 
 /// The stamp of a file whose words come only partly from the owner.
 const MIXED: &str = "mixed: only parts come from the owner's own words";
@@ -247,6 +253,103 @@ pub fn stamp(text: &str, claim: &Claim) -> Result<String, MemoryError> {
     Ok(render_frontmatter(&fm) + parsed.body)
 }
 
+fn history_err(e: StoreError) -> MemoryError {
+    MemoryError {
+        code: E_MEMORY_HISTORY,
+        detail: e.code().to_string(),
+    }
+}
+
+/// Check a write's claim against the stored owner messages. A `user` claim that fails a check
+/// is kept as `quoted` or `agent` with the code of the first failing check; it never refuses.
+/// Errors only when the store cannot be read or the claim has no source.
+pub fn verify(store: &Store, turn: &TurnContext, args: &ClaimArgs) -> Result<Claim, MemoryError> {
+    let source = match args.source {
+        Some(Source::User) => Source::User,
+        Some(other) => return Ok(Claim::plain(other)),
+        None => {
+            return Err(MemoryError {
+                code: E_MEMORY_ARGS,
+                detail: "a claim needs a source".to_string(),
+            });
+        }
+    };
+    let quote = args
+        .user_quote
+        .as_deref()
+        .map(|q| q.trim().chars().take(MAX_QUOTE_CHARS).collect::<String>());
+    let claim = |kind: Kind, code: &'static str| Claim {
+        kind,
+        requested: source,
+        code: Some(code),
+        quote: quote.clone(),
+        message: args.quote_message,
+        receipt: None,
+        proposal: None,
+    };
+
+    let (Some(given), Some(message)) = (args.user_quote.as_deref(), args.quote_message) else {
+        return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_MISSING));
+    };
+    let q = given.trim();
+    if q.is_empty() {
+        return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_MISSING));
+    }
+    if q.chars().count() > MAX_QUOTE_CHARS {
+        return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_LONG));
+    }
+
+    let turn_row = store
+        .get(turn.row_id)
+        .map_err(history_err)?
+        .ok_or_else(|| MemoryError {
+            code: E_MEMORY_HISTORY,
+            detail: "turn row missing".to_string(),
+        })?;
+    let row = match store.get(message).map_err(history_err)? {
+        Some(row)
+            if row.origin == "owner"
+                && row.conversation_key == turn.conversation_key
+                && row.author_id == turn_row.author_id =>
+        {
+            row
+        }
+        _ => return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_ROW)),
+    };
+    if row.id != turn.row_id && row.steered_into != Some(turn.row_id) {
+        return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_TURN));
+    }
+    if !row.text.contains(q) {
+        return Ok(claim(Kind::Agent, E_MEMORY_QUOTE_TEXT));
+    }
+
+    let receipt = Some((row.platform, row.message_id));
+    if q != row.text.trim() || !is_approval(q) {
+        return Ok(Claim {
+            receipt,
+            ..claim(Kind::Quoted, E_MEMORY_QUOTE_APPROVAL)
+        });
+    }
+    let Some(p) = store
+        .memory_proposal(&turn.conversation_key, turn.row_id)
+        .map_err(history_err)?
+    else {
+        return Ok(Claim {
+            receipt,
+            ..claim(Kind::Quoted, E_MEMORY_QUOTE_PROPOSAL)
+        });
+    };
+    Ok(Claim {
+        kind: Kind::User,
+        requested: source,
+        code: None,
+        quote: Some(q.to_string()),
+        message: Some(message),
+        receipt,
+        proposal: Some((p.row_id, proposal_hash(&p.reply))),
+    })
+}
+
 /// SHA-256 round constants (FIPS 180-4 section 4.2.2).
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -324,7 +427,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::E_MEMORY_QUOTE_APPROVAL;
+    use crate::store::{Admitted, LaneStart, LaneState, State};
     use serde_json::Value;
 
     fn hex(bytes: &[u8]) -> String {
@@ -705,5 +808,390 @@ mod tests {
         assert_eq!(err.code, E_MEMORY_FRONTMATTER);
         let err = stamp_unclaimed("no fence").unwrap_err();
         assert_eq!(err.code, E_MEMORY_FRONTMATTER);
+    }
+
+    fn open_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        (dir, store)
+    }
+
+    fn turn(row: i64, key: &str) -> TurnContext {
+        TurnContext {
+            row_id: row,
+            conversation_key: key.to_string(),
+        }
+    }
+
+    /// Admit a row from `author` in `key` and return its id.
+    fn admit_by(store: &mut Store, key: &str, author: &str, text: &str) -> i64 {
+        let message_id = format!("m{}", store.count().expect("count") + 1);
+        match store
+            .admit("test", &message_id, key, "chan1", author, text)
+            .expect("admit")
+        {
+            Admitted::New(id) => id,
+            Admitted::Duplicate => panic!("duplicate {message_id}"),
+        }
+    }
+
+    /// Admit an owner row (author 111) in `key` and return its id.
+    fn admit(store: &mut Store, key: &str, text: &str) -> i64 {
+        admit_by(store, key, "111", text)
+    }
+
+    /// An owner row of `key` that the lead answered with `reply`.
+    fn proposed(store: &mut Store, key: &str, reply: &str) -> i64 {
+        let id = admit(store, key, "please remember");
+        assert!(store.claim(id).expect("claim"));
+        store.finish_group(id, reply, None, None).expect("finish");
+        id
+    }
+
+    fn user(quote: &str, message: i64) -> ClaimArgs {
+        ClaimArgs {
+            source: Some(Source::User),
+            user_quote: Some(quote.to_string()),
+            quote_message: Some(message),
+        }
+    }
+
+    fn message_id_of(store: &Store, row: i64) -> String {
+        store.get(row).expect("get").expect("row").message_id
+    }
+
+    /// The expected values of a checked claim.
+    struct Want<'a> {
+        kind: Kind,
+        code: Option<&'a str>,
+        quote: Option<&'a str>,
+        message: Option<i64>,
+        receipt: Option<(&'a str, &'a str)>,
+        proposal: Option<(i64, &'a str)>,
+    }
+
+    fn check(claim: &Claim, want: Want) {
+        assert_eq!(claim.kind, want.kind);
+        assert_eq!(claim.requested, Source::User);
+        assert_eq!(claim.code, want.code);
+        assert_eq!(claim.downgraded(), want.kind != Kind::User);
+        assert_eq!(claim.quote.as_deref(), want.quote);
+        assert_eq!(claim.message, want.message);
+        assert_eq!(
+            claim
+                .receipt
+                .as_ref()
+                .map(|(p, m)| (p.as_str(), m.as_str())),
+            want.receipt
+        );
+        assert_eq!(
+            claim.proposal.as_ref().map(|(r, h)| (*r, h.as_str())),
+            want.proposal
+        );
+
+        let json: Value = serde_json::from_str(&claim.to_json()).expect("claim json");
+        assert_eq!(json["source"], want.kind.name());
+        assert_eq!(json["requested"], "user");
+        assert_eq!(json["downgraded"], want.kind != Kind::User);
+        assert_eq!(json["code"], serde_json::json!(want.code));
+        assert_eq!(json["quote"], serde_json::json!(want.quote));
+        assert_eq!(json["message"], serde_json::json!(want.message));
+        assert_eq!(
+            json["platform"],
+            serde_json::json!(want.receipt.map(|(p, _)| p))
+        );
+        assert_eq!(
+            json["message_id"],
+            serde_json::json!(want.receipt.map(|(_, m)| m))
+        );
+        assert_eq!(
+            json["proposal_row"],
+            serde_json::json!(want.proposal.map(|(r, _)| r))
+        );
+        assert_eq!(
+            json["proposal_hash"],
+            serde_json::json!(want.proposal.map(|(_, h)| h))
+        );
+    }
+
+    /// An agent claim downgraded with `code`: no receipt and no proposal.
+    fn want_agent<'a>(code: &'a str, quote: Option<&'a str>, message: Option<i64>) -> Want<'a> {
+        Want {
+            kind: Kind::Agent,
+            code: Some(code),
+            quote,
+            message,
+            receipt: None,
+            proposal: None,
+        }
+    }
+
+    #[test]
+    fn approval_after_proposal_is_user() {
+        let (_dir, mut store) = open_store();
+        let p = proposed(&mut store, "k1", "proposal-text");
+        let r = admit(&mut store, "k1", "응");
+        assert_eq!((p, r), (1, 2));
+        let mid = message_id_of(&store, r);
+        let hash = proposal_hash("proposal-text");
+        let claim = verify(&store, &turn(r, "k1"), &user("응", r)).expect("verify");
+        check(
+            &claim,
+            Want {
+                kind: Kind::User,
+                code: None,
+                quote: Some("응"),
+                message: Some(r),
+                receipt: Some(("test", &mid)),
+                proposal: Some((p, &hash)),
+            },
+        );
+    }
+
+    #[test]
+    fn each_approval_form_is_user() {
+        let (_dir, mut store) = open_store();
+        let mut forms: Vec<String> = APPROVALS.iter().map(|w| w.to_string()).collect();
+        forms.push("yes!".to_string());
+        for (n, form) in forms.iter().enumerate() {
+            let key = format!("k{n}");
+            let p = proposed(&mut store, &key, "proposal-text");
+            let r = admit(&mut store, &key, form);
+            let claim = verify(&store, &turn(r, &key), &user(form, r)).expect("verify");
+            assert_eq!(claim.kind, Kind::User, "{form:?}");
+            assert_eq!(claim.code, None, "{form:?}");
+            assert_eq!(claim.quote.as_deref(), Some(form.as_str()));
+            assert_eq!(
+                claim.proposal,
+                Some((p, proposal_hash("proposal-text"))),
+                "{form:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn steered_approval_is_user() {
+        let (_dir, mut store) = open_store();
+        let p = proposed(&mut store, "k1", "proposal-text");
+        let t = admit(&mut store, "k1", "please remember tea");
+        assert!(store.claim(t).expect("claim"));
+        let r = admit(&mut store, "k1", "좋아");
+        assert!(store.steer_into(r, t).expect("steer"));
+        assert_eq!((p, t, r), (1, 2, 3));
+        let mid = message_id_of(&store, r);
+        let hash = proposal_hash("proposal-text");
+        let claim = verify(&store, &turn(t, "k1"), &user("좋아", r)).expect("verify");
+        check(
+            &claim,
+            Want {
+                kind: Kind::User,
+                code: None,
+                quote: Some("좋아"),
+                message: Some(r),
+                receipt: Some(("test", &mid)),
+                proposal: Some((p, &hash)),
+            },
+        );
+    }
+
+    #[test]
+    fn wrong_row_is_agent() {
+        let (_dir, mut store) = open_store();
+        let t = admit(&mut store, "k1", "응");
+        let LaneStart::New(lane) = store
+            .start_lane("call-1", "k1", "task", None, 3)
+            .expect("lane")
+        else {
+            panic!("lane not started");
+        };
+        assert!(
+            store
+                .finish_lane(lane, 1, "응", LaneState::Idle, None)
+                .expect("finish")
+        );
+        let lane_row = store.count().expect("count");
+        assert_eq!(
+            store.get(lane_row).expect("get").expect("row").origin,
+            "lane"
+        );
+        let other_conversation = admit(&mut store, "k2", "응");
+        let other_author = admit_by(&mut store, "k1", "222", "응");
+        for message in [999, lane_row, other_conversation, other_author] {
+            let claim = verify(&store, &turn(t, "k1"), &user("응", message)).expect("verify");
+            check(
+                &claim,
+                want_agent(E_MEMORY_QUOTE_ROW, Some("응"), Some(message)),
+            );
+        }
+    }
+
+    #[test]
+    fn row_outside_the_turn_is_agent() {
+        let (_dir, mut store) = open_store();
+        let earlier = admit(&mut store, "k1", "응");
+        let t = admit(&mut store, "k1", "please remember tea");
+        assert!(earlier < t);
+        let claim = verify(&store, &turn(t, "k1"), &user("응", earlier)).expect("verify");
+        check(
+            &claim,
+            want_agent(E_MEMORY_QUOTE_TURN, Some("응"), Some(earlier)),
+        );
+    }
+
+    #[test]
+    fn quote_not_in_row_is_agent() {
+        let (_dir, mut store) = open_store();
+        proposed(&mut store, "k1", "proposal-text");
+        let r = admit(&mut store, "k1", "maybe later");
+        let claim = verify(&store, &turn(r, "k1"), &user("yes", r)).expect("verify");
+        check(
+            &claim,
+            want_agent(E_MEMORY_QUOTE_TEXT, Some("yes"), Some(r)),
+        );
+    }
+
+    #[test]
+    fn partial_quote_is_quoted() {
+        let (_dir, mut store) = open_store();
+        proposed(&mut store, "k1", "proposal-text");
+        let r = admit(&mut store, "k1", "remember that I like green tea");
+        let mid = message_id_of(&store, r);
+        let claim = verify(&store, &turn(r, "k1"), &user("green tea", r)).expect("verify");
+        check(
+            &claim,
+            Want {
+                kind: Kind::Quoted,
+                code: Some(E_MEMORY_QUOTE_APPROVAL),
+                quote: Some("green tea"),
+                message: Some(r),
+                receipt: Some(("test", &mid)),
+                proposal: None,
+            },
+        );
+
+        proposed(&mut store, "k2", "proposal-text");
+        let r = admit(&mut store, "k2", "응 좋아");
+        let mid = message_id_of(&store, r);
+        let claim = verify(&store, &turn(r, "k2"), &user("응 좋아", r)).expect("verify");
+        check(
+            &claim,
+            Want {
+                kind: Kind::Quoted,
+                code: Some(E_MEMORY_QUOTE_APPROVAL),
+                quote: Some("응 좋아"),
+                message: Some(r),
+                receipt: Some(("test", &mid)),
+                proposal: None,
+            },
+        );
+    }
+
+    #[test]
+    fn approval_without_proposal_is_quoted() {
+        let (_dir, mut store) = open_store();
+        let quoted = |store: &Store, r: i64, key: &str| {
+            let mid = message_id_of(store, r);
+            let claim = verify(store, &turn(r, key), &user("응", r)).expect("verify");
+            check(
+                &claim,
+                Want {
+                    kind: Kind::Quoted,
+                    code: Some(E_MEMORY_QUOTE_PROPOSAL),
+                    quote: Some("응"),
+                    message: Some(r),
+                    receipt: Some(("test", &mid)),
+                    proposal: None,
+                },
+            );
+        };
+
+        // No earlier reply in the conversation.
+        let r = admit(&mut store, "k1", "응");
+        quoted(&store, r, "k1");
+
+        // A failed row between the proposal and the turn.
+        proposed(&mut store, "k2", "proposal-text");
+        let failed = admit(&mut store, "k2", "something else");
+        store
+            .mark(failed, State::Failed, Some("E_TEST"))
+            .expect("mark");
+        let r = admit(&mut store, "k2", "응");
+        quoted(&store, r, "k2");
+
+        // The turn's row came in before the proposal's reply was stored.
+        let p = admit(&mut store, "k3", "please remember");
+        assert!(store.claim(p).expect("claim"));
+        let r = admit(&mut store, "k3", "응");
+        store
+            .finish_group(p, "proposal-text", None, None)
+            .expect("finish");
+        quoted(&store, r, "k3");
+    }
+
+    #[test]
+    fn over_long_quote_is_agent() {
+        let (_dir, mut store) = open_store();
+        let long = "가".repeat(MAX_QUOTE_CHARS + 1);
+        let r = admit(&mut store, "k1", &long);
+        let capped = "가".repeat(MAX_QUOTE_CHARS);
+        let claim = verify(&store, &turn(r, "k1"), &user(&long, r)).expect("verify");
+        check(
+            &claim,
+            want_agent(E_MEMORY_QUOTE_LONG, Some(&capped), Some(r)),
+        );
+        assert_eq!(
+            claim.quote.as_deref().map(|q| q.chars().count()),
+            Some(MAX_QUOTE_CHARS)
+        );
+    }
+
+    #[test]
+    fn missing_quote_is_agent() {
+        let (_dir, mut store) = open_store();
+        proposed(&mut store, "k1", "proposal-text");
+        let r = admit(&mut store, "k1", "응");
+        let t = turn(r, "k1");
+
+        let no_quote = ClaimArgs {
+            user_quote: None,
+            ..user("응", r)
+        };
+        let claim = verify(&store, &t, &no_quote).expect("verify");
+        check(&claim, want_agent(E_MEMORY_QUOTE_MISSING, None, Some(r)));
+
+        let no_message = ClaimArgs {
+            quote_message: None,
+            ..user("응", r)
+        };
+        let claim = verify(&store, &t, &no_message).expect("verify");
+        check(&claim, want_agent(E_MEMORY_QUOTE_MISSING, Some("응"), None));
+
+        let claim = verify(&store, &t, &user("   ", r)).expect("verify");
+        check(
+            &claim,
+            want_agent(E_MEMORY_QUOTE_MISSING, Some(""), Some(r)),
+        );
+    }
+
+    #[test]
+    fn agent_and_inferred_skip_the_store() {
+        let (_dir, store) = open_store();
+        assert_eq!(store.count().expect("count"), 0);
+        let missing_turn = turn(42, "k1");
+        for source in [Source::Agent, Source::Inferred] {
+            let args = ClaimArgs {
+                source: Some(source),
+                ..ClaimArgs::default()
+            };
+            let claim = verify(&store, &missing_turn, &args).expect("plain claim");
+            assert_eq!(claim, Claim::plain(source));
+            assert!(!claim.downgraded());
+        }
+        let args = ClaimArgs {
+            source: Some(Source::User),
+            ..user("응", 1)
+        };
+        let err = verify(&store, &missing_turn, &args).unwrap_err();
+        assert_eq!(err.code, E_MEMORY_HISTORY);
     }
 }
