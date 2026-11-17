@@ -432,6 +432,40 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **이후 단계.** M5는 만료나 변경을 lead에게 알리고, 만료 시각에 맞춰 lead를 다시 켭니다(지금의 `now` 인자가 그때 시계 객체가 됩니다). M11은 떠올리기(recall)에서 같은 비밀 검사 표로 거절 대신 가리기를 하고, 위에 적은 로그와 표시의 경로도 가립니다. 그 밖의 일은 기억 로드맵의 이후 단계에서 다룹니다.
 
+### 3.12 기억의 출처 기록 (slice 6 M4)
+
+**주장 인자.** 쓰기 도구 여섯 개는 모두 선택 인자 세 개를 더 받습니다. `source`는 `user`(주인이 lead의 제안에 승인함), `agent`(lead 자신의 의견), `inferred`(lead의 추측) 중 하나입니다. `source: user`일 때는 주인의 말 그대로인 `user_quote`와, 주인 메시지 머리줄 `[moraebot conversation=<key> message=<id>]`의 번호인 `quote_message`를 함께 줍니다. `source`가 `user`가 아닌데 이 둘 중 하나를 주면 `E_MEMORY_ARGS`로 거절합니다. `source`를 주지 않으면 주장이 없는 쓰기이고, 기록 칸은 NULL입니다.
+
+**`reply_upto`와 제안 규칙.** 메시지 표 `inbox`에 칸 `reply_upto`가 생겼습니다. lead의 답장을 저장하는 두 `UPDATE`가 그 순간 표의 가장 큰 번호를 이 칸에 함께 적습니다. 예전 DB는 기존 `migrate`로 이 칸을 얻고, 예전 답장의 값은 NULL입니다. `Store::memory_proposal`은 지금 턴 메시지보다 앞에 있는, 같은 대화의 가장 최근 답장을 고릅니다. 그 답장의 `reply_upto`가 NULL이거나, 턴 메시지 번호가 `reply_upto`보다 크지 않거나, 그 답장과 턴 메시지 사이에 이 턴으로 끼어들지 않은 같은 대화의 메시지가 있으면 제안이 없습니다. 시계 대신 번호를 쓰므로 테스트가 시간에 흔들리지 않습니다.
+
+**검사 순서.** `provenance::verify`는 `user` 주장을 아래 순서로 보고, 처음 걸린 곳의 코드를 남깁니다. 쓰기를 거절하지는 않습니다.
+
+1. 인용과 메시지 번호가 둘 다 있고 인용이 공백만은 아닐 것. 아니면 `agent`, `E_MEMORY_QUOTE_MISSING`.
+2. 인용이 300자(`MAX_QUOTE_CHARS`) 이하일 것. 아니면 `agent`, `E_MEMORY_QUOTE_LONG`. 기록에는 앞 300자만 남습니다.
+3. 그 번호의 메시지가 주인 메시지(`origin = owner`)이고, 같은 대화이고, 지금 턴 메시지와 보낸 사람이 같을 것. 아니면 `agent`, `E_MEMORY_QUOTE_ROW`.
+4. 그 메시지가 지금 턴 메시지이거나 이 턴으로 끼어든 메시지일 것. 아니면 `agent`, `E_MEMORY_QUOTE_TURN`.
+5. 인용이 메시지 글 안에 있을 것. 아니면 `agent`, `E_MEMORY_QUOTE_TEXT`.
+6. 인용이 메시지 글 전체이고 승인 단어(`APPROVALS`의 17개)일 것. 앞뒤 공백과 끝의 `.` 또는 `!` 하나는 무시하고, 영어 대소문자는 가리지 않습니다. 아니면 `quoted`, `E_MEMORY_QUOTE_APPROVAL`.
+7. `memory_proposal`이 제안을 찾을 것. 아니면 `quoted`, `E_MEMORY_QUOTE_PROPOSAL`.
+
+모두 통과하면 `user`이고, 제안 글의 SHA-256 앞 16자리(`proposal_hash`)를 함께 남깁니다. SHA-256은 새 라이브러리 없이 `src/memory/provenance.rs`에 직접 구현했습니다. `agent`와 `inferred`는 검사 없이 그대로 받습니다.
+
+**`claim_json` 칸.** `memory_commits.claim_json`에는 키가 늘 모두 있는 JSON 한 줄이 들어갑니다(없는 값은 `null`): `v`(1), `source`(저장된 종류), `requested`(lead가 요청한 종류), `downgraded`, `code`, `quote`, `message`, `platform`, `message_id`, `proposal_row`, `proposal_hash`. `platform`과 `message_id`는 `user`와 `quoted`일 때만, `proposal_row`와 `proposal_hash`는 `user`일 때만 채워집니다. 도구 결과 JSON에는 `source`, `downgraded`, 그리고 코드가 있으면 `code`가 붙습니다.
+
+**도장과 mixed 규칙.** `provenance:` 줄은 moraebot만 적고, lead가 바꾸려 하면 여전히 `E_MEMORY_PROVENANCE`입니다. 값은 맨 앞 단어로 종류를 가립니다: `user:`, `quoted:`, `agent:`, `inferred:`, `mixed:`. 줄이 없거나 같은 종류면 새 값으로, `agent`와 `inferred`끼리도 새 값으로 바꿉니다. 그 밖의 조합(주인 말에서 온 `user`/`quoted` 파일을 다른 종류로 고치기, 다섯 단어가 아닌 옛 값)은 `mixed:`가 됩니다. 주장 없는 쓰기는 `user:`/`quoted:` 파일만 `mixed:`로 바꾸고, 나머지 파일은 바이트까지 그대로 둡니다. 줄을 적을 때는 frontmatter 전체를 표준 모양으로 다시 씁니다. 이름 바꾸기와 지우기는 글을 바꾸지 않고, 주장 없는 만들기도 줄을 붙이지 않습니다. 블록에서는 이 줄이 파일 요소의 `provenance="..."` 속성으로 보입니다.
+
+**쓰는 순서에 더해진 단계.** 3.11의 순서에 다음이 더해졌습니다. 앞의 두 단계는 거절할 수 있고, 뒤의 것은 거절하지 않습니다.
+
+1. `reason` 검사 바로 뒤: `user_quote`가 비밀처럼 보이면 `E_MEMORY_SECRET`.
+2. 3.11의 2~8단계(바뀌는 게 없으면 `E_MEMORY_NOOP`)까지 그대로.
+3. (새 단계) `source`가 있으면 `verify`로 주장을 판정합니다.
+4. (새 단계) 도장. 바뀐 글마다 `stamp` 또는 `stamp_unclaimed`를 적용하고, 글이 바뀌었으면 크기와 frontmatter를 다시 검사합니다.
+5. 판정을 `claim_json`에 담아 3.10의 순서로 기록하고 파일을 씁니다.
+
+**한계.** 메신저에서 나중에 고친 메시지는 보지 않고 처음 저장한 글과 비교합니다. M4 이전에 저장된 답장은 제안이 될 수 없어서, 업그레이드 직후 첫 승인은 `quoted`가 됩니다. `provenance:` 줄은 기록일 뿐 어떤 권한도 주지 않습니다.
+
+**이후 단계.** M6은 boundaries처럼 주인의 정확한 말이 꼭 필요한 파일에 인용이 확인되지 않으면 쓰기를 거절하는 규칙을 붙이고, M12 이후의 뒤에서 도는 쓰기 작업도 같은 주장 기록을 씁니다. 그 밖의 일은 기억 로드맵의 이후 단계에서 다룹니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
