@@ -336,10 +336,7 @@ async fn lane_child_gets_the_overlay() {
         omp::overlay_path(&h.config).to_string_lossy()
     );
     let lines = h.log_lines();
-    assert!(
-        lines[starts[0]..].iter().any(|l| *l == expected),
-        "{lines:?}"
-    );
+    assert!(lines[starts[0]..].contains(&expected), "{lines:?}");
     omp.shutdown_all().await;
 }
 
