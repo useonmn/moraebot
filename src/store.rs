@@ -227,6 +227,13 @@ pub struct Store {
     conn: Connection,
 }
 
+/// The lead reply an owner turn answers: its row and text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub row_id: i64,
+    pub reply: String,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS inbox(
     id INTEGER PRIMARY KEY,
@@ -247,6 +254,7 @@ CREATE TABLE IF NOT EXISTS inbox(
     text_sent INTEGER NOT NULL DEFAULT 0,
     origin TEXT NOT NULL DEFAULT 'owner',
     steered_into INTEGER,
+    reply_upto INTEGER,
     UNIQUE(platform, message_id)
 );
 CREATE TABLE IF NOT EXISTS conversations(
@@ -302,13 +310,14 @@ CREATE INDEX IF NOT EXISTS memory_snapshots_by_path ON memory_snapshots(path, co
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 7] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 8] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
     ("inbox", "text_sent", "INTEGER NOT NULL DEFAULT 0"),
     ("inbox", "origin", "TEXT NOT NULL DEFAULT 'owner'"),
     ("inbox", "steered_into", "INTEGER"),
+    ("inbox", "reply_upto", "INTEGER"),
     ("lanes", "done", "TEXT"),
 ];
 
@@ -611,7 +620,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             &format!(
-                "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, updated_at = {NOW} WHERE id = ?1"
+                "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, reply_upto = (SELECT MAX(id) FROM inbox), updated_at = {NOW} WHERE id = ?1"
             ),
             params![id, reply, out_files],
         )?;
@@ -762,7 +771,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             &format!(
-                "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, updated_at = {NOW} WHERE id = ?1"
+                "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, reply_upto = (SELECT MAX(id) FROM inbox), updated_at = {NOW} WHERE id = ?1"
             ),
             params![main_id, reply, out_files],
         )?;
@@ -782,6 +791,40 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The lead reply that the turn of `turn_row` directly follows in `conversation_key`:
+    /// the newest earlier reply of the conversation, stored before the turn's row came in,
+    /// with no other row of the conversation in between except rows steered into its turn.
+    pub fn memory_proposal(
+        &self,
+        conversation_key: &str,
+        turn_row: i64,
+    ) -> Result<Option<Proposal>, StoreError> {
+        let last: Option<(i64, String, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT id, reply, reply_upto FROM inbox
+                 WHERE conversation_key = ?1 AND id < ?2 AND reply IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![conversation_key, turn_row],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((row_id, reply, Some(upto))) = last else {
+            return Ok(None);
+        };
+        if turn_row <= upto {
+            return Ok(None);
+        }
+        let between: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox
+                           WHERE conversation_key = ?1 AND id > ?2 AND id < ?3
+                             AND (steered_into IS NULL OR steered_into != ?2))",
+            params![conversation_key, row_id, turn_row],
+            |r| r.get(0),
+        )?;
+        Ok((!between).then_some(Proposal { row_id, reply }))
     }
 
     /// Marks every row of a turn group `failed` with `code`, in one transaction.
@@ -2275,6 +2318,129 @@ mod tests {
         assert!(s.claim(e).unwrap());
         let n = new_id(admit(&mut s, "m3", K1));
         assert!(s.steer_into(n, m).unwrap());
+    }
+
+    fn reply_upto_of(s: &Store, id: i64) -> Option<i64> {
+        s.conn
+            .query_row("SELECT reply_upto FROM inbox WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// A claimed row of `key` that already holds the lead reply "proposal-text".
+    fn proposed(s: &mut Store, mid: &str, key: &str) -> i64 {
+        let id = claimed(s, mid, key);
+        s.finish_group(id, "proposal-text", None, None).unwrap();
+        id
+    }
+
+    #[test]
+    fn reply_upto_marks_the_last_row_at_reply_time() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = claimed(&mut s, "m1", K1);
+        let b = claimed(&mut s, "m2", K1);
+        assert_eq!(reply_upto_of(&s, a), None);
+        s.save_reply(a, "r1", None).unwrap();
+        assert_eq!(reply_upto_of(&s, a), Some(b));
+        let c = new_id(admit(&mut s, "m3", K1));
+        s.finish_group(b, "r", None, None).unwrap();
+        assert_eq!(reply_upto_of(&s, b), Some(c));
+        assert_eq!(reply_upto_of(&s, c), None);
+    }
+
+    #[test]
+    fn proposal_is_the_last_reply_before_the_turn() {
+        let (_d, _p, mut s) = open_tmp();
+        let t0 = new_id(admit(&mut s, "m0", K1));
+        assert_eq!(s.memory_proposal(K1, t0).unwrap(), None);
+        let p = proposed(&mut s, "m1", K1);
+        let t = new_id(admit(&mut s, "m2", K1));
+        let expected = Proposal {
+            row_id: p,
+            reply: "proposal-text".to_string(),
+        };
+        assert_eq!(s.memory_proposal(K1, t).unwrap(), Some(expected));
+        // A later reply in another conversation changes nothing.
+        proposed(&mut s, "m3", K2);
+        assert_eq!(s.memory_proposal(K1, t).unwrap().unwrap().row_id, p);
+        // No reply in K2 before its first row.
+        let other = new_id(admit(&mut s, "m5", "p:th:333"));
+        assert_eq!(s.memory_proposal("p:th:333", other).unwrap(), None);
+        // A finished lane-result row is a proposal too.
+        let lane = new_lane(&mut s, "call-a", K2);
+        assert!(s
+            .finish_lane(lane, 1, "result", LaneState::Idle, None)
+            .unwrap());
+        let result: i64 = s
+            .conn
+            .query_row("SELECT id FROM inbox WHERE origin = 'lane'", [], |r| r.get(0))
+            .unwrap();
+        assert!(s.claim(result).unwrap());
+        s.finish_group(result, "lane-reply", None, None).unwrap();
+        let t3 = new_id(admit(&mut s, "m6", K2));
+        let found = s.memory_proposal(K2, t3).unwrap().unwrap();
+        assert_eq!(found.row_id, result);
+        assert_eq!(found.reply, "lane-reply");
+    }
+
+    #[test]
+    fn proposal_allows_rows_steered_into_it() {
+        let (_d, _p, mut s) = open_tmp();
+        let p = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, p).unwrap());
+        s.finish_group(p, "x", None, Some(st)).unwrap();
+        let t = new_id(admit(&mut s, "m3", K1));
+        assert_eq!(s.memory_proposal(K1, t).unwrap().unwrap().row_id, p);
+    }
+
+    #[test]
+    fn proposal_breaks_on_rows_in_between() {
+        let (_d, _p, mut s) = open_tmp();
+        proposed(&mut s, "m1", K1);
+        let q = new_id(admit(&mut s, "m2", K1));
+        s.mark(q, State::Failed, Some("E_TEST")).unwrap();
+        let t = new_id(admit(&mut s, "m3", K1));
+        assert_eq!(s.memory_proposal(K1, t).unwrap(), None);
+        // The same row in another conversation does not break it.
+        let p2 = proposed(&mut s, "m4", K2);
+        let q2 = new_id(admit(&mut s, "m5", K1));
+        s.mark(q2, State::Failed, Some("E_TEST")).unwrap();
+        let t2 = new_id(admit(&mut s, "m6", K2));
+        assert_eq!(s.memory_proposal(K2, t2).unwrap().unwrap().row_id, p2);
+    }
+
+    #[test]
+    fn proposal_needs_the_turn_after_the_reply() {
+        let (_d, _p, mut s) = open_tmp();
+        let p = claimed(&mut s, "m1", K1);
+        let t = new_id(admit(&mut s, "m2", K1));
+        s.finish_group(p, "x", None, None).unwrap();
+        assert_eq!(s.memory_proposal(K1, t).unwrap(), None);
+        // A reply written before `reply_upto` existed binds nothing.
+        s.conn
+            .execute(
+                "UPDATE inbox SET reply = 'old', reply_upto = NULL WHERE id = ?1",
+                [p],
+            )
+            .unwrap();
+        let t2 = new_id(admit(&mut s, "m3", K1));
+        assert_eq!(s.memory_proposal(K1, t2).unwrap(), None);
+    }
+
+    #[test]
+    fn old_inbox_gains_reply_upto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        drop(conn);
+        let mut s = Store::open(&path).unwrap();
+        assert!(columns(&s.conn).iter().any(|c| c == "reply_upto"));
+        let p = proposed(&mut s, "m1", K1);
+        let t = new_id(admit(&mut s, "m2", K1));
+        assert_eq!(s.memory_proposal(K1, t).unwrap().unwrap().row_id, p);
     }
 
     #[test]
