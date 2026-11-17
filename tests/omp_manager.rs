@@ -12,7 +12,7 @@ use moraebot::lead;
 use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
 use moraebot::memory::{self, frontmatter, history};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
-use moraebot::store::Store;
+use moraebot::store::{LaneStart, LaneState, Store};
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -1085,9 +1085,8 @@ async fn lead_registers_memory_tools_lanes_do_not() {
     assert_eq!(registered.len(), 2, "{registered:?}");
     let (lead_frame_is_lane, lead_names) = &registered[0];
     assert!(!lead_frame_is_lane);
-    for tool in [memory::MEMORY_LIST_TOOL, memory::MEMORY_READ_TOOL] {
-        assert!(lead_names.iter().any(|n| n == tool), "{lead_names:?}");
-    }
+    assert_eq!(lead_names[0], omp::SEND_FILE_TOOL, "{lead_names:?}");
+    assert_eq!(&lead_names[1..9], &MEMORY_TOOLS, "{lead_names:?}");
     let (lane_frame_is_lane, lane_names) = &registered[1];
     assert!(lane_frame_is_lane);
     assert_eq!(lane_names, &[done::LANE_DONE_TOOL]);
@@ -1125,6 +1124,246 @@ async fn memory_read_round_trip_through_the_lead() {
             .starts_with(&format!("{}:", memory::E_MEMORY_PATH)),
         "{results:?}"
     );
+    manager.shutdown_all().await;
+}
+
+/// Every memory tool, in registration order.
+const MEMORY_TOOLS: [&str; 8] = [
+    memory::MEMORY_LIST_TOOL,
+    memory::MEMORY_READ_TOOL,
+    memory::MEMORY_CREATE_TOOL,
+    memory::MEMORY_STR_REPLACE_TOOL,
+    memory::MEMORY_INSERT_TOOL,
+    memory::MEMORY_DELETE_TOOL,
+    memory::MEMORY_RENAME_TOOL,
+    memory::MEMORY_UPDATE_DESCRIPTION_TOOL,
+];
+
+impl Harness {
+    /// A `tools`-mode manager with memory whose fake lead makes `calls` on a `run-tools` prompt.
+    fn memory_tools_manager(&self, calls: &[Value]) -> OmpManager {
+        let calls = calls
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.manager("tools")
+            .with_extra_env([("FAKE_OMP_TOOL_CALLS", calls)])
+            .with_memory(self.memory())
+    }
+
+    fn memory_commits(&self) -> Vec<moraebot::store::MemoryCommitRow> {
+        self.store
+            .lock()
+            .unwrap()
+            .memory_commits()
+            .expect("commits")
+    }
+
+    fn memory_file(&self, rel: &str) -> PathBuf {
+        self.config.home.join(memory::MEMORY_DIR).join(rel)
+    }
+}
+
+fn tool_call(tool: &str, arguments: Value) -> Value {
+    serde_json::json!({"tool": tool, "arguments": arguments})
+}
+
+fn create_call(path: &str) -> Value {
+    tool_call(
+        memory::MEMORY_CREATE_TOOL,
+        serde_json::json!({"path": path, "description": "about a", "body": "line one\n", "reason": "r"}),
+    )
+}
+
+fn refused_with(result: &(bool, String), code: &str) -> bool {
+    result.0 && result.1.starts_with(&format!("{code}:"))
+}
+
+#[tokio::test]
+async fn memory_write_round_trip_through_the_lead() {
+    let h = Harness::new();
+    let calls = [
+        create_call("notes/a.md"),
+        tool_call(
+            memory::MEMORY_STR_REPLACE_TOOL,
+            serde_json::json!({"path": "notes/a.md", "old_string": "line one", "new_string": "line two", "reason": "r"}),
+        ),
+        tool_call(
+            memory::MEMORY_INSERT_TOOL,
+            serde_json::json!({"path": "notes/a.md", "insert_line": 1, "insert_text": "top", "reason": "r"}),
+        ),
+        tool_call(
+            memory::MEMORY_UPDATE_DESCRIPTION_TOOL,
+            serde_json::json!({"path": "notes/a.md", "description": "about b", "reason": "r"}),
+        ),
+        tool_call(
+            memory::MEMORY_RENAME_TOOL,
+            serde_json::json!({"old_path": "notes/a.md", "new_path": "notes/b.md", "reason": "r"}),
+        ),
+        tool_call(
+            memory::MEMORY_DELETE_TOOL,
+            serde_json::json!({"path": "notes/b.md", "reason": "r"}),
+        ),
+    ];
+    let manager = h.memory_tools_manager(&calls);
+    let outcome = bounded(manager.prompt(KEY_A, 1, "run-tools"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: run-tools".into()));
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 6, "{results:?}");
+    let mut last = 0;
+    for ((is_error, text), call) in results.iter().zip(&calls) {
+        assert!(!is_error, "{results:?}");
+        let value: Value = serde_json::from_str(text).expect("write result json");
+        assert_eq!(value["command"], call["tool"], "{value}");
+        let committed = value["committed"].as_i64().expect("committed id");
+        assert!(committed > last, "{results:?}");
+        last = committed;
+    }
+    let renamed: Value = serde_json::from_str(&results[4].1).unwrap();
+    assert_eq!(renamed["to"], "notes/b.md");
+    assert!(!h.memory_file("notes/a.md").exists());
+    assert!(!h.memory_file("notes/b.md").exists());
+
+    let commits = h.memory_commits();
+    assert_eq!(commits.len(), 7, "the import and six writes");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    for row in &commits[1..] {
+        assert_eq!(row.commit.writer, memory::WRITER_LEAD);
+        assert_eq!(row.commit.turn_row, Some(1));
+        assert_eq!(row.commit.conversation_key.as_deref(), Some(KEY_A));
+        assert!(row.applied);
+    }
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn write_during_lane_result_turn_is_refused() {
+    let h = Harness::new();
+    let lane_row = {
+        let mut store = h.store.lock().unwrap();
+        let lane = match store
+            .start_lane("toolu_1", KEY_A, "t", None, lane::MAX_RUNNING_LANES)
+            .expect("start lane")
+        {
+            LaneStart::New(id) => id,
+            other => panic!("expected a new lane, got {other:?}"),
+        };
+        assert!(
+            store
+                .finish_lane(lane, 1, "lane result", LaneState::Idle, None)
+                .expect("finish lane")
+        );
+        let row = store.get(3).expect("get").expect("lane row 3");
+        assert_eq!(row.origin, "lane");
+        row.id
+    };
+    assert_eq!(lane_row, 3);
+
+    let manager = h.memory_tools_manager(&[create_call("notes/a.md")]);
+    bounded(manager.prompt(KEY_A, lane_row, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_ORIGIN),
+        "{results:?}"
+    );
+    assert!(!h.memory_file("notes/a.md").exists());
+    let commits = h.memory_commits();
+    assert_eq!(commits.len(), 1, "only the import");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+
+    // Control: the same call during an owner turn is recorded.
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(!results[1].0, "{results:?}");
+    assert!(h.memory_file("notes/a.md").exists());
+    assert_eq!(h.memory_commits().len(), 2);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn committed_write_shows_at_next_start() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[tool_call(
+        memory::MEMORY_STR_REPLACE_TOOL,
+        serde_json::json!({
+            "path": memory::PERSONA,
+            "old_string": persona_seed_body(),
+            "new_string": "tool-marker\n",
+            "reason": "r"
+        }),
+    )]);
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let pid = manager.child_pid().await.expect("live child");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+
+    let lost = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(lost.code(), Some(omp::E_CHILD_LOST));
+    assert_eq!(
+        h.append_flags().len(),
+        1,
+        "a lost child starts no new child"
+    );
+    let outcome = bounded(manager.prompt(KEY_A, 3, "third"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: third".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2, "exactly two START lines");
+    assert!(!flags[0][0].contains("tool-marker"));
+    assert!(flags[1][0].contains("tool-marker"));
+    assert!(!flags[1][0].contains("<dirty path="));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn hand_edit_blocks_memory_writes() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[
+        create_call("notes/a.md"),
+        tool_call(
+            memory::MEMORY_READ_TOOL,
+            serde_json::json!({"path": memory::HUMAN}),
+        ),
+    ]);
+    bounded(manager.prompt(KEY_A, 1, "import")).await;
+    assert_eq!(h.memory_commits().len(), 1, "the import");
+    std::fs::write(
+        h.memory_file(memory::HUMAN),
+        "---\ndescription: d\n---\nhand-marker\n",
+    )
+    .expect("hand edit");
+
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_DIRTY),
+        "{results:?}"
+    );
+    assert!(!results[1].0, "{results:?}");
+    let read: Value = serde_json::from_str(&results[1].1).expect("memory_read json");
+    assert_eq!(read["body"], "hand-marker\n");
+    assert!(!h.memory_file("notes/a.md").exists());
+    assert_eq!(h.memory_commits().len(), 1, "no commit was added");
     manager.shutdown_all().await;
 }
 
