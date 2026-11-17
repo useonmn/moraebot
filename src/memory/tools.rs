@@ -1,6 +1,6 @@
 //! The lead's memory host tools: two read tools over the working files, six write
-//! tools that go through the write engine, the two agreement tools and the onboarding finish
-//! tool.
+//! tools that go through the write engine, the two agreement tools, the onboarding finish
+//! tool, and the patch and observe tools that also go through the write engine.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,11 +14,13 @@ use super::onboarding;
 use super::provenance::{ClaimArgs, Source};
 use super::write::{Edit, apply};
 use super::{
-    E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_AGREEMENT_BREAK_TOOL,
-    MEMORY_AGREEMENT_RECORD_TOOL, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL,
-    MEMORY_LIST_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
+    E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, E_MEMORY_PATCH,
+    MEMORY_AGREEMENT_BREAK_TOOL, MEMORY_AGREEMENT_RECORD_TOOL, MEMORY_APPLY_PATCH_TOOL,
+    MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_LIST_TOOL,
+    MEMORY_OBSERVE_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
     MEMORY_UPDATE_DESCRIPTION_TOOL, ONBOARDING_FINISH_TOOL, ONBOARDING_OUTCOMES,
 };
+use super::{guard, patch, people};
 use crate::lane::refused;
 use crate::omp::{TurnContext, lock};
 use crate::store::Store;
@@ -161,6 +163,72 @@ fn write_specs() -> [(&'static str, String, Value); 6] {
     ]
 }
 
+/// The optional properties of `memory_observe`.
+const OBSERVE_OPTIONAL: [&str; 2] = ["name", "aliases"];
+
+/// The name, description and schema of `memory_apply_patch` and `memory_observe`, in
+/// registration order.
+fn patch_and_observe_specs() -> [(&'static str, String, Map<String, Value>); 2] {
+    let reason = || text("Why this change is made, in one line.");
+    let mut observe = write_schema(json!({
+        "slug": text("The person's slug: lowercase letters, digits and -; human means the owner."),
+        "text": text("The fact, in one line."),
+        "reason": reason(),
+        "name": text("The person's name, written on a new card."),
+        "aliases": text("Other names of the person, written on a new card.")
+    }));
+    if let Some(Value::Array(required)) = observe.get_mut("required") {
+        required.retain(|key| !OBSERVE_OPTIONAL.iter().any(|optional| key == optional));
+    }
+    [
+        (
+            MEMORY_APPLY_PATCH_TOOL,
+            format!(
+                "Change several memory files in one commit: the whole patch is applied or none \
+                 of it. Format: a line *** Begin Patch; then for each file *** Add File: <path> \
+                 followed by the whole new file (frontmatter included) with every line starting \
+                 with +, or *** Update File: <path> (optionally followed by *** Move to: <new \
+                 path>) and hunks that each start with @@ (or @@ <a line to find first>) and \
+                 hold lines starting with a space (keep), - (remove) or + (add), or *** Delete \
+                 File: <path>; then a line *** End Patch. Every rule of the single-file tools \
+                 applies to each file. {WRITE_RULES}"
+            ),
+            write_schema(json!({
+                "patch": text("The whole patch, from *** Begin Patch to *** End Patch."),
+                "reason": reason()
+            })),
+        ),
+        (
+            MEMORY_OBSERVE_TOOL,
+            format!(
+                "Record one fact about a person in people/<slug>/observations.md (slug: \
+                 lowercase letters, digits and -; slug human means the owner and writes to \
+                 system/human.md). A repeated fact raises its n= count instead of adding a line. \
+                 The card people/<slug>/card.md is created when missing; give name and aliases \
+                 for it. {WRITE_RULES}"
+            ),
+            observe,
+        ),
+    ]
+}
+
+/// A write host tool that runs `write` for `name` against the turn running when it is called.
+fn write_tool(
+    name: &'static str,
+    description: String,
+    parameters: Map<String, Value>,
+    home: &MemoryHome,
+    store: &Arc<Mutex<Store>>,
+    turn: &Arc<Mutex<Option<TurnContext>>>,
+) -> HostTool {
+    let (home, store, turn) = (home.clone(), Arc::clone(store), Arc::clone(turn));
+    HostTool::new(name, description, parameters, move |arguments, _| {
+        let context = lock(&turn).clone();
+        write(&home, &store, context, name, &Value::Object(arguments)).map(Into::into)
+    })
+    .load_mode(ToolLoadMode::Essential)
+}
+
 /// The allowed properties of `memory_agreement_record`.
 const RECORD_KEYS: [&str; 6] = [
     "scope",
@@ -222,8 +290,9 @@ fn finish_schema() -> Map<String, Value> {
 }
 
 /// The lead's memory tools: `memory_list` and `memory_read`, the six write tools,
-/// `memory_agreement_record` and `memory_agreement_break`, then `onboarding_finish`. A write,
-/// agreement or onboarding handler reads `turn` when it is called, so it sees the running turn.
+/// `memory_agreement_record` and `memory_agreement_break`, `onboarding_finish`, then
+/// `memory_apply_patch` and `memory_observe`. A write, agreement or onboarding handler reads
+/// `turn` when it is called, so it sees the running turn.
 pub fn host_tools(
     home: MemoryHome,
     store: Arc<Mutex<Store>>,
@@ -264,20 +333,15 @@ pub fn host_tools(
         .load_mode(ToolLoadMode::Essential),
     ];
     for (name, description, properties) in write_specs() {
-        let (home, store, turn) = (home.clone(), Arc::clone(&store), Arc::clone(&turn));
-        tools.push(
-            HostTool::new(
-                name,
-                description,
-                write_schema(properties),
-                move |arguments, _| {
-                    let context = lock(&turn).clone();
-                    write(&home, &store, context, name, &Value::Object(arguments)).map(Into::into)
-                },
-            )
-            .load_mode(ToolLoadMode::Essential),
-        );
+        let schema = write_schema(properties);
+        tools.push(write_tool(name, description, schema, &home, &store, &turn));
     }
+    let late: Vec<HostTool> = patch_and_observe_specs()
+        .into_iter()
+        .map(|(name, description, schema)| {
+            write_tool(name, description, schema, &home, &store, &turn)
+        })
+        .collect();
     let (record_store, record_turn) = (Arc::clone(&store), Arc::clone(&turn));
     tools.push(
         HostTool::new(
@@ -324,6 +388,7 @@ pub fn host_tools(
         )
         .load_mode(ToolLoadMode::Essential),
     );
+    tools.extend(late);
     tools
 }
 
@@ -387,6 +452,8 @@ fn properties(tool: &str) -> Option<&'static [&'static str]> {
         MEMORY_DELETE_TOOL => &["path", "reason"],
         MEMORY_RENAME_TOOL => &["old_path", "new_path", "reason"],
         MEMORY_UPDATE_DESCRIPTION_TOOL => &["path", "description", "reason"],
+        MEMORY_APPLY_PATCH_TOOL => &["patch", "reason"],
+        MEMORY_OBSERVE_TOOL => &["slug", "text", "reason", "name", "aliases"],
         _ => return None,
     })
 }
@@ -483,8 +550,44 @@ fn claim_args(f: &Map<String, Value>) -> Result<ClaimArgs, HostToolError> {
     })
 }
 
+/// The optional string property `key`.
+fn optional(fields: &Map<String, Value>, key: &str) -> Result<Option<String>, HostToolError> {
+    match fields.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(refused(E_MEMORY_ARGS, &format!("`{key}` must be a string"))),
+    }
+}
+
+/// A refused write tool call before the engine runs: the code it is logged with and the error.
+struct ArgsRefusal {
+    code: &'static str,
+    error: HostToolError,
+}
+
+impl From<HostToolError> for ArgsRefusal {
+    fn from(error: HostToolError) -> Self {
+        Self {
+            code: E_MEMORY_ARGS,
+            error,
+        }
+    }
+}
+
+/// The file operations of a `memory_apply_patch` call; a patch that cannot be read is refused
+/// with `E_MEMORY_PATCH`, naming only its line and problem.
+fn patch_ops(text: &str) -> Result<Vec<patch::FileOp>, ArgsRefusal> {
+    patch::parse(text).map_err(|e| ArgsRefusal {
+        code: E_MEMORY_PATCH,
+        error: refused(
+            E_MEMORY_PATCH,
+            &format!("line {}: {}", e.line, e.problem.name()),
+        ),
+    })
+}
+
 /// The edit, the reason and the claim arguments a write tool's arguments ask for.
-fn edit(tool: &str, args: &Value) -> Result<(Edit, String, ClaimArgs), HostToolError> {
+fn edit(tool: &str, args: &Value) -> Result<(Edit, String, ClaimArgs), ArgsRefusal> {
     let unknown = || refused(E_MEMORY_ARGS, "unknown memory tool");
     let mut allowed = properties(tool).ok_or_else(unknown)?.to_vec();
     allowed.extend(CLAIM_KEYS);
@@ -517,7 +620,17 @@ fn edit(tool: &str, args: &Value) -> Result<(Edit, String, ClaimArgs), HostToolE
             path: owned("path")?,
             description: owned("description")?,
         },
-        _ => return Err(unknown()),
+        MEMORY_APPLY_PATCH_TOOL => Edit::Patch {
+            ops: patch_ops(string(f, "patch")?)?,
+        },
+        MEMORY_OBSERVE_TOOL => Edit::Observe {
+            slug: owned("slug")?,
+            name: optional(f, "name")?,
+            aliases: optional(f, "aliases")?,
+            fact: owned("text")?,
+            date: people::date_of(guard::unix_now()),
+        },
+        _ => return Err(unknown().into()),
     };
     Ok((edit, owned("reason")?, claim_args(f)?))
 }
@@ -543,7 +656,10 @@ pub fn write(
             "memory tool arguments repaired"
         );
     }
-    let (edit, reason, claim) = edit(tool, &args).inspect_err(args_refused(tool))?;
+    let (edit, reason, claim) = edit(tool, &args).map_err(|refusal| {
+        tracing::info!(tool, path = "", code = refusal.code, "memory tool refused");
+        refusal.error
+    })?;
     apply(store, home, turn.as_ref(), edit, &reason, &claim)
         .map(|mut applied| {
             applied.repaired = repaired;
@@ -858,9 +974,11 @@ mod tests {
                 MEMORY_AGREEMENT_RECORD_TOOL,
                 MEMORY_AGREEMENT_BREAK_TOOL,
                 ONBOARDING_FINISH_TOOL,
+                MEMORY_APPLY_PATCH_TOOL,
+                MEMORY_OBSERVE_TOOL,
             ]
         );
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
         for tool in &tools {
             assert_eq!(tool.definition().load_mode, Some(ToolLoadMode::Essential));
             assert_eq!(
@@ -1338,6 +1456,182 @@ mod tests {
         let result = finish_onboarding(&store, &memory, Some(turn), &valid);
         assert_eq!(code_of(result), crate::memory::E_ONBOARDING_STATE);
         assert_eq!(lock(&store).onboarding().expect("onboarding"), None);
+    }
+
+    /// A patch that adds `notes/x.md` and `notes/y.md`.
+    const ADD_TWO: &str = "*** Begin Patch\n*** Add File: notes/x.md\n+---\n+description: x\n+---\n+ex\n*** Add File: notes/y.md\n+---\n+description: y\n+---\n+why\n*** End Patch\n";
+
+    /// The schema a registered lead tool was given.
+    fn registered_schema(name: &str) -> Map<String, Value> {
+        let (dir, memory) = fixture();
+        let store = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        host_tools(memory, Arc::new(Mutex::new(store)), Arc::default())
+            .into_iter()
+            .find(|t| t.definition().name == name)
+            .expect("registered")
+            .definition()
+            .parameters
+            .clone()
+    }
+
+    #[test]
+    fn patch_and_observe_schemas() {
+        let patch = registered_schema(MEMORY_APPLY_PATCH_TOOL);
+        assert_eq!(required(&patch), ["patch", "reason"]);
+        let observe = registered_schema(MEMORY_OBSERVE_TOOL);
+        assert_eq!(required(&observe), ["reason", "slug", "text"]);
+        for schema in [&patch, &observe] {
+            for key in CLAIM_KEYS {
+                assert!(schema["properties"].get(key).is_some(), "{key}");
+            }
+            assert_eq!(schema["additionalProperties"], Value::Bool(false));
+        }
+        for key in OBSERVE_OPTIONAL {
+            assert_eq!(observe["properties"][key]["type"], "string", "{key}");
+        }
+    }
+
+    #[test]
+    fn patch_and_observe_args_are_checked() {
+        let (_dir, memory, store, _turn) = store_fixture();
+        let valid = [
+            (
+                MEMORY_APPLY_PATCH_TOOL,
+                json!({"patch": ADD_TWO, "reason": "r"}),
+                vec!["patch", "reason"],
+            ),
+            (
+                MEMORY_OBSERVE_TOOL,
+                json!({"slug": "kim", "text": "likes tea", "reason": "r", "name": "Kim", "aliases": "K"}),
+                vec!["slug", "text", "reason"],
+            ),
+        ];
+        for (tool, args, required) in valid {
+            // With no turn, arguments that pass the parser are refused with E_MEMORY_ORIGIN,
+            // so every E_MEMORY_ARGS below comes from the parser.
+            assert_eq!(
+                code_of(write(&memory, &store, None, tool, &args)),
+                E_MEMORY_ORIGIN,
+                "{tool}"
+            );
+            let mut cases = Vec::new();
+            for key in required {
+                let mut missing = args.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                cases.push(missing);
+            }
+            for key in args.as_object().unwrap().keys() {
+                let mut wrong = args.clone();
+                wrong[key] = json!(7);
+                cases.push(wrong);
+            }
+            let mut extra = args.clone();
+            extra["extra"] = json!("x");
+            cases.push(extra);
+            cases.push(json!("not an object"));
+            for case in cases {
+                assert_eq!(
+                    code_of(write(&memory, &store, None, tool, &case)),
+                    E_MEMORY_ARGS,
+                    "{tool} {case}"
+                );
+            }
+        }
+        let text = write(
+            &memory,
+            &store,
+            None,
+            MEMORY_APPLY_PATCH_TOOL,
+            &json!({"patch": "hello", "reason": "r"}),
+        )
+        .expect_err("refused")
+        .to_string();
+        let (code, detail) = text.split_once(": ").expect("`<CODE>: <detail>`");
+        assert_eq!(code, E_MEMORY_PATCH);
+        let expected = format!("line {}: {}", 1, patch::PatchProblem::NoBegin.name());
+        assert!(detail.starts_with(&expected), "{detail}");
+        assert!(commit_rows(&store).is_empty());
+    }
+
+    #[test]
+    fn patch_result_lists_paths() {
+        let (_dir, memory, store, turn) = store_fixture();
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_APPLY_PATCH_TOOL,
+            &json!({"patch": ADD_TWO, "reason": "r"}),
+        ));
+        assert_eq!(out["command"], MEMORY_APPLY_PATCH_TOOL, "{out}");
+        assert_eq!(out["paths"], json!(["notes/x.md", "notes/y.md"]), "{out}");
+        assert!(out["committed"].is_i64(), "{out}");
+        assert_eq!(
+            file(&memory, "notes/y.md"),
+            "---\ndescription: y\n---\nwhy\n"
+        );
+    }
+
+    #[test]
+    fn observe_result_counts() {
+        let (_dir, memory, store, turn) = store_fixture();
+        let args = json!({"slug": "kim", "text": "likes tea", "name": "Kim", "reason": "r"});
+        for n in [1, 2] {
+            let out = result_json(write(
+                &memory,
+                &store,
+                Some(turn.clone()),
+                MEMORY_OBSERVE_TOOL,
+                &args,
+            ));
+            assert_eq!(out["n"], json!(n), "{out}");
+            assert_eq!(out["path"], "people/kim/observations.md", "{out}");
+        }
+        let card = file(&memory, "people/kim/card.md");
+        assert_eq!(
+            frontmatter::parse(&card).expect("card").body,
+            "IDENTITY: Kim\n"
+        );
+        let observations = file(&memory, "people/kim/observations.md");
+        let entries: Vec<&str> = observations
+            .lines()
+            .filter(|line| line.starts_with("- ["))
+            .collect();
+        assert_eq!(entries.len(), 1, "{observations}");
+        let date = entries[0].get(3..13).expect("date");
+        let shape: String = date
+            .chars()
+            .map(|c| if c.is_ascii_digit() { 'd' } else { c })
+            .collect();
+        assert_eq!(shape, "dddd-dd-dd");
+        assert!(
+            entries[0].ends_with("] likes tea <!-- n=2 -->"),
+            "{}",
+            entries[0]
+        );
+    }
+
+    #[test]
+    fn patch_parameter_repair() {
+        let (_dir, memory, store, turn) = store_fixture();
+        let args = json!({"patch": format!("{ADD_TWO}\n<parameter name=\"reason\">r")});
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_APPLY_PATCH_TOOL,
+            &args,
+        ));
+        assert_eq!(out["repaired"], json!(["reason"]), "{out}");
+        assert_eq!(out["paths"], json!(["notes/x.md", "notes/y.md"]), "{out}");
+        assert_eq!(
+            file(&memory, "notes/x.md"),
+            "---\ndescription: x\n---\nex\n"
+        );
+        assert_eq!(
+            commit_rows(&store).pop().expect("commit").commit.reason,
+            "r"
+        );
     }
 
     #[test]
