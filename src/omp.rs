@@ -598,11 +598,11 @@ fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, e
     ) {
         return;
     }
-    if let Some(turn) = lock(gate).as_mut() {
-        if !turn.started {
-            turn.started = true;
-            running.send_replace(Some(turn.key.clone()));
-        }
+    if let Some(turn) = lock(gate).as_mut()
+        && !turn.started
+    {
+        turn.started = true;
+        running.send_replace(Some(turn.key.clone()));
     }
 }
 
@@ -865,16 +865,16 @@ impl OmpManager {
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
             || matches!(steered, Some((_, Outcome::NeedsCheck { .. })));
-        if lost {
-            if let Some(current) = live.take() {
-                tracing::warn!(
-                    conversation = %key,
-                    row = row_id,
-                    code = main.code(),
-                    "closing omp lead child"
-                );
-                current.close(&self.lead_kill).await;
-            }
+        if lost
+            && let Some(current) = live.take()
+        {
+            tracing::warn!(
+                conversation = %key,
+                row = row_id,
+                code = main.code(),
+                "closing omp lead child"
+            );
+            current.close(&self.lead_kill).await;
         }
         *lock(&self.turn) = None;
         self.running.send_replace(None);

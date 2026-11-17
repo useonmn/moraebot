@@ -334,7 +334,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 /// `json_set` argument list over `$e` (the entry path); fails when the entry is missing.
 fn update_out_file(conn: &Connection, id: i64, index: usize, set: &str) -> Result<(), StoreError> {
     let entry = "'$[' || ?2 || ']'";
-    let set = set.replace("$e", &entry);
+    let set = set.replace("$e", entry);
     let changed = conn.execute(
         &format!(
             "UPDATE inbox SET out_files = json_set(out_files, {set}), updated_at = {NOW}
