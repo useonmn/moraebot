@@ -50,6 +50,16 @@
 //! Lane mode `hold_open` answers `open_session` with a `fake_held` marker
 //! instead of a response and then writes nothing more. A held fake is released
 //! only by stdin closing or a kill.
+//!
+//! Compaction and settle frames (lead fakes only; a lane fake ignores them):
+//! when a prompt's message (envelope line stripped) contains
+//! FAKE_OMP_COMPACT_TRIGGER (unset: never), one compaction frame follows that
+//! prompt's `agent_start`: `auto_compaction_end` for FAKE_OMP_COMPACT `auto`
+//! (default), `manual_compaction_end` for `manual`, an `aborted` one without a
+//! result for `aborted`, a `skipped` one without a result for `skipped`. A
+//! prompt whose message contains FAKE_OMP_UNSETTLED_TRIGGER (unset: never)
+//! gets a `prompt_result` with `"sessionSettled": false`; with
+//! FAKE_OMP_SETTLE_FRAME=1 a `session_settled` frame follows it at once.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -296,6 +306,7 @@ impl Fake {
     ) {
         respond_ok(out, id, "prompt", json!({"agentInvoked": true}));
         send(out, &json!({"type": "agent_start"}));
+        compact_on_trigger(prompt_message(frame), out);
         let turn = ToolTurn {
             prompt_id: id.clone(),
             message: prompt_message(frame).to_owned(),
@@ -471,8 +482,55 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
             send(out, &json!({"type": "agent_end", "messages": []}));
             prompt_error(id, out);
         }
-        _ => finish_echo(id, prompt_message(frame), out),
+        _ => {
+            compact_on_trigger(prompt_message(frame), out);
+            finish_echo(id, prompt_message(frame), out);
+        }
     }
+}
+
+/// Writes the compaction frame FAKE_OMP_COMPACT selects (default `auto`) when
+/// `message` contains FAKE_OMP_COMPACT_TRIGGER.
+fn compact_on_trigger(message: &str, out: &mut impl Write) {
+    if !message_has_trigger(message, "FAKE_OMP_COMPACT_TRIGGER") {
+        return;
+    }
+    let result = json!({
+        "summary": "fake summary",
+        "firstKeptEntryId": "fake-entry-1",
+        "tokensBefore": 1000,
+    });
+    let kind = std::env::var("FAKE_OMP_COMPACT").unwrap_or_else(|_| "auto".to_owned());
+    let frame = match kind.as_str() {
+        "manual" => json!({"type": "manual_compaction_end", "aborted": false, "result": result}),
+        "aborted" => json!({
+            "type": "auto_compaction_end",
+            "action": "context-full",
+            "aborted": true,
+            "willRetry": false,
+        }),
+        "skipped" => json!({
+            "type": "auto_compaction_end",
+            "action": "context-full",
+            "aborted": false,
+            "willRetry": false,
+            "skipped": true,
+        }),
+        _ => json!({
+            "type": "auto_compaction_end",
+            "action": "context-full",
+            "aborted": false,
+            "willRetry": false,
+            "result": result,
+        }),
+    };
+    send(out, &frame);
+}
+
+/// `message` contains the text the environment variable `variable` holds
+/// (an unset variable never matches).
+fn message_has_trigger(message: &str, variable: &str) -> bool {
+    std::env::var(variable).is_ok_and(|trigger| message.contains(&trigger))
 }
 
 /// The prompt's message without a leading `[moraebot ...]` envelope line.
@@ -491,7 +549,11 @@ fn prompt_message(frame: &Value) -> &str {
 
 fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
     end_run(&format!("echo: {message}"), json!({}), out);
-    completed(id, out);
+    let settled = !message_has_trigger(message, "FAKE_OMP_UNSETTLED_TRIGGER");
+    completed_with(id, settled, out);
+    if !settled && std::env::var("FAKE_OMP_SETTLE_FRAME").as_deref() == Ok("1") {
+        send(out, &json!({"type": "session_settled"}));
+    }
 }
 
 /// Writes `message_end` and `agent_end` for one assistant `text`; `extra`
@@ -512,6 +574,10 @@ fn end_run(text: &str, extra: Value, out: &mut impl Write) {
 }
 
 fn completed(id: &Value, out: &mut impl Write) {
+    completed_with(id, true, out);
+}
+
+fn completed_with(id: &Value, settled: bool, out: &mut impl Write) {
     send(
         out,
         &json!({
@@ -519,7 +585,7 @@ fn completed(id: &Value, out: &mut impl Write) {
             "id": id,
             "agentInvoked": true,
             "status": "completed",
-            "sessionSettled": true,
+            "sessionSettled": settled,
         }),
     );
 }
