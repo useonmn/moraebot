@@ -18,7 +18,9 @@ use moraebot::done;
 use moraebot::gateway::STORE_FILE;
 use moraebot::gateway::{Gateway, GatewayError};
 use moraebot::memory::home::MemoryHome;
-use moraebot::memory::{self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED};
+use moraebot::memory::{
+    self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, provenance,
+};
 use moraebot::omp;
 use moraebot::store::{InboxRow, Store};
 use moraebot::testing::FakeAdapter;
@@ -823,4 +825,133 @@ async fn guards_and_index_through_the_gateway() {
         "the expired file stays out"
     );
     assert!(!second.contains(DIRTY_MARK), "nothing is dirty");
+}
+
+#[tokio::test]
+async fn owner_approval_through_the_gateway() {
+    const PROPOSAL_DM: &str = "1300000000000000021";
+    const APPROVAL_DM: &str = "1300000000000000022";
+    const APPROVAL: &str = "응";
+    const TEA: &str = "system/tea.md";
+    let mut rig = Rig::new();
+
+    // Gateway 1: the owner's message and the lead's reply, which becomes the proposal.
+    lead_block_after_dm(
+        &mut rig,
+        PROPOSAL_DM,
+        "please remember that I like green tea",
+        &[],
+    )
+    .await;
+    let store = open_store(&rig);
+    let proposal = inbox_row(&store, PROPOSAL_DM);
+    assert_eq!(proposal.id, 1, "the proposal turn is row 1");
+    let proposal_reply = proposal.reply.clone().expect("the lead's reply is stored");
+    drop(store);
+
+    // Gateway 2: the owner approves; the lead claims the approval once rightly and once
+    // with the earlier message, which is outside the turn.
+    let calls = [
+        json!({
+            "tool": memory::MEMORY_CREATE_TOOL,
+            "arguments": {
+                "path": TEA,
+                "description": "tea",
+                "body": "green tea\n",
+                "reason": "e2e approved",
+                "source": "user",
+                "user_quote": APPROVAL,
+                "quote_message": 2
+            }
+        }),
+        json!({
+            "tool": memory::MEMORY_CREATE_TOOL,
+            "arguments": {
+                "path": "notes/guess.md",
+                "description": "guess",
+                "body": "likes tea\n",
+                "reason": "e2e old quote",
+                "source": "user",
+                "user_quote": "green tea",
+                "quote_message": 1
+            }
+        }),
+    ]
+    .map(|call| call.to_string())
+    .join("\n");
+    lead_block_after_dm(
+        &mut rig,
+        APPROVAL_DM,
+        APPROVAL,
+        &[
+            ("FAKE_OMP_MODE", "tools"),
+            ("FAKE_OMP_TOOL_TRIGGER", APPROVAL),
+            ("FAKE_OMP_TOOL_CALLS", &calls),
+        ],
+    )
+    .await;
+
+    let store = open_store(&rig);
+    let approval = inbox_row(&store, APPROVAL_DM);
+    assert_eq!(approval.id, 2, "the approval turn is row 2");
+    let commits = store.memory_commits().expect("commits");
+    assert_eq!(commits.len(), 3, "the import and two lead writes");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    let claims: Vec<Value> = commits[1..]
+        .iter()
+        .map(|row| {
+            assert_eq!(row.commit.writer, memory::WRITER_LEAD);
+            assert_eq!(row.commit.turn_row, Some(approval.id));
+            let json = row.commit.claim_json.as_deref().expect("claim recorded");
+            serde_json::from_str(json).expect("claim JSON")
+        })
+        .collect();
+    let (user, agent) = (&claims[0], &claims[1]);
+    assert_eq!(user["source"], "user", "{user}");
+    assert_eq!(user["downgraded"], false, "{user}");
+    assert_eq!(user["message"], 2, "{user}");
+    assert_eq!(user["proposal_row"], 1, "{user}");
+    assert_eq!(
+        user["proposal_hash"],
+        provenance::proposal_hash(&proposal_reply),
+        "{user}"
+    );
+    assert_eq!(user["platform"], approval.platform.as_str(), "{user}");
+    assert_eq!(user["message_id"], APPROVAL_DM, "{user}");
+    assert_eq!(agent["source"], "agent", "{agent}");
+    assert_eq!(agent["requested"], "user", "{agent}");
+    assert_eq!(agent["downgraded"], true, "{agent}");
+    assert_eq!(agent["code"], memory::E_MEMORY_QUOTE_TURN, "{agent}");
+    // QA evidence (shown with --nocapture): the recorded kinds and codes only.
+    for claim in &claims {
+        println!(
+            "claim source={} downgraded={} code={}",
+            claim["source"], claim["downgraded"], claim["code"]
+        );
+    }
+    drop(store);
+
+    let tea = std::fs::read_to_string(rig.memory_file(TEA)).expect("tea note");
+    let parsed = frontmatter::parse(&tea).expect("tea frontmatter");
+    let stamp = parsed
+        .frontmatter
+        .get(memory::PROVENANCE_KEY)
+        .expect("provenance written by moraebot");
+    assert!(stamp.starts_with("user:"), "{stamp}");
+    assert!(
+        std::fs::read_to_string(rig.memory_file("notes/guess.md"))
+            .expect("the downgraded write is kept")
+            .contains("likes tea")
+    );
+
+    // Gateway 3: the lead's block shows the stamp on the approved file.
+    let block = lead_block_after_dm(&mut rig, "1300000000000000023", "hello lead", &[]).await;
+    let element = block
+        .lines()
+        .find(|line| line.contains(&format!("path=\"{TEA}\"")))
+        .expect("the approved file is in the block");
+    assert!(
+        element.contains(" provenance=\"user: owner message 2 "),
+        "{element}"
+    );
 }
