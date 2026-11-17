@@ -1112,7 +1112,7 @@ impl OmpManager {
         );
         if !caught_up {
             tracing::warn!(
-                expected,
+                reason = "events_behind",
                 "omp lead events did not catch up; re-pin deferred"
             );
         }
