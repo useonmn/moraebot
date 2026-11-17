@@ -923,16 +923,16 @@ impl Harness {
                 let argv = start_argv(&line);
                 let at = argv.iter().position(|a| a == "--session-dir").unwrap();
                 lane = argv[at + 1].contains("/lanes/");
-            } else if let Ok(frame) = serde_json::from_str::<Value>(&line) {
-                if frame["type"] == "set_host_tools" {
-                    let names = frame["tools"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|t| t["name"].as_str().unwrap().to_owned())
-                        .collect();
-                    out.push((lane, names));
-                }
+            } else if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                && frame["type"] == "set_host_tools"
+            {
+                let names = frame["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["name"].as_str().unwrap().to_owned())
+                    .collect();
+                out.push((lane, names));
             }
         }
         out

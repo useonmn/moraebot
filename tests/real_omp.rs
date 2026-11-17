@@ -90,10 +90,10 @@ fn get_state(
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            if let Ok(frame) = serde_json::from_str::<Value>(&line) {
-                if tx.send(frame).is_err() {
-                    break;
-                }
+            if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                && tx.send(frame).is_err()
+            {
+                break;
             }
         }
     });

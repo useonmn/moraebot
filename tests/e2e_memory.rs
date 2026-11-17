@@ -475,9 +475,7 @@ async fn lane_gets_overlay_but_no_memory() {
     let overlay = std::path::absolute(omp::overlay_path(&rig.config)).expect("absolute");
     let expected = format!("CONFIG_FILES {}", overlay.display());
     assert!(
-        rig.tap.seen[*lane_at..]
-            .iter()
-            .any(|line| *line == expected),
+        rig.tap.seen[*lane_at..].contains(&expected),
         "the lane logs the overlay path"
     );
     assert_eq!(
