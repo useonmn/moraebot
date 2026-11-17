@@ -1154,8 +1154,17 @@ impl OmpManager {
         let rendered = {
             let mut store = lock(&self.store);
             match history::prepare(&mut store, home).and_then(|committed| {
-                history::dirty(home, &committed)
-                    .map(|dirty| render::render(&committed, &dirty, (self.clock)()))
+                let dirty = history::dirty(home, &committed)?;
+                let agreements = store.agreements().map_err(|e| memory::home::MemoryError {
+                    code: memory::E_MEMORY_HISTORY,
+                    detail: e.code().to_owned(),
+                })?;
+                Ok(render::render(
+                    &committed,
+                    &dirty,
+                    &agreements,
+                    (self.clock)(),
+                ))
             }) {
                 Ok(rendered) => rendered,
                 Err(e) => {

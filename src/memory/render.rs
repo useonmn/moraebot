@@ -9,6 +9,7 @@ use super::{
     NOT_INDEXED, PERSONA, PROVENANCE_KEY, SYSTEM_DIR,
 };
 use super::{frontmatter, guard};
+use crate::store::AgreementRow;
 
 /// What the lead is told about the block before the files start.
 const PREAMBLE: &str = "\
@@ -20,6 +21,12 @@ Read a file with memory_read when it matters; memory_list shows what exists.
 /// The first line of the notes index, after its opening tag.
 const INDEX_HEADER: &str =
     "Other memory files by folder, names without \".md\". Read one with memory_read.";
+
+/// The first line of the agreements element, after its opening tag.
+const AGREEMENTS_HEADER: &str = "Rules you keep for the owner, one per line by #id. [broken xN] is how often you broke a rule; tell moraebot each time with memory_agreement_break. A rule marked NEEDS-HUMAN was broken too often: keep it from now on, and if a task can only be done by breaking it, pause and get the owner's go-ahead first.";
+
+/// The bound of the rendered agreements element (escaped text), before its one budget marker.
+const AGREEMENTS_RENDER_BYTES: usize = 16384;
 
 /// The rendered memory block and every file that did not make it in as a normal block.
 pub struct Rendered {
@@ -157,12 +164,64 @@ fn index(committed: &Committed, now: i64, problems: &mut Vec<(String, &'static s
     format!("{OPEN}{INDEX_HEADER}\n{lines}{omitted}{CLOSE}")
 }
 
+/// One agreement line: `- #<id> [<scope>] [<author>]`, then `[broken x<n>]` when broken,
+/// `NEEDS-HUMAN:` when flagged, then the escaped text.
+fn agreement_item(row: &AgreementRow) -> String {
+    let broken = if row.broken > 0 {
+        format!("[broken x{}] ", row.broken)
+    } else {
+        String::new()
+    };
+    let flag = if row.needs_human { "NEEDS-HUMAN: " } else { "" };
+    format!(
+        "- #{} [{}] [{}] {broken}{flag}{}\n",
+        row.id,
+        row.scope,
+        row.author,
+        escape(&row.text)
+    )
+}
+
+/// The agreements element, empty when there are none. Items are added in order while the
+/// element stays within `AGREEMENTS_RENDER_BYTES`; the first item past it ends the list with one
+/// `omitted` marker.
+fn agreements_element(
+    agreements: &[AgreementRow],
+    problems: &mut Vec<(String, &'static str)>,
+) -> String {
+    if agreements.is_empty() {
+        return String::new();
+    }
+    const OPEN: &str = "<agreements>\n";
+    const CLOSE: &str = "</agreements>\n";
+    let fixed = OPEN.len() + AGREEMENTS_HEADER.len() + 1 + CLOSE.len();
+    let (mut items, mut cut) = (String::new(), String::new());
+    for row in agreements {
+        let item = agreement_item(row);
+        if fixed + items.len() + item.len() > AGREEMENTS_RENDER_BYTES {
+            cut = marker("omitted", "agreements", E_MEMORY_BUDGET);
+            problems.push(("agreements".to_owned(), E_MEMORY_BUDGET));
+            break;
+        }
+        items.push_str(&item);
+    }
+    format!("{OPEN}{AGREEMENTS_HEADER}\n{items}{cut}{CLOSE}")
+}
+
 /// Renders the committed system files into one memory block, followed by the notes index. A pure
-/// function of its input: the same committed texts, dirty paths and `now` give byte-identical
-/// text. A file whose `expires` is at or before `now` (Unix seconds) is left out, a text that
-/// cannot be used becomes a marker line, and every dirty path is marked in the metadata.
-pub fn render(committed: &Committed, dirty: &[String], now: i64) -> Rendered {
+/// function of its input: the same committed texts, dirty paths, agreements and `now` give
+/// byte-identical text. A file whose `expires` is at or before `now` (Unix seconds) is left out, a
+/// text that cannot be used becomes a marker line, and every dirty path is marked in the
+/// metadata. Agreements, in the given order, follow the self element and take their bytes from
+/// the budget before any file.
+pub fn render(
+    committed: &Committed,
+    dirty: &[String],
+    agreements: &[AgreementRow],
+    now: i64,
+) -> Rendered {
     let mut problems = Vec::new();
+    let agreements = agreements_element(agreements, &mut problems);
     let prefix = format!("{SYSTEM_DIR}/");
     let mut paths: Vec<&str> = Vec::new();
     for (path, text) in &committed.files {
@@ -187,7 +246,8 @@ pub fn render(committed: &Committed, dirty: &[String], now: i64) -> Rendered {
     .iter()
     .map(|part| part.len() + 1)
     .sum::<usize>()
-        + metadata_bound.len();
+        + metadata_bound.len()
+        + agreements.len();
 
     let mut entries: Vec<(&str, &str, bool)> = Vec::new();
     for (path, tag) in [(PERSONA, "persona"), (IDENTITY, "identity")] {
@@ -245,7 +305,7 @@ pub fn render(committed: &Committed, dirty: &[String], now: i64) -> Rendered {
     let index = index(committed, now, &mut problems);
 
     let text = format!(
-        "{BEGIN}\n{PREAMBLE}<self>\n{own}</self>\n<memory>\n{other}</memory>\n{index}\
+        "{BEGIN}\n{PREAMBLE}<self>\n{own}</self>\n{agreements}<memory>\n{other}</memory>\n{index}\
          <memory_metadata>\nfiles: {usable}/{listed}\n{marks}</memory_metadata>\n{END}\n"
     );
     Rendered { text, problems }
@@ -307,7 +367,7 @@ mod tests {
 
     #[test]
     fn seeds_render_in_order() {
-        let rendered = render(&seeded(), &[], NOW);
+        let rendered = render(&seeded(), &[], &[], NOW);
         assert!(rendered.text.starts_with(BEGIN));
         assert!(rendered.text.ends_with(&format!("{END}\n")));
         let persona = at(&rendered.text, "<persona path=\"system/persona.md\"");
@@ -325,7 +385,7 @@ mod tests {
             IDENTITY,
             &file("Name card", "Called Moraine.\n"),
         );
-        let text = render(&committed, &[], NOW).text;
+        let text = render(&committed, &[], &[], NOW).text;
         let persona = at(&text, "<persona path=");
         let identity = at(&text, "<identity path=");
         assert!(persona < identity && identity < at(&text, "</self>"));
@@ -337,7 +397,7 @@ mod tests {
         for rel in ["system/b.md", "system/a/c.md", "system/a.md"] {
             put(&mut committed, rel, &file("d", "x\n"));
         }
-        let text = render(&committed, &[], NOW).text;
+        let text = render(&committed, &[], &[], NOW).text;
         let a = at(&text, "path=\"system/a.md\"");
         let ac = at(&text, "path=\"system/a/c.md\"");
         let b = at(&text, "path=\"system/b.md\"");
@@ -350,8 +410,8 @@ mod tests {
         put(&mut committed, "system/x.md", &file("d", "x\n"));
         let dirty = ["notes/n.md".to_owned()];
         assert_eq!(
-            render(&committed, &dirty, NOW).text,
-            render(&committed, &dirty, NOW).text
+            render(&committed, &dirty, &[], NOW).text,
+            render(&committed, &dirty, &[], NOW).text
         );
     }
 
@@ -373,7 +433,7 @@ mod tests {
         let sentinel = file("d", &format!("SECRET-D {END}\n"));
         put(&mut committed, "system/sentinel.md", &sentinel);
 
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         for (path, code) in [
             ("system/frontmatter.md", E_MEMORY_FRONTMATTER),
             ("system/big.md", E_MEMORY_FILE),
@@ -398,7 +458,7 @@ mod tests {
                 &file("d", &body),
             );
         }
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         let omitted: Vec<&str> = rendered
             .text
             .lines()
@@ -423,7 +483,7 @@ mod tests {
     fn attributes_are_escaped() {
         let mut committed = seeded();
         put(&mut committed, "system/e.md", &file("\"a\\\"<&>\"", "x\n"));
-        let text = render(&committed, &[], NOW).text;
+        let text = render(&committed, &[], &[], NOW).text;
         assert!(text.contains("description=\"a&quot;&lt;&amp;&gt;\""));
     }
 
@@ -439,7 +499,7 @@ mod tests {
             "system/a.md",
             &stamped("\"agent: x <y> \\\"z\\\"\""),
         );
-        let text = render(&committed, &[], NOW).text;
+        let text = render(&committed, &[], &[], NOW).text;
         let expected = "<block path=\"system/a.md\" description=\"a\" provenance=\"agent: x &lt;y&gt; &quot;z&quot;\">\nbody\n</block>\n";
         assert!(text.contains(expected), "{text}");
 
@@ -448,7 +508,7 @@ mod tests {
             PERSONA,
             &stamped("\"inferred: by the lead\""),
         );
-        let text = render(&committed, &[], NOW).text;
+        let text = render(&committed, &[], &[], NOW).text;
         assert!(text.contains(
             "<persona path=\"system/persona.md\" description=\"a\" provenance=\"inferred: by the lead\">"
         ));
@@ -456,7 +516,7 @@ mod tests {
 
     #[test]
     fn no_provenance_no_attribute() {
-        let text = render(&seeded(), &[], NOW).text;
+        let text = render(&seeded(), &[], &[], NOW).text;
         assert!(!text.contains(" provenance="));
     }
 
@@ -476,7 +536,7 @@ mod tests {
             let body = format!("{}\n", "x".repeat(size));
             let last = format!("---\ndescription: d\n{provenance}---\n{body}");
             put(&mut committed, "system/f6.md", &last);
-            render(&committed, &[], NOW)
+            render(&committed, &[], &[], NOW)
                 .problems
                 .contains(&("system/f6.md".to_owned(), E_MEMORY_BUDGET))
         };
@@ -500,7 +560,7 @@ mod tests {
         let committed = seeded();
         let mut dirty: Vec<String> = (0..22).map(|n| format!("notes/d{n:02}.md")).collect();
         dirty.reverse();
-        let rendered = render(&committed, &dirty, NOW);
+        let rendered = render(&committed, &dirty, &[], NOW);
         let text = &rendered.text;
         let metadata = &text[at(text, "<memory_metadata>\n")..at(text, "</memory_metadata>\n")];
         let files_line = "<memory_metadata>\nfiles: 2/2\n";
@@ -522,7 +582,7 @@ mod tests {
     fn non_system_paths_are_not_rendered() {
         let mut committed = seeded();
         put(&mut committed, "notes/n.md", &file("d", "NOTE-MARKER\n"));
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         assert!(!rendered.text.contains("NOTE-MARKER"));
         assert!(!rendered.text.contains("notes/n.md"));
         assert!(rendered.text.contains("files: 2/2\n"));
@@ -573,13 +633,13 @@ mod tests {
             &expiring("2026-11-17", "EXPIRING-MARKER\n"),
         );
 
-        let before = render(&committed, &[], NOW - 1);
+        let before = render(&committed, &[], &[], NOW - 1);
         assert!(before.text.contains("<block path=\"system/a.md\""));
         assert!(before.text.contains("EXPIRING-MARKER"));
         assert!(before.text.contains("files: 3/3\n"));
         assert!(before.problems.is_empty());
 
-        let after = render(&committed, &[], NOW);
+        let after = render(&committed, &[], &[], NOW);
         assert!(!after.text.contains("EXPIRING-MARKER"));
         assert!(!after.text.contains("system/a.md"));
         assert!(after.text.contains("files: 2/2\n"));
@@ -598,7 +658,7 @@ mod tests {
             &expiring("soon", "SOON-MARKER\n"),
         );
         for now in [0, i64::MAX] {
-            let rendered = render(&committed, &[], now);
+            let rendered = render(&committed, &[], &[], now);
             assert!(rendered.text.contains("SOON-MARKER"), "{now}");
             assert!(rendered.text.contains("files: 3/3\n"), "{now}");
             assert!(rendered.problems.is_empty(), "{now}");
@@ -618,7 +678,7 @@ mod tests {
         ] {
             put(&mut committed, rel, &file("d", "x\n"));
         }
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         let expected = format!(
             "</memory>\n<external_projection>\n{INDEX_HEADER}\nnotes/: a, b\nnotes/x/: 1\n\
              people/: bob\nreference/: r\n</external_projection>\n<memory_metadata>"
@@ -645,7 +705,7 @@ mod tests {
         );
         put(&mut committed, "notes/a, b.md", &file("d", "x\n"));
         put(&mut committed, "notes/<x>.md", &file("d", "x\n"));
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         assert_eq!(
             index_of(&rendered.text),
             format!(
@@ -666,7 +726,7 @@ mod tests {
             &expiring("2000-01-01", "x\n"),
         );
         for committed in [seeded(), only_hidden] {
-            let rendered = render(&committed, &[], NOW);
+            let rendered = render(&committed, &[], &[], NOW);
             assert!(!rendered.text.contains("<external_projection>"));
             assert!(rendered.text.contains("</memory>\n<memory_metadata>\n"));
             assert!(rendered.problems.is_empty());
@@ -697,7 +757,7 @@ mod tests {
         for path in &paths {
             put(&mut committed, path, &file("d", "x\n"));
         }
-        let rendered = render(&committed, &[], NOW);
+        let rendered = render(&committed, &[], &[], NOW);
         let element = index_of(&rendered.text);
         let omitted_bytes: usize = element
             .lines()
@@ -752,14 +812,14 @@ mod tests {
         for name in &names {
             put(&mut exact, &format!("notes/{name}.md"), &file("d", "x\n"));
         }
-        let rendered = render(&exact, &[], NOW);
+        let rendered = render(&exact, &[], &[], NOW);
         assert_eq!(index_of(&rendered.text).len(), MAX_INDEX_BYTES);
         assert!(!rendered.text.contains("<omitted_names"));
         assert!(rendered.problems.is_empty());
 
         let one_more = format!("notes/{}z.md", names.last().expect("last"));
         put(&mut exact, &one_more, &file("d", "x\n"));
-        let rendered = render(&exact, &[], NOW);
+        let rendered = render(&exact, &[], &[], NOW);
         let (_, omitted) = index_parts(index_of(&rendered.text));
         assert_eq!(omitted, vec![("notes/".to_owned(), 1)]);
         assert_eq!(
@@ -792,7 +852,7 @@ mod tests {
             let end = "</memory>\n";
             text[..at(text, end) + end.len()].to_owned()
         };
-        let without = render(&committed, &[], NOW).text;
+        let without = render(&committed, &[], &[], NOW).text;
         for n in 0..2000 {
             put(
                 &mut committed,
@@ -800,9 +860,160 @@ mod tests {
                 &file("d", "x\n"),
             );
         }
-        let with = render(&committed, &[], NOW).text;
+        let with = render(&committed, &[], &[], NOW).text;
         assert!(with.contains("<external_projection>"));
         assert_eq!(system_part(&with), system_part(&without));
+    }
+
+    fn agreement(id: i64, scope: &str, author: &str, text: &str, broken: i64) -> AgreementRow {
+        AgreementRow {
+            id,
+            scope: scope.to_owned(),
+            author: author.to_owned(),
+            text: text.to_owned(),
+            broken,
+            needs_human: broken >= crate::memory::NEEDS_HUMAN_AT,
+        }
+    }
+
+    /// The agreements element, from its opening tag through its closing line.
+    fn agreements_of(text: &str) -> &str {
+        let close = "</agreements>\n";
+        &text[at(text, "<agreements>\n")..at(text, close) + close.len()]
+    }
+
+    /// The item lines of the agreements element.
+    fn items_of(text: &str) -> Vec<&str> {
+        agreements_of(text)
+            .lines()
+            .filter(|line| line.starts_with("- #"))
+            .collect()
+    }
+
+    #[test]
+    fn agreements_follow_self() {
+        let rows = [agreement(1, "global", "agent", "never force push", 0)];
+        let text = render(&seeded(), &[], &rows, NOW).text;
+        let element = at(&text, "<agreements>\n");
+        assert!(at(&text, "</self>\n") < element);
+        assert!(element < at(&text, "<memory>\n"));
+        assert!(text.contains("</self>\n<agreements>\n"));
+        assert!(text.contains("</agreements>\n<memory>\n"));
+        assert_eq!(
+            agreements_of(&text),
+            format!(
+                "<agreements>\n{AGREEMENTS_HEADER}\n- #1 [global] [agent] never force push\n</agreements>\n"
+            )
+        );
+    }
+
+    #[test]
+    fn agreement_items_render_counts_and_flag() {
+        let rows = [
+            agreement(2, "project", "human", "b", 2),
+            agreement(1, "global", "agent", "a", 0),
+            agreement(3, "project", "agent", "c", 3),
+        ];
+        let text = render(&seeded(), &[], &rows, NOW).text;
+        assert_eq!(
+            items_of(&text),
+            [
+                "- #2 [project] [human] [broken x2] b",
+                "- #1 [global] [agent] a",
+                "- #3 [project] [agent] [broken x3] NEEDS-HUMAN: c",
+            ]
+        );
+    }
+
+    #[test]
+    fn agreement_text_is_escaped() {
+        let rows = [agreement(1, "global", "agent", "keep <b> & \"c\"", 0)];
+        let text = render(&seeded(), &[], &rows, NOW).text;
+        assert_eq!(
+            items_of(&text),
+            ["- #1 [global] [agent] keep &lt;b&gt; &amp; &quot;c&quot;"]
+        );
+        assert!(!text.contains("<b>"));
+    }
+
+    #[test]
+    fn no_agreements_no_element() {
+        let rendered = render(&seeded(), &[], &[], NOW);
+        assert!(!rendered.text.contains("<agreements>"));
+        assert!(rendered.text.contains("</self>\n<memory>\n"));
+        assert!(rendered.problems.is_empty());
+    }
+
+    #[test]
+    fn escaped_agreements_keep_persona_and_human() {
+        let quotes = "\"".repeat(192);
+        let rows: Vec<AgreementRow> = (1..=64)
+            .map(|id| agreement(id, "project", "agent", &quotes, 0))
+            .collect();
+        let raw: usize = rows.iter().map(|row| row.text.len()).sum();
+        assert_eq!(raw, crate::memory::MAX_AGREEMENT_BYTES);
+
+        let rendered = render(&seeded(), &[], &rows, NOW);
+        let element = agreements_of(&rendered.text);
+        let marker_line = marker("omitted", "agreements", E_MEMORY_BUDGET);
+        assert!(element.len() <= AGREEMENTS_RENDER_BYTES + marker_line.len());
+        assert_eq!(element.matches("<omitted ").count(), 1);
+        assert_eq!(element.matches(marker_line.as_str()).count(), 1);
+        assert!(element.ends_with(&format!("{marker_line}</agreements>\n")));
+        assert!(!items_of(&rendered.text).is_empty());
+        assert_eq!(
+            rendered.problems,
+            vec![("agreements".to_owned(), E_MEMORY_BUDGET)]
+        );
+        assert!(
+            rendered
+                .text
+                .contains("<persona path=\"system/persona.md\"")
+        );
+        assert!(rendered.text.contains("<block path=\"system/human.md\""));
+        assert!(!rendered.text.contains("<omitted path=\"system/"));
+        assert!(rendered.text.len() <= MAX_RENDER_BYTES);
+    }
+
+    #[test]
+    fn agreements_count_against_the_budget() {
+        let build = |size: usize| {
+            let mut committed = seeded();
+            for n in 1..=5 {
+                let body = format!("{}\n", "x".repeat(15 * 1024));
+                put(
+                    &mut committed,
+                    &format!("system/f{n}.md"),
+                    &file("d", &body),
+                );
+            }
+            let body = format!("{}\n", "x".repeat(size));
+            put(&mut committed, "system/f6.md", &file("d", &body));
+            committed
+        };
+        let last_omitted = |rendered: &Rendered| {
+            rendered
+                .problems
+                .contains(&("system/f6.md".to_owned(), E_MEMORY_BUDGET))
+        };
+        // The largest last file that still fits without agreements.
+        let size = (1..MAX_FILE_BYTES as usize - 100)
+            .take_while(|size| !last_omitted(&render(&build(*size), &[], &[], NOW)))
+            .last()
+            .expect("some size fits");
+        let committed = build(size);
+        assert!(!last_omitted(&render(&committed, &[], &[], NOW)));
+
+        let rows = [agreement(1, "global", "agent", "never force push", 0)];
+        let rendered = render(&committed, &[], &rows, NOW);
+        assert!(last_omitted(&rendered));
+        assert!(rendered.text.contains(&format!(
+            "<omitted path=\"system/f6.md\" code=\"{E_MEMORY_BUDGET}\"/>"
+        )));
+        assert_eq!(
+            items_of(&rendered.text),
+            ["- #1 [global] [agent] never force push"]
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use moraebot::lead;
 use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
 use moraebot::memory::{self, frontmatter, history, notice};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
-use moraebot::store::{LaneStart, LaneState, Store};
+use moraebot::store::{AgreementAdded, LaneStart, LaneState, NewAgreement, Store};
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -2011,6 +2011,63 @@ async fn write_alone_does_not_restart_the_lead() {
         .outcome;
     assert_eq!(outcome, Outcome::Reply("echo: second".into()));
     assert_eq!(h.append_flags().len(), 1);
+    manager.shutdown_all().await;
+}
+
+/// Adds one `global` agent agreement straight to the ledger, as recorded in owner turn 1.
+fn add_agreement(h: &Harness, text: &str) -> i64 {
+    let norm = text.to_lowercase();
+    let new = NewAgreement {
+        scope: "global",
+        author: "agent",
+        text,
+        norm: &norm,
+        turn_row: 1,
+        reason: "test",
+        claim_json: None,
+    };
+    match h
+        .store
+        .lock()
+        .unwrap()
+        .add_agreement(&new, 64, 12288)
+        .expect("add agreement")
+    {
+        AgreementAdded::Added(id) => id,
+        other => panic!("agreement not added: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn agreements_reach_the_lead_block() {
+    let h = Harness::new();
+    assert_eq!(add_agreement(&h, "never force push"), 1);
+    let manager = h.manager("ok").with_memory(h.memory());
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 1);
+    assert!(flags[0][0].contains("<agreements>\n"));
+    assert!(
+        flags[0][0]
+            .lines()
+            .any(|line| line == "- #1 [global] [agent] never force push")
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn agreement_change_alone_does_not_restart() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    assert_eq!(add_agreement(&h, "ask before deploys"), 1);
+    let outcome = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: second".into()));
+    assert_eq!(h.append_flags().len(), 1, "exactly one START line");
     manager.shutdown_all().await;
 }
 
