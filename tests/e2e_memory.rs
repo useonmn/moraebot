@@ -14,16 +14,18 @@ use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::dispatch::{N_ONBOARDING_HELLO, notice_text};
 use moraebot::done;
 use moraebot::gateway::STORE_FILE;
 use moraebot::gateway::{Gateway, GatewayError};
 use moraebot::memory::home::MemoryHome;
 use moraebot::memory::{
-    self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, notice, provenance,
+    self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, notice, onboarding,
+    provenance,
 };
 use moraebot::omp;
-use moraebot::store::{InboxRow, Store};
-use moraebot::testing::FakeAdapter;
+use moraebot::store::{InboxRow, OnboardingRow, OnboardingState, Store};
+use moraebot::testing::{Call, FakeAdapter};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -1211,4 +1213,161 @@ async fn agreements_and_boundaries_through_the_gateway() {
     assert_eq!(agreements.len(), 1, "{agreements:?}");
     assert_eq!(agreements[0].broken, 3);
     assert!(agreements[0].needs_human);
+}
+
+/// The lines of one prompt's notice block that start with `onboarding `.
+fn onboarding_lines(prompt: &str) -> Vec<&str> {
+    prompt
+        .lines()
+        .skip_while(|line| *line != memory::NOTICE_BEGIN)
+        .take_while(|line| *line != memory::NOTICE_END)
+        .filter(|line| line.starts_with("onboarding "))
+        .collect()
+}
+
+/// The `Send` calls one fake adapter recorded, as `(channel, text)`.
+fn sends(adapter: &FakeAdapter) -> Vec<(String, String)> {
+    adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Send { channel, text } => Some((channel, text)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn onboarding_through_the_gateway() {
+    let mut rig = Rig::new();
+    onboarding::request(&rig.config.home).expect("onboarding request");
+    let request = onboarding::request_file(&rig.config.home);
+    let calls = [
+        json!({
+            "tool": memory::MEMORY_CREATE_TOOL,
+            "arguments": {
+                "path": memory::IDENTITY,
+                "description": "What the lead is called",
+                "body": "Name: Sora\n",
+                "reason": "r",
+                "source": "user",
+                "user_quote": "Call yourself Sora",
+                "quote_message": 2
+            }
+        }),
+        json!({
+            "tool": memory::ONBOARDING_FINISH_TOOL,
+            "arguments": {"outcome": "done", "reason": "r"}
+        }),
+    ]
+    .map(|call| call.to_string())
+    .join("\n");
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &calls)],
+        )
+        .expect("open gateway"),
+    );
+    // Startup: the request turns into one greeting in the configured channel.
+    bounded(adapter.wait_for_send(1)).await;
+    assert_eq!(
+        adapter.calls().first(),
+        Some(&Call::Send {
+            channel: CHANNEL.to_owned(),
+            text: notice_text(N_ONBOARDING_HELLO).to_owned(),
+        })
+    );
+    assert!(!request.exists(), "the greeting consumed the request");
+    // Row 1: the owner's first reply.
+    adapter.inject(dm("1300000000000000051", "hi")).await;
+    bounded(adapter.wait_for_send(2)).await;
+    // Row 2: the lead saves the name with the owner's words and ends the meeting.
+    adapter
+        .inject(dm("1300000000000000052", "Call yourself Sora. run-tools"))
+        .await;
+    bounded(adapter.wait_for_send(3)).await;
+    // Row 3: the refresh request re-pins the lead before this prompt.
+    adapter.inject(dm("1300000000000000053", "again")).await;
+    bounded(adapter.wait_for_send(4)).await;
+    running.stop().await;
+    let first_sends = sends(&adapter);
+
+    // A second gateway on the same home: no greeting, no onboarding line.
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(dynamic, &[("FAKE_OMP_MODE", "ok")])
+            .expect("open gateway"),
+    );
+    adapter.inject(dm("1300000000000000054", "hi")).await;
+    bounded(adapter.wait_for_send(1)).await;
+    running.stop().await;
+    let second_sends = sends(&adapter);
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let to_channel = first_sends
+        .iter()
+        .filter(|(channel, _)| channel == CHANNEL)
+        .count();
+    assert_eq!(to_channel, 1, "{first_sends:?}");
+    assert_eq!(second_sends.len(), 1, "{second_sends:?}");
+    assert_eq!(second_sends[0].0, DM_CHANNEL);
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids and counts only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(
+        leads.len(),
+        3,
+        "first start, refresh re-pin, second gateway"
+    );
+    let flags = append_flags(&leads[1].2);
+    assert_eq!(flags.len(), 1, "one append element");
+    assert!(flags[0].contains("Name: Sora"), "the re-pin has the name");
+
+    let prompts: Vec<String> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "prompt")
+        .map(|frame| {
+            frame["message"]
+                .as_str()
+                .expect("prompt message")
+                .to_owned()
+        })
+        .collect();
+    println!("prompts={}", prompts.len());
+    assert_eq!(prompts.len(), 4, "four lead prompts");
+    assert_eq!(onboarding_lines(&prompts[0]), ["onboarding turn=1"]);
+    assert_eq!(onboarding_lines(&prompts[1]), ["onboarding turn=2"]);
+    for (at, prompt) in prompts.iter().enumerate().skip(2) {
+        assert!(
+            !prompt.lines().any(|line| line.starts_with("onboarding ")),
+            "prompt {at}: {prompt:?}"
+        );
+    }
+
+    let identity = std::fs::read_to_string(rig.memory_file(memory::IDENTITY)).expect("identity");
+    let parsed = frontmatter::parse(&identity).expect("identity frontmatter");
+    let stamp = parsed
+        .frontmatter
+        .get(memory::PROVENANCE_KEY)
+        .expect("provenance written by moraebot");
+    assert!(
+        stamp.starts_with("quoted: owner message 2 contains \"Call yourself Sora\""),
+        "{stamp}"
+    );
+    assert_eq!(
+        open_store(&rig).onboarding().expect("onboarding row"),
+        Some(OnboardingRow {
+            state: OnboardingState::Done,
+            after_row: 0
+        })
+    );
 }
