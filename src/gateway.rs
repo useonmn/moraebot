@@ -20,6 +20,7 @@ use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
+use crate::memory::home::{MemoryError, MemoryHome};
 use crate::omp::OmpManager;
 use crate::store::{Store, StoreError};
 
@@ -43,6 +44,8 @@ pub enum GatewayError {
     Adapter(#[from] AdapterError),
     #[error("{0}")]
     Config(#[from] ConfigError),
+    #[error("{0}")]
+    Memory(#[from] MemoryError),
     #[error("{E_GATEWAY_TASK}: dispatcher task failed: {0}")]
     Task(JoinError),
     #[error("{E_GATEWAY_SIGNAL}: cannot listen for signals: {0}")]
@@ -57,6 +60,7 @@ impl GatewayError {
             Self::Store(err) => err.code(),
             Self::Adapter(err) => err.code,
             Self::Config(err) => err.code,
+            Self::Memory(err) => err.code,
             Self::Task(_) => E_GATEWAY_TASK,
             Self::Signal(_) => E_GATEWAY_SIGNAL,
             Self::ShutdownTimeout => E_SHUTDOWN_TIMEOUT,
@@ -74,14 +78,18 @@ pub struct Gateway {
 impl Gateway {
     /// Opens the inbox and builds the omp manager with the lead guidance followed by the
     /// adapter's behavior hints (each replaced by its override file in the home,
-    /// `E_HINTS_FILE` when unusable). A second gateway on the same home fails here with
-    /// `E_ALREADY_RUNNING`. Nothing is started yet.
+    /// `E_HINTS_FILE` when unusable), and with the owner memory, whose folders and seeds
+    /// are made first (`E_MEMORY_LAYOUT` when they cannot be). A second gateway on the
+    /// same home fails here with `E_ALREADY_RUNNING`. Nothing is started yet.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
         let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
+        let memory = MemoryHome::new(&config.home);
+        memory.ensure_layout()?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
         let omp = OmpManager::new(config.clone(), Arc::clone(&store))
-            .with_hints(lead::system_prompt(&guidance, &hints));
+            .with_hints(lead::system_prompt(&guidance, &hints))
+            .with_memory(memory);
         Ok(Self {
             config: config.clone(),
             adapter,
@@ -150,5 +158,40 @@ impl Gateway {
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
+    use crate::memory::E_MEMORY_LAYOUT;
+    use crate::testing::FakeAdapter;
+
+    #[test]
+    fn open_fails_with_memory_layout_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("qa-mbhome");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(crate::memory::MEMORY_DIR), b"not a folder").unwrap();
+        let config = Config {
+            messenger: Platform::Discord,
+            work_dir: dir.path().to_path_buf(),
+            omp_path: dir.path().join("no-omp"),
+            home: home.clone(),
+            access_mode: AccessMode::OwnerOnly,
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("secrets").join("discord.token"),
+            }),
+            slack: None,
+            omp: OmpConfig::default(),
+        };
+        let error = Gateway::open(&config, Arc::new(FakeAdapter::new()))
+            .err()
+            .expect("open refuses the home");
+        assert_eq!(error.code(), E_MEMORY_LAYOUT);
+        assert!(!home.join(STORE_FILE).exists(), "no store is opened");
     }
 }

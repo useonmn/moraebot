@@ -36,6 +36,8 @@ use crate::config::Config;
 use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
+use crate::memory::home::MemoryHome;
+use crate::memory::{self, render};
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -650,6 +652,7 @@ pub struct OmpManager {
     extra_env: Vec<(OsString, OsString)>,
     hints: String,
     host_tools: Vec<HostTool>,
+    memory: Option<MemoryHome>,
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
     gate: SteerGate,
@@ -681,6 +684,7 @@ impl OmpManager {
             extra_env: Vec::new(),
             hints: String::new(),
             host_tools: Vec::new(),
+            memory: None,
             live: Default::default(),
             lead_kill: Default::default(),
             gate: Default::default(),
@@ -737,6 +741,13 @@ impl OmpManager {
     /// Host tools for the lead, registered after `send_file`.
     pub fn with_host_tools(mut self, tools: Vec<HostTool>) -> Self {
         self.host_tools.extend(tools);
+        self
+    }
+
+    /// Owner memory for the lead: the block is rendered from `home` at each lead start and
+    /// appended after the hints, and `memory_list`/`memory_read` follow the host tools.
+    pub fn with_memory(mut self, home: MemoryHome) -> Self {
+        self.memory = Some(home);
         self
     }
 
@@ -933,11 +944,20 @@ impl OmpManager {
             .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
         let session_dir = lead_session_dir(&self.config);
+        let append = match self.memory.as_ref().map(render::render) {
+            Some(rendered) => {
+                for (path, code) in &rendered.problems {
+                    tracing::warn!(path = %path, code, "memory file not rendered");
+                }
+                render::append(&self.hints, &rendered.text)
+            }
+            None => self.hints.clone(),
+        };
         let command = private_dir(&session_dir)
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &session_dir, &self.hints),
+                    omp_args(&self.config, &session_dir, &append),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )
@@ -954,6 +974,9 @@ impl OmpManager {
             Arc::clone(&sent_files),
         )];
         tools.extend(self.host_tools.iter().cloned());
+        if let Some(home) = &self.memory {
+            tools.extend(memory::tools::host_tools(home.clone()));
+        }
         tools.extend(self.lanes.host_tools());
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);

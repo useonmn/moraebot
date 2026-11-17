@@ -121,7 +121,7 @@ pub struct LaneManager {
     pub(crate) extra_env: Vec<(OsString, OsString)>,
 }
 
-fn refused(code: &str, reason: &str) -> HostToolError {
+pub(crate) fn refused(code: &str, reason: &str) -> HostToolError {
     format!("{code}: {reason}").into()
 }
 

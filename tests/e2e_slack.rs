@@ -281,7 +281,9 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
         lead::system_prompt(lead::DEFAULT_GUIDANCE, DEFAULT_HINTS)
     );
     assert!(
-        rig.tap.argvs()[0].contains(&hints_flag),
+        rig.tap.argvs()[0]
+            .iter()
+            .any(|a| a.starts_with(&hints_flag)),
         "omp gets the Slack default hints"
     );
     rig.assert_no_child_left();
