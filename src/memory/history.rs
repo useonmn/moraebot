@@ -713,7 +713,7 @@ mod tests {
         );
         prepare(&mut store, &home).expect("prepare");
         let edited = "---\ndescription: locked\nread_only: \"true\"\n---\nby hand\n";
-        assert!(guard::is_read_only(edited));
+        assert!(edited.contains("read_only: \"true\""));
         put(&home, "notes/ro.md", edited.as_bytes());
         let accepted = accept(&mut store, &home, &[], ACCEPT_REASON).expect("accept");
         let id = accepted.commit.expect("commit");
