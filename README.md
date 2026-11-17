@@ -311,6 +311,14 @@ agreement needs-human id=3 broken=3 text="never force push"
   1. There's no owner command to list, acknowledge or drop agreements yet. The only way for you to fix the ledger is to stop moraebot, open the inbox database (`~/.moraebot/inbox.sqlite`) with `sqlite3`, drop the guard triggers (`memory_agreements_guard`, `memory_agreements_no_delete`, `memory_agreement_breaks_no_update`, `memory_agreement_breaks_no_delete`), edit the rows, and start moraebot again. The triggers come back on the next start.
   2. The lead can fill the ledger up to the cap (64 agreements, 12 KiB of text in total) without your approval. The agreements element takes its block room before the memory files. The 12 KiB cap counts raw text only, so the block also stops listing rules once the element reaches about 16 KiB and shows an `omitted` budget marker instead. Persona and human keep their room.
 
+**Size budget.** moraebot estimates how big your always-on memory is: the bytes of every recorded `system/` file that hasn't expired (files shown only as an error marker count too), plus the `<agreements>` element, divided by 4. The budget is 30000 estimated tokens, so about 120000 bytes. At 80% of it (24000 tokens, 96000 bytes) the block's `<memory_metadata>` element ends with one extra line, right before its closing tag:
+
+```text
+<pressure tokens="24000" budget="30000" percent="80" code="E_MEMORY_PRESSURE">...</pressure>
+```
+
+The numbers are machine-readable, and the text after them asks the lead to make the files shorter or move details into `notes/`. Below 80% the block is unchanged. The line's bytes count against the block's 64 KiB, so it never pushes the block past its limit. Once the estimate reaches the budget, the next message of yours that reaches the lead carries one notice line, `pressure over_budget tokens=<t> budget=<b> percent=<p>`, after any `agreement` and `onboarding` lines, and the log gets one warning with `code=E_MEMORY_PRESSURE`, the token estimate and the budget, but no file text or path. That happens once per crossing: not again while memory stays over budget, and again only after it dropped below and went over once more. A lead restart doesn't repeat it, but a restart of moraebot itself does if memory is still over. Nothing is sent to you in the messenger. One catch: the block itself is cut at 64 KiB, which is only about 16400 tokens, so by the time the 80% line appears some `system/` files are already left out of the block as `omitted`.
+
 **omp's own memory is off.** omp has a memory feature of its own. moraebot turns it off for every omp it starts (the lead and every lane): before each start it writes `~/.moraebot/omp/config-overlay.yml` (mode 600) with exactly this text, and points omp at it with the `PI_CONFIG_FILES` environment variable:
 
 ```yaml
