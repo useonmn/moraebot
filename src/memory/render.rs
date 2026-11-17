@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use super::history::Committed;
 use super::{
-    BEGIN, E_MEMORY_BUDGET, E_MEMORY_DIRTY, E_MEMORY_EXPIRED, E_MEMORY_FILE, E_MEMORY_FRONTMATTER,
-    END, IDENTITY, MAX_DIRTY_LISTED, MAX_FILE_BYTES, MAX_INDEX_BYTES, MAX_RENDER_BYTES,
-    NOT_INDEXED, PERSONA, PROVENANCE_KEY, SYSTEM_DIR,
+    BEGIN, BYTES_PER_TOKEN, E_MEMORY_BUDGET, E_MEMORY_DIRTY, E_MEMORY_EXPIRED, E_MEMORY_FILE,
+    E_MEMORY_FRONTMATTER, E_MEMORY_PRESSURE, END, IDENTITY, MAX_DIRTY_LISTED, MAX_FILE_BYTES,
+    MAX_INDEX_BYTES, MAX_RENDER_BYTES, NOT_INDEXED, PERSONA, PRESSURE_BUDGET_TOKENS,
+    PRESSURE_WARN_PERCENT, PROVENANCE_KEY, SYSTEM_DIR,
 };
 use super::{frontmatter, guard};
 use crate::store::AgreementRow;
@@ -28,12 +29,64 @@ const AGREEMENTS_HEADER: &str = "Rules you keep for the owner, one per line by #
 /// The bound of the rendered agreements element (escaped text), before its one budget marker.
 const AGREEMENTS_RENDER_BYTES: usize = 16384;
 
+/// The text of the pressure line in the metadata, after its attributes.
+const PRESSURE_NOTE: &str = "Your system/ files and agreements are close to or past their size budget. Make them shorter, or move details into notes/ files and leave a one-line pointer.";
+
 /// The rendered memory block and every file that did not make it in as a normal block.
 pub struct Rendered {
     /// The block, from `BEGIN` to `END`, every line ending in `\n`.
     pub text: String,
     /// `(path, code)` of every `unusable`, `omitted` and `dirty` marker.
     pub problems: Vec<(String, &'static str)>,
+}
+
+/// How full the system files and agreements are, in estimated tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pressure {
+    pub tokens: usize,
+    pub budget: usize,
+}
+
+impl Pressure {
+    /// `tokens * 100 / budget`, rounded down.
+    pub fn percent(self) -> usize {
+        self.tokens * 100 / self.budget
+    }
+
+    /// At or past `PRESSURE_WARN_PERCENT` of the budget: `tokens * 100 >= budget * PRESSURE_WARN_PERCENT`.
+    pub fn warns(self) -> bool {
+        self.tokens * 100 >= self.budget * PRESSURE_WARN_PERCENT
+    }
+
+    /// At or past the budget: `tokens >= budget`.
+    pub fn over(self) -> bool {
+        self.tokens >= self.budget
+    }
+}
+
+/// The size estimate for `render`'s input: the bytes of every committed `system/` file not
+/// expired at `now`, plus the rendered agreements element, divided by `BYTES_PER_TOKEN`.
+pub fn pressure(committed: &Committed, agreements: &[AgreementRow], now: i64) -> Pressure {
+    let element = agreements_element(agreements, &mut Vec::new());
+    estimate(system_bytes(committed, now), element.len())
+}
+
+/// The byte sum of every committed `system/` file not expired at `now`, unusable ones included.
+fn system_bytes(committed: &Committed, now: i64) -> usize {
+    let prefix = format!("{SYSTEM_DIR}/");
+    committed
+        .files
+        .iter()
+        .filter(|(path, text)| path.starts_with(&prefix) && !guard::is_expired(text, now))
+        .map(|(_, text)| text.len())
+        .sum()
+}
+
+fn estimate(system_bytes: usize, agreements_bytes: usize) -> Pressure {
+    Pressure {
+        tokens: (system_bytes + agreements_bytes) / BYTES_PER_TOKEN,
+        budget: PRESSURE_BUDGET_TOKENS,
+    }
 }
 
 enum Loaded {
@@ -235,6 +288,17 @@ pub fn render(
         }
     }
     let listed = paths.len();
+    let pressure = estimate(system_bytes(committed, now), agreements.len());
+    let pressure_line = if pressure.warns() {
+        format!(
+            "<pressure tokens=\"{}\" budget=\"{}\" percent=\"{}\" code=\"{E_MEMORY_PRESSURE}\">{PRESSURE_NOTE}</pressure>\n",
+            pressure.tokens,
+            pressure.budget,
+            pressure.percent()
+        )
+    } else {
+        String::new()
+    };
     let metadata_bound =
         format!("<memory_metadata>\nfiles: {listed}/{listed}\n</memory_metadata>\n");
     let mut used = [
@@ -247,6 +311,7 @@ pub fn render(
     .map(|part| part.len() + 1)
     .sum::<usize>()
         + metadata_bound.len()
+        + pressure_line.len()
         + agreements.len();
 
     let mut entries: Vec<(&str, &str, bool)> = Vec::new();
@@ -306,7 +371,7 @@ pub fn render(
 
     let text = format!(
         "{BEGIN}\n{PREAMBLE}<self>\n{own}</self>\n{agreements}<memory>\n{other}</memory>\n{index}\
-         <memory_metadata>\nfiles: {usable}/{listed}\n{marks}</memory_metadata>\n{END}\n"
+         <memory_metadata>\nfiles: {usable}/{listed}\n{marks}{pressure_line}</memory_metadata>\n{END}\n"
     );
     Rendered { text, problems }
 }
@@ -1014,6 +1079,150 @@ mod tests {
             items_of(&rendered.text),
             ["- #1 [global] [agent] never force push"]
         );
+    }
+
+    /// A committed file text of exactly `n` bytes (n >= 24): frontmatter `description: d`, then `x`s and a newline.
+    fn sized(n: usize) -> String {
+        let text = file("d", &format!("{}\n", "x".repeat(n - 24)));
+        assert_eq!(text.len(), n);
+        text
+    }
+
+    #[test]
+    fn pressure_counts_system_bytes_over_four() {
+        let mut c = Committed::default();
+        put(&mut c, "system/a.md", &sized(100));
+        put(&mut c, "system/b/c.md", &sized(103));
+        put(&mut c, "notes/n.md", &sized(1000));
+        put(&mut c, "system/old.md", &expiring("2000-01-01", "x\n"));
+        put(&mut c, "system/big.md", &"y".repeat(20000));
+        assert_eq!(
+            pressure(&c, &[], NOW),
+            Pressure {
+                tokens: (100 + 103 + 20000) / 4,
+                budget: 30000
+            }
+        );
+        assert_eq!(pressure(&c, &[], NOW).tokens, 5050);
+        c.files.remove("system/big.md");
+        assert_eq!(
+            pressure(&c, &[], NOW),
+            Pressure {
+                tokens: 50,
+                budget: 30000
+            }
+        );
+    }
+
+    #[test]
+    fn pressure_includes_the_agreements_element() {
+        let mut c = Committed::default();
+        put(&mut c, "system/a.md", &sized(100));
+        put(&mut c, "system/b/c.md", &sized(103));
+        put(&mut c, "notes/n.md", &sized(1000));
+        put(&mut c, "system/old.md", &expiring("2000-01-01", "x\n"));
+        let rows = [agreement(1, "global", "agent", "never force push", 0)];
+        let element = agreements_of(&render(&c, &[], &rows, NOW).text).len();
+        assert_eq!(pressure(&c, &rows, NOW).tokens, (203 + element) / 4);
+    }
+
+    #[test]
+    fn pressure_line_at_the_exact_threshold() {
+        let build = |last: usize| {
+            let mut c = Committed::default();
+            for n in 1..=5 {
+                put(&mut c, &format!("system/f{n}.md"), &sized(16000));
+            }
+            put(&mut c, "system/f6.md", &sized(last));
+            c
+        };
+        let line = format!(
+            "<pressure tokens=\"24000\" budget=\"30000\" percent=\"80\" code=\"{E_MEMORY_PRESSURE}\">{PRESSURE_NOTE}</pressure>"
+        );
+        for last in [16000, 16003] {
+            let text = render(&build(last), &[], &[], NOW).text;
+            let before_close = text[..at(&text, "</memory_metadata>\n")].lines().last();
+            assert_eq!(before_close, Some(line.as_str()), "last file {last}");
+            assert_eq!(text.matches("<pressure ").count(), 1, "last file {last}");
+        }
+        let text = render(&build(15999), &[], &[], NOW).text;
+        assert_eq!(text.matches("<pressure ").count(), 0);
+    }
+
+    #[test]
+    fn pressure_percent_and_over() {
+        for (tokens, warns, over, percent) in [
+            (23999, false, false, 79),
+            (24000, true, false, 80),
+            (29999, true, false, 99),
+            (30000, true, true, 100),
+            (45000, true, true, 150),
+        ] {
+            let p = Pressure {
+                tokens,
+                budget: 30000,
+            };
+            assert_eq!(
+                (p.warns(), p.over(), p.percent()),
+                (warns, over, percent),
+                "{tokens}"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_line_follows_dirty_markers() {
+        let mut c = Committed::default();
+        for n in 1..=6 {
+            put(&mut c, &format!("system/f{n}.md"), &sized(16000));
+        }
+        let text = render(&c, &["notes/d.md".to_owned()], &[], NOW).text;
+        let open = "<memory_metadata>\n";
+        let lines: Vec<&str> = text
+            [at(&text, open) + open.len()..at(&text, "</memory_metadata>\n")]
+            .lines()
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with("files: "), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            format!("<dirty path=\"notes/d.md\" code=\"{E_MEMORY_DIRTY}\"/>")
+        );
+        assert!(lines[2].starts_with("<pressure "), "{lines:?}");
+    }
+
+    #[test]
+    fn pressure_line_counts_against_the_budget() {
+        let build = |big: usize, last: usize| {
+            let mut c = Committed::default();
+            put(&mut c, "system/big.md", &"y".repeat(big));
+            for n in 1..=4 {
+                put(&mut c, &format!("system/f{n}.md"), &sized(15000));
+            }
+            put(&mut c, "system/f5.md", &sized(last));
+            c
+        };
+        let omitted = |big: usize, last: usize| {
+            render(&build(big, last), &[], &[], NOW)
+                .problems
+                .contains(&("system/f5.md".to_owned(), E_MEMORY_BUDGET))
+        };
+        let sizes: Vec<usize> = (24..15000).collect();
+        let point = sizes.partition_point(|s| !omitted(20000, *s));
+        assert!(point > 0 && point < sizes.len(), "{point}");
+        let last = sizes[point - 1];
+
+        let fits = render(&build(20000, last), &[], &[], NOW);
+        assert_eq!(fits.text.matches("<pressure ").count(), 0);
+        assert!(!omitted(20000, last));
+        assert!(fits.text.contains("<block path=\"system/f5.md\""));
+
+        let over = render(&build(40000, last), &[], &[], NOW);
+        assert_eq!(over.text.matches("<pressure ").count(), 1);
+        assert!(omitted(40000, last));
+        let unusable = marker("unusable", "system/big.md", E_MEMORY_FILE);
+        assert_eq!(fits.text.matches(&unusable).count(), 1);
+        assert_eq!(over.text.matches(&unusable).count(), 1);
     }
 
     #[test]
