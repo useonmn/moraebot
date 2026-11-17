@@ -12,7 +12,11 @@
 //!
 //! What changed since the lead's block was pinned, and the notice lines that say so, live in
 //! `notice`.
+//!
+//! The standing agreements ledger (stored in the inbox database) and its tools live in
+//! `agreements`.
 
+pub mod agreements;
 pub mod frontmatter;
 pub mod guard;
 pub mod history;
@@ -129,9 +133,32 @@ pub const MAX_NOTICE_PATHS: usize = 20;
 /// Owner turns without a lead memory save between two nudges.
 pub const NUDGE_EVERY: i64 = 10;
 /// Files that shape who the lead is.
-pub const SOUL_PATHS: [&str; 2] = [PERSONA, IDENTITY];
+pub const SOUL_PATHS: [&str; 3] = [PERSONA, IDENTITY, BOUNDARIES];
 /// The file under the memory root that requests a re-pin at the next owner turn.
 pub const REFRESH_FILE: &str = ".refresh";
+
+/// The owner's exact "don't" words.
+pub const BOUNDARIES: &str = "system/boundaries.md";
+/// Reserved: the agreements ledger lives in the database, and no memory file may use this path.
+pub const AGREEMENTS_FILE: &str = "system/agreements.md";
+/// The lead's host tool that records a standing agreement.
+pub const MEMORY_AGREEMENT_RECORD_TOOL: &str = "memory_agreement_record";
+/// The lead's host tool that reports a broken agreement.
+pub const MEMORY_AGREEMENT_BREAK_TOOL: &str = "memory_agreement_break";
+/// The scopes an agreement may have.
+pub const AGREEMENT_SCOPES: [&str; 2] = ["global", "project"];
+/// An agreement the owner approved.
+pub const AUTHOR_HUMAN: &str = "human";
+/// An agreement the lead recorded on its own.
+pub const AUTHOR_AGENT: &str = "agent";
+/// The most agreements the ledger holds.
+pub const MAX_AGREEMENTS: usize = 64;
+/// The longest agreement text, in characters.
+pub const MAX_AGREEMENT_CHARS: usize = 240;
+/// The sum of all stored agreement texts in UTF-8 bytes, before escaping.
+pub const MAX_AGREEMENT_BYTES: usize = 12288;
+/// The broken count at which an agreement needs the owner.
+pub const NEEDS_HUMAN_AT: i64 = 3;
 
 /// The memory folders or seeds could not be made.
 pub const E_MEMORY_LAYOUT: &str = "E_MEMORY_LAYOUT";
@@ -187,3 +214,16 @@ pub const E_MEMORY_QUOTE_TEXT: &str = "E_MEMORY_QUOTE_TEXT";
 pub const E_MEMORY_QUOTE_APPROVAL: &str = "E_MEMORY_QUOTE_APPROVAL";
 /// An approval with no lead reply right before it.
 pub const E_MEMORY_QUOTE_PROPOSAL: &str = "E_MEMORY_QUOTE_PROPOSAL";
+/// A change of `system/boundaries.md` without a verified owner approval.
+pub const E_MEMORY_QUOTE: &str = "E_MEMORY_QUOTE";
+/// The agreements guard: the reserved file path, an unverified `user` agreement, or the database
+/// guard.
+pub const E_MEMORY_AGREEMENT: &str = "E_MEMORY_AGREEMENT";
+/// The same agreement (normalized text) is already recorded.
+pub const E_MEMORY_AGREEMENT_EXISTS: &str = "E_MEMORY_AGREEMENT_EXISTS";
+/// The ledger holds `MAX_AGREEMENTS` agreements.
+pub const E_MEMORY_AGREEMENT_FULL: &str = "E_MEMORY_AGREEMENT_FULL";
+/// No agreement has that id.
+pub const E_MEMORY_AGREEMENT_UNKNOWN: &str = "E_MEMORY_AGREEMENT_UNKNOWN";
+/// This agreement's break was already counted in this owner turn.
+pub const E_MEMORY_AGREEMENT_REPEAT: &str = "E_MEMORY_AGREEMENT_REPEAT";
