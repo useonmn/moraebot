@@ -4,6 +4,7 @@
 //! Because of the exclusive lock, nothing else may open the file while a `Store` is
 //! alive: read everything through this API.
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -200,6 +201,28 @@ pub enum LaneMessage {
     Limit,
 }
 
+/// What one memory commit records besides its changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCommit {
+    pub writer: String,
+    pub reason: String,
+    pub turn_row: Option<i64>,
+    pub conversation_key: Option<String>,
+    pub claim_json: Option<String>,
+}
+
+/// A stored memory commit with its id, timestamp and applied flag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCommitRow {
+    pub id: i64,
+    pub at: String,
+    pub commit: MemoryCommit,
+    pub applied: bool,
+}
+
+/// One changed memory path: the path and its new full text, `None` when deleted.
+pub type MemoryChange = (String, Option<String>);
+
 pub struct Store {
     conn: Connection,
 }
@@ -258,6 +281,23 @@ CREATE TABLE IF NOT EXISTS lanes(
     updated_at TEXT NOT NULL,
     done TEXT
 );
+CREATE TABLE IF NOT EXISTS memory_commits(
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,
+    writer TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    turn_row INTEGER,
+    conversation_key TEXT,
+    claim_json TEXT,
+    applied INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS memory_snapshots(
+    commit_id INTEGER NOT NULL REFERENCES memory_commits(id),
+    path TEXT NOT NULL,
+    body TEXT,
+    PRIMARY KEY(commit_id, path)
+);
+CREATE INDEX IF NOT EXISTS memory_snapshots_by_path ON memory_snapshots(path, commit_id);
 ";
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
@@ -1087,6 +1127,107 @@ impl Store {
             .optional()?
             .is_some())
     }
+
+    /// Records a memory commit (`applied = 0`) and one snapshot per change in one
+    /// transaction. Returns the commit id.
+    pub fn record_memory_commit(
+        &mut self,
+        commit: &MemoryCommit,
+        changes: &[MemoryChange],
+    ) -> Result<i64, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO memory_commits(at, writer, reason, turn_row, conversation_key, claim_json)
+                 VALUES ({NOW}, ?1, ?2, ?3, ?4, ?5)"
+            ),
+            params![
+                commit.writer,
+                commit.reason,
+                commit.turn_row,
+                commit.conversation_key,
+                commit.claim_json
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        for (path, body) in changes {
+            tx.execute(
+                "INSERT INTO memory_snapshots(commit_id, path, body) VALUES (?1, ?2, ?3)",
+                params![id, path, body],
+            )?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Marks a memory commit as written to the working files.
+    pub fn mark_memory_applied(&self, id: i64) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute("UPDATE memory_commits SET applied = 1 WHERE id = ?1", [id])?;
+        if changed == 0 {
+            return Err(StoreError::Invalid("no such memory commit"));
+        }
+        Ok(())
+    }
+
+    /// Memory commits not yet written to the working files, oldest first, each with its
+    /// snapshots ordered by path.
+    pub fn unapplied_memory_commits(&self) -> Result<Vec<(i64, Vec<MemoryChange>)>, StoreError> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare("SELECT id FROM memory_commits WHERE applied = 0 ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| Ok((id, self.memory_snapshots(id)?)))
+            .collect()
+    }
+
+    /// For every path ever recorded, its snapshot from the highest commit id (`None` when
+    /// that commit deleted it).
+    pub fn memory_latest(&self) -> Result<BTreeMap<String, Option<String>>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.path, s.body FROM memory_snapshots s
+             WHERE s.commit_id = (SELECT MAX(commit_id) FROM memory_snapshots WHERE path = s.path)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every memory commit, oldest first.
+    pub fn memory_commits(&self) -> Result<Vec<MemoryCommitRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, at, writer, reason, turn_row, conversation_key, claim_json, applied
+             FROM memory_commits ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryCommitRow {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                commit: MemoryCommit {
+                    writer: r.get(2)?,
+                    reason: r.get(3)?,
+                    turn_row: r.get(4)?,
+                    conversation_key: r.get(5)?,
+                    claim_json: r.get(6)?,
+                },
+                applied: r.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The snapshots of one memory commit, ordered by path.
+    pub fn memory_snapshots(&self, commit_id: i64) -> Result<Vec<MemoryChange>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, body FROM memory_snapshots WHERE commit_id = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map([commit_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -1894,6 +2035,166 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn mem_commit(writer: &str) -> MemoryCommit {
+        MemoryCommit {
+            writer: writer.to_string(),
+            reason: "r".to_string(),
+            turn_row: None,
+            conversation_key: None,
+            claim_json: None,
+        }
+    }
+
+    fn change(path: &str, body: Option<&str>) -> MemoryChange {
+        (path.to_string(), body.map(str::to_string))
+    }
+
+    fn memory_objects(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM sqlite_master WHERE name LIKE 'memory_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    const MEMORY_OBJECTS: [&str; 3] = [
+        "memory_commits",
+        "memory_snapshots",
+        "memory_snapshots_by_path",
+    ];
+
+    #[test]
+    fn memory_tables_exist_after_open() {
+        let (_d, _p, s) = open_tmp();
+        assert_eq!(memory_objects(&s.conn), MEMORY_OBJECTS);
+    }
+
+    #[test]
+    fn memory_tables_are_added_to_an_old_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO inbox(platform, message_id, conversation_key, author_id, text, state, received_at, updated_at)
+             VALUES ('test', 'old', ?1, '111', 'hi', 'done', 't', 't')",
+            [K1],
+        )
+        .unwrap();
+        assert!(memory_objects(&conn).is_empty());
+        drop(conn);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(memory_objects(&s.conn), MEMORY_OBJECTS);
+        assert_eq!(s.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn memory_commit_round_trips() {
+        let (_d, _p, mut s) = open_tmp();
+        let commit = MemoryCommit {
+            writer: "lead".to_string(),
+            reason: "why".to_string(),
+            turn_row: Some(7),
+            conversation_key: Some(K1.to_string()),
+            claim_json: Some("{}".to_string()),
+        };
+        let id = s
+            .record_memory_commit(
+                &commit,
+                &[
+                    change("system/b.md", Some("text b")),
+                    change("notes/a.md", None),
+                ],
+            )
+            .unwrap();
+        let rows = s.memory_commits().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].commit, commit);
+        assert!(!rows[0].applied);
+        assert!(!rows[0].at.is_empty());
+        assert_eq!(
+            s.memory_snapshots(id).unwrap(),
+            vec![
+                change("notes/a.md", None),
+                change("system/b.md", Some("text b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_record_is_one_transaction() {
+        let (_d, _p, mut s) = open_tmp();
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON memory_snapshots
+                 BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+            )
+            .unwrap();
+        assert!(
+            s.record_memory_commit(&mem_commit("lead"), &[change("notes/a.md", Some("x"))])
+                .is_err()
+        );
+        assert!(s.memory_commits().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_snapshot_per_path_wins() {
+        let (_d, _p, mut s) = open_tmp();
+        s.record_memory_commit(
+            &mem_commit("import"),
+            &[change("a.md", Some("a1")), change("b.md", Some("b1"))],
+        )
+        .unwrap();
+        s.record_memory_commit(
+            &mem_commit("lead"),
+            &[change("a.md", Some("a2")), change("c.md", Some("c2"))],
+        )
+        .unwrap();
+        s.record_memory_commit(&mem_commit("lead"), &[change("b.md", None)])
+            .unwrap();
+        let latest = s.memory_latest().unwrap();
+        assert_eq!(
+            latest.into_iter().collect::<Vec<_>>(),
+            vec![
+                change("a.md", Some("a2")),
+                change("b.md", None),
+                change("c.md", Some("c2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn unapplied_lists_only_unapplied_in_order() {
+        let (_d, _p, mut s) = open_tmp();
+        let ids: Vec<i64> = ["a", "b", "c"]
+            .iter()
+            .map(|p| {
+                s.record_memory_commit(
+                    &mem_commit("lead"),
+                    &[
+                        change(&format!("{p}2.md"), Some("2")),
+                        change(&format!("{p}1.md"), None),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        s.mark_memory_applied(ids[1]).unwrap();
+        let pending = s.unapplied_memory_commits().unwrap();
+        assert_eq!(
+            pending.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [ids[0], ids[2]]
+        );
+        assert_eq!(
+            pending[0].1,
+            vec![change("a1.md", None), change("a2.md", Some("2"))]
+        );
+        let err = s.mark_memory_applied(ids[2] + 100).unwrap_err();
+        assert_eq!(err.code(), E_STORE_INVALID);
     }
 
     #[test]
