@@ -18,6 +18,9 @@
 //!
 //! The first meeting with the owner (the request file, the state in the inbox database and the
 //! lead's finish tool) lives in `onboarding`.
+//!
+//! The size estimate of the system files and its line in the block live in `render`; the
+//! over-budget notice lives in `notice`.
 
 pub mod agreements;
 pub mod frontmatter;
@@ -243,3 +246,11 @@ pub const MAX_ONBOARDING_TURNS: i64 = 10;
 pub const E_ONBOARDING_STATE: &str = "E_ONBOARDING_STATE";
 /// The onboarding request file could not be written or removed.
 pub const E_ONBOARDING_REQUEST: &str = "E_ONBOARDING_REQUEST";
+/// Bytes counted as one token in the size estimate.
+pub const BYTES_PER_TOKEN: usize = 4;
+/// The advisory size of the system files and agreements, in estimated tokens.
+pub const PRESSURE_BUDGET_TOKENS: usize = 30000;
+/// The share of the budget at which the block carries the pressure line.
+pub const PRESSURE_WARN_PERCENT: usize = 80;
+/// The system files and agreements reached the warning share of their size budget.
+pub const E_MEMORY_PRESSURE: &str = "E_MEMORY_PRESSURE";
