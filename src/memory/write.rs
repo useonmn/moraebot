@@ -6,13 +6,14 @@ use super::frontmatter::{self, Frontmatter, render_frontmatter};
 use super::guard;
 use super::history::{self, Committed};
 use super::home::{MemoryError, MemoryHome};
-use super::provenance::{self, Claim, ClaimArgs};
+use super::provenance::{self, Claim, ClaimArgs, Kind};
 use super::{
-    BEGIN, E_MEMORY_ARGS, E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER,
-    E_MEMORY_HISTORY, E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN,
-    E_MEMORY_PATH, E_MEMORY_PROTECTED, E_MEMORY_READ_ONLY, END, MAX_DIRTY_LISTED, MAX_FILE_BYTES,
-    MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL,
-    MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, SOUL_PATHS, WRITER_LEAD,
+    AGREEMENTS_FILE, BEGIN, BOUNDARIES, E_MEMORY_AGREEMENT, E_MEMORY_ARGS, E_MEMORY_DIRTY,
+    E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY, E_MEMORY_NO_MATCH,
+    E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH, E_MEMORY_PROTECTED,
+    E_MEMORY_QUOTE, E_MEMORY_READ_ONLY, END, MAX_DIRTY_LISTED, MAX_FILE_BYTES, MEMORY_CREATE_TOOL,
+    MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
+    MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, SOUL_PATHS, WRITER_LEAD,
 };
 use crate::omp::{TurnContext, lock};
 use crate::store::{MemoryChange, MemoryCommit, Store};
@@ -166,20 +167,8 @@ fn run(
         guard::refuse_secret("user_quote", quote)?;
     }
 
-    let Some(turn) = turn else {
-        return Err(refused(E_MEMORY_ORIGIN, "no lead turn is running"));
-    };
     let mut store = lock(store);
-    match store.get(turn.row_id) {
-        Ok(Some(row)) if row.origin == "owner" => {}
-        Ok(_) => {
-            return Err(refused(
-                E_MEMORY_ORIGIN,
-                "the running turn does not answer an owner message",
-            ));
-        }
-        Err(e) => return Err(refused(E_MEMORY_HISTORY, e.code())),
-    }
+    let turn = owner_turn(&store, turn)?;
 
     check_paths(home, &edit)?;
 
@@ -220,6 +209,15 @@ fn run(
         Some(_) => Some(provenance::verify(&store, turn, claim)?),
         None => None,
     };
+    if changes.iter().any(|(path, _)| path == BOUNDARIES)
+        && !matches!(&claim, Some(claim) if claim.kind == Kind::User)
+    {
+        let detail = match claim.as_ref().and_then(|claim| claim.code) {
+            Some(code) => code.to_string(),
+            None => "source user with the owner's approval is required".to_string(),
+        };
+        return Err(refused(E_MEMORY_QUOTE, detail));
+    }
     let stamped = !matches!(
         (&claim, &edit),
         (_, Edit::Rename { .. } | Edit::Delete { .. }) | (None, Edit::Create { .. })
@@ -266,6 +264,25 @@ fn run(
     })
 }
 
+/// The running owner turn: `E_MEMORY_ORIGIN` when no turn runs or its row is not an owner
+/// message; `E_MEMORY_HISTORY` when the row cannot be read.
+pub(crate) fn owner_turn<'a>(
+    store: &Store,
+    turn: Option<&'a TurnContext>,
+) -> Result<&'a TurnContext, MemoryError> {
+    let Some(turn) = turn else {
+        return Err(refused(E_MEMORY_ORIGIN, "no lead turn is running"));
+    };
+    match store.get(turn.row_id) {
+        Ok(Some(row)) if row.origin == "owner" => Ok(turn),
+        Ok(_) => Err(refused(
+            E_MEMORY_ORIGIN,
+            "the running turn does not answer an owner message",
+        )),
+        Err(e) => Err(refused(E_MEMORY_HISTORY, e.code())),
+    }
+}
+
 /// The content checks of `history::check_text` for a text the engine stamped, without the
 /// provenance comparison: the stamp may carry owner words that hold a sentinel or, once
 /// escaped, match the secret table.
@@ -285,8 +302,8 @@ fn check_stamped(text: &str) -> Result<(), MemoryError> {
 
 /// Step 3: every named path is plain ASCII and passes the path rules, a path that would newly
 /// hold text (the `Create` path, the `Rename` target) does not look like a secret, a rename
-/// moves the file somewhere else, and the persona and the owner card are neither deleted nor
-/// renamed.
+/// moves the file somewhere else, the persona and the owner card are neither deleted nor
+/// renamed, and no named path is the reserved agreements path.
 fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
     let files: Vec<&str> = match edit {
         Edit::Delete { path } if !path.ends_with(".md") => {
@@ -324,6 +341,18 @@ fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
         return Err(refused(
             E_MEMORY_PROTECTED,
             format!("{}: cannot be deleted or renamed", edit.path()),
+        ));
+    }
+    let reserved = match edit {
+        Edit::Rename { old_path, new_path } => {
+            old_path == AGREEMENTS_FILE || new_path == AGREEMENTS_FILE
+        }
+        other => other.path() == AGREEMENTS_FILE,
+    };
+    if reserved {
+        return Err(refused(
+            E_MEMORY_AGREEMENT,
+            format!("{AGREEMENTS_FILE} is reserved for the agreements ledger"),
         ));
     }
     Ok(())
@@ -1764,6 +1793,188 @@ mod tests {
             Some(before.replacen("description: new note", "description: changed", 1))
         );
         assert_eq!(kind_of(fx.provenance("notes/d.md")), "agent");
+    }
+
+    /// An owner turn that approves a proposal: an owner row of `k1` answered with a reply,
+    /// then the approval row `yes`. Returns the turn on the approval row and its id.
+    fn approved_turn(fx: &Fx) -> (TurnContext, i64) {
+        let n = lock(&fx.store).count().expect("count");
+        let proposal = fx.owner_row(&format!("m-proposal-{n}"), "please remember");
+        {
+            let mut store = lock(&fx.store);
+            assert!(store.claim(proposal).expect("claim"));
+            store
+                .finish_group(proposal, "proposal-text", None, None)
+                .expect("finish");
+        }
+        let approval = fx.owner_row(&format!("m-approval-{n}"), "yes");
+        (turn(approval), approval)
+    }
+
+    const BOUNDARY_BODY: &str = "- never force push\n";
+
+    /// Creates `system/boundaries.md` with a verified owner approval.
+    fn verified_boundaries(fx: &Fx) -> Applied {
+        let (turn, row) = approved_turn(fx);
+        apply(
+            &fx.store,
+            &fx.home,
+            Some(&turn),
+            create(BOUNDARIES, BOUNDARY_BODY),
+            REASON,
+            &user("yes", row),
+        )
+        .expect("verified boundaries write")
+    }
+
+    #[test]
+    fn boundaries_need_a_verified_owner_quote() {
+        let fx = fx();
+        let owner = Some(OWNER_ROW);
+        let no_quote = ClaimArgs {
+            source: Some(Source::User),
+            ..ClaimArgs::default()
+        };
+        for (claim, detail) in [
+            (
+                ClaimArgs::default(),
+                "source user with the owner's approval is required",
+            ),
+            (
+                source(Source::Agent),
+                "source user with the owner's approval is required",
+            ),
+            (
+                source(Source::Inferred),
+                "source user with the owner's approval is required",
+            ),
+            (no_quote, E_MEMORY_QUOTE_MISSING),
+        ] {
+            let err = assert_claim_refused(
+                &fx,
+                owner,
+                create(BOUNDARIES, BOUNDARY_BODY),
+                REASON,
+                &claim,
+                E_MEMORY_QUOTE,
+            );
+            assert_eq!(err.detail, detail, "{claim:?}");
+        }
+
+        let never = fx.owner_row("m-never", "never force push");
+        assert!(lock(&fx.store).claim(never).expect("claim"));
+        let quoted = user("never", never);
+        let claim = provenance::verify(&lock(&fx.store), &turn(never), &quoted).expect("verify");
+        assert_eq!(claim.kind, Kind::Quoted);
+        assert_eq!(claim.code, Some(E_MEMORY_QUOTE_APPROVAL));
+        let err = assert_claim_refused(
+            &fx,
+            Some(never),
+            create(BOUNDARIES, BOUNDARY_BODY),
+            REASON,
+            &quoted,
+            E_MEMORY_QUOTE,
+        );
+        assert_eq!(err.detail, E_MEMORY_QUOTE_APPROVAL);
+        assert_eq!(fx.file(BOUNDARIES), None);
+
+        let before = fx.commits().len();
+        let applied = verified_boundaries(&fx);
+        assert!(applied.soul_edit);
+        assert_eq!(fx.commits().len(), before + 1);
+        assert!(
+            fx.provenance(BOUNDARIES)
+                .expect("provenance")
+                .starts_with("user:")
+        );
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn boundaries_changes_and_removal_need_the_quote_too() {
+        let fx = fx();
+        verified_boundaries(&fx);
+        let before = fx.file(BOUNDARIES).expect("boundaries");
+        for edit in [
+            replace(BOUNDARIES, "never", "always"),
+            insert_at(BOUNDARIES, 1, "- never skip tests"),
+            describe(BOUNDARIES, "changed"),
+            delete(BOUNDARIES),
+            rename(BOUNDARIES, "notes/moved.md"),
+        ] {
+            assert_refused(&fx, Some(OWNER_ROW), edit, REASON, E_MEMORY_QUOTE);
+            assert_eq!(fx.file(BOUNDARIES).as_deref(), Some(before.as_str()));
+        }
+        assert_eq!(fx.file("notes/moved.md"), None);
+
+        let (turn, row) = approved_turn(&fx);
+        let applied = apply(
+            &fx.store,
+            &fx.home,
+            Some(&turn),
+            replace(BOUNDARIES, "never", "always"),
+            REASON,
+            &user("yes", row),
+        )
+        .expect("verified replace");
+        assert!(applied.soul_edit);
+        let text = fx.file(BOUNDARIES).expect("boundaries");
+        assert_eq!(
+            frontmatter::parse(&text).expect("parse").body,
+            "- always force push\n"
+        );
+
+        let fx = fx_with(&[("notes/x.md", A)]);
+        assert_eq!(fx.file(BOUNDARIES), None);
+        assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            rename("notes/x.md", BOUNDARIES),
+            REASON,
+            E_MEMORY_QUOTE,
+        );
+    }
+
+    #[test]
+    fn agreements_file_is_reserved() {
+        let fx = fx_with(&[("notes/x.md", A)]);
+        for edit in [
+            create(AGREEMENTS_FILE, "- never force push\n"),
+            rename("notes/x.md", AGREEMENTS_FILE),
+        ] {
+            let err = assert_refused(&fx, Some(OWNER_ROW), edit, REASON, E_MEMORY_AGREEMENT);
+            assert_eq!(
+                err.detail,
+                "system/agreements.md is reserved for the agreements ledger"
+            );
+        }
+        assert_eq!(fx.file(AGREEMENTS_FILE), None);
+    }
+
+    #[test]
+    fn owner_turn_gate_is_shared() {
+        let fx = fx();
+        let store = lock(&fx.store);
+        let err = owner_turn(&store, None).expect_err("no turn");
+        assert_eq!(
+            (err.code, err.detail.as_str()),
+            (E_MEMORY_ORIGIN, "no lead turn is running")
+        );
+        let lane = turn(LANE_ROW);
+        let err = owner_turn(&store, Some(&lane)).expect_err("lane turn");
+        assert_eq!(
+            (err.code, err.detail.as_str()),
+            (
+                E_MEMORY_ORIGIN,
+                "the running turn does not answer an owner message"
+            )
+        );
+        let missing = turn(MISSING_ROW);
+        let err = owner_turn(&store, Some(&missing)).expect_err("missing row");
+        assert_eq!(err.code, E_MEMORY_ORIGIN);
+        let owner = turn(OWNER_ROW);
+        let got = owner_turn(&store, Some(&owner)).expect("owner turn");
+        assert!(std::ptr::eq(got, &owner));
     }
 
     /// Two owner-turn writers released together by a barrier, each creating one of `paths`.
