@@ -2166,7 +2166,18 @@ async fn group_needs_check_marks_every_member() {
     gate.notify_one();
     bounded(d_task).await.unwrap();
     assert_eq!(h.row(d).state, State::NeedsCheck);
-    assert_eq!(h.prompts().len(), 2, "A and B's steer only");
+    // `try_steer` only queues B's frame; the shutdown may kill the child before it is
+    // written, so B's steer may or may not be in the log. D must never reach omp.
+    let bodies: Vec<String> = h
+        .prompts()
+        .iter()
+        .map(|p| p["message"].as_str().expect("prompt body").to_owned())
+        .collect();
+    assert_eq!(bodies.first().map(String::as_str), Some("A"));
+    assert!(
+        bodies.iter().all(|b| b == "A" || b == "B") && bodies.len() <= 2,
+        "only A and B's steer: {bodies:?}"
+    );
     h.close().await;
 }
 
