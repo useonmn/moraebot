@@ -7,11 +7,14 @@ use std::time::Duration;
 use moraebot::adapter::MessengerAdapter;
 use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
-use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
+use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError, STORE_FILE};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
+use moraebot::memory::history::{self, ACCEPT_REASON};
+use moraebot::memory::home::MemoryHome;
 use moraebot::slack::SlackAdapter;
+use moraebot::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
 
 /// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
@@ -32,6 +35,8 @@ Commands:
                                 Install the launchd agent (macOS)
   uninstall-launchd [--label LABEL]
                                 Remove the launchd agent
+  memory accept [--config PATH] [--reason TEXT] [PATH...]
+                                Record hand edits of memory files (stop the gateway first)
   --version, -V                 Print the version
 ";
 
@@ -58,6 +63,11 @@ enum Command {
     UninstallLaunchd {
         label: String,
     },
+    MemoryAccept {
+        config: Option<PathBuf>,
+        reason: Option<String>,
+        paths: Vec<String>,
+    },
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -73,6 +83,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "guide" => parse_messenger(name, rest).map(|messenger| Command::Guide { messenger }),
         "install-launchd" => parse_install_launchd(rest),
         "uninstall-launchd" => parse_uninstall_launchd(rest),
+        "memory" => parse_memory(rest),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -112,6 +123,34 @@ fn parse_install_launchd(args: &[String]) -> Result<Command, String> {
         config,
         label,
         dry_run,
+    })
+}
+
+fn parse_memory(args: &[String]) -> Result<Command, String> {
+    match args.split_first() {
+        Some((name, rest)) if name == "accept" => parse_memory_accept(rest),
+        Some((other, _)) => Err(format!("unknown memory command '{other}'")),
+        None => Err("memory needs a command: accept".to_string()),
+    }
+}
+
+fn parse_memory_accept(args: &[String]) -> Result<Command, String> {
+    let mut config = None;
+    let mut reason = None;
+    let mut paths = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(flag_value(&mut rest, arg)?)),
+            "--reason" => reason = Some(flag_value(&mut rest, arg)?),
+            flag if flag.starts_with("--") => return Err(format!("unexpected argument '{flag}'")),
+            path => paths.push(path.to_string()),
+        }
+    }
+    Ok(Command::MemoryAccept {
+        config,
+        reason,
+        paths,
     })
 }
 
@@ -193,6 +232,44 @@ fn install_launchd(
 fn uninstall_launchd(env: &Env, label: &str) -> Result<ExitCode, ConfigError> {
     launchd::uninstall(env, label, &mut io::stdout().lock())?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Records the owner's hand edits of memory files. Needs the inbox database, so it fails with
+/// `E_ALREADY_RUNNING` while a gateway holds it. Prints only paths, codes and the commit id.
+fn memory_accept(
+    env: &Env,
+    config: Option<PathBuf>,
+    reason: Option<String>,
+    paths: &[String],
+) -> Result<ExitCode, ConfigError> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    let outcome = Store::open(&config.home.join(STORE_FILE))
+        .map_err(|err| err.to_string())
+        .and_then(|mut store| {
+            history::accept(
+                &mut store,
+                &MemoryHome::new(&config.home),
+                paths,
+                reason.as_deref().unwrap_or(ACCEPT_REASON),
+            )
+            .map_err(|err| err.to_string())
+        });
+    match outcome {
+        Ok(accepted) => {
+            let line =
+                serde_json::json!({"committed": accepted.commit, "accepted": accepted.paths});
+            writeln!(io::stdout().lock(), "{line}")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Loads and validates the config, starts logging, then serves until a signal.
@@ -301,6 +378,11 @@ fn main() -> ExitCode {
             dry_run,
         } => install_launchd(&env, config, &label, dry_run),
         Command::UninstallLaunchd { label } => uninstall_launchd(&env, &label),
+        Command::MemoryAccept {
+            config,
+            reason,
+            paths,
+        } => memory_accept(&env, config, reason, &paths),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -365,6 +447,24 @@ mod tests {
             Ok(Command::Run { config: None })
         );
         assert_eq!(
+            parse_args(&args(&["memory", "accept"])),
+            Ok(Command::MemoryAccept {
+                config: None,
+                reason: None,
+                paths: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "memory", "accept", "--config", "c", "--reason", "r", "a.md", "b.md"
+            ])),
+            Ok(Command::MemoryAccept {
+                config: Some(PathBuf::from("c")),
+                reason: Some("r".to_string()),
+                paths: vec!["a.md".to_string(), "b.md".to_string()],
+            })
+        );
+        assert_eq!(
             parse_args(&args(&["check-config"])),
             Ok(Command::CheckConfig { config: None })
         );
@@ -392,6 +492,9 @@ mod tests {
             &["install-launchd", "--label"],
             &["install-launchd", "extra"],
             &["uninstall-launchd", "--dry-run"],
+            &["memory"],
+            &["memory", "nope"],
+            &["memory", "accept", "--reason"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
