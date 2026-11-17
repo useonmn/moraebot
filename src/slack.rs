@@ -154,10 +154,10 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     if event.get("type")?.as_str()? != "message" {
         return None;
     }
-    if let Some(subtype) = event.get("subtype") {
-        if !matches!(subtype.as_str(), Some("thread_broadcast" | "file_share")) {
-            return None;
-        }
+    if let Some(subtype) = event.get("subtype")
+        && !matches!(subtype.as_str(), Some("thread_broadcast" | "file_share"))
+    {
+        return None;
     }
     if event.get("bot_id").is_some() {
         return None;

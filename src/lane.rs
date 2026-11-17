@@ -487,11 +487,11 @@ impl LaneManager {
                     omp::kill_group(*check);
                 }
             }
-            if let Some(mut child) = set.children.remove(&job.id) {
-                if let Some(group) = child.kill.as_mut() {
-                    // The child was reaped by `close` above.
-                    group.disarm();
-                }
+            if let Some(mut child) = set.children.remove(&job.id)
+                && let Some(group) = child.kill.as_mut()
+            {
+                // The child was reaped by `close` above.
+                group.disarm();
             }
             if let Some(pid) = pid {
                 self.pids.send_modify(|pids| pids.retain(|p| *p != pid));

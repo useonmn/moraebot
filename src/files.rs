@@ -1156,7 +1156,7 @@ mod tests {
             Some("text/plain"),
             9,
         );
-        let json = serde_json::to_string(&[file.clone()]).unwrap();
+        let json = serde_json::to_string(std::slice::from_ref(&file)).unwrap();
         assert!(serde_json::from_str::<Vec<SavedFile>>(&json).unwrap() == [file.clone()]);
         assert!(!format!("{file:?}").contains("secret"));
         let out: OutFile =

@@ -285,7 +285,7 @@ async fn max_cost_adds_flag_only_when_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -304,7 +304,7 @@ async fn flag_present_when_hints_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok").with_hints("probe hints".into());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -320,7 +320,7 @@ async fn flag_present_when_hints_set() {
 async fn no_flag_when_hints_empty() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints(String::new());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -506,7 +506,7 @@ async fn reopen_checks_free_lease_then_prompts() {
 async fn fresh_conversation_skips_lease_check() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
     assert!(h.frames("get_session_lease").is_empty());
     assert_eq!(h.frames("open_session").len(), 1);
     manager.shutdown_all().await;
@@ -593,10 +593,7 @@ async fn lead_session_id_is_stored_and_lease_checked() {
 async fn killed_child_is_lost_then_respawned() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "first"))
-        .await
-        .main
-        .outcome;
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
     let pid = manager.child_pid().await.expect("live child");
     let killed = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])

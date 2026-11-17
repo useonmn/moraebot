@@ -333,13 +333,13 @@ impl Config {
                 "omp.turn_timeout_minutes must be greater than zero (omit it for no limit)",
             ));
         }
-        if let Some(cost) = omp.max_cost_usd {
-            if !(cost.is_finite() && cost > 0.0) {
-                return Err(ConfigError::new(
-                    E_CONFIG_VALUE,
-                    "omp.max_cost_usd must be greater than zero (omit it for no limit)",
-                ));
-            }
+        if let Some(cost) = omp.max_cost_usd
+            && !(cost.is_finite() && cost > 0.0)
+        {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "omp.max_cost_usd must be greater than zero (omit it for no limit)",
+            ));
         }
 
         let home = match file.home {
@@ -387,7 +387,7 @@ impl Config {
                 bot_token_file: Some(s.bot_token_file.clone()),
                 app_token_file: Some(s.app_token_file.clone()),
             }),
-            omp: has_omp_limits.then(|| OmpSection {
+            omp: has_omp_limits.then_some(OmpSection {
                 turn_timeout_minutes: self.omp.turn_timeout_minutes,
                 max_cost_usd: self.omp.max_cost_usd,
             }),
