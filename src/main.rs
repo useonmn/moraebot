@@ -32,6 +32,7 @@ Commands:
                                 Install the launchd agent (macOS)
   uninstall-launchd [--label LABEL]
                                 Remove the launchd agent
+  --version, -V                 Print the version
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,6 +269,10 @@ fn main() -> ExitCode {
     // Files this process creates (logs, launchd output) are owner-only.
     unsafe { libc::umask(0o077) };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("moraebot {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let command = match parse_args(&args) {
         Ok(command) => command,
         Err(message) => {
