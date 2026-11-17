@@ -1397,6 +1397,103 @@ async fn hand_edit_blocks_memory_writes() {
     manager.shutdown_all().await;
 }
 
+/// A secret-like value built at run time: `parts` joined, then `n` copies of `fill`, so no
+/// source line holds a whole token.
+fn fake(parts: &[&str], fill: char, n: usize) -> String {
+    let mut out = parts.concat();
+    out.extend(std::iter::repeat_n(fill, n));
+    out
+}
+
+#[tokio::test]
+async fn read_only_write_is_refused_through_the_lead() {
+    let h = Harness::new();
+    let ro = h.memory_file("notes/ro.md");
+    std::fs::create_dir_all(ro.parent().expect("parent")).expect("notes folder");
+    let text = "---\ndescription: d\nread_only: \"true\"\n---\nro-marker\n";
+    std::fs::write(&ro, text).expect("write read_only file");
+    let manager = h.memory_tools_manager(&[tool_call(
+        memory::MEMORY_STR_REPLACE_TOOL,
+        serde_json::json!({"path": "notes/ro.md", "old_string": "ro-marker", "new_string": "changed", "reason": "r"}),
+    )]);
+    bounded(manager.prompt(KEY_A, 1, "import")).await;
+    assert_eq!(h.memory_commits().len(), 1, "the import");
+
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_READ_ONLY),
+        "{results:?}"
+    );
+    assert_eq!(std::fs::read(&ro).expect("read_only file"), text.as_bytes());
+    assert_eq!(h.memory_commits().len(), 1, "no commit was added");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn secret_write_is_refused_through_the_lead() {
+    let h = Harness::new();
+    let key = fake(&["sk", "-"], 'a', 24);
+    let manager = h.memory_tools_manager(&[tool_call(
+        memory::MEMORY_CREATE_TOOL,
+        serde_json::json!({
+            "path": "notes/k.md",
+            "description": "d",
+            "body": format!("key {key}\n"),
+            "reason": "r"
+        }),
+    )]);
+    bounded(manager.prompt(KEY_A, 1, "import")).await;
+    assert_eq!(h.memory_commits().len(), 1, "the import");
+
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "tool result count");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_SECRET),
+        "not refused with the secret code"
+    );
+    assert!(!results[0].1.contains(&key), "refusal echoes the value");
+    assert!(!h.memory_file("notes/k.md").exists());
+    assert_eq!(h.memory_commits().len(), 1, "no commit was added");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn mis_closed_call_is_repaired_through_the_lead() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[tool_call(
+        memory::MEMORY_STR_REPLACE_TOOL,
+        serde_json::json!({
+            "path": memory::PERSONA,
+            "old_string": format!(
+                "{}</old_string>\n<parameter name=\"new_string\">repair-marker\n",
+                persona_seed_body()
+            ),
+            "reason": "r"
+        }),
+    )]);
+    bounded(manager.prompt(KEY_A, 1, "import")).await;
+    assert_eq!(h.memory_commits().len(), 1, "the import");
+
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let value: Value = serde_json::from_str(&results[0].1).expect("write result json");
+    assert_eq!(
+        value["repaired"],
+        serde_json::json!(["new_string"]),
+        "{value}"
+    );
+    let persona = std::fs::read_to_string(h.memory_file(memory::PERSONA)).expect("persona");
+    let body = frontmatter::parse(&persona).expect("persona parses").body;
+    assert_eq!(body, "repair-marker\n");
+    assert_eq!(h.memory_commits().len(), 2, "the import and the write");
+    manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn no_memory_means_unchanged_argv_and_tools() {
     let h = Harness::new();
