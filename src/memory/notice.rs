@@ -1,21 +1,355 @@
 //! What changed since the lead's block was pinned, and the notice lines that say so.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::{MEMORY_DIR, REFRESH_FILE};
+use super::history::Committed;
+use super::{
+    EXPIRES_KEY, MAX_NOTICE_PATHS, MEMORY_DIR, NOTICE_BEGIN, NOTICE_END, NUDGE_EVERY, REFRESH_FILE,
+    SOUL_PATHS, WRITER_LEAD, frontmatter, guard,
+};
+use crate::store::MemoryChangeRow;
+
+/// Unix seconds now; tests inject a fixed or stepped clock.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// The wall clock (`guard::unix_now`).
+pub fn system_clock() -> Clock {
+    Arc::new(guard::unix_now)
+}
+
+/// How one path changed over the notice window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Updated,
+    Removed,
+}
+
+impl ChangeKind {
+    /// The notice keyword: `added`, `updated` or `removed`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Updated => "updated",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// One path changed by a writer other than the lead since the last notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub path: String,
+    pub kind: ChangeKind,
+    pub writer: String,
+    pub commit: i64,
+}
+
+/// What one notice block says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notices {
+    pub compactions: u64,
+    pub owner_turns: Option<i64>,
+    pub changed: Vec<Changed>,
+    pub expired: Vec<String>,
+}
 
 /// `<home>/memory/.refresh`: the explicit refresh request, `home` being the moraebot home.
 pub fn refresh_file(home: &Path) -> PathBuf {
     home.join(MEMORY_DIR).join(REFRESH_FILE)
 }
 
+/// The non-lead changes in `rows` folded to one entry per path, sorted by path.
+pub fn changed(rows: &[MemoryChangeRow]) -> Vec<Changed> {
+    // Per path: the first row's `existed`, then the last row's `present`, writer and commit.
+    let mut folded: BTreeMap<&str, (bool, &MemoryChangeRow)> = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.writer != WRITER_LEAD) {
+        folded
+            .entry(row.path.as_str())
+            .and_modify(|(_, last)| *last = row)
+            .or_insert((row.existed, row));
+    }
+    folded
+        .into_iter()
+        .filter_map(|(path, (existed, last))| {
+            let kind = match (existed, last.present) {
+                (false, true) => ChangeKind::Added,
+                (true, true) => ChangeKind::Updated,
+                (true, false) => ChangeKind::Removed,
+                (false, false) => return None,
+            };
+            Some(Changed {
+                path: path.to_string(),
+                kind,
+                writer: last.writer.clone(),
+                commit: last.commit_id,
+            })
+        })
+        .collect()
+}
+
+/// The committed paths whose `expires` instant is in `(after, now]`, sorted by path.
+pub fn expired_between(committed: &Committed, after: i64, now: i64) -> Vec<String> {
+    committed
+        .files
+        .iter()
+        .filter(|(_, text)| {
+            frontmatter::parse(text).is_ok_and(|parsed| {
+                parsed
+                    .frontmatter
+                    .get(EXPIRES_KEY)
+                    .and_then(guard::expires_at)
+                    .is_some_and(|at| after < at && at <= now)
+            })
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Whether `owner_turns` without a lead save calls for a nudge line.
+pub fn nudge_due(owner_turns: i64) -> bool {
+    owner_turns > 0 && owner_turns % NUDGE_EVERY == 0
+}
+
+/// The notice block for `notices`, or `None` when it would have no line.
+pub fn block(notices: &Notices) -> Option<String> {
+    let mut lines = Vec::new();
+    if notices.compactions > 0 {
+        lines.push(format!("compaction count={}", notices.compactions));
+    }
+    if let Some(n) = notices.owner_turns.filter(|n| nudge_due(*n)) {
+        lines.push(format!("nudge owner_turns={n}"));
+    }
+    for c in notices
+        .changed
+        .iter()
+        .filter(|c| SOUL_PATHS.contains(&c.path.as_str()))
+    {
+        lines.push(format!(
+            "soul path={} writer={} commit={}",
+            quoted(&c.path),
+            c.writer,
+            c.commit
+        ));
+    }
+    for c in notices.changed.iter().take(MAX_NOTICE_PATHS) {
+        lines.push(format!(
+            "changed kind={} path={} writer={} commit={}",
+            c.kind.name(),
+            quoted(&c.path),
+            c.writer,
+            c.commit
+        ));
+    }
+    if notices.changed.len() > MAX_NOTICE_PATHS {
+        lines.push(format!(
+            "changed more={}",
+            notices.changed.len() - MAX_NOTICE_PATHS
+        ));
+    }
+    for path in notices.expired.iter().take(MAX_NOTICE_PATHS) {
+        lines.push(format!("expired path={}", quoted(path)));
+    }
+    if notices.expired.len() > MAX_NOTICE_PATHS {
+        lines.push(format!(
+            "expired more={}",
+            notices.expired.len() - MAX_NOTICE_PATHS
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = format!("{NOTICE_BEGIN}\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(NOTICE_END);
+    out.push('\n');
+    Some(out)
+}
+
+/// `input` with `block` right after its first line.
+pub fn insert(input: &str, block: &str) -> String {
+    match input.split_once('\n') {
+        Some((tag, rest)) => format!("{tag}\n{block}{rest}"),
+        None => format!("{input}\n{block}"),
+    }
+}
+
+fn quoted(path: &str) -> String {
+    serde_json::Value::from(path).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lead;
+    use crate::memory::{IDENTITY, PERSONA, WRITER_HUMAN};
+
+    fn row(
+        commit_id: i64,
+        writer: &str,
+        path: &str,
+        existed: bool,
+        present: bool,
+    ) -> MemoryChangeRow {
+        MemoryChangeRow {
+            commit_id,
+            writer: writer.to_string(),
+            path: path.to_string(),
+            existed,
+            present,
+        }
+    }
+
+    fn change(path: &str, kind: ChangeKind, commit: i64) -> Changed {
+        Changed {
+            path: path.to_string(),
+            kind,
+            writer: WRITER_HUMAN.to_string(),
+            commit,
+        }
+    }
 
     #[test]
     fn refresh_file_is_under_the_memory_root() {
         let home = Path::new("qa-mbhome");
         assert_eq!(refresh_file(home), home.join("memory").join(".refresh"));
+    }
+
+    #[test]
+    fn changed_drops_lead_and_folds_by_path() {
+        let rows = [
+            row(2, WRITER_LEAD, PERSONA, true, true),
+            row(3, WRITER_HUMAN, "notes/a.md", true, true),
+            row(4, WRITER_HUMAN, "notes/a.md", true, false),
+            row(5, WRITER_HUMAN, "notes/b.md", false, true),
+            row(6, WRITER_HUMAN, "notes/c.md", false, true),
+            row(7, WRITER_HUMAN, "notes/c.md", true, false),
+        ];
+        assert_eq!(
+            changed(&rows),
+            vec![
+                change("notes/a.md", ChangeKind::Removed, 4),
+                change("notes/b.md", ChangeKind::Added, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_window_is_half_open() {
+        let file = |expires: &str| format!("---\ndescription: d\nexpires: {expires}\n---\nbody\n");
+        let mut committed = Committed::default();
+        for (path, text) in [
+            ("notes/at100.md", file("1970-01-01T00:01:40Z")),
+            ("notes/at200.md", file("1970-01-01T00:03:20Z")),
+            ("notes/at300.md", file("1970-01-01T00:05:00Z")),
+            (
+                "notes/never.md",
+                "---\ndescription: d\n---\nbody\n".to_string(),
+            ),
+            (
+                "notes/bad.md",
+                "no frontmatter\nexpires: 1970-01-01T00:03:20Z\n".to_string(),
+            ),
+        ] {
+            committed.files.insert(path.to_string(), text);
+        }
+        assert_eq!(
+            expired_between(&committed, 100, 300),
+            vec!["notes/at200.md".to_string(), "notes/at300.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn nudge_every_ten() {
+        for n in [0, 1, 9, 11] {
+            assert!(!nudge_due(n), "{n}");
+        }
+        for n in [10, 20, 30] {
+            assert!(nudge_due(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn block_is_none_when_empty() {
+        assert_eq!(block(&Notices::default()), None);
+        let quiet = Notices {
+            compactions: 0,
+            owner_turns: Some(9),
+            ..Notices::default()
+        };
+        assert_eq!(block(&quiet), None);
+    }
+
+    #[test]
+    fn block_bytes_in_order() {
+        let notices = Notices {
+            compactions: 2,
+            owner_turns: Some(10),
+            changed: vec![
+                change(IDENTITY, ChangeKind::Updated, 7),
+                change(PERSONA, ChangeKind::Updated, 7),
+            ],
+            expired: vec!["notes/x y.md".to_string()],
+        };
+        let expected = concat!(
+            "[moraebot memory-notice]\n",
+            "compaction count=2\n",
+            "nudge owner_turns=10\n",
+            "soul path=\"system/identity.md\" writer=human commit=7\n",
+            "soul path=\"system/persona.md\" writer=human commit=7\n",
+            "changed kind=updated path=\"system/identity.md\" writer=human commit=7\n",
+            "changed kind=updated path=\"system/persona.md\" writer=human commit=7\n",
+            "expired path=\"notes/x y.md\"\n",
+            "[moraebot memory-notice end]\n",
+        );
+        assert_eq!(block(&notices).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn block_caps_paths_at_twenty() {
+        let notices = Notices {
+            changed: (0..23)
+                .map(|i| change(&format!("notes/c{i:02}.md"), ChangeKind::Added, i + 1))
+                .collect(),
+            expired: (0..21).map(|i| format!("notes/e{i:02}.md")).collect(),
+            ..Notices::default()
+        };
+        let text = block(&notices).expect("block");
+        let lines: Vec<&str> = text.lines().collect();
+        let count = |prefix: &str| lines.iter().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(count("changed kind="), 20);
+        assert_eq!(count("expired path="), 20);
+        assert_eq!(count("changed more="), 1);
+        assert_eq!(count("expired more="), 1);
+        assert!(lines.contains(&"changed more=3"));
+        assert!(lines.contains(&"expired more=1"));
+        assert!(lines.contains(&"changed kind=added path=\"notes/c19.md\" writer=human commit=20"));
+        assert!(!lines.iter().any(|l| l.contains("notes/c20.md")));
+        assert!(!lines.iter().any(|l| l.contains("notes/e20.md")));
+        assert_eq!(lines.first(), Some(&NOTICE_BEGIN));
+        assert_eq!(lines.last(), Some(&NOTICE_END));
+    }
+
+    #[test]
+    fn insert_goes_after_the_tag_line() {
+        let b = "[moraebot memory-notice]\ncompaction count=1\n[moraebot memory-notice end]\n";
+        let tag = "[moraebot conversation=k message=1]\n";
+        let out = insert(&format!("{tag}hi"), b);
+        assert_eq!(out, format!("{tag}{b}hi"));
+        let parsed = lead::parse_tag(&out).expect("tag");
+        assert_eq!(parsed.message, Some(1));
+        assert_eq!(insert("tag", b), format!("tag\n{b}"));
+    }
+
+    #[test]
+    fn system_clock_is_unix_now() {
+        let before = guard::unix_now();
+        let now = system_clock()();
+        assert!((now - before).abs() <= 5, "{before} {now}");
     }
 }
