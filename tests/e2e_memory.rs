@@ -1509,3 +1509,182 @@ async fn memory_pressure_through_the_gateway() {
         );
     }
 }
+
+#[tokio::test]
+async fn people_and_patches_through_the_gateway() {
+    const CARD: &str = "---\ndescription: About Kim\nkind: person\n---\nIDENTITY: Kim\nATTRIBUTE: works on the build\n";
+    let mut rig = Rig::new();
+    let add_two = "*** Begin Patch\n\
+                   *** Add File: people/kim/card.md\n\
+                   +---\n\
+                   +description: About Kim\n\
+                   +kind: person\n\
+                   +---\n\
+                   +IDENTITY: Kim\n\
+                   +ATTRIBUTE: works on the build\n\
+                   *** Add File: notes/kim.md\n\
+                   +---\n\
+                   +description: notes on Kim\n\
+                   +---\n\
+                   +met in the build channel\n\
+                   *** End Patch";
+    let move_and_edit = "*** Begin Patch\n\
+                         *** Update File: notes/kim.md\n\
+                         *** Move to: notes/kim-notes.md\n\
+                         @@\n\
+                         -met in the build channel\n\
+                         +met in the release channel\n\
+                         *** End Patch";
+    let one_bad_hunk = "*** Begin Patch\n\
+                        *** Add File: notes/later.md\n\
+                        +---\n\
+                        +description: later\n\
+                        +---\n\
+                        +a later note\n\
+                        *** Update File: notes/kim-notes.md\n\
+                        @@\n\
+                        -not in the file\n\
+                        *** End Patch";
+    let patch = |text: &str| {
+        json!({
+            "tool": memory::MEMORY_APPLY_PATCH_TOOL,
+            "arguments": {"patch": text, "reason": "r"}
+        })
+    };
+    let observe = |slug: &str, text: &str| {
+        json!({
+            "tool": memory::MEMORY_OBSERVE_TOOL,
+            "arguments": {"slug": slug, "text": text, "reason": "r"}
+        })
+    };
+    let calls = [
+        patch(add_two),
+        patch(move_and_edit),
+        patch(one_bad_hunk),
+        observe("kim", "likes tea"),
+        observe("kim", "Likes tea"),
+        observe("human", "prefers short replies"),
+    ]
+    .map(|call| call.to_string())
+    .join("\n");
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &calls)],
+        )
+        .expect("open gateway"),
+    );
+    adapter.inject(dm("1300000000000000061", "run-tools")).await;
+    bounded(adapter.wait_for_send(1)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids and counts only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(leads.len(), 1, "a lead write does not restart the lead");
+
+    let frames = rig.tap.tool_frames_after(0);
+    let names = frames.first().expect("the lead frame");
+    let at = names
+        .iter()
+        .position(|name| name == memory::MEMORY_APPLY_PATCH_TOOL)
+        .expect("apply_patch registered");
+    assert_eq!(names[at - 1], memory::ONBOARDING_FINISH_TOOL, "{names:?}");
+    assert_eq!(names[at + 1], memory::MEMORY_OBSERVE_TOOL, "{names:?}");
+    assert!(
+        names[at + 2..]
+            .iter()
+            .all(|name| !name.starts_with("memory_")),
+        "{names:?}"
+    );
+
+    let frames: Vec<Value> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "host_tool_result")
+        .collect();
+    println!("host_tool_results={}", frames.len());
+    assert_eq!(frames.len(), 6, "{frames:?}");
+    let errors: Vec<bool> = frames
+        .iter()
+        .map(|frame| frame["isError"] == true)
+        .collect();
+    assert_eq!(
+        errors,
+        [false, false, true, false, false, false],
+        "{frames:?}"
+    );
+    let texts: Vec<&str> = frames
+        .iter()
+        .map(|frame| {
+            frame["result"]["content"][0]["text"]
+                .as_str()
+                .expect("result text")
+        })
+        .collect();
+    assert!(
+        texts[2].starts_with(&format!("{}:", memory::E_MEMORY_PATCH)),
+        "{texts:?}"
+    );
+    let json_of = |at: usize| -> Value { serde_json::from_str(texts[at]).expect("result JSON") };
+    assert_eq!(
+        json_of(0)["paths"],
+        json!(["notes/kim.md", "people/kim/card.md"])
+    );
+    assert_eq!(
+        json_of(1)["paths"],
+        json!(["notes/kim-notes.md", "notes/kim.md"])
+    );
+    for (at, n) in [(3, 1), (4, 2), (5, 1)] {
+        assert_eq!(json_of(at)["n"], json!(n), "result {}", at + 1);
+    }
+
+    let read = |rel: &str| std::fs::read_to_string(rig.memory_file(rel)).expect("memory file");
+    assert_eq!(
+        std::fs::read(rig.memory_file("people/kim/card.md")).expect("card"),
+        CARD.as_bytes()
+    );
+    assert!(!rig.memory_file("notes/kim.md").exists());
+    assert!(!rig.memory_file("notes/later.md").exists());
+    assert!(read("notes/kim-notes.md").ends_with("met in the release channel\n"));
+    let observations = read("people/kim/observations.md");
+    let entries: Vec<&str> = observations
+        .lines()
+        .filter(|line| line.starts_with("- ["))
+        .collect();
+    assert_eq!(entries.len(), 1, "{observations}");
+    assert!(
+        entries[0].ends_with("] likes tea <!-- n=2 -->"),
+        "{observations}"
+    );
+    let human = read(memory::HUMAN);
+    let headings = human
+        .lines()
+        .filter(|line| *line == memory::EXPLICIT_SECTION)
+        .count();
+    assert_eq!(headings, 1, "{human}");
+    let entries: Vec<&str> = human
+        .lines()
+        .filter(|line| line.starts_with("- ["))
+        .collect();
+    assert_eq!(entries.len(), 1, "{human}");
+    assert!(
+        entries[0].ends_with("] prefers short replies <!-- n=1 -->"),
+        "{human}"
+    );
+
+    let commits = open_store(&rig).memory_commits().expect("commits");
+    let lead_commits = commits
+        .iter()
+        .filter(|row| row.commit.writer == memory::WRITER_LEAD)
+        .count();
+    println!("lead commits={lead_commits}");
+    assert_eq!(lead_commits, 5, "patches 1 and 2 and three observes");
+}
