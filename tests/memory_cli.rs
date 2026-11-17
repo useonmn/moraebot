@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use moraebot::gateway::STORE_FILE;
 use moraebot::memory::history::{self, ACCEPT_REASON};
 use moraebot::memory::home::MemoryHome;
-use moraebot::memory::{E_MEMORY_FRONTMATTER, WRITER_HUMAN};
+use moraebot::memory::{E_MEMORY_FRONTMATTER, E_MEMORY_LAYOUT, WRITER_HUMAN, notice};
 use moraebot::store::{E_ALREADY_RUNNING, Store};
 
 const PERSONA: &str = "system/persona.md";
@@ -85,6 +85,15 @@ impl Rig {
             .expect("run accept")
     }
 
+    fn refresh(&self, extra: &[&str]) -> Output {
+        moraebot(&self.home)
+            .args(["memory", "refresh", "--config"])
+            .arg(self.home.join("config.toml"))
+            .args(extra)
+            .output()
+            .expect("run refresh")
+    }
+
     fn store(&self) -> Store {
         Store::open(&self.home.join(STORE_FILE)).expect("store")
     }
@@ -136,6 +145,38 @@ fn accept_refuses_while_the_store_is_held() {
     let output = rig.accept(&[]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).starts_with(E_ALREADY_RUNNING));
+}
+
+#[test]
+fn refresh_writes_the_request_file() {
+    let rig = Rig::new();
+    let output = rig.refresh(&[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"refresh": "requested"})
+    );
+    let meta = fs::metadata(notice::refresh_file(&rig.home)).expect("request file");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn refresh_works_while_the_store_is_held() {
+    let rig = Rig::new();
+    let _held = rig.store();
+    let output = rig.refresh(&[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(notice::refresh_file(&rig.home).exists());
+}
+
+#[test]
+fn refresh_without_memory_folder_is_coded() {
+    let rig = Rig::new();
+    fs::remove_dir_all(rig.home.join("memory")).expect("remove memory folder");
+    let output = rig.refresh(&[]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with(&format!("{E_MEMORY_LAYOUT}:")));
+    assert!(!rig.home.join("memory").exists());
 }
 
 #[test]

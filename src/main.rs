@@ -1,4 +1,6 @@
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,6 +15,8 @@ use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::memory::history::{self, ACCEPT_REASON};
 use moraebot::memory::home::MemoryHome;
+use moraebot::memory::notice;
+use moraebot::memory::{E_MEMORY_LAYOUT, E_MEMORY_WRITE};
 use moraebot::slack::SlackAdapter;
 use moraebot::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -37,6 +41,7 @@ Commands:
                                 Remove the launchd agent
   memory accept [--config PATH] [--reason TEXT] [PATH...]
                                 Record hand edits of memory files (stop the gateway first)
+  memory refresh [--config PATH]   Re-pin the running lead's memory before its next message
   --version, -V                 Print the version
 ";
 
@@ -67,6 +72,9 @@ enum Command {
         config: Option<PathBuf>,
         reason: Option<String>,
         paths: Vec<String>,
+    },
+    MemoryRefresh {
+        config: Option<PathBuf>,
     },
 }
 
@@ -129,8 +137,9 @@ fn parse_install_launchd(args: &[String]) -> Result<Command, String> {
 fn parse_memory(args: &[String]) -> Result<Command, String> {
     match args.split_first() {
         Some((name, rest)) if name == "accept" => parse_memory_accept(rest),
+        Some((name, rest)) if name == "refresh" => parse_memory_refresh(rest),
         Some((other, _)) => Err(format!("unknown memory command '{other}'")),
-        None => Err("memory needs a command: accept".to_string()),
+        None => Err("memory needs a command: accept or refresh".to_string()),
     }
 }
 
@@ -152,6 +161,10 @@ fn parse_memory_accept(args: &[String]) -> Result<Command, String> {
         reason,
         paths,
     })
+}
+
+fn parse_memory_refresh(args: &[String]) -> Result<Command, String> {
+    parse_config_flag(args).map(|config| Command::MemoryRefresh { config })
 }
 
 fn parse_uninstall_launchd(args: &[String]) -> Result<Command, String> {
@@ -272,6 +285,36 @@ fn memory_accept(
     }
 }
 
+/// Asks the running lead to re-pin its memory before its next message by creating the request
+/// file. It never opens the store, so it works while a gateway holds it.
+fn memory_refresh(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigError> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    if !config.home.join(moraebot::memory::MEMORY_DIR).is_dir() {
+        eprintln!("{E_MEMORY_LAYOUT}: memory folder missing; start the gateway once");
+        return Ok(ExitCode::FAILURE);
+    }
+    let request = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(notice::refresh_file(&config.home));
+    if let Err(err) = request {
+        eprintln!("{E_MEMORY_WRITE}: {:?}", err.kind());
+        return Ok(ExitCode::FAILURE);
+    }
+    writeln!(
+        io::stdout().lock(),
+        "{}",
+        serde_json::json!({"refresh": "requested"})
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Loads and validates the config, starts logging, then serves until a signal.
 fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = match config {
@@ -383,6 +426,7 @@ fn main() -> ExitCode {
             reason,
             paths,
         } => memory_accept(&env, config, reason, &paths),
+        Command::MemoryRefresh { config } => memory_refresh(&env, config),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -465,6 +509,16 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_args(&args(&["memory", "refresh"])),
+            Ok(Command::MemoryRefresh { config: None })
+        );
+        assert_eq!(
+            parse_args(&args(&["memory", "refresh", "--config", "c"])),
+            Ok(Command::MemoryRefresh {
+                config: Some(PathBuf::from("c"))
+            })
+        );
+        assert_eq!(
             parse_args(&args(&["check-config"])),
             Ok(Command::CheckConfig { config: None })
         );
@@ -495,6 +549,9 @@ mod tests {
             &["memory"],
             &["memory", "nope"],
             &["memory", "accept", "--reason"],
+            &["memory", "refresh", "x"],
+            &["memory", "refresh", "--config"],
+            &["memory", "refresh", "--reason", "r"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
