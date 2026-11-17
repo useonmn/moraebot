@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::frontmatter;
 use super::home::{MemoryError, MemoryHome};
 use super::{
     BEGIN, E_MEMORY_ARGS, E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY,
     E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_PROTECTED, E_MEMORY_PROVENANCE, E_MEMORY_WRITE,
     END, MAX_FILE_BYTES, MAX_REASON_CHARS, PROTECTED, WRITER_HUMAN, WRITER_IMPORT,
 };
+use super::{frontmatter, guard};
 use crate::store::{MemoryChange, MemoryCommit, Store, StoreError};
 
 /// The reason of the one commit that imports the files found at the first start.
@@ -107,7 +107,8 @@ pub fn dirty(home: &MemoryHome, committed: &Committed) -> Result<Vec<String>, Me
 }
 
 /// The shared checks of a new file text: size, NUL and block sentinels, then frontmatter, then
-/// an unchanged `provenance` against `previous` (an unparsable previous text has none).
+/// an unchanged `provenance` against `previous` (an unparsable previous text has none), then
+/// the secret table over the whole text.
 pub fn check_text(text: &str, previous: Option<&str>) -> Result<(), MemoryError> {
     if text.len() as u64 > MAX_FILE_BYTES {
         return Err(refused(E_MEMORY_FILE, "too large"));
@@ -126,10 +127,11 @@ pub fn check_text(text: &str, previous: Option<&str>) -> Result<(), MemoryError>
     if parsed.frontmatter.get("provenance") != before.as_deref() {
         return Err(refused(E_MEMORY_PROVENANCE, "provenance cannot be changed"));
     }
-    Ok(())
+    guard::refuse_secret("text", text)
 }
 
-/// A write reason: one non-blank line of at most `MAX_REASON_CHARS` characters.
+/// A write reason: one non-blank line of at most `MAX_REASON_CHARS` characters that does not
+/// look like a secret.
 pub fn check_reason(reason: &str) -> Result<(), MemoryError> {
     if reason.trim().is_empty() {
         return Err(refused(E_MEMORY_ARGS, "reason is empty"));
@@ -143,7 +145,7 @@ pub fn check_reason(reason: &str) -> Result<(), MemoryError> {
             format!("reason is longer than {MAX_REASON_CHARS} characters"),
         ));
     }
-    Ok(())
+    guard::refuse_secret("reason", reason)
 }
 
 /// Records one commit, then writes its changes to the working files, then marks it applied.
@@ -172,8 +174,9 @@ pub fn record(
 }
 
 /// Records the owner's hand edits of `paths` (every dirty path when empty) as one commit by
-/// the human writer. Every selected path must pass the text checks; the first refusal stops
-/// everything and nothing is recorded.
+/// the human writer. Every selected path must pass the text checks, and an untracked path on
+/// disk must not look like a secret; the first refusal stops everything and nothing is
+/// recorded. `read_only` does not apply here: the owner may change any file.
 pub fn accept(
     store: &mut Store,
     home: &MemoryHome,
@@ -199,6 +202,9 @@ pub fn accept(
     let mut changes: Vec<MemoryChange> = Vec::new();
     for path in &selected {
         if !committed.files.contains_key(path) {
+            if std::fs::symlink_metadata(home.root().join(path)).is_ok() {
+                guard::refuse_secret("path", path)?;
+            }
             check_spelling(home, &committed, path)?;
         }
         let previous = committed.files.get(path).map(String::as_str);
@@ -286,7 +292,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::memory::{HUMAN, PERSONA};
+    use crate::memory::{E_MEMORY_SECRET, HUMAN, PERSONA};
 
     const NOTE: &str = "---\ndescription: a note\n---\nv2-marker\n";
 
@@ -584,6 +590,23 @@ mod tests {
         }
         check_text(owner, Some(owner)).expect("unchanged provenance");
         check_text(plain, Some("not frontmatter")).expect("unparsable previous");
+
+        let pem = ["-----BEGIN ", "EC PRIVATE", " KEY-----"].concat();
+        let secret = format!("---\ndescription: d\n---\n{pem}\n");
+        let err = check_text(&secret, None).expect_err("secret");
+        assert_eq!(err.code, E_MEMORY_SECRET);
+        assert!(!err.detail.contains(&pem));
+        assert_eq!(
+            check_text(&format!("{pem}\n"), None)
+                .expect_err("frontmatter first")
+                .code,
+            E_MEMORY_FRONTMATTER
+        );
+        let big_secret = format!("{secret}{}", "a".repeat(MAX_FILE_BYTES as usize));
+        assert_eq!(
+            check_text(&big_secret, None).expect_err("size first").code,
+            E_MEMORY_FILE
+        );
     }
 
     #[test]
@@ -593,6 +616,136 @@ mod tests {
             assert_eq!(check_reason(reason).expect_err(reason).code, E_MEMORY_ARGS);
         }
         check_reason(&"a".repeat(MAX_REASON_CHARS)).expect("200 characters");
+
+        let key = fake(&["AK", "IA"], 'A', 16);
+        let err = check_reason(&format!("note {key}")).expect_err("secret");
+        assert_eq!(err.code, E_MEMORY_SECRET);
+        assert!(!err.detail.contains(&key));
+        let long_secret = format!("{key} {}", "a".repeat(MAX_REASON_CHARS));
+        assert_eq!(
+            check_reason(&long_secret).expect_err("length first").code,
+            E_MEMORY_ARGS
+        );
+    }
+
+    /// A secret-like value built at run time: `parts` joined, then `n` copies of `fill`, so no
+    /// source line holds a whole token.
+    fn fake(parts: &[&str], fill: char, n: usize) -> String {
+        let mut out = parts.concat();
+        out.extend(std::iter::repeat_n(fill, n));
+        out
+    }
+
+    #[test]
+    fn accept_refuses_secrets_and_records_nothing() {
+        let (_dir, mut store, home) = laid_out();
+        prepare(&mut store, &home).expect("prepare");
+        let sk = fake(&["sk", "-"], 'a', 24);
+        let persona = format!("---\ndescription: by hand\n---\nkey {sk}\n");
+        put(&home, PERSONA, persona.as_bytes());
+        for paths in [Vec::new(), strings(&[PERSONA])] {
+            let err = accept(&mut store, &home, &paths, ACCEPT_REASON).expect_err("secret");
+            assert_eq!(err.code, E_MEMORY_SECRET, "{paths:?}");
+            assert!(!err.detail.contains(&sk));
+            assert_eq!(count(&store), 1);
+        }
+        let gh_path = format!("notes/{}.md", fake(&["gh", "p_"], 'A', 36));
+        put(&home, &gh_path, NOTE.as_bytes());
+        let before = bytes_under(home.root());
+        let err = accept(&mut store, &home, &strings(&[&gh_path]), ACCEPT_REASON)
+            .expect_err("secret path");
+        assert_eq!(err.code, E_MEMORY_SECRET);
+        assert!(!err.detail.contains(&gh_path["notes/".len()..]));
+        assert_eq!(count(&store), 1);
+        assert_eq!(bytes_under(home.root()), before);
+    }
+
+    #[test]
+    fn accept_removes_secret_like_path() {
+        let (_dir, mut store, home) = laid_out();
+        let sk_path = format!(
+            "notes/{}.md",
+            fake(&["sk", "-", "learn-pipeline-"], 'x', 12)
+        );
+        put(&home, &sk_path, NOTE.as_bytes());
+        let imported = prepare(&mut store, &home).expect("import");
+        assert!(imported.files.contains_key(&sk_path));
+        std::fs::remove_file(home.root().join(&sk_path)).expect("delete by hand");
+        let accepted = accept(&mut store, &home, &[], ACCEPT_REASON).expect("accept");
+        assert_eq!(accepted.paths, strings(&[&sk_path]));
+        let row = store.memory_commits().expect("commits").pop().expect("row");
+        assert_eq!(Some(row.id), accepted.commit);
+        assert_eq!(row.commit.writer, WRITER_HUMAN);
+        assert_eq!(
+            store.memory_snapshots(row.id).expect("snapshots"),
+            vec![(sk_path.clone(), None)]
+        );
+        let committed = committed(&store).expect("committed");
+        assert!(dirty(&home, &committed).expect("dirty").is_empty());
+
+        assert_eq!(
+            store
+                .admit("test", "m1", "k1", "chan1", "111", "hi")
+                .expect("admit"),
+            crate::store::Admitted::New(1)
+        );
+        let store = std::sync::Mutex::new(store);
+        let turn = crate::omp::TurnContext {
+            row_id: 1,
+            conversation_key: "k1".to_string(),
+        };
+        let edit = crate::memory::write::Edit::Create {
+            path: "notes/c.md".to_string(),
+            description: "c".to_string(),
+            body: "c".to_string(),
+        };
+        crate::memory::write::apply(&store, &home, Some(&turn), edit, "after accept")
+            .expect("lead write after accept");
+    }
+
+    #[test]
+    fn accept_changes_read_only_files() {
+        let (_dir, mut store, home) = laid_out();
+        put(
+            &home,
+            "notes/ro.md",
+            b"---\ndescription: locked\nread_only: \"true\"\n---\nbody\n",
+        );
+        prepare(&mut store, &home).expect("prepare");
+        let edited = "---\ndescription: locked\nread_only: \"true\"\n---\nby hand\n";
+        assert!(guard::is_read_only(edited));
+        put(&home, "notes/ro.md", edited.as_bytes());
+        let accepted = accept(&mut store, &home, &[], ACCEPT_REASON).expect("accept");
+        let id = accepted.commit.expect("commit");
+        let row = store.memory_commits().expect("commits").pop().expect("row");
+        assert_eq!(row.id, id);
+        assert_eq!(row.commit.writer, WRITER_HUMAN);
+        assert_eq!(
+            store.memory_snapshots(id).expect("snapshots"),
+            vec![("notes/ro.md".to_string(), Some(edited.to_string()))]
+        );
+    }
+
+    #[test]
+    fn import_keeps_files_as_found() {
+        let (_dir, mut store, home) = laid_out();
+        let text = format!(
+            "---\ndescription: s\n---\n{}\n",
+            fake(&["pass", "word="], 'q', 12)
+        );
+        assert!(guard::find_secret(&text).is_some());
+        put(&home, "notes/s.md", text.as_bytes());
+        let committed = prepare(&mut store, &home).expect("import");
+        assert_eq!(committed.files.get("notes/s.md"), Some(&text));
+        let row = store.memory_commits().expect("commits").pop().expect("row");
+        assert_eq!(row.commit.writer, WRITER_IMPORT);
+        assert!(
+            store
+                .memory_snapshots(row.id)
+                .expect("snapshots")
+                .contains(&("notes/s.md".to_string(), Some(text.clone())))
+        );
+        assert!(dirty(&home, &committed).expect("dirty").is_empty());
     }
 
     #[test]

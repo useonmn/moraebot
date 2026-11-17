@@ -3,13 +3,14 @@
 use std::sync::Mutex;
 
 use super::frontmatter::{self, Frontmatter, render_frontmatter};
+use super::guard;
 use super::history::{self, Committed};
 use super::home::{MemoryError, MemoryHome};
 use super::{
     E_MEMORY_ARGS, E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY,
     E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH,
-    E_MEMORY_PROTECTED, MAX_DIRTY_LISTED, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL,
-    MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
+    E_MEMORY_PROTECTED, E_MEMORY_READ_ONLY, MAX_DIRTY_LISTED, MEMORY_CREATE_TOOL,
+    MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
     MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, WRITER_LEAD,
 };
 use crate::omp::{TurnContext, lock};
@@ -111,7 +112,8 @@ fn refused(code: &'static str, detail: impl Into<String>) -> MemoryError {
 
 /// Checks `edit` against the running turn, the paths, the history and the new text, then
 /// records it as one lead commit and applies it to the working files. The store stays locked
-/// from the origin check to the end, so writers never interleave.
+/// from the origin check to the end, so writers never interleave. A path that looks like a
+/// secret is logged as `-`.
 pub fn apply(
     store: &Mutex<Store>,
     home: &MemoryHome,
@@ -120,7 +122,10 @@ pub fn apply(
     reason: &str,
 ) -> Result<Applied, MemoryError> {
     let tool = edit.tool();
-    let path = edit.path().to_string();
+    let path = match guard::find_secret(edit.path()) {
+        Some(_) => "-".to_string(),
+        None => edit.path().to_string(),
+    };
     let result = run(store, home, turn, edit, reason);
     match &result {
         Ok(applied) => {
@@ -173,6 +178,7 @@ fn run(
     }
 
     check_existence(home, &committed, &edit)?;
+    check_read_only(&committed, &edit)?;
 
     let (changes, previous): (Vec<MemoryChange>, Vec<Option<String>>) =
         new_texts(&committed, &edit)?.into_iter().unzip();
@@ -211,8 +217,10 @@ fn run(
     })
 }
 
-/// Step 3: every named path is plain ASCII and passes the path rules, a rename moves the file
-/// somewhere else, and the persona and the owner card are neither deleted nor renamed.
+/// Step 3: every named path is plain ASCII and passes the path rules, a path that would newly
+/// hold text (the `Create` path, the `Rename` target) does not look like a secret, a rename
+/// moves the file somewhere else, and the persona and the owner card are neither deleted nor
+/// renamed.
 fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
     let files: Vec<&str> = match edit {
         Edit::Delete { path } if !path.ends_with(".md") => {
@@ -226,6 +234,11 @@ fn check_paths(home: &MemoryHome, edit: &Edit) -> Result<(), MemoryError> {
     for path in files {
         plain_ascii(path)?;
         home.resolve(path)?;
+    }
+    match edit {
+        Edit::Create { path, .. } => guard::refuse_secret("path", path)?,
+        Edit::Rename { new_path, .. } => guard::refuse_secret("path", new_path)?,
+        _ => {}
     }
     if let Edit::Rename { old_path, new_path } = edit
         && old_path == new_path
@@ -332,6 +345,28 @@ fn check_absent(home: &MemoryHome, committed: &Committed, target: &str) -> Resul
     home.exact_spelling(target)
 }
 
+/// Step 7: no committed path the edit would change or remove is marked `read_only` in its
+/// committed text. `Create` and the `Rename` target name uncommitted paths.
+fn check_read_only(committed: &Committed, edit: &Edit) -> Result<(), MemoryError> {
+    let paths: Vec<&str> = match edit {
+        Edit::Create { .. } => Vec::new(),
+        Edit::Delete { path } if !path.ends_with(".md") => under(committed, path)
+            .into_iter()
+            .map(String::as_str)
+            .collect(),
+        other => vec![other.path()],
+    };
+    match paths.into_iter().find(|path| {
+        committed
+            .files
+            .get(*path)
+            .is_some_and(|text| guard::is_read_only(text))
+    }) {
+        Some(path) => Err(refused(E_MEMORY_READ_ONLY, format!("{path}: read_only"))),
+        None => Ok(()),
+    }
+}
+
 /// The committed paths inside the folder `dir`.
 fn under<'a>(committed: &'a Committed, dir: &str) -> Vec<&'a String> {
     let prefix = format!("{dir}/");
@@ -342,7 +377,7 @@ fn under<'a>(committed: &'a Committed, dir: &str) -> Vec<&'a String> {
         .collect()
 }
 
-/// Step 7: every change of `edit`, each with the text its `provenance` is compared against.
+/// Step 8: every change of `edit`, each with the text its `provenance` is compared against.
 fn new_texts(
     committed: &Committed,
     edit: &Edit,
@@ -443,7 +478,8 @@ mod tests {
     use super::*;
     use crate::memory::home::HUMAN_SEED;
     use crate::memory::{
-        E_MEMORY_FILE, E_MEMORY_PROVENANCE, END, HUMAN, MAX_FILE_BYTES, MAX_REASON_CHARS, PERSONA,
+        E_MEMORY_FILE, E_MEMORY_PROVENANCE, E_MEMORY_SECRET, END, HUMAN, MAX_FILE_BYTES,
+        MAX_REASON_CHARS, PERSONA,
     };
     use crate::store::{Admitted, LaneStart, LaneState, MemoryCommitRow};
 
@@ -489,6 +525,11 @@ mod tests {
     /// A home with the seeds and the notes a, b and p, imported, plus an owner row (id 1) and
     /// a lane-result row (id 2) in the inbox.
     fn fx() -> Fx {
+        fx_with(&[])
+    }
+
+    /// `fx` with `extra` files written before the import.
+    fn fx_with(extra: &[(&str, &str)]) -> Fx {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
         assert_eq!(
@@ -513,6 +554,9 @@ mod tests {
         let home = MemoryHome::new(dir.path());
         home.ensure_layout().expect("layout");
         for (rel, text) in [("notes/a.md", A), ("notes/b.md", B), ("notes/p.md", P)] {
+            put(&home, rel, text);
+        }
+        for (rel, text) in extra {
             put(&home, rel, text);
         }
         history::prepare(&mut store, &home).expect("import");
@@ -826,14 +870,202 @@ mod tests {
     }
 
     /// Asserts that the edit is refused with `code` and that neither a memory file nor the
-    /// commit count changed.
-    fn assert_refused(fx: &Fx, row: Option<i64>, edit: Edit, reason: &str, code: &str) {
+    /// commit count changed; returns the refusal.
+    fn assert_refused(
+        fx: &Fx,
+        row: Option<i64>,
+        edit: Edit,
+        reason: &str,
+        code: &str,
+    ) -> MemoryError {
         let before = (bytes_under(fx.home.root()), fx.commits().len());
         let turn = row.map(turn);
         let err = apply(&fx.store, &fx.home, turn.as_ref(), edit.clone(), reason).expect_err(code);
         assert_eq!(err.code, code, "{edit:?}");
         let after = (bytes_under(fx.home.root()), fx.commits().len());
         assert_eq!(after, before, "{code} {edit:?}");
+        err
+    }
+
+    /// A secret-like value built at run time: `parts` joined, then `n` copies of `fill`, so no
+    /// source line holds a whole token.
+    fn fake(parts: &[&str], fill: char, n: usize) -> String {
+        let mut out = parts.concat();
+        out.extend(std::iter::repeat_n(fill, n));
+        out
+    }
+
+    fn sk_key() -> String {
+        fake(&["sk", "-"], 'a', 24)
+    }
+
+    fn github_token() -> String {
+        fake(&["gh", "p_"], 'A', 36)
+    }
+
+    fn private_key_header() -> String {
+        ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat()
+    }
+
+    /// Asserts that `err` is a secret refusal of `class` whose detail does not hold the
+    /// matched bytes of `secret`.
+    fn assert_no_echo(err: &MemoryError, secret: &str, class: guard::SecretClass) {
+        assert_eq!(err.code, E_MEMORY_SECRET);
+        let found = guard::find_secret(secret).expect("a secret");
+        assert_eq!(found.class, class);
+        assert!(!err.detail.contains(&secret[found.start..found.end]));
+        assert!(err.detail.contains(class.name()), "{}", class.name());
+    }
+
+    const RO: &str = "---\ndescription: locked\nread_only: \"true\"\n---\nbody\n";
+    const RW: &str = "---\ndescription: open\nread_only: \"false\"\n---\nbody\n";
+
+    /// Every edit of `path` the read_only step guards, the folder delete aside.
+    fn edits_of(path: &str) -> Vec<Edit> {
+        vec![
+            replace(path, "body", "changed"),
+            insert_at(path, 1, "top"),
+            describe(path, "changed"),
+            delete(path),
+            rename(path, "notes/moved.md"),
+        ]
+    }
+
+    #[test]
+    fn read_only_file_refuses_every_write() {
+        let files = [("notes/ro.md", RO), ("notes/rw.md", RW)];
+        let mut locked = edits_of("notes/ro.md");
+        locked.push(delete("notes"));
+        for edit in locked {
+            let fx = fx_with(&files);
+            let err = assert_refused(&fx, Some(OWNER_ROW), edit, REASON, E_MEMORY_READ_ONLY);
+            assert_eq!(err.detail, "notes/ro.md: read_only");
+        }
+        for edit in edits_of("notes/rw.md") {
+            let fx = fx_with(&files);
+            let before = fx.commits().len();
+            fx.apply(edit.clone()).expect("unlocked write");
+            assert_eq!(fx.commits().len(), before + 1, "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_can_be_set_but_not_removed() {
+        let fx = fx();
+        let open = "description: a note\n";
+        let locked = "description: a note\nread_only: \"true\"\n";
+        fx.apply(replace("notes/a.md", open, locked)).expect("lock");
+        assert!(guard::is_read_only(&fx.file("notes/a.md").expect("a")));
+        assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            replace("notes/a.md", locked, open),
+            REASON,
+            E_MEMORY_READ_ONLY,
+        );
+    }
+
+    #[test]
+    fn secret_writes_are_refused_without_echo() {
+        use guard::SecretClass;
+        let (sk, pem, gh) = (sk_key(), private_key_header(), github_token());
+        let slack = fake(&["xo", "xb-"], '1', 12);
+        let sk_path = format!("notes/{sk}.md");
+        let cases = [
+            (
+                create("notes/c.md", &format!("key {sk}")),
+                REASON.to_string(),
+                sk.clone(),
+                SecretClass::SkKey,
+            ),
+            (
+                replace("notes/a.md", "line2", &pem),
+                REASON.to_string(),
+                pem.clone(),
+                SecretClass::PrivateKey,
+            ),
+            (
+                describe("notes/a.md", &gh),
+                REASON.to_string(),
+                gh.clone(),
+                SecretClass::GithubToken,
+            ),
+            (
+                create(&sk_path, "x"),
+                REASON.to_string(),
+                sk_path.clone(),
+                SecretClass::SkKey,
+            ),
+            (
+                create("notes/c.md", "x"),
+                format!("note {slack}"),
+                slack.clone(),
+                SecretClass::SlackToken,
+            ),
+        ];
+        for (edit, reason, secret, class) in cases {
+            let fx = fx();
+            let err = assert_refused(&fx, Some(OWNER_ROW), edit, &reason, E_MEMORY_SECRET);
+            assert_no_echo(&err, &secret, class);
+        }
+    }
+
+    #[test]
+    fn old_secret_must_be_removed_first() {
+        let token = fake(&["gl", "pat-"], 'a', 20);
+        let text = format!("---\ndescription: g\n---\nline1\n{token}\n");
+        let fx = fx_with(&[("notes/g.md", &text)]);
+        let err = assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            replace("notes/g.md", "line1", "LINE1"),
+            REASON,
+            E_MEMORY_SECRET,
+        );
+        assert_no_echo(&err, &token, guard::SecretClass::GitlabToken);
+        fx.apply(replace("notes/g.md", &token, "removed"))
+            .expect("remove the secret");
+        assert_eq!(
+            fx.file("notes/g.md").as_deref(),
+            Some("---\ndescription: g\n---\nline1\nremoved\n")
+        );
+    }
+
+    #[test]
+    fn secret_like_path_can_be_removed() {
+        let sk_path = format!(
+            "notes/{}.md",
+            fake(&["sk", "-", "learn-pipeline-experiments"], 'x', 0)
+        );
+        let gh_path = format!("notes/{}.md", github_token());
+        assert!(guard::find_secret(&sk_path).is_some());
+        assert!(guard::find_secret(&gh_path).is_some());
+        let fx = fx_with(&[(sk_path.as_str(), A), (gh_path.as_str(), A)]);
+        let count = fx.commits().len();
+        fx.apply(replace(&sk_path, "line1", "LINE1"))
+            .expect("edit in place");
+        fx.apply(delete(&sk_path)).expect("delete");
+        fx.apply(rename(&gh_path, "notes/plain.md"))
+            .expect("rename away");
+        assert_eq!(fx.commits().len(), count + 3);
+        assert_eq!(fx.file(&sk_path), None);
+        assert_eq!(fx.file(&gh_path), None);
+        assert_eq!(fx.file("notes/plain.md").as_deref(), Some(A));
+        let new_path = format!("notes/{}.md", sk_key());
+        assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            create(&new_path, "x"),
+            REASON,
+            E_MEMORY_SECRET,
+        );
+        assert_refused(
+            &fx,
+            Some(OWNER_ROW),
+            rename("notes/plain.md", &gh_path),
+            REASON,
+            E_MEMORY_SECRET,
+        );
     }
 
     #[test]
@@ -1065,7 +1297,31 @@ mod tests {
 
     #[test]
     fn refusal_order_is_fixed() {
-        let fx = fx();
+        let fx = fx_with(&[("notes/ro.md", RO)]);
+        let owner = Some(OWNER_ROW);
+        let secret_path = format!("notes/{}.md", sk_key());
+        let secret_reason = format!("note {}", fake(&["AK", "IA"], 'A', 16));
+        for edit in [
+            replace("notes/ro.md", "zzz", "y"),
+            replace("notes/ro.md", "body", &private_key_header()),
+            replace("notes/ro.md", "body", "body"),
+        ] {
+            assert_refused(&fx, owner, edit, REASON, E_MEMORY_READ_ONLY);
+        }
+        assert_refused(
+            &fx,
+            Some(LANE_ROW),
+            create(&secret_path, "x"),
+            REASON,
+            E_MEMORY_ORIGIN,
+        );
+        assert_refused(
+            &fx,
+            None,
+            create("notes/c.md", "x"),
+            &secret_reason,
+            E_MEMORY_SECRET,
+        );
         assert_refused(
             &fx,
             Some(LANE_ROW),
@@ -1074,6 +1330,13 @@ mod tests {
             E_MEMORY_ORIGIN,
         );
         put(&fx.home, "notes/a.md", "---\ndescription: by hand\n---\n");
+        assert_refused(
+            &fx,
+            owner,
+            create(&secret_path, "x"),
+            REASON,
+            E_MEMORY_SECRET,
+        );
         assert_refused(
             &fx,
             Some(OWNER_ROW),
