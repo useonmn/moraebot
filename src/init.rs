@@ -10,10 +10,21 @@ use crate::config::{
     AccessMode, Config, ConfigError, DiscordConfig, E_CHANNEL_MISSING, E_IO, E_OMP_MISSING,
     E_OWNER_MISSING, Env, OmpConfig, Platform, SlackConfig, report_checks,
 };
+use crate::memory::{E_ONBOARDING_REQUEST, onboarding};
 
 pub const E_INIT_EOF: &str = "E_INIT_EOF";
 pub const E_SETUP_NO_CONFIG: &str = "E_SETUP_NO_CONFIG";
 pub const E_SLACK_TOKEN_KIND: &str = "E_SLACK_TOKEN_KIND";
+
+/// Printed after `moraebot init` when the new config passed every check.
+pub const NEXT_STEPS: &str = "\
+Next steps:
+  moraebot check-config     check the setup again at any time
+  moraebot install-launchd  keep moraebot running in the background (macOS)
+  moraebot run              or run it in this terminal instead
+Then message the bot in its channel or in a DM. At its next start it says hello in the
+channel and asks a few questions about you; reply skip to skip them.
+";
 
 const DEFAULT_WORK_DIR: &str = "~/moraebot-work";
 const TOKEN_FILE_NAME: &str = "discord.token";
@@ -507,7 +518,13 @@ pub fn run<R: BufRead, W: Write>(
         &omp_path.to_string_lossy(),
         &work_dir,
     )?;
-    prompter.finish(&config, &config_path, env, tokens)
+    let outcome = prompter.finish(&config, &config_path, env, tokens)?;
+    onboarding::request(&config.home)
+        .map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
+    if outcome == (InitOutcome::Written { checks_ok: true }) {
+        write!(prompter.out, "{NEXT_STEPS}")?;
+    }
+    Ok(outcome)
 }
 
 /// `moraebot setup <messenger>`: asks only that messenger's required fields, keeps every
@@ -743,6 +760,34 @@ mod tests {
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
         loaded.validate().expect("valid");
         assert_eq!(loaded.owner_id(), "111");
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn run_requests_onboarding_and_prints_next_steps() {
+        let fx = Fixture::new();
+        let (result, out) = fx.run(&fx.happy_input());
+        assert_eq!(
+            result.expect("init runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        assert!(out.ends_with(NEXT_STEPS));
+        let request = onboarding::request_file(&fx.dir.path().join("mhome"));
+        assert_eq!(mode_of(&request), 0o600);
+    }
+
+    #[test]
+    fn kept_config_requests_nothing() {
+        let fx = Fixture::new();
+        fs::create_dir_all(fx.config_path().parent().expect("parent")).expect("mkdir");
+        fs::write(fx.config_path(), "original").expect("write");
+        let (result, out) = fx.run("n\n");
+        assert_eq!(result.expect("init runs"), InitOutcome::Kept);
+        assert!(!out.contains(NEXT_STEPS));
+        assert!(!onboarding::request_file(&fx.dir.path().join("mhome")).exists());
     }
 
     #[test]
@@ -1010,6 +1055,21 @@ mod tests {
             let input = format!("2\nU111\nC222\n{BOT}\n{APP}\n{}\n\n", self.omp.display());
             self.run(&input).0
         }
+    }
+
+    #[test]
+    fn setup_requests_nothing() {
+        let fx = Fixture::new();
+        assert!(fx.setup_after_init_slack().is_ok());
+        let request = onboarding::request_file(&fx.dir.path().join("mhome"));
+        fs::remove_file(&request).expect("init left a request");
+        let (result, out) = fx.setup(Platform::Slack, "U222\n\n\n\n");
+        assert_eq!(
+            result.expect("setup runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        assert!(!request.exists());
+        assert!(!out.contains(NEXT_STEPS));
     }
 
     #[test]

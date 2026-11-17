@@ -16,6 +16,7 @@ use moraebot::logging;
 use moraebot::memory::history::{self, ACCEPT_REASON};
 use moraebot::memory::home::MemoryHome;
 use moraebot::memory::notice;
+use moraebot::memory::onboarding;
 use moraebot::memory::{E_MEMORY_LAYOUT, E_MEMORY_WRITE};
 use moraebot::slack::SlackAdapter;
 use moraebot::store::Store;
@@ -42,6 +43,7 @@ Commands:
   memory accept [--config PATH] [--reason TEXT] [PATH...]
                                 Record hand edits of memory files (stop the gateway first)
   memory refresh [--config PATH]   Re-pin the running lead's memory before its next message
+  onboarding [--config PATH]    Greet and ask the first-meeting questions again at the next start
   --version, -V                 Print the version
 ";
 
@@ -76,6 +78,9 @@ enum Command {
     MemoryRefresh {
         config: Option<PathBuf>,
     },
+    Onboarding {
+        config: Option<PathBuf>,
+    },
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -92,6 +97,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "install-launchd" => parse_install_launchd(rest),
         "uninstall-launchd" => parse_uninstall_launchd(rest),
         "memory" => parse_memory(rest),
+        "onboarding" => parse_config_flag(rest).map(|config| Command::Onboarding { config }),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -315,6 +321,26 @@ fn memory_refresh(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Config
     Ok(ExitCode::SUCCESS)
 }
 
+/// Asks for the first meeting with the owner at the next gateway start by creating the request
+/// file. It never opens the store, so it works while a gateway holds it.
+fn onboarding_request(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigError> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    if let Err(e) = onboarding::request(&config.home) {
+        eprintln!("{}: {}", e.code, e.detail);
+        return Ok(ExitCode::FAILURE);
+    }
+    writeln!(
+        io::stdout().lock(),
+        "{}",
+        serde_json::json!({"onboarding": "requested"})
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Loads and validates the config, starts logging, then serves until a signal.
 fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = match config {
@@ -427,6 +453,7 @@ fn main() -> ExitCode {
             paths,
         } => memory_accept(&env, config, reason, &paths),
         Command::MemoryRefresh { config } => memory_refresh(&env, config),
+        Command::Onboarding { config } => onboarding_request(&env, config),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -519,6 +546,16 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_args(&args(&["onboarding"])),
+            Ok(Command::Onboarding { config: None })
+        );
+        assert_eq!(
+            parse_args(&args(&["onboarding", "--config", "/x"])),
+            Ok(Command::Onboarding {
+                config: Some(PathBuf::from("/x"))
+            })
+        );
+        assert_eq!(
             parse_args(&args(&["check-config"])),
             Ok(Command::CheckConfig { config: None })
         );
@@ -552,6 +589,7 @@ mod tests {
             &["memory", "refresh", "x"],
             &["memory", "refresh", "--config"],
             &["memory", "refresh", "--reason", "r"],
+            &["onboarding", "extra"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
