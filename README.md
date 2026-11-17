@@ -281,6 +281,31 @@ your message text
 
 - **Lead writes aren't announced.** The lead already sees its own writes in the tool results, so they never show up as `changed` or `soul` lines. `moraebot memory accept` can't run while the gateway runs, so for now there's no other writer and those two lines stay empty in normal use. Later slices add other writers.
 - **`soul_edit`.** When a lead write changes `system/persona.md` or `system/identity.md`, its result JSON carries `"soul_edit": true`, and the lead is told to tell you about the change. Other writes' results are unchanged.
+- **Boundaries.** `system/boundaries.md` is your list of things the lead must never do. Every change to it needs your approval reply: creating, editing, inserting a line, changing the description, deleting, and renaming to or from that path. The lead has to write with `source: user`, and the claim has to pass every check above as `user`. A partial quote (`quoted`), any other source, or no source is refused with `E_MEMORY_QUOTE`, and nothing changes. The file also counts as a soul file, so a lead write to it carries `"soul_edit": true` and another writer's change shows as a `soul` notice line. Your own hand edit followed by `moraebot memory accept` still works.
+- **Agreements.** Agreements are lasting rules the lead keeps for you. They don't live in a file. They're rows in the inbox database, in the tables `memory_agreements` and `memory_agreement_breaks`. The lead gets two tools for them:
+  - `memory_agreement_record` saves one rule with a `scope` (`global` or `project`), the rule `text` and a `reason`. It takes the same optional `source`, `user_quote` and `quote_message` as the write tools.
+  - `memory_agreement_break` reports that the lead broke rule `#id`, with a `reason`.
+
+  Both work only in a turn that answers one of your messages (`E_MEMORY_ORIGIN` otherwise). A rule is one line of at most 240 characters. Secret-like text and memory block markers are refused. A rule is `human` only when the lead records it with `source: user` and the claim passes as `user`. With no source, `agent` or `inferred`, it's `agent`. A `source: user` claim that fails isn't downgraded; it's refused with `E_MEMORY_AGREEMENT`. A rule that differs from an existing one only in letter case or spacing is refused with `E_MEMORY_AGREEMENT_EXISTS` and its number. The ledger holds at most 64 rules and 12 KiB of rule text in total (`MAX_AGREEMENT_BYTES`), and a full ledger refuses new rules with `E_MEMORY_AGREEMENT_FULL`. A break counts once per message of yours: reporting the same rule again in the same turn is refused with `E_MEMORY_AGREEMENT_REPEAT` and the count stays. An unknown number gives `E_MEMORY_AGREEMENT_UNKNOWN`.
+- **NEEDS-HUMAN.** At 3 breaks a rule is marked `NEEDS-HUMAN:`. The count keeps going up after that. The next message of yours that reaches the lead carries one notice line per newly marked rule, once only, even across restarts:
+
+```text
+agreement needs-human id=3 broken=3 text="never force push"
+```
+
+  The lead is told not to break such a rule again, and to stop and ask you if a task can only be done by breaking it.
+- **Agreements in the block.** When there's at least one rule, the block has an `<agreements>` element right after `<self>`: a short header line, then one line per rule, yours (`human`) first, then by number:
+
+```text
+- #1 [global] [human] never force push
+- #3 [project] [agent] [broken x3] NEEDS-HUMAN: run the tests before reporting done
+```
+
+  A new rule or a new count doesn't restart the lead. It shows in the block after the next compaction or `moraebot memory refresh`. Until then the lead knows from its tool results and the notice line. With no rules the block is the same as before.
+- **The guard.** The database itself refuses to lower a break count, clear `NEEDS-HUMAN`, clear the noticed mark, change a rule's scope, author or text, delete a rule, or change or delete a break record. `system/agreements.md` is reserved: creating, editing, or renaming to or from it with the memory tools is refused with `E_MEMORY_AGREEMENT`.
+- **Known gap until M17.** Two things are missing on purpose for now:
+  1. There's no owner command to list, acknowledge or drop agreements yet. The only way for you to fix the ledger is to stop moraebot, open the inbox database (`~/.moraebot/inbox.sqlite`) with `sqlite3`, drop the guard triggers (`memory_agreements_guard`, `memory_agreements_no_delete`, `memory_agreement_breaks_no_update`, `memory_agreement_breaks_no_delete`), edit the rows, and start moraebot again. The triggers come back on the next start.
+  2. The lead can fill the ledger up to the cap (64 agreements, 12 KiB of text in total) without your approval. The agreements element takes its block room before the memory files. The 12 KiB cap counts raw text only, so the block also stops listing rules once the element reaches about 16 KiB and shows an `omitted` budget marker instead. Persona and human keep their room.
 
 **omp's own memory is off.** omp has a memory feature of its own. moraebot turns it off for every omp it starts (the lead and every lane): before each start it writes `~/.moraebot/omp/config-overlay.yml` (mode 600) with exactly this text, and points omp at it with the `PI_CONFIG_FILES` environment variable:
 
@@ -338,6 +363,7 @@ After installing, check these by hand once:
 - [ ] **Memory claims.** Answer a lead proposal with `ok`; when the lead saves it with `source: user`, the file's `provenance:` line starts with `user:`.
 - [ ] **Memory guards.** A file with `read_only: "true"` is refused when the lead tries to change it; a note outside `system/` shows by name at the end of the lead's block.
 - [ ] **Memory re-pin.** After a long conversation, check the log for `omp lead re-pinned by restart` and its `restart_ms`; run `moraebot memory refresh` once and see the next reply arrive normally.
+- [ ] **Agreements.** Tell the lead a lasting rule, approve its proposal, and check that the reply's tool result shows `author` `human`; after `moraebot memory refresh`, the next reply's block lists it under `<agreements>`.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:

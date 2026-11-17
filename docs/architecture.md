@@ -503,6 +503,37 @@ expired more=<n>
 
 **이후 단계.** M6은 약속(agreements)과 boundaries 줄을, M7은 기억이 커졌다는 경고 줄을 알림에 더합니다. M10은 lead를 다시 켜지 않고 omp 확장으로 그 자리에서 블록을 바꿉니다. 그 밖의 일은 기억 로드맵의 이후 단계에서 다룹니다.
 
+### 3.14 약속과 경계 (slice 6 M6)
+
+**왜 파일이 아니라 데이터베이스인가 (M6-D1).** 약속 목록(장부)은 `inbox.sqlite`의 표에 둡니다. 그러면 "어긴 횟수 낮추기 금지" 같은 규칙을 데이터베이스가 직접 지킵니다. 파일이었다면 고칠 때마다 옛 글과 새 글을 비교해야 했을 겁니다. 대신 `system/agreements.md`(`AGREEMENTS_FILE`) 경로는 비워 둡니다. 기억 쓰기 도구로 이 경로를 만들거나, 고치거나, 이 경로로 또는 이 경로에서 이름을 바꾸면 `E_MEMORY_AGREEMENT`로 거절합니다.
+
+**표 두 개.** `memory_agreements`는 약속 한 줄에 한 행입니다. 번호, 범위(`global`/`project`), 작성자(`human`/`agent`), 글, 비교용 글(`norm`, 대소문자와 띄어쓰기를 맞춘 것, `UNIQUE`), 어긴 횟수(`broken`), `needs_human`, `noticed`, 만든 시각과 메시지, 이유, 출처 확인 결과(`claim_json`)를 담습니다. `memory_agreement_breaks`는 어긴 기록 한 번에 한 행이고, 기본 키가 `(agreement_id, turn_row)`라서 한 주인 메시지 동안 같은 약속은 한 번만 들어갑니다. 두 표 모두 새 표라서 기존 표는 바뀌지 않습니다.
+
+**트리거 네 개.** 모두 `RAISE(ABORT, 'E_MEMORY_AGREEMENT')`로 막습니다.
+- `memory_agreements_guard`: 번호, 범위, 작성자, 글, `norm`, 만든 시각과 메시지, 이유, `claim_json`을 바꾸거나, `broken`, `needs_human`, `noticed`를 낮추는 수정.
+- `memory_agreements_no_delete`: 약속 지우기.
+- `memory_agreement_breaks_no_update`, `memory_agreement_breaks_no_delete`: 어긴 기록 고치기와 지우기.
+
+그래서 나중 단계의 코드가 실수해도 장부는 망가지지 않습니다. 트리거는 시작할 때마다 `IF NOT EXISTS`로 다시 만들어집니다.
+
+**기록 흐름 (`memory_agreement_record`).** 확인 순서는 이렇습니다. 이유(`reason`) 확인, 인용이 비밀처럼 보이는지 확인, 주인 메시지에 답하는 턴인지(`write::owner_turn`, 아니면 `E_MEMORY_ORIGIN`), 범위, 글(한 줄, 240글자 이하, NUL·블록 경계 표시·비밀 없음). 그다음 작성자를 정합니다. `source`가 없거나 `agent`/`inferred`이면 `agent`입니다. `source: user`는 M4 확인(`provenance::verify`)이 `user`일 때만 `human`이고, 아니면 낮추지 않고 `E_MEMORY_AGREEMENT`로 거절합니다. 마지막으로 `Store::add_agreement`가 한 트랜잭션에서 같은 `norm`이 있는지(`E_MEMORY_AGREEMENT_EXISTS`), 64개(`MAX_AGREEMENTS`)나 글 합계 12288바이트(`MAX_AGREEMENT_BYTES`)를 넘는지(`E_MEMORY_AGREEMENT_FULL`) 보고 넣습니다.
+
+**어김 흐름 (`memory_agreement_break`).** 이유 확인, 주인 턴 확인 다음에 `Store::break_agreement`가 한 트랜잭션에서 처리합니다. 없는 번호면 `E_MEMORY_AGREEMENT_UNKNOWN`입니다. 어긴 기록을 `INSERT OR IGNORE`로 넣어 이미 있으면 `E_MEMORY_AGREEMENT_REPEAT`이고 횟수는 그대로입니다. 들어갔으면 `broken`을 하나 올리고, 3(`NEEDS_HUMAN_AT`) 이상이면 `needs_human`을 켭니다. 결과 JSON의 `flagged`는 이번에 처음 켜졌는지입니다.
+
+**쓰기 엔진의 boundaries 단계.** `system/boundaries.md`(`BOUNDARIES`)는 기존 거절 순서 끝, "바뀌는 게 없음"(`E_MEMORY_NOOP`) 확인과 출처 확인 다음, `provenance:` 줄을 찍기 전에 봅니다. 바뀌는 경로에 이 파일이 있는데 출처 확인 결과가 `user`가 아니면 `E_MEMORY_QUOTE`로 거절합니다. 세부 내용에는 실패한 확인 코드가 들어가고, 출처가 없으면 `source user`가 필요하다는 문장이 들어갑니다. 이 파일은 `SOUL_PATHS`에도 들어가서 `soul_edit`와 `soul` 알림 줄 대상이 됩니다(M6-D9).
+
+**블록에서의 자리와 모양.** 약속이 하나라도 있으면 `render`가 `</self>` 바로 다음, `<memory>` 앞에 `<agreements>` 칸을 넣습니다. 첫 줄은 짧은 안내 문장이고, 그다음 약속마다 한 줄입니다. 순서는 `human` 먼저, 그다음 번호 순입니다.
+
+```text
+- #<id> [<scope>] [<author>] [broken x<n>] NEEDS-HUMAN: <text>
+```
+
+`[broken x<n>]`은 한 번 이상 어겼을 때만, `NEEDS-HUMAN:`은 표시가 켜졌을 때만 붙고, 글은 이스케이프합니다. 칸은 기억 파일보다 먼저 블록 한도에서 자리를 차지합니다. 이스케이프하면 글이 길어지므로 칸 전체가 16384바이트(`AGREEMENTS_RENDER_BYTES`)를 넘는 첫 항목에서 목록을 멈추고 `omitted` 예산 표시(`E_MEMORY_BUDGET`) 한 줄을 넣습니다. 약속이 없으면 칸이 없고 블록은 M5와 바이트까지 같습니다. 고정 규칙은 M5 그대로라서 새 약속은 다음 압축이나 `moraebot memory refresh` 뒤에 보입니다.
+
+**`noticed` 워터마크.** 이 알림의 워터마크는 `notice::Watermarks`가 아니라 `memory_agreements.noticed` 열입니다. `notice::collect`가 `needs_human`이 켜졌고 `noticed`가 0인 약속을 읽고(`unnoticed_flags`), 바로 `mark_flags_noticed`로 1로 바꿉니다. 그래서 lead가 다시 켜져도 같은 알림은 반복되지 않습니다. 알림 줄 모양은 `agreement needs-human id=<id> broken=<n> text=<JSON 문자열>`입니다.
+
+**이후 단계.** M15는 대화가 끝난 뒤 따로 돌면서 같은 `break_agreement`로 어긴 횟수를 셉니다. M17은 주인 명령 `list/ack/drop`을 더하고, 보호 트리거를 주인 명령만 쓰는 길로 바꿉니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
