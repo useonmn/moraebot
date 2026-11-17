@@ -3,9 +3,10 @@
 use super::frontmatter;
 use super::home::MemoryHome;
 use super::{
-    BEGIN, E_MEMORY_BUDGET, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, END, IDENTITY, MAX_RENDER_BYTES,
-    PERSONA, SYSTEM_DIR,
+    BEGIN, E_MEMORY_BUDGET, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, END, IDENTITY, MAX_DEPTH,
+    MAX_RENDER_BYTES, PERSONA, SYSTEM_DIR,
 };
+use std::path::Path;
 
 /// What the lead is told about the block before the files start.
 const PREAMBLE: &str = "\
@@ -61,6 +62,38 @@ fn element(tag: &str, path: &str, description: &str, body: &str) -> String {
     )
 }
 
+/// `*.md` entries under `system/` that `MemoryHome::list` skips because they are a symlink or
+/// not a regular file (a FIFO, a socket). Hidden names are skipped; symlinks are never followed.
+fn special_entries(home: &MemoryHome) -> Vec<String> {
+    fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let child = format!("{rel}/{name}");
+            if kind.is_dir() {
+                if depth < MAX_DEPTH {
+                    walk(&entry.path(), &child, depth + 1, out);
+                }
+            } else if !kind.is_file() && name.ends_with(".md") {
+                out.push(child);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&home.root().join(SYSTEM_DIR), SYSTEM_DIR, 2, &mut out);
+    out.sort();
+    out
+}
+
 fn marker(tag: &str, path: &str, code: &str) -> String {
     format!("<{tag} path=\"{}\" code=\"{code}\"/>\n", escape(path))
 }
@@ -80,7 +113,8 @@ pub fn render(home: &MemoryHome) -> Rendered {
             return Rendered { text, problems };
         }
     };
-    let listed = paths.len();
+    let special = special_entries(home);
+    let listed = paths.len() + special.len();
     let metadata_bound =
         format!("<memory_metadata>\nfiles: {listed}/{listed}\n</memory_metadata>\n");
     let mut used = [
@@ -100,15 +134,23 @@ pub fn render(home: &MemoryHome) -> Rendered {
             entries.push((path, tag, true));
         }
     }
-    for path in &paths {
-        if path != PERSONA && path != IDENTITY {
-            entries.push((path, "block", false));
-        }
-    }
+    let mut others: Vec<(&str, &str)> = paths
+        .iter()
+        .filter(|p| *p != PERSONA && *p != IDENTITY)
+        .map(|p| (p.as_str(), "block"))
+        .chain(special.iter().map(|p| (p.as_str(), "")))
+        .collect();
+    others.sort();
+    entries.extend(others.into_iter().map(|(path, tag)| (path, tag, false)));
 
     let (mut own, mut other, mut usable) = (String::new(), String::new(), 0);
     for (path, tag, in_self) in entries {
         let out = if in_self { &mut own } else { &mut other };
+        if tag.is_empty() {
+            out.push_str(&marker("unusable", path, E_MEMORY_FILE));
+            problems.push((path.to_owned(), E_MEMORY_FILE));
+            continue;
+        }
         match load(home, path) {
             Loaded::Unusable(code) => {
                 out.push_str(&marker("unusable", path, code));
@@ -300,5 +342,36 @@ mod tests {
     fn append_joins_with_blank_line() {
         assert_eq!(append("h", "B"), "h\n\nB");
         assert_eq!(append("", "B"), "B");
+    }
+
+    #[test]
+    fn symlinks_and_special_files_become_markers() {
+        let (dir, memory) = laid_out();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, file("d", "SECRET-LINK\n")).expect("outside");
+        std::os::unix::fs::symlink(&outside, memory.root().join("system/link.md")).expect("link");
+        let fifo = std::ffi::CString::new(
+            memory
+                .root()
+                .join("system/fifo.md")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .expect("c path");
+        // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let rendered = render(&memory);
+        for path in ["system/fifo.md", "system/link.md"] {
+            let marker = format!("<unusable path=\"{path}\" code=\"{E_MEMORY_FILE}\"/>");
+            assert!(rendered.text.contains(&marker), "{marker}");
+            assert!(
+                rendered
+                    .problems
+                    .contains(&(path.to_owned(), E_MEMORY_FILE))
+            );
+        }
+        assert!(!rendered.text.contains("SECRET-LINK"));
+        assert!(rendered.text.contains("files: 2/4\n"));
     }
 }
