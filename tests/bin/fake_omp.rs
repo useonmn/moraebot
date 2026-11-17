@@ -60,12 +60,29 @@
 //! prompt whose message contains FAKE_OMP_UNSETTLED_TRIGGER (unset: never)
 //! gets a `prompt_result` with `"sessionSettled": false`; with
 //! FAKE_OMP_SETTLE_FRAME=1 a `session_settled` frame follows it at once.
+//!
+//! Memory extension: when argv holds the element `-e`, FAKE_OMP_EXT_ACK is set
+//! and the extension's home variable (`extension::HOME_ENV`) is set, the fake
+//! writes `<home>/omp/<ACK_FILE>` = `{"pid": <own pid>, "version":
+//! <FAKE_OMP_EXT_ACK>}` (temp file and rename, mode 0o600) before `ready`, and
+//! logs `EXT_ACK <value>`. A fake that wrote the ack then plays the
+//! extension's outbox at every received `prompt` frame (main or steer), after
+//! logging the frame and before answering it: the non-dot `.md` entries of
+//! `<home>/omp/<OUTBOX_DIR>` are read in ascending name order and deleted,
+//! their texts are joined and held as pending for that frame's `message`, and a
+//! later attempt with the same `message` returns the held text again; a
+//! non-empty accepted text is logged as `OUTBOX <json string>`. An outbox that
+//! cannot be listed drains nothing. With FAKE_OMP_HOOK_RETRY=1 the step runs
+//! twice per frame and only the second attempt is logged. Answering the frame
+//! clears the held text.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
+use moraebot::memory::extension::{ACK_FILE, HOME_ENV, OUTBOX_DIR};
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "fake-session-1";
@@ -108,6 +125,16 @@ struct Fake {
     first_prompt_seen: bool,
     /// Set by a `hold` case: nothing more is written.
     held: bool,
+    /// `<home>/omp` when this fake wrote the extension ack.
+    ext_dir: Option<PathBuf>,
+    /// Outbox text drained for a prompt and not yet confirmed by its answer.
+    pending: Option<Pending>,
+}
+
+/// Drained outbox text and the `message` of the prompt it was drained for.
+struct Pending {
+    prompt: String,
+    text: String,
 }
 
 fn main() {
@@ -128,6 +155,7 @@ fn main() {
             log_line(path, &format!("CONFIG_FILES {}", value.to_string_lossy()));
         }
     }
+    let ext_dir = write_ext_ack(&argv, log.as_deref());
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -155,6 +183,8 @@ fn main() {
         steer_turn: None,
         first_prompt_seen: false,
         held: false,
+        ext_dir,
+        pending: None,
     };
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -167,8 +197,63 @@ fn main() {
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let is_prompt = frame.get("type").and_then(Value::as_str) == Some("prompt");
+        if is_prompt {
+            fake.play_outbox(&frame, log.as_deref());
+        }
         fake.handle(&frame, &mut out);
+        if is_prompt {
+            fake.pending = None;
+        }
     }
+}
+
+/// Writes the extension ack when argv holds `-e` and both FAKE_OMP_EXT_ACK and
+/// the extension's home variable are set; returns `<home>/omp` when it did.
+fn write_ext_ack(argv: &[String], log: Option<&Path>) -> Option<PathBuf> {
+    if !argv.iter().any(|arg| arg == "-e") {
+        return None;
+    }
+    let version = std::env::var("FAKE_OMP_EXT_ACK").ok()?;
+    let dir = PathBuf::from(std::env::var_os(HOME_ENV)?).join("omp");
+    let ack = json!({"pid": std::process::id(), "version": version});
+    let tmp = dir.join(format!(".{ACK_FILE}.{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .expect("create the ack temp file");
+    file.write_all(ack.to_string().as_bytes())
+        .expect("write the ack temp file");
+    std::fs::rename(&tmp, dir.join(ACK_FILE)).expect("rename the ack file");
+    if let Some(path) = log {
+        log_line(path, &format!("EXT_ACK {version}"));
+    }
+    Some(dir)
+}
+
+/// The text of every non-dot `.md` entry of `dir`, in ascending name order,
+/// each deleted after reading. An outbox that cannot be listed drains nothing.
+fn drain(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".md") && !name.starts_with('.'))
+        .collect();
+    names.sort();
+    let mut text = String::new();
+    for name in names {
+        let path = dir.join(&name);
+        if let Ok(entry) = std::fs::read_to_string(&path) {
+            text.push_str(&entry);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    text
 }
 
 /// Whether the `--session-dir` argument contains `/lanes/` (a lane child).
@@ -194,6 +279,52 @@ fn select_mode(lane: bool) -> String {
 }
 
 impl Fake {
+    /// The extension's outbox step for one `prompt` frame (twice with
+    /// FAKE_OMP_HOOK_RETRY=1, the first attempt discarded); logs the accepted
+    /// attempt's non-empty text as `OUTBOX <json string>`.
+    fn play_outbox(&mut self, frame: &Value, log: Option<&Path>) {
+        let Some(dir) = self.ext_dir.clone() else {
+            return;
+        };
+        let message = frame
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if std::env::var("FAKE_OMP_HOOK_RETRY").as_deref() == Ok("1") {
+            self.outbox_attempt(&dir, message);
+        }
+        let text = self.outbox_attempt(&dir, message);
+        if let (false, Some(path)) = (text.is_empty(), log) {
+            let value = serde_json::to_string(&text).expect("text is serializable");
+            log_line(path, &format!("OUTBOX {value}"));
+        }
+    }
+
+    /// One `before_agent_start` attempt: the held text for the same `message`
+    /// plus a fresh drain, held again when non-empty.
+    fn outbox_attempt(&mut self, dir: &Path, message: &str) -> String {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.prompt != message)
+        {
+            self.pending = None;
+        }
+        let mut text = self
+            .pending
+            .take()
+            .map(|pending| pending.text)
+            .unwrap_or_default();
+        text.push_str(&drain(&dir.join(OUTBOX_DIR)));
+        if !text.is_empty() {
+            self.pending = Some(Pending {
+                prompt: message.to_owned(),
+                text: text.clone(),
+            });
+        }
+        text
+    }
+
     fn handle(&mut self, frame: &Value, out: &mut impl Write) {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let command = frame

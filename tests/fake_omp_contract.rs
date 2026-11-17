@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use moraebot::memory::extension::{ACK_FILE, HOME_ENV, OUTBOX_DIR};
 use omp_rpc::{
-    Client, ClientOptions, Error, Event, GetSessionLeaseCommand, HostTool, HostToolError,
+    Client, ClientOptions, Error, Event, GetSessionLeaseCommand, GetStateCommand, HostTool,
+    HostToolError,
     OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent, RpcNotification,
     StreamingBehavior, DEFAULT_PROMPT_TIMEOUT,
 };
@@ -975,4 +977,163 @@ fn no_new_frames_without_the_variables() {
         types,
         ["agent_start", "message_end", "agent_end", "prompt_result"]
     );
+}
+
+/// Spawns fake-omp for the memory extension: FAKE_OMP_LOG is `<dir>/fake.log`,
+/// `<dir>/omp` exists, and `args` and `envs` are passed as given.
+fn spawn_ext(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Client {
+    std::fs::create_dir_all(dir.join("omp")).expect("create the omp folder");
+    let log = dir.join("fake.log");
+    let log = log.to_str().expect("utf-8 log path");
+    let mut all = vec![("FAKE_OMP_LOG", log)];
+    all.extend_from_slice(envs);
+    let (client, _events) = spawn_env(args, &all, Vec::new());
+    client
+}
+
+/// The `-e` argument, FAKE_OMP_EXT_ACK=v-111 and the extension home `dir`.
+fn ext_envs(dir: &Path) -> Vec<(&'static str, &str)> {
+    vec![
+        ("FAKE_OMP_EXT_ACK", "v-111"),
+        (HOME_ENV, dir.to_str().expect("utf-8 temp path")),
+    ]
+}
+
+fn answer_state(client: &Client) {
+    let state = client.call(&GetStateCommand {}).expect("get_state");
+    assert_eq!(state.session_id, "fake-session-1");
+}
+
+fn prompt_completed(client: &Client, message: &str) {
+    let turn = client
+        .prompt_and_wait(&prompt(message), DEFAULT_PROMPT_TIMEOUT)
+        .expect("prompt");
+    let result = turn.result.expect("prompt result");
+    assert!(matches!(result.status, PromptStatus::Completed));
+}
+
+/// Writes the two outbox entries `...01.md` = `a\n`, `...02.md` = `b\n` and the
+/// hidden `.x.tmp` = `t\n`; returns the outbox folder.
+fn fill_outbox(dir: &Path) -> std::path::PathBuf {
+    let outbox = dir.join("omp").join(OUTBOX_DIR);
+    std::fs::create_dir_all(&outbox).expect("create the outbox");
+    std::fs::write(outbox.join("00000000000000000002.md"), "b\n").expect("entry 2");
+    std::fs::write(outbox.join("00000000000000000001.md"), "a\n").expect("entry 1");
+    std::fs::write(outbox.join(".x.tmp"), "t\n").expect("hidden entry");
+    outbox
+}
+
+/// Log index and decoded JSON value of each `OUTBOX ` line.
+fn outbox_lines(lines: &[String]) -> Vec<(usize, String)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let value = line.strip_prefix("OUTBOX ")?;
+            let text: String = serde_json::from_str(value).expect("OUTBOX value is a JSON string");
+            Some((index, text))
+        })
+        .collect()
+}
+
+/// Log index of the `prompt` frame whose message is `message`.
+fn prompt_frame_index(lines: &[String], message: &str) -> usize {
+    lines
+        .iter()
+        .position(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|frame| {
+                frame["type"] == "prompt" && frame["message"] == message
+            })
+        })
+        .expect("prompt frame logged")
+}
+
+#[test]
+fn fake_writes_the_ack_only_with_the_flag() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = spawn_ext(dir.path(), &["-e", "x"], &ext_envs(dir.path()));
+    answer_state(&client);
+    let ack_path = dir.path().join("omp").join(ACK_FILE);
+    let ack: Value =
+        serde_json::from_slice(&std::fs::read(&ack_path).expect("read the ack")).expect("ack JSON");
+    assert_eq!(ack["pid"], json!(client.pid().expect("child pid")));
+    assert_eq!(ack["version"], "v-111");
+    let mode = std::fs::metadata(&ack_path).expect("ack metadata").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let lines = log_frames(&dir.path().join("fake.log"));
+    assert!(lines.iter().any(|line| line == "EXT_ACK v-111"), "{lines:?}");
+
+    for missing in ["-e", "FAKE_OMP_EXT_ACK", HOME_ENV] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args: &[&str] = if missing == "-e" { &[] } else { &["-e", "x"] };
+        let envs: Vec<(&str, &str)> = ext_envs(dir.path())
+            .into_iter()
+            .filter(|(name, _)| *name != missing)
+            .collect();
+        let client = spawn_ext(dir.path(), args, &envs);
+        answer_state(&client);
+        assert!(
+            !dir.path().join("omp").join(ACK_FILE).exists(),
+            "ack written without {missing}"
+        );
+    }
+}
+
+#[test]
+fn fake_drains_the_outbox_at_each_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = spawn_ext(dir.path(), &["-e", "x"], &ext_envs(dir.path()));
+    let outbox = fill_outbox(dir.path());
+    client.call(&open_session_command()).expect("open_session");
+    prompt_completed(&client, "hi");
+    let lines = log_frames(&dir.path().join("fake.log"));
+    let drained = outbox_lines(&lines);
+    assert_eq!(drained.len(), 1, "{drained:?}");
+    assert_eq!(drained[0].1, "a\nb\n");
+    assert!(drained[0].0 > prompt_frame_index(&lines, "hi"));
+    assert!(!outbox.join("00000000000000000001.md").exists());
+    assert!(!outbox.join("00000000000000000002.md").exists());
+    assert!(outbox.join(".x.tmp").exists());
+    prompt_completed(&client, "again");
+    let lines = log_frames(&dir.path().join("fake.log"));
+    assert_eq!(outbox_lines(&lines).len(), 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = spawn_ext(dir.path(), &[], &ext_envs(dir.path()));
+    let outbox = fill_outbox(dir.path());
+    prompt_completed(&client, "hi");
+    assert!(outbox.join("00000000000000000001.md").exists());
+    assert!(outbox.join("00000000000000000002.md").exists());
+    let lines = log_frames(&dir.path().join("fake.log"));
+    assert!(outbox_lines(&lines).is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = spawn_ext(dir.path(), &["-e", "x"], &ext_envs(dir.path()));
+    std::fs::write(dir.path().join("omp").join(OUTBOX_DIR), "").expect("outbox as a file");
+    prompt_completed(&client, "hi");
+    answer_state(&client);
+    let lines = log_frames(&dir.path().join("fake.log"));
+    assert!(outbox_lines(&lines).is_empty());
+}
+
+#[test]
+fn fake_delivers_once_across_a_hook_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut envs = ext_envs(dir.path());
+    envs.push(("FAKE_OMP_HOOK_RETRY", "1"));
+    let client = spawn_ext(dir.path(), &["-e", "x"], &envs);
+    let outbox = fill_outbox(dir.path());
+    client.call(&open_session_command()).expect("open_session");
+    prompt_completed(&client, "hi");
+    let lines = log_frames(&dir.path().join("fake.log"));
+    let drained = outbox_lines(&lines);
+    assert_eq!(drained.len(), 1, "{drained:?}");
+    assert_eq!(drained[0].1, "a\nb\n");
+    assert!(!outbox.join("00000000000000000001.md").exists());
+    assert!(!outbox.join("00000000000000000002.md").exists());
+    prompt_completed(&client, "again");
+    let lines = log_frames(&dir.path().join("fake.log"));
+    assert_eq!(outbox_lines(&lines).len(), 1);
 }
