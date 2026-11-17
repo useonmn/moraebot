@@ -29,7 +29,30 @@ The bot only runs while you're logged in to macOS and the Mac is awake.
 
 You'll need macOS, a Discord or Slack account, and omp already installed and working in your terminal.
 
-### 1. Install Rust
+### 1. Install moraebot
+
+```sh
+curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
+```
+
+This downloads the latest release for Apple Silicon Macs, checks it against the release's SHA-256 checksum, makes sure it runs, and only then puts it at `~/.local/bin/moraebot`. If anything fails, your existing moraebot stays as it was. When `~/.local/bin` isn't on your `PATH` yet, the script prints the line to add to your shell startup file.
+
+Two settings change what it does. Put them right before `sh`, not before `curl`:
+
+- `MORAEBOT_VERSION` picks a release instead of the latest one.
+- `MORAEBOT_INSTALL_DIR` puts the binary in another folder.
+
+```sh
+curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | MORAEBOT_VERSION=v0.1.0 sh
+```
+
+Download it with curl like this, not with a browser. A file saved by a browser can be flagged by macOS Gatekeeper, and the unsigned binary may then refuse to open.
+
+### 2. Build from source (optional)
+
+Skip this if you used the line above. It's for developers who want to build moraebot themselves.
+
+Install Rust:
 
 ```sh
 brew install rust
@@ -41,10 +64,10 @@ Or use rustup if you prefer:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### 2. Build moraebot
+Then build moraebot:
 
 ```sh
-git clone https://github.com/<YOUR_GITHUB_USER>/moraebot.git
+git clone https://github.com/useonmn/moraebot.git
 cd moraebot
 cargo build --release
 ```
@@ -279,6 +302,14 @@ The file name is cleaned up first, so it can't point outside that folder. moraeb
 
 ## Upgrading from an earlier version
 
+Re-run the install line from Install, then `moraebot install-launchd` if you use the background service:
+
+```sh
+moraebot install-launchd
+```
+
+Run `install-launchd` from a terminal, not by asking the bot. It restarts the bot's own process.
+
 Files need one more permission than earlier versions asked for. If you set up the bot before this version:
 
 - Discord: invite the bot again with the invite link from [docs/guides/discord.md](docs/guides/discord.md), or give its role the Attach Files permission in the channel.
@@ -302,6 +333,7 @@ This unloads the LaunchAgent and removes its plist. To remove everything else to
 
 ```sh
 rm -rf ~/.moraebot
+rm ~/.local/bin/moraebot
 ```
 
-That deletes the config, the token file, the message database, and the logs. Your work folder is left alone. Finally, delete the Discord application or the Slack app if you no longer need the bot.
+That deletes the installed binary, the config, the token file, the message database, and the logs. Your work folder is left alone. Finally, delete the Discord application or the Slack app if you no longer need the bot.

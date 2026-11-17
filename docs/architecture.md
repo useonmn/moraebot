@@ -359,6 +359,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 ```
 ~/.moraebot/
   config.toml              설정 파일 (사람이 읽고 고치는 파일)
+  bin/moraebot             install-launchd가 복사해 두는 실행 파일 (launchd가 이것을 켬)
   secrets/discord.token    Discord 봇 토큰 (주인만 읽기, 권한 600)
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록, 허용 사용자, pairing 대기
