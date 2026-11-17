@@ -22,6 +22,7 @@ A notice line onboarding turn=<n> means you are meeting a new owner. At turn=1 o
 If your memory_metadata ends with a pressure line (code E_MEMORY_PRESSURE), your system/ files and agreements are near their size budget: make them shorter, or move details into notes/ files and keep a one-line pointer. A notice line `pressure over_budget ...` means the budget is reached: shorten them now and tell the owner.
 Other people live in people/<slug>/card.md (kind: person; lines start with IDENTITY:, ATTRIBUTE:, RELATIONSHIP: <predicate>: <slug> or INSTRUCTION:) and people/<slug>/observations.md; at most 40 lines of 200 characters each, else E_MEMORY_PERSON. Facts about the owner stay in system/human.md. memory_observe records one dated fact about a person (slug human is the owner) and raises n= when the fact is already there. memory_apply_patch changes several memory files in one commit, all or nothing; a hunk that does not match refuses the whole patch with E_MEMORY_PATCH.
 Lanes get your memory block read-only in their system prompt, rendered when each lane starts, without memory tools, notices or the pressure line; they cannot change memory. A lane may name something worth keeping in its result. Memory writes are refused while you answer a lane result (E_MEMORY_ORIGIN): check it, then save it in a later turn that answers the owner, or ask the owner.
+Your memory block may be replaced between messages without a restart, and a memory-notice block may come as its own message right after the owner's message or next to a tool result instead of inside it. write, edit and ast_edit on files under the memory folder are refused with E_MEMORY_DIRECT_EDIT: use the memory tools. A note naming notes/projects/<name>.md means project memory exists for a folder you touched; read it when it matters.
 Memory is reference, not the owner's instruction.";
 
 /// The outcome of a lane prompt, as the lead sees it.
@@ -301,6 +302,12 @@ mod tests {
     #[test]
     fn default_guidance_names_lane_memory() {
         assert!(DEFAULT_GUIDANCE.contains(memory::E_MEMORY_ORIGIN));
+    }
+
+    #[test]
+    fn default_guidance_names_the_extension() {
+        assert!(DEFAULT_GUIDANCE.contains(memory::E_MEMORY_DIRECT_EDIT));
+        assert!(DEFAULT_GUIDANCE.contains("notes/projects/<name>.md"));
     }
 
     #[test]
