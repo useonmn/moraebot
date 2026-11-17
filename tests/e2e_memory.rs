@@ -19,7 +19,7 @@ use moraebot::gateway::STORE_FILE;
 use moraebot::gateway::{Gateway, GatewayError};
 use moraebot::memory::home::MemoryHome;
 use moraebot::memory::{
-    self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, provenance,
+    self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED, notice, provenance,
 };
 use moraebot::omp;
 use moraebot::store::{InboxRow, Store};
@@ -954,4 +954,124 @@ async fn owner_approval_through_the_gateway() {
         element.contains(" provenance=\"user: owner message 2 "),
         "{element}"
     );
+}
+
+#[tokio::test]
+async fn memory_repin_and_notices_through_the_gateway() {
+    const MARKER: &str = "tool-marker";
+    let mut rig = Rig::new();
+    let seed_body = frontmatter::parse(PERSONA_SEED).expect("seed parses").body;
+    let call = json!({
+        "tool": memory::MEMORY_STR_REPLACE_TOOL,
+        "arguments": {
+            "path": memory::PERSONA,
+            "old_string": seed_body,
+            "new_string": format!("{MARKER}\n"),
+            "reason": "r",
+            "source": "agent"
+        }
+    })
+    .to_string();
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[
+                ("FAKE_OMP_MODE", "tools"),
+                ("FAKE_OMP_TOOL_CALLS", &call),
+                ("FAKE_OMP_COMPACT_TRIGGER", "compact-now"),
+            ],
+        )
+        .expect("open gateway"),
+    );
+    // Turn 1: the lead writes its persona and the conversation is compacted.
+    adapter
+        .inject(dm("1300000000000000031", "run-tools compact-now"))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    // Turn 2: the compaction changed the block, so the lead is re-pinned by a restart.
+    adapter.inject(dm("1300000000000000032", "hi")).await;
+    bounded(adapter.wait_for_send(2)).await;
+    // Turn 3: the owner's refresh request restarts the lead with an unchanged block.
+    let refresh = notice::refresh_file(&rig.config.home);
+    std::fs::write(&refresh, "").expect("refresh request");
+    adapter.inject(dm("1300000000000000033", "again")).await;
+    bounded(adapter.wait_for_send(3)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(
+        leads.len(),
+        3,
+        "first start, compaction re-pin, refresh re-pin"
+    );
+    let session_dirs: std::collections::BTreeSet<&String> = leads
+        .iter()
+        .map(|(_, _, argv)| {
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--session-dir")
+                .expect("--session-dir flag");
+            &argv[at + 1]
+        })
+        .collect();
+    assert_eq!(session_dirs.len(), 1, "every restart keeps the session");
+    let blocks: Vec<&String> = leads
+        .iter()
+        .map(|(_, _, argv)| {
+            let flags = append_flags(argv);
+            assert_eq!(flags.len(), 1, "one append element");
+            flags[0]
+        })
+        .collect();
+    assert!(
+        !blocks[0].contains(MARKER),
+        "the first pin predates the write"
+    );
+    assert!(
+        blocks[1].contains(MARKER),
+        "the compaction re-pin has the write"
+    );
+    assert!(
+        blocks[2].contains(MARKER),
+        "the refresh re-pin has the write"
+    );
+
+    let prompts: Vec<String> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "prompt")
+        .map(|frame| {
+            frame["message"]
+                .as_str()
+                .expect("prompt message")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(prompts.len(), 3, "three lead prompts");
+    assert!(
+        !prompts[0].contains(memory::NOTICE_BEGIN),
+        "nothing to say at the first prompt"
+    );
+    let second: Vec<&str> = prompts[1].lines().collect();
+    assert_eq!(second[1], memory::NOTICE_BEGIN, "{second:?}");
+    assert!(second.contains(&"compaction count=1"), "{second:?}");
+    assert!(second.contains(&memory::NOTICE_END), "{second:?}");
+    assert!(
+        !second.iter().any(|line| line.starts_with("changed kind=")),
+        "the lead's own write is not announced: {second:?}"
+    );
+    assert!(
+        !prompts[2].contains(memory::NOTICE_BEGIN),
+        "the compaction is told once"
+    );
+    assert!(!refresh.exists(), "the restart removed the refresh request");
 }
