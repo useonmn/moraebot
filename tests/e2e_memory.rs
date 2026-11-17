@@ -1,6 +1,6 @@
 //! Offline end-to-end tests of owner memory through the library-level gateway:
 //! `Gateway::open` makes the memory home, the lead started through the dispatcher gets
-//! the memory block, and lanes get only the omp overlay. `FakeAdapter` is the messenger
+//! the memory block, and lanes get the omp overlay and the read-only block. `FakeAdapter` is the messenger
 //! and `fake-omp` is the lead and every lane. Nothing leaves the machine.
 
 use std::fs::OpenOptions;
@@ -431,7 +431,7 @@ async fn owner_edited_file_is_used_and_never_overwritten() {
 }
 
 #[tokio::test]
-async fn lane_gets_overlay_but_no_memory() {
+async fn lane_gets_overlay_and_read_only_memory() {
     let mut rig = Rig::new();
     let (adapter, dynamic) = fake_adapter();
     let script = lane_start_script("summarize the notes", "file .");
@@ -465,7 +465,12 @@ async fn lane_gets_overlay_but_no_memory() {
 
     assert_eq!(append_flags(lead_argv).len(), 1, "the lead has the block");
     assert!(append_flags(lead_argv)[0].contains(memory::BEGIN));
-    assert!(append_flags(lane_argv).is_empty(), "{lane_argv:?}");
+    assert_eq!(append_flags(lane_argv).len(), 1, "the lane has the block");
+    let lane_block = append_flags(lane_argv)[0];
+    assert!(lane_block.starts_with(&format!("{APPEND_FLAG}={}", memory::BEGIN)));
+    assert!(lane_block.contains(frontmatter::parse(PERSONA_SEED).expect("seed parses").body));
+    assert!(!lane_block.contains(memory::MEMORY_READ_TOOL));
+    assert!(append_flags(lead_argv)[0].contains(memory::MEMORY_READ_TOOL));
 
     // The lead registers its tools once, at its start; the next frame is the lane's.
     let lead_tools = &rig.tap.tool_frames_after(*lead_at)[0];

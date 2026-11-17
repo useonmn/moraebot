@@ -1,8 +1,9 @@
 //! Lanes: separate headless omp children started by the lead through host tools. Messenger-agnostic.
 //!
 //! The lead calls `lane_start`, `lane_message` and `lane_status` (registered on the lead
-//! child next to `send_file`). A lane is its own omp RPC child with no appended system
-//! prompt; it runs one prompt on a worker thread and closes. A lane with a done line gets
+//! child next to `send_file`). A lane is its own omp RPC child; its appended system prompt
+//! is only the owner's memory block in its read-only lane form (none without memory). It
+//! runs one prompt on a worker thread and closes. A lane with a done line gets
 //! exactly one host tool, `lane_done`: the lane claims its work is done, moraebot runs
 //! the Done checks inside that call and refuses a claim that fails them. Its result is
 //! stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same transaction as
@@ -34,6 +35,7 @@ use tokio::sync::{Notify, watch};
 use crate::config::Config;
 use crate::done::{self, DoneLine};
 use crate::lead::{self, LaneResult};
+use crate::memory::{home::MemoryHome, notice, render};
 use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
@@ -119,6 +121,10 @@ pub struct LaneManager {
     inner: Mutex<LaneSet>,
     pids: watch::Sender<Vec<u32>>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
+    /// The owner's memory; when set, each lane child gets it rendered read-only.
+    pub(crate) memory: Option<MemoryHome>,
+    /// The clock for `expires` in the lane block; the manager's clock.
+    pub(crate) clock: notice::Clock,
 }
 
 pub(crate) fn refused(code: &str, reason: &str) -> HostToolError {
@@ -147,6 +153,8 @@ impl LaneManager {
             inner: Mutex::default(),
             pids: watch::channel(Vec::new()).0,
             extra_env: Vec::new(),
+            memory: None,
+            clock: notice::system_clock(),
         }
     }
 
@@ -634,11 +642,17 @@ impl LaneManager {
     ) -> Result<LaneOutcome, Outcome> {
         let name = format!("lane-{}", job.id);
         let session_dir = omp::lane_session_dir(&self.config, job.id);
+        let hints = match &self.memory {
+            Some(home) => {
+                omp::memory_block(&self.store, home, render::Reader::Lane, (self.clock)()).text
+            }
+            None => String::new(),
+        };
         let command = omp::private_dir(&session_dir)
             .and_then(|()| {
                 omp::child_command(
                     &self.config,
-                    omp::omp_args(&self.config, &session_dir, ""),
+                    omp::omp_args(&self.config, &session_dir, &hints),
                     &omp::stderr_log_path(&self.config, &name),
                     &self.extra_env,
                 )

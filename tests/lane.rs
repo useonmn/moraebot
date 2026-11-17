@@ -15,8 +15,10 @@ use moraebot::lane::{
     E_LANE_UNKNOWN,
 };
 use moraebot::lead;
+use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
+use moraebot::memory::{self, frontmatter, history};
 use moraebot::omp::{self, OmpManager, Outcome};
-use moraebot::store::{LaneState, Store};
+use moraebot::store::{Admitted, AgreementAdded, LaneState, NewAgreement, Store};
 use serde_json::{Value, json};
 
 const KEY: &str = "discord:th:111";
@@ -913,4 +915,226 @@ async fn lane_status_lists_done_line() {
     assert_eq!(listed[0]["lane_id"], 1);
     assert_eq!(listed[0]["done"], "file marker");
     bounded(omp.shutdown_all()).await;
+}
+
+// --- the owner's memory in lanes, read-only -----------------------------------------------
+
+impl Harness {
+    /// The memory home of this harness, with its folders and seeds made.
+    fn memory(&self) -> MemoryHome {
+        let home = MemoryHome::new(&self.config.home);
+        home.ensure_layout().expect("memory layout");
+        home
+    }
+
+    fn memory_file(&self, rel: &str) -> PathBuf {
+        self.config.home.join(memory::MEMORY_DIR).join(rel)
+    }
+
+    fn put_memory(&self, rel: &str, text: &str) {
+        let path = self.memory_file(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("memory folder");
+        std::fs::write(path, text).expect("memory file");
+    }
+
+    /// Commits a hand edit of the persona whose body is `marker`.
+    fn change_persona(&self, marker: &str) {
+        self.put_memory(
+            memory::PERSONA,
+            &format!("---\ndescription: d\n---\n{marker}\n"),
+        );
+        history::accept(&mut self.store.lock().unwrap(), &self.memory(), &[], "test")
+            .expect("accept the hand edit");
+    }
+
+    /// Admits and claims an owner row of `KEY`; returns its id.
+    fn owner_row(&self, message_id: &str) -> i64 {
+        let mut store = self.store.lock().unwrap();
+        let id = match store
+            .admit("discord", message_id, KEY, "222", "111", "body")
+            .expect("admit")
+        {
+            Admitted::New(id) => id,
+            Admitted::Duplicate => panic!("duplicate message id"),
+        };
+        assert!(store.claim(id).expect("claim"));
+        id
+    }
+
+    /// Adds one `global` agent agreement, recorded in owner turn `turn_row`.
+    fn add_agreement(&self, text: &str, turn_row: i64) {
+        let norm = text.to_lowercase();
+        let new = NewAgreement {
+            scope: "global",
+            author: "agent",
+            text,
+            norm: &norm,
+            turn_row,
+            reason: "test",
+            claim_json: None,
+        };
+        let added = self
+            .store
+            .lock()
+            .unwrap()
+            .add_agreement(&new, 64, 12288)
+            .expect("add agreement");
+        assert_eq!(added, AgreementAdded::Added(1));
+    }
+
+    /// The `--append-system-prompt=` elements of every lane (`lane`) or lead child start,
+    /// in log order.
+    fn appends(&self, lane: bool) -> Vec<Vec<String>> {
+        self.log_lines()
+            .iter()
+            .filter(|l| l.starts_with("START pid="))
+            .filter(|l| session_dir_arg(l).contains("/lanes/") == lane)
+            .map(|l| {
+                start_argv(l)
+                    .into_iter()
+                    .filter(|a| a.starts_with("--append-system-prompt="))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn memory_manager(&self, calls: &[Value]) -> OmpManager {
+        self.manager("ok", calls).with_memory(self.memory())
+    }
+
+    /// Every `prompt` frame of the log, lead and lanes, in order.
+    fn prompt_frames(&self) -> Vec<Value> {
+        self.log_lines()
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|f| f["type"] == "prompt")
+            .collect()
+    }
+}
+
+fn persona_seed_body() -> &'static str {
+    frontmatter::parse(PERSONA_SEED).expect("seed parses").body
+}
+
+#[tokio::test]
+async fn lane_gets_the_read_only_block() {
+    let h = Harness::new();
+    h.memory();
+    h.put_memory("notes/n1.md", "---\ndescription: n\n---\nnote\n");
+    let row = h.owner_row("m-a1");
+    assert_eq!(row, 1);
+    h.add_agreement("never force push", row);
+    let omp = h.memory_manager(&[lane_start("t1")]);
+    prompt_until_lane_result(&omp, row, "run-tools go").await;
+
+    let lead = h.appends(false);
+    assert_eq!(lead.len(), 1, "one lead start");
+    assert_eq!(lead[0].len(), 1);
+    assert!(
+        lead[0][0].contains(memory::MEMORY_READ_TOOL),
+        "lead preamble"
+    );
+
+    let lanes = h.appends(true);
+    assert_eq!(lanes.len(), 1, "one lane start");
+    assert_eq!(lanes[0].len(), 1, "one append element");
+    let a = &lanes[0][0];
+    assert!(a.starts_with(&format!("--append-system-prompt={}", memory::BEGIN)));
+    assert!(a.ends_with(&format!("{}\n", memory::END)));
+    for part in [
+        persona_seed_body().to_owned(),
+        format!("path=\"{}\"", memory::HUMAN),
+        "<agreements>".to_owned(),
+        "- #1 [global] [agent] never force push".to_owned(),
+        "<external_projection>".to_owned(),
+        "\nnotes/: n1\n".to_owned(),
+    ] {
+        assert!(a.contains(&part), "lane block lacks {part:?}");
+    }
+    for absent in [
+        memory::MEMORY_READ_TOOL,
+        memory::MEMORY_LIST_TOOL,
+        memory::MEMORY_AGREEMENT_BREAK_TOOL,
+        "<pressure ",
+    ] {
+        assert!(!a.contains(absent), "lane block has {absent:?}");
+    }
+
+    let tools = h.frames_after_start(0, "set_host_tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    let names: Vec<&str> = tools[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [done::LANE_DONE_TOOL]);
+
+    let overlay = format!(
+        "CONFIG_FILES {}",
+        omp::overlay_path(&h.config).to_string_lossy()
+    );
+    assert!(h.log_lines()[h.lane_starts()[0]..].contains(&overlay));
+    omp.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn lane_sees_later_commits_and_gets_no_notice() {
+    let h = Harness::new();
+    h.memory();
+    let omp = h.memory_manager(&[lane_start("t1")]);
+    let r1 = h.owner_row("m-b1");
+    bounded(omp.prompt(KEY, r1, &lead::owner_input(KEY, r1, "hello"))).await;
+    h.change_persona("v2-marker-111");
+    let r2 = h.owner_row("m-b2");
+    prompt_until_lane_result(&omp, r2, &lead::owner_input(KEY, r2, "run-tools go")).await;
+
+    let lead = h.appends(false);
+    assert_eq!(lead.len(), 1, "the lead was not restarted");
+    assert!(lead[0][0].contains(persona_seed_body()));
+    assert!(!lead[0][0].contains("v2-marker-111"));
+
+    let lanes = h.appends(true);
+    assert_eq!(lanes.len(), 1, "one lane start");
+    assert!(lanes[0][0].contains("v2-marker-111"));
+    assert!(!lanes[0][0].contains(persona_seed_body()));
+
+    let lane_prompts = h.frames_after_start(0, "prompt");
+    assert_eq!(lane_prompts.len(), 1, "{lane_prompts:?}");
+    let prompts = h.prompt_frames();
+    assert_eq!(prompts.len(), 3);
+    let message = |f: &Value| f["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message(&prompts[1]).contains(memory::NOTICE_BEGIN),
+        "the lead got a notice"
+    );
+    let lane_message = message(&lane_prompts[0]);
+    assert!(lane_message.starts_with("t1"));
+    assert!(!lane_message.contains(memory::NOTICE_BEGIN));
+    omp.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn lane_block_uses_the_manager_clock() {
+    let h = Harness::new();
+    h.memory();
+    h.put_memory(
+        "system/soon.md",
+        "---\ndescription: s\nexpires: 2026-01-01\n---\nsoon-marker-111\n",
+    );
+    // 2025-01-01T00:00:00Z: before the expiry; the real time is after it.
+    let omp = h
+        .memory_manager(&[lane_start("t1")])
+        .with_clock(Arc::new(|| 1_735_689_600));
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+
+    assert!(
+        h.appends(false)[0][0].contains("soon-marker-111"),
+        "lead clock"
+    );
+    assert!(
+        h.appends(true)[0][0].contains("soon-marker-111"),
+        "lane clock"
+    );
+    omp.shutdown_all().await;
 }

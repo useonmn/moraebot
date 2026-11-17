@@ -412,6 +412,37 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The memory block for `reader`, rendered now from the recorded history. When the history
+/// cannot be read: the unavailable block, with one warning in the log.
+pub(crate) fn memory_block(
+    store: &Mutex<Store>,
+    home: &MemoryHome,
+    reader: render::Reader,
+    now: i64,
+) -> render::Rendered {
+    let mut store = lock(store);
+    match history::prepare(&mut store, home).and_then(|committed| {
+        let dirty = history::dirty(home, &committed)?;
+        let agreements = store.agreements().map_err(|e| memory::home::MemoryError {
+            code: memory::E_MEMORY_HISTORY,
+            detail: e.code().to_owned(),
+        })?;
+        Ok(render::render_for(
+            reader,
+            &committed,
+            &dirty,
+            &agreements,
+            now,
+        ))
+    }) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            tracing::warn!(code = e.code, "memory history unavailable");
+            render::unavailable_for(reader, e.code)
+        }
+    }
+}
+
 /// SIGKILLs the child's process group (the RPC client starts the child as its own
 /// group leader). Best effort: the group may already be gone.
 pub(crate) fn kill_group(pid: u32) {
@@ -845,13 +876,21 @@ impl OmpManager {
 
     /// Owner memory for the lead: the block is rendered from `home` at each lead start and
     /// appended after the hints, and `memory_list`/`memory_read` follow the host tools.
+    /// Lanes get the same files rendered read-only (`render::Reader::Lane`) at each lane start.
     pub fn with_memory(mut self, home: MemoryHome) -> Self {
+        // The lane manager is first shared when the lead child starts.
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .memory = Some(home.clone());
         self.memory = Some(home);
         self
     }
 
     /// Replaces the clock used for rendering and notices (tests inject one).
     pub fn with_clock(mut self, clock: notice::Clock) -> Self {
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .clock = clock.clone();
         self.clock = clock;
         self
     }
@@ -1151,28 +1190,7 @@ impl OmpManager {
         let Some(home) = &self.memory else {
             return self.hints.clone();
         };
-        let rendered = {
-            let mut store = lock(&self.store);
-            match history::prepare(&mut store, home).and_then(|committed| {
-                let dirty = history::dirty(home, &committed)?;
-                let agreements = store.agreements().map_err(|e| memory::home::MemoryError {
-                    code: memory::E_MEMORY_HISTORY,
-                    detail: e.code().to_owned(),
-                })?;
-                Ok(render::render(
-                    &committed,
-                    &dirty,
-                    &agreements,
-                    (self.clock)(),
-                ))
-            }) {
-                Ok(rendered) => rendered,
-                Err(e) => {
-                    tracing::warn!(code = e.code, "memory history unavailable");
-                    render::unavailable(e.code)
-                }
-            }
-        };
+        let rendered = memory_block(&self.store, home, render::Reader::Lead, (self.clock)());
         for (path, code) in &rendered.problems {
             tracing::warn!(path = %path, code, "memory file not rendered");
         }
