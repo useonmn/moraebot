@@ -16,6 +16,9 @@
 //! The standing agreements ledger (stored in the inbox database) and its tools live in
 //! `agreements`.
 //!
+//! Person cards and observation files under `people/` live in `people`; multi-file patches
+//! live in `patch`.
+//!
 //! The first meeting with the owner (the request file, the state in the inbox database and the
 //! lead's finish tool) lives in `onboarding`.
 //!
@@ -29,6 +32,8 @@ pub mod history;
 pub mod home;
 pub mod notice;
 pub mod onboarding;
+pub mod patch;
+pub mod people;
 pub mod provenance;
 pub mod render;
 pub mod tools;
@@ -254,3 +259,38 @@ pub const PRESSURE_BUDGET_TOKENS: usize = 30000;
 pub const PRESSURE_WARN_PERCENT: usize = 80;
 /// The system files and agreements reached the warning share of their size budget.
 pub const E_MEMORY_PRESSURE: &str = "E_MEMORY_PRESSURE";
+/// The folder of person records.
+pub const PEOPLE_DIR: &str = "people";
+/// Who a person is: one file per person folder.
+pub const CARD_FILE: &str = "card.md";
+/// Dated facts about a person: one file per person folder.
+pub const OBSERVATIONS_FILE: &str = "observations.md";
+/// The slug that means the owner, whose card is `HUMAN`.
+pub const HUMAN_SLUG: &str = "human";
+/// The heading of the facts the lead was told.
+pub const EXPLICIT_SECTION: &str = "## Explicit";
+/// The starts a card line may have.
+pub const CARD_PREFIXES: [&str; 4] = [
+    "IDENTITY: ",
+    "ATTRIBUTE: ",
+    "RELATIONSHIP: ",
+    "INSTRUCTION: ",
+];
+/// The most card lines or observation entries in one file.
+pub const MAX_PERSON_ENTRIES: usize = 40;
+/// The longest card line or observation entry, in characters.
+pub const MAX_PERSON_LINE_CHARS: usize = 200;
+/// The longest person slug.
+pub const MAX_SLUG_CHARS: usize = 40;
+/// The lead's host tool that applies a multi-file patch in one commit.
+pub const MEMORY_APPLY_PATCH_TOOL: &str = "memory_apply_patch";
+/// The lead's host tool that records one dated fact about a person.
+pub const MEMORY_OBSERVE_TOOL: &str = "memory_observe";
+/// The largest patch text.
+pub const MAX_PATCH_BYTES: usize = 64 * 1024;
+/// The most files one patch may name.
+pub const MAX_PATCH_FILES: usize = 20;
+/// A person card or observation file breaks its format or limits, or a bad slug.
+pub const E_MEMORY_PERSON: &str = "E_MEMORY_PERSON";
+/// A patch that cannot be read or does not apply.
+pub const E_MEMORY_PATCH: &str = "E_MEMORY_PATCH";
