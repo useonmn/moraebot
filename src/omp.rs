@@ -86,8 +86,8 @@ pub const OVERLAY_FILE: &str = "config-overlay.yml";
 /// is quoted so a YAML 1.1 reader cannot turn it into `false`.
 pub const OMP_OVERLAY: &str = "memory:\n  backend: \"off\"\nautolearn:\n  enabled: false\n";
 
-/// Counter for overlay temp file names, so concurrent spawns never share one.
-static OVERLAY_TMP: AtomicU64 = AtomicU64::new(0);
+/// Counter for `write_private` temp file names, so concurrent writers never share one.
+static PRIVATE_TMP: AtomicU64 = AtomicU64::new(0);
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Absolute path, so a `kill` shim earlier in PATH cannot intercept the group kill.
@@ -361,20 +361,29 @@ pub fn ensure_overlay(config: &Config) -> std::io::Result<PathBuf> {
     if std::fs::read(&path).is_ok_and(|bytes| bytes == OMP_OVERLAY.as_bytes()) {
         return std::path::absolute(&path);
     }
-    let n = OVERLAY_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".config-overlay.{}.{n}.tmp", std::process::id()));
+    write_private(&dir, OVERLAY_FILE, OMP_OVERLAY.as_bytes())?;
+    std::path::absolute(&path)
+}
+
+/// Writes `bytes` to `dir/name` readable by the owner only: creates `dir` (`0o700`), writes
+/// a hidden temp file (`0o600`) in it and renames that over the target, so a reader never
+/// sees a partial file. The temp file is removed on error.
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    private_dir(dir)?;
+    let n = PRIVATE_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
     let written = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(OMP_OVERLAY.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, &path));
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
     if let Err(error) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    std::path::absolute(&path)
+    Ok(())
 }
 
 /// The omp command for one child: `args`, stderr appended to `stderr_path` (mode
