@@ -6,7 +6,7 @@ use super::history::Committed;
 use super::{
     BEGIN, E_MEMORY_BUDGET, E_MEMORY_DIRTY, E_MEMORY_EXPIRED, E_MEMORY_FILE, E_MEMORY_FRONTMATTER,
     END, IDENTITY, MAX_DIRTY_LISTED, MAX_FILE_BYTES, MAX_INDEX_BYTES, MAX_RENDER_BYTES,
-    NOT_INDEXED, PERSONA, SYSTEM_DIR,
+    NOT_INDEXED, PERSONA, PROVENANCE_KEY, SYSTEM_DIR,
 };
 use super::{frontmatter, guard};
 
@@ -30,7 +30,11 @@ pub struct Rendered {
 }
 
 enum Loaded {
-    Usable { description: String, body: String },
+    Usable {
+        description: String,
+        provenance: Option<String>,
+        body: String,
+    },
     Unusable(&'static str),
 }
 
@@ -47,6 +51,7 @@ fn load(text: &str) -> Loaded {
     }
     Loaded::Usable {
         description: parsed.frontmatter.description().to_owned(),
+        provenance: parsed.frontmatter.get(PROVENANCE_KEY).map(str::to_owned),
         body: format!("{}\n", parsed.body.trim_end_matches('\n')),
     }
 }
@@ -59,9 +64,18 @@ fn escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn element(tag: &str, path: &str, description: &str, body: &str) -> String {
+fn element(
+    tag: &str,
+    path: &str,
+    description: &str,
+    provenance: Option<&str>,
+    body: &str,
+) -> String {
+    let provenance = provenance
+        .map(|p| format!(" provenance=\"{}\"", escape(p)))
+        .unwrap_or_default();
     format!(
-        "<{tag} path=\"{}\" description=\"{}\">\n{body}</{tag}>\n",
+        "<{tag} path=\"{}\" description=\"{}\"{provenance}>\n{body}</{tag}>\n",
         escape(path),
         escape(description)
     )
@@ -196,8 +210,12 @@ pub fn render(committed: &Committed, dirty: &[String], now: i64) -> Rendered {
                 out.push_str(&marker("unusable", path, code));
                 problems.push((path.to_owned(), code));
             }
-            Loaded::Usable { description, body } => {
-                let block = element(tag, path, &description, &body);
+            Loaded::Usable {
+                description,
+                provenance,
+                body,
+            } => {
+                let block = element(tag, path, &description, provenance.as_deref(), &body);
                 if used + block.len() > MAX_RENDER_BYTES {
                     out.push_str(&marker("omitted", path, E_MEMORY_BUDGET));
                     problems.push((path.to_owned(), E_MEMORY_BUDGET));
@@ -407,6 +425,68 @@ mod tests {
         put(&mut committed, "system/e.md", &file("\"a\\\"<&>\"", "x\n"));
         let text = render(&committed, &[], NOW).text;
         assert!(text.contains("description=\"a&quot;&lt;&amp;&gt;\""));
+    }
+
+    fn stamped(provenance: &str) -> String {
+        format!("---\ndescription: a\nprovenance: {provenance}\n---\nbody\n")
+    }
+
+    #[test]
+    fn provenance_is_an_attribute() {
+        let mut committed = seeded();
+        put(
+            &mut committed,
+            "system/a.md",
+            &stamped("\"agent: x <y> \\\"z\\\"\""),
+        );
+        let text = render(&committed, &[], NOW).text;
+        let expected = "<block path=\"system/a.md\" description=\"a\" provenance=\"agent: x &lt;y&gt; &quot;z&quot;\">\nbody\n</block>\n";
+        assert!(text.contains(expected), "{text}");
+
+        put(
+            &mut committed,
+            PERSONA,
+            &stamped("\"inferred: by the lead\""),
+        );
+        let text = render(&committed, &[], NOW).text;
+        assert!(text.contains(
+            "<persona path=\"system/persona.md\" description=\"a\" provenance=\"inferred: by the lead\">"
+        ));
+    }
+
+    #[test]
+    fn no_provenance_no_attribute() {
+        let text = render(&seeded(), &[], NOW).text;
+        assert!(!text.contains(" provenance="));
+    }
+
+    #[test]
+    fn provenance_counts_against_the_budget() {
+        let long = format!("provenance: {}\n", "p".repeat(200));
+        let omitted = |size: usize, provenance: &str| {
+            let mut committed = seeded();
+            for n in 1..=5 {
+                let body = format!("{}\n", "x".repeat(15 * 1024));
+                put(
+                    &mut committed,
+                    &format!("system/f{n}.md"),
+                    &file("d", &body),
+                );
+            }
+            let body = format!("{}\n", "x".repeat(size));
+            let last = format!("---\ndescription: d\n{provenance}---\n{body}");
+            put(&mut committed, "system/f6.md", &last);
+            render(&committed, &[], NOW)
+                .problems
+                .contains(&("system/f6.md".to_owned(), E_MEMORY_BUDGET))
+        };
+        // The largest last file that still fits without provenance.
+        let size = (1..MAX_FILE_BYTES as usize - 100)
+            .take_while(|size| !omitted(*size, ""))
+            .last()
+            .expect("some size fits");
+        assert!(!omitted(size, ""));
+        assert!(omitted(size, &long));
     }
 
     #[test]
