@@ -15,9 +15,12 @@ use std::time::Duration;
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::done;
+use moraebot::gateway::STORE_FILE;
 use moraebot::gateway::{Gateway, GatewayError};
-use moraebot::memory::{self, frontmatter, home::HUMAN_SEED, home::PERSONA_SEED};
+use moraebot::memory::home::MemoryHome;
+use moraebot::memory::{self, frontmatter, history, home::HUMAN_SEED, home::PERSONA_SEED};
 use moraebot::omp;
+use moraebot::store::{InboxRow, Store};
 use moraebot::testing::FakeAdapter;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -325,6 +328,46 @@ async fn lead_block_after_one_dm(rig: &mut Rig) -> String {
     flags[0].clone()
 }
 
+/// Runs one gateway on the rig with `vars`, sends one DM with `message_id` and returns the
+/// append element of the lead start this run added. Each run on a rig needs its own id.
+async fn lead_block_after_dm(
+    rig: &mut Rig,
+    message_id: &str,
+    text: &str,
+    vars: &[(&str, &str)],
+) -> String {
+    let before = rig.tap.starts_of(false).len();
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(rig.open(dynamic, vars).expect("open gateway"));
+    adapter.inject(dm(message_id, text)).await;
+    bounded(adapter.wait_for_send(1)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    assert_eq!(leads.len(), before + 1, "one new lead child");
+    let flags = append_flags(&leads[before].2);
+    assert_eq!(flags.len(), 1, "one append element");
+    flags[0].clone()
+}
+
+/// The rig's inbox database, opened while no gateway runs.
+fn open_store(rig: &Rig) -> Store {
+    Store::open(&rig.config.home.join(STORE_FILE)).expect("open store")
+}
+
+/// The inbox row of the messenger message `message_id`.
+fn inbox_row(store: &Store, message_id: &str) -> InboxRow {
+    let count = store.count().expect("count");
+    (1..=count)
+        .filter_map(|id| store.get(id).expect("get row"))
+        .find(|row| row.message_id == message_id)
+        .expect("inbox row of the DM")
+}
+
+const DIRTY_MARK: &str = "<dirty path=";
+
 #[tokio::test]
 async fn first_start_seeds_and_the_lead_sees_the_block() {
     let mut rig = Rig::new();
@@ -458,4 +501,217 @@ async fn layout_failure_stops_the_gateway_with_code() {
     rig.tap.drain().await;
     assert!(rig.tap.starts().is_empty(), "no omp child started");
     assert!(rig.memory_root().is_file(), "the file is left as it was");
+}
+
+#[tokio::test]
+async fn lead_write_is_recorded_and_projected_after_restart() {
+    const MARKER: &str = "e2e-marker";
+    const DM_ID: &str = "1300000000000000011";
+    let mut rig = Rig::new();
+    let seed_body = frontmatter::parse(PERSONA_SEED).expect("seed parses").body;
+    let call = json!({
+        "tool": memory::MEMORY_STR_REPLACE_TOOL,
+        "arguments": {
+            "path": memory::PERSONA,
+            "old_string": seed_body,
+            "new_string": format!("{MARKER}\n"),
+            "reason": "e2e write"
+        }
+    })
+    .to_string();
+    let first = lead_block_after_dm(
+        &mut rig,
+        DM_ID,
+        "run-tools please",
+        &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &call)],
+    )
+    .await;
+    assert!(
+        !first.contains(MARKER),
+        "the first start predates the write"
+    );
+
+    let store = open_store(&rig);
+    let row = inbox_row(&store, DM_ID);
+    let commits = store.memory_commits().expect("commits");
+    assert_eq!(commits.len(), 2, "the import and one lead write");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    let lead = &commits[1];
+    assert_eq!(lead.commit.writer, memory::WRITER_LEAD);
+    assert_eq!(lead.commit.turn_row, Some(row.id));
+    assert_eq!(
+        lead.commit.conversation_key.as_deref(),
+        Some(row.conversation_key.as_str())
+    );
+    assert!(lead.applied);
+    let snapshots = store.memory_snapshots(lead.id).expect("snapshots");
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0].0, memory::PERSONA);
+    let text = snapshots[0].1.clone().expect("persona text");
+    assert!(text.contains(MARKER));
+    assert_eq!(
+        std::fs::read(rig.memory_file(memory::PERSONA)).expect("persona"),
+        text.as_bytes(),
+        "the working file holds the committed text"
+    );
+    drop(store);
+
+    let second = lead_block_after_dm(&mut rig, "1300000000000000012", "hello lead", &[]).await;
+    assert!(second.contains(MARKER), "the write is projected");
+    assert!(!second.contains(DIRTY_MARK), "nothing is dirty");
+}
+
+#[tokio::test]
+async fn hand_edit_is_held_back_until_accepted() {
+    const MARKER: &str = "hand-e2e";
+    let mut rig = Rig::new();
+    let first = lead_block_after_dm(&mut rig, "1300000000000000021", "hello lead", &[]).await;
+    assert!(!first.contains(DIRTY_MARK));
+    let store = open_store(&rig);
+    assert_eq!(
+        store.memory_commits().expect("commits").len(),
+        1,
+        "the import"
+    );
+    drop(store);
+
+    std::fs::write(
+        rig.memory_file(memory::PERSONA),
+        format!("---\ndescription: edited by hand\n---\n{MARKER}\n"),
+    )
+    .expect("hand edit");
+
+    let held = lead_block_after_dm(&mut rig, "1300000000000000022", "hello lead", &[]).await;
+    assert!(!held.contains(MARKER), "the hand edit is not projected");
+    assert!(
+        held.contains(&format!("{DIRTY_MARK}\"{}\"", memory::PERSONA)),
+        "the persona is marked dirty"
+    );
+
+    let mut store = open_store(&rig);
+    let accepted = history::accept(
+        &mut store,
+        &MemoryHome::new(&rig.config.home),
+        &[],
+        history::ACCEPT_REASON,
+    )
+    .expect("accept");
+    assert_eq!(accepted.paths, [memory::PERSONA]);
+    let commit = accepted.commit.expect("an accept commit");
+    let commits = store.memory_commits().expect("commits");
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[1].id, commit);
+    assert_eq!(commits[1].commit.writer, memory::WRITER_HUMAN);
+    assert!(commits[1].applied);
+    drop(store);
+
+    let accepted = lead_block_after_dm(&mut rig, "1300000000000000023", "hello lead", &[]).await;
+    assert!(accepted.contains(MARKER), "the accepted edit is projected");
+    assert!(!accepted.contains(DIRTY_MARK), "nothing is dirty");
+}
+
+/// The inbox tables of a database made before M2, copied from the slice-4 schema text in
+/// `src/store.rs` tests: no memory tables.
+const SLICE4_SCHEMA: &str = "
+    CREATE TABLE inbox(
+        id INTEGER PRIMARY KEY,
+        platform TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('queued','processing','reply_pending','done','failed','needs_check')),
+        reply TEXT,
+        notice_sent INTEGER NOT NULL DEFAULT 0,
+        received_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        error TEXT,
+        attachments TEXT,
+        files_ready INTEGER NOT NULL DEFAULT 1,
+        out_files TEXT,
+        text_sent INTEGER NOT NULL DEFAULT 0,
+        origin TEXT NOT NULL DEFAULT 'owner',
+        steered_into INTEGER,
+        UNIQUE(platform, message_id)
+    );
+    CREATE TABLE conversations(
+        conversation_key TEXT PRIMARY KEY,
+        platform TEXT,
+        channel_id TEXT NOT NULL,
+        omp_session_id TEXT,
+        created_at TEXT,
+        last_activity_at TEXT
+    );
+    CREATE TABLE known_threads(
+        platform TEXT,
+        thread_id TEXT,
+        PRIMARY KEY(platform, thread_id)
+    );
+    CREATE TABLE sessions(
+        name TEXT PRIMARY KEY,
+        omp_session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE lanes(
+        id INTEGER PRIMARY KEY,
+        tool_call_id TEXT NOT NULL UNIQUE,
+        conversation_key TEXT NOT NULL,
+        task TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('running','idle','failed','needs_check')),
+        error TEXT,
+        prompts INTEGER NOT NULL DEFAULT 1,
+        omp_session_id TEXT,
+        notice_sent INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+";
+
+#[tokio::test]
+async fn old_m1_home_is_imported_on_first_start() {
+    const NOTE: &str = "notes/m1.md";
+    const NOTE_TEXT: &str = "---\ndescription: a note from M1\n---\nm1-marker\n";
+    let mut rig = Rig::new();
+    let files = [
+        (memory::PERSONA, PERSONA_SEED),
+        (memory::HUMAN, HUMAN_SEED),
+        (NOTE, NOTE_TEXT),
+    ];
+    for (rel, text) in files {
+        let path = rig.memory_file(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("memory dirs");
+        std::fs::write(&path, text).expect("memory file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    }
+    for dir in [
+        rig.memory_root(),
+        rig.memory_file(memory::SYSTEM_DIR),
+        rig.memory_file("notes"),
+    ] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    let conn = rusqlite::Connection::open(rig.config.home.join(STORE_FILE)).expect("old db");
+    conn.execute_batch(SLICE4_SCHEMA).expect("old schema");
+    drop(conn);
+
+    let block = lead_block_after_one_dm(&mut rig).await;
+    assert!(
+        !block.contains(DIRTY_MARK),
+        "nothing is dirty after the import"
+    );
+
+    let store = open_store(&rig);
+    let commits = store.memory_commits().expect("commits");
+    assert_eq!(commits.len(), 1, "exactly one commit");
+    assert_eq!(commits[0].commit.writer, memory::WRITER_IMPORT);
+    assert!(commits[0].applied);
+    let mut expected: Vec<(String, Option<String>)> = files
+        .iter()
+        .map(|(rel, text)| ((*rel).to_owned(), Some((*text).to_owned())))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        store.memory_snapshots(commits[0].id).expect("snapshots"),
+        expected
+    );
 }
