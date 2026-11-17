@@ -1282,6 +1282,61 @@ impl Store {
         let rows = stmt.query_map([commit_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// The newest memory commit id, `0` when there is none.
+    pub fn memory_head(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM memory_commits", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// One row per snapshot of every commit newer than `after`, ordered by commit and path.
+    /// `existed` is whether the path's previous snapshot had a text, `present` whether
+    /// this one has.
+    pub fn memory_changes_since(&self, after: i64) -> Result<Vec<MemoryChangeRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.commit_id, c.writer, s.path,
+                    COALESCE((SELECT p.body IS NOT NULL FROM memory_snapshots p
+                              WHERE p.path = s.path AND p.commit_id < s.commit_id
+                              ORDER BY p.commit_id DESC LIMIT 1), 0),
+                    s.body IS NOT NULL
+             FROM memory_snapshots s JOIN memory_commits c ON c.id = s.commit_id
+             WHERE s.commit_id > ?1
+             ORDER BY s.commit_id, s.path",
+        )?;
+        let rows = stmt.query_map([after], |r| {
+            Ok(MemoryChangeRow {
+                commit_id: r.get(0)?,
+                writer: r.get(1)?,
+                path: r.get(2)?,
+                existed: r.get(3)?,
+                present: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Owner turns the lead ran up to and including `turn_row` since the turn of its last
+    /// memory commit: steered, queued and failed rows do not count.
+    pub fn owner_turns_since_save(&self, turn_row: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM inbox
+             WHERE origin = 'owner' AND steered_into IS NULL
+               AND state NOT IN ('queued', 'failed')
+               AND id <= ?1
+               AND id > COALESCE((SELECT MAX(turn_row) FROM memory_commits WHERE writer = 'lead'), 0)",
+            [turn_row],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Runs raw SQL on the store's connection (tests break the database with it).
+    #[cfg(test)]
+    pub(crate) fn exec_for_test(&self, sql: &str) -> rusqlite::Result<()> {
+        self.conn.execute_batch(sql)
+    }
 }
 
 #[cfg(test)]
@@ -2103,6 +2158,128 @@ mod tests {
 
     fn change(path: &str, body: Option<&str>) -> MemoryChange {
         (path.to_string(), body.map(str::to_string))
+    }
+
+    fn applied_commit(
+        s: &mut Store,
+        writer: &str,
+        turn_row: Option<i64>,
+        changes: &[MemoryChange],
+    ) -> i64 {
+        let commit = MemoryCommit {
+            turn_row,
+            ..mem_commit(writer)
+        };
+        let id = s.record_memory_commit(&commit, changes).unwrap();
+        s.mark_memory_applied(id).unwrap();
+        id
+    }
+
+    fn change_row(
+        commit_id: i64,
+        writer: &str,
+        path: &str,
+        existed: bool,
+        present: bool,
+    ) -> MemoryChangeRow {
+        MemoryChangeRow {
+            commit_id,
+            writer: writer.to_string(),
+            path: path.to_string(),
+            existed,
+            present,
+        }
+    }
+
+    #[test]
+    fn memory_head_is_the_newest_commit() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(s.memory_head().unwrap(), 0);
+        applied_commit(&mut s, "import", None, &[change("a.md", Some("a1"))]);
+        applied_commit(&mut s, "lead", None, &[change("a.md", Some("a2"))]);
+        let third = applied_commit(&mut s, "human", None, &[change("b.md", Some("b1"))]);
+        assert_eq!(s.memory_head().unwrap(), third);
+    }
+
+    #[test]
+    fn changes_since_marks_existed_and_present() {
+        let (_d, _p, mut s) = open_tmp();
+        let (a, b, c) = ("notes/a.md", "notes/b.md", "notes/c.md");
+        let ca = applied_commit(
+            &mut s,
+            "import",
+            None,
+            &[change(a, Some("a1")), change(b, Some("b1"))],
+        );
+        let cb = applied_commit(
+            &mut s,
+            "human",
+            None,
+            &[change(a, Some("a2")), change(b, None)],
+        );
+        let cc = applied_commit(&mut s, "lead", None, &[change(c, Some("c1"))]);
+        let cd = applied_commit(&mut s, "human", None, &[change(c, None)]);
+        let ce = applied_commit(&mut s, "lead", None, &[change(b, Some("b2"))]);
+        let e_row = change_row(ce, "lead", b, false, true);
+        assert_eq!(
+            s.memory_changes_since(ca).unwrap(),
+            vec![
+                change_row(cb, "human", a, true, true),
+                change_row(cb, "human", b, true, false),
+                change_row(cc, "lead", c, false, true),
+                change_row(cd, "human", c, true, false),
+                e_row.clone(),
+            ]
+        );
+        assert_eq!(s.memory_changes_since(cd).unwrap(), vec![e_row]);
+        assert!(s.memory_changes_since(ce).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owner_turns_count_from_the_last_lead_save() {
+        let (_d, _p, mut s) = open_tmp();
+        let r1 = claimed(&mut s, "m1", K1);
+        let r2 = claimed(&mut s, "m2", K2);
+        let r3 = claimed(&mut s, "m3", K2);
+        let r4 = claimed(&mut s, "m4", K1);
+        let failed = claimed(&mut s, "m5", K2);
+        s.mark(failed, State::Failed, Some("E_TEST")).unwrap();
+        let queued = new_id(admit(&mut s, "m6", K2));
+        let steered = new_id(admit(&mut s, "m7", K1));
+        assert!(s.steer_into(steered, r4).unwrap());
+        let lane = new_lane(&mut s, "call-1", K1);
+        assert!(
+            s.finish_lane(lane, 1, "lane result", LaneState::Idle, None)
+                .unwrap()
+        );
+        let lane_row: i64 = s
+            .conn
+            .query_row("SELECT id FROM inbox WHERE origin = 'lane'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(s.claim(lane_row).unwrap());
+        let r9 = claimed(&mut s, "m9", K1);
+        assert_eq!(
+            [r1, r2, r3, r4, failed, queued, steered, lane_row, r9],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(state_of(&s, queued).0, State::Queued);
+
+        assert_eq!(s.owner_turns_since_save(r9).unwrap(), 5);
+        applied_commit(&mut s, "lead", Some(r2), &[change("a.md", Some("a1"))]);
+        assert_eq!(s.owner_turns_since_save(r9).unwrap(), 3);
+        assert_eq!(s.owner_turns_since_save(r4).unwrap(), 2);
+        applied_commit(&mut s, "human", Some(r4), &[change("b.md", Some("b1"))]);
+        assert_eq!(s.owner_turns_since_save(r9).unwrap(), 3);
+    }
+
+    #[test]
+    fn exec_for_test_runs_on_the_store_connection() {
+        let (_d, _p, mut s) = open_tmp();
+        let id = applied_commit(&mut s, "import", None, &[change("a.md", Some("a1"))]);
+        s.exec_for_test("DROP TABLE memory_snapshots").unwrap();
+        assert!(s.memory_snapshots(id).is_err());
     }
 
     fn memory_objects(conn: &Connection) -> Vec<String> {
