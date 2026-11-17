@@ -19,7 +19,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory::home::MemoryHome;
-use crate::memory::{self, history, notice, render};
+use crate::memory::{self, extension, history, notice, render};
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -793,6 +793,10 @@ pub struct OmpManager {
     running: Arc<watch::Sender<Option<String>>>,
     turn: Arc<Mutex<Option<TurnContext>>>,
     lanes: Arc<LaneManager>,
+    /// The live lead child acked the memory extension (checked at each start).
+    extension_loaded: AtomicBool,
+    /// Test-only replacement for the extension text written at each lead start.
+    extension_source: Option<String>,
 }
 
 impl OmpManager {
@@ -830,6 +834,8 @@ impl OmpManager {
             running: Arc::new(watch::channel(None).0),
             turn,
             lanes,
+            extension_loaded: AtomicBool::new(false),
+            extension_source: None,
         }
     }
 
@@ -902,6 +908,18 @@ impl OmpManager {
             .clock = clock.clone();
         self.clock = clock;
         self
+    }
+
+    /// Replaces the shipped extension text written at each lead start (the opt-in real-omp
+    /// test uses a broken one). Production never calls it.
+    pub fn with_extension_source(mut self, source: String) -> Self {
+        self.extension_source = Some(source);
+        self
+    }
+
+    /// Whether the live lead child loaded the memory extension (tests read it).
+    pub fn extension_loaded(&self) -> bool {
+        self.extension_loaded.load(Ordering::SeqCst)
     }
 
     /// Watches the lead state (tests wait on it; nothing else reads it outside this module).
@@ -1128,7 +1146,19 @@ impl OmpManager {
         };
         match collected {
             Ok(notices) => match notice::block(&notices) {
-                Some(block) => notice::insert(text, &block),
+                Some(block) => {
+                    if self.extension_loaded() {
+                        match extension::queue(&self.config.home, &block) {
+                            Ok(()) => return text.to_owned(),
+                            Err(e) => tracing::warn!(
+                                code = memory::E_MEMORY_WRITE,
+                                error = %e.kind(),
+                                "memory notice not queued"
+                            ),
+                        }
+                    }
+                    notice::insert(text, &block)
+                }
                 None => text.to_owned(),
             },
             Err(e) => {
@@ -1183,6 +1213,19 @@ impl OmpManager {
                 ("compaction", fresh)
             }
         };
+        if self.extension_loaded() {
+            let written = extension::block_of(&text)
+                .is_some_and(|block| extension::write_block(&self.config.home, block).is_ok());
+            if written {
+                self.pin_to(text);
+                tracing::info!(reason, "omp lead re-pinned in place");
+                return Ok(());
+            }
+            tracing::warn!(
+                code = memory::E_MEMORY_WRITE,
+                "memory block not written; re-pinning by restart"
+            );
+        }
         let began = Instant::now();
         if let Some(old) = live.take() {
             old.close(&self.lead_kill).await;
@@ -1206,21 +1249,60 @@ impl OmpManager {
         render::append(&self.hints, &rendered.text)
     }
 
+    /// Writes the memory extension and its files for a lead start with `append`; returns the
+    /// extension's absolute path and the absolute moraebot home for `extension::HOME_ENV`.
+    fn prepare_extension(&self, append: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+        let home = &self.config.home;
+        let path = extension::prepare(home, extension::block_of(append))?;
+        if let Some(source) = &self.extension_source {
+            write_private(
+                &extension::dir(home),
+                extension::EXT_FILE,
+                source.as_bytes(),
+            )?;
+        }
+        Ok((path, std::path::absolute(home)?))
+    }
+
     /// Starts the lead child with `append` as its appended system prompt. With memory,
-    /// `append` becomes the pin and a pending refresh request is removed.
+    /// the lead gets the memory extension (`-e`), `append` becomes the pin and a pending
+    /// refresh request is removed.
     async fn start(&self, append: String) -> Result<Live, Outcome> {
         let previous_session = lock(&self.store)
             .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
         let session_dir = lead_session_dir(&self.config);
+        let mut args = omp_args(&self.config, &session_dir, &append);
+        let mut extension_home = None;
+        if self.memory.is_some() {
+            self.extension_loaded.store(false, Ordering::SeqCst);
+            match self.prepare_extension(&append) {
+                Ok((path, home)) => {
+                    args.push("-e".into());
+                    args.push(path.into_os_string());
+                    extension_home = Some(home);
+                }
+                Err(e) => tracing::warn!(
+                    code = memory::E_MEMORY_EXT_MISSING,
+                    error = %e.kind(),
+                    "memory extension not written"
+                ),
+            }
+        }
         let command = private_dir(&session_dir)
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &session_dir, &append),
+                    args,
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )
+            })
+            .map(|mut command| {
+                if let Some(home) = &extension_home {
+                    command.env(extension::HOME_ENV, home);
+                }
+                command
             })
             .map_err(|e| Outcome::failed(E_OMP_SPAWN, e))?;
         let session_dir = session_dir.to_string_lossy().into_owned();
@@ -1299,46 +1381,66 @@ impl OmpManager {
             tracing::warn!(code = e.code(), "could not store the lead's omp session id");
         }
         tracing::info!(pid = started.pid, "omp lead child ready");
+        if extension_home.is_some() {
+            match extension::check_ack(&self.config.home, started.pid) {
+                Ok(()) => {
+                    self.extension_loaded.store(true, Ordering::SeqCst);
+                    tracing::info!(pid = started.pid, "memory extension loaded");
+                }
+                Err(code) => {
+                    tracing::warn!(
+                        code,
+                        "memory extension not loaded; the lead re-pins by restart"
+                    );
+                }
+            }
+        }
         self.lead_state.send_modify(|s| s.settled = true);
         if self.memory.is_some() {
-            let compactions = self.lead_state.borrow().compactions;
-            *lock(&self.pin) = Some(Pin {
-                text: append,
-                compactions,
-            });
-            let head = lock(&self.store).memory_head();
-            match head {
-                Ok(head) => {
-                    let now = (self.clock)();
-                    let mut marks = lock(&self.marks);
-                    match marks.as_mut() {
-                        None => {
-                            *marks = Some(notice::Watermarks::at_pin(head, now, compactions));
-                        }
-                        Some(marks) => marks.repin(head, now),
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    code = memory::E_MEMORY_HISTORY,
-                    detail = e.code(),
-                    "memory notice marks not moved"
-                ),
-            }
-            match std::fs::remove_file(notice::refresh_file(&self.config.home)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(
-                    code = memory::E_MEMORY_WRITE,
-                    error = %e.kind(),
-                    "could not remove the memory refresh request"
-                ),
-            }
+            self.pin_to(append);
         }
         Ok(Live {
             requests,
             worker,
             sent_files,
         })
+    }
+
+    /// Makes `append` the pin of the live lead: moves the pin, the notice marks and removes
+    /// a pending refresh request (at a start, or at an in-place re-pin).
+    fn pin_to(&self, append: String) {
+        let compactions = self.lead_state.borrow().compactions;
+        *lock(&self.pin) = Some(Pin {
+            text: append,
+            compactions,
+        });
+        let head = lock(&self.store).memory_head();
+        match head {
+            Ok(head) => {
+                let now = (self.clock)();
+                let mut marks = lock(&self.marks);
+                match marks.as_mut() {
+                    None => {
+                        *marks = Some(notice::Watermarks::at_pin(head, now, compactions));
+                    }
+                    Some(marks) => marks.repin(head, now),
+                }
+            }
+            Err(e) => tracing::warn!(
+                code = memory::E_MEMORY_HISTORY,
+                detail = e.code(),
+                "memory notice marks not moved"
+            ),
+        }
+        match std::fs::remove_file(notice::refresh_file(&self.config.home)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                code = memory::E_MEMORY_WRITE,
+                error = %e.kind(),
+                "could not remove the memory refresh request"
+            ),
+        }
     }
 }
 
