@@ -2225,3 +2225,321 @@ async fn no_memory_never_restarts() {
     assert!(refresh.exists());
     manager.shutdown_all().await;
 }
+
+// --- memory notices in the owner envelope -----------------------------------------------
+
+impl Harness {
+    /// Admits and claims an owner row of `key`; returns its id.
+    fn owner_row(&self, key: &str, message_id: &str) -> i64 {
+        let mut store = self.store.lock().unwrap();
+        let id = match store
+            .admit("discord", message_id, key, "222", "111", "body")
+            .expect("admit")
+        {
+            moraebot::store::Admitted::New(id) => id,
+            moraebot::store::Admitted::Duplicate => panic!("duplicate message id"),
+        };
+        assert!(store.claim(id).expect("claim"));
+        id
+    }
+
+    fn owner_turns(&self, row: i64) -> i64 {
+        self.store
+            .lock()
+            .unwrap()
+            .owner_turns_since_save(row)
+            .expect("owner turns")
+    }
+
+    /// The `message` of every prompt frame, in order.
+    fn prompt_messages(&self) -> Vec<String> {
+        self.frames("prompt")
+            .iter()
+            .map(|f| f["message"].as_str().expect("prompt message").to_owned())
+            .collect()
+    }
+}
+
+/// Sends a tagged owner input for a fresh owner row of `key` and returns the row.
+async fn owner_prompt(h: &Harness, manager: &OmpManager, key: &str, id: &str, body: &str) -> i64 {
+    let row = h.owner_row(key, id);
+    bounded(manager.prompt(key, row, &lead::owner_input(key, row, body))).await;
+    row
+}
+
+/// The lines between the notice markers; empty when the message has no block.
+fn notice_lines(message: &str) -> Vec<&str> {
+    let lines: Vec<&str> = message.split('\n').collect();
+    let Some(begin) = lines.iter().position(|l| *l == memory::NOTICE_BEGIN) else {
+        return Vec::new();
+    };
+    let end = lines
+        .iter()
+        .position(|l| *l == memory::NOTICE_END)
+        .expect("notice end marker");
+    lines[begin + 1..end].to_vec()
+}
+
+#[tokio::test]
+async fn notice_block_follows_the_tag_line() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "nb-1", "one").await;
+    h.change_persona("v2-marker");
+    let commit = h.memory_commits().last().expect("commit").id;
+    let r2 = owner_prompt(&h, &manager, KEY_A, "nb-2", "two").await;
+    owner_prompt(&h, &manager, KEY_A, "nb-3", "three").await;
+
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 3);
+    let soul = format!("soul path=\"system/persona.md\" writer=human commit={commit}");
+    let changed =
+        format!("changed kind=updated path=\"system/persona.md\" writer=human commit={commit}");
+    let tag = format!("[moraebot conversation={KEY_A} message={r2}]");
+    let expected = [
+        tag.as_str(),
+        memory::NOTICE_BEGIN,
+        soul.as_str(),
+        changed.as_str(),
+        memory::NOTICE_END,
+        "two",
+    ];
+    assert_eq!(messages[1].split('\n').collect::<Vec<_>>(), expected);
+    assert!(!messages[0].contains(memory::NOTICE_BEGIN));
+    assert!(!messages[2].contains(memory::NOTICE_BEGIN));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn lead_writes_are_not_announced() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[create_call("notes/a.md")]);
+    owner_prompt(&h, &manager, KEY_A, "lw-1", "run-tools").await;
+    owner_prompt(&h, &manager, KEY_A, "lw-2", "hi").await;
+    let commits = h.memory_commits();
+    assert_eq!(
+        commits.last().expect("commit").commit.writer,
+        memory::WRITER_LEAD
+    );
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 2);
+    assert!(
+        !messages[1].contains(memory::NOTICE_BEGIN),
+        "{}",
+        messages[1]
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn changed_lines_cap_at_twenty() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "cap-1", "one").await;
+    for k in 0..23 {
+        let path = h.memory_file(&format!("notes/n{k}.md"));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("notes folder");
+        std::fs::write(path, "---\ndescription: d\n---\nbody\n").expect("write note");
+    }
+    history::accept(&mut h.store.lock().unwrap(), &h.memory(), &[], "test").expect("accept");
+    owner_prompt(&h, &manager, KEY_A, "cap-2", "two").await;
+
+    let messages = h.prompt_messages();
+    let lines = notice_lines(&messages[1]);
+    let added = lines
+        .iter()
+        .filter(|l| l.starts_with("changed kind=added "))
+        .count();
+    assert_eq!(added, 20, "{lines:?}");
+    assert!(lines.contains(&"changed more=3"), "{lines:?}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn expired_notice_once() {
+    const EXPIRES: &str = "2030-01-01T00:00:00Z";
+    let h = Harness::new();
+    let home = h.memory();
+    let note = h.memory_file("notes/x.md");
+    std::fs::create_dir_all(note.parent().expect("parent")).expect("notes folder");
+    std::fs::write(
+        &note,
+        format!("---\ndescription: d\nexpires: {EXPIRES}\n---\nx\n"),
+    )
+    .expect("write note");
+    let at = memory::guard::expires_at(EXPIRES).expect("instant");
+    let (now, clock) = stepped_clock(at - 10);
+    let manager = h.manager("ok").with_memory(home).with_clock(clock);
+    owner_prompt(&h, &manager, KEY_A, "ex-1", "one").await;
+    now.store(at + 10, Ordering::SeqCst);
+    owner_prompt(&h, &manager, KEY_A, "ex-2", "two").await;
+    owner_prompt(&h, &manager, KEY_A, "ex-3", "three").await;
+
+    let messages = h.prompt_messages();
+    assert!(notice_lines(&messages[0]).is_empty());
+    assert_eq!(notice_lines(&messages[1]), ["expired path=\"notes/x.md\""]);
+    assert!(notice_lines(&messages[2]).is_empty());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn compaction_notice_counts() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT])
+        .with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "cn-1", "compact-now").await;
+    owner_prompt(&h, &manager, KEY_A, "cn-2", "two").await;
+    owner_prompt(&h, &manager, KEY_A, "cn-3", "three").await;
+
+    let messages = h.prompt_messages();
+    assert!(notice_lines(&messages[0]).is_empty());
+    assert_eq!(notice_lines(&messages[1]), ["compaction count=1"]);
+    assert!(notice_lines(&messages[2]).is_empty());
+    assert_eq!(h.append_flags().len(), 1);
+    manager.shutdown_all().await;
+}
+
+fn nudge_lines(message: &str) -> Vec<&str> {
+    notice_lines(message)
+        .into_iter()
+        .filter(|l| l.starts_with("nudge "))
+        .collect()
+}
+
+#[tokio::test]
+async fn nudge_after_ten_owner_turns() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    let mut nudged = false;
+    for n in 0..12 {
+        let row = h.owner_row(KEY_A, &format!("nu-{n}"));
+        let count = h.owner_turns(row);
+        bounded(manager.prompt(KEY_A, row, &lead::owner_input(KEY_A, row, "hi"))).await;
+        let messages = h.prompt_messages();
+        let last = messages.last().expect("prompt frame");
+        if count == 10 {
+            assert_eq!(nudge_lines(last), ["nudge owner_turns=10"]);
+            nudged = true;
+            break;
+        }
+        assert!(nudge_lines(last).is_empty(), "count {count}: {last}");
+    }
+    assert!(nudged, "the count reached 10 within 12 prompts");
+    manager.shutdown_all().await;
+
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[create_call("notes/a.md")]);
+    let mut last_row = 0;
+    for n in 1..=10 {
+        let body = if n == 5 { "run-tools" } else { "hi" };
+        last_row = owner_prompt(&h, &manager, KEY_A, &format!("nt-{n}"), body).await;
+    }
+    assert_eq!(h.owner_turns(last_row), 5);
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 10);
+    assert!(nudge_lines(&messages[9]).is_empty(), "{}", messages[9]);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn notices_skip_lane_results() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "ln-1", "one").await;
+    h.change_persona("v2-marker");
+    let lane_input = lead::lane_result(KEY_A, 1, &lead::LaneResult::Text("t"));
+    bounded(manager.prompt(KEY_A, 900, &lane_input)).await;
+    owner_prompt(&h, &manager, KEY_A, "ln-3", "three").await;
+
+    let messages = h.prompt_messages();
+    assert_eq!(messages[1], lane_input);
+    assert!(
+        notice_lines(&messages[2])
+            .iter()
+            .any(|l| l.starts_with("changed kind=updated path=\"system/persona.md\" ")),
+        "{}",
+        messages[2]
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn steer_carries_notices_without_nudge() {
+    let h = Harness::new();
+    let manager = h.steer_memory_manager("separate");
+    let mut main_row = 0;
+    for n in 0..12 {
+        main_row = h.owner_row(KEY_STEER, &format!("st-{n}"));
+        if h.owner_turns(main_row) == 10 {
+            break;
+        }
+    }
+    assert_eq!(h.owner_turns(main_row), 10);
+    let main_text = lead::owner_input(KEY_STEER, main_row, "m1");
+    let main = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.prompt(KEY_STEER, main_row, &main_text).await })
+    };
+    turn_running(&manager, KEY_STEER).await;
+    h.change_persona("v2-marker");
+    let s = h.admit("st-steer", "m2");
+    let steer_text = lead::owner_input(KEY_STEER, s, "m2");
+    assert!(manager.try_steer(KEY_STEER, s, &steer_text, |main| {
+        h.store.lock().unwrap().steer_into(s, main).unwrap()
+    }));
+    assert_eq!(h.owner_turns(s), 10);
+    let report = bounded(main).await.expect("prompt task");
+    assert_eq!(codes(&report), (None, Some((s, None))));
+
+    let frames = h.frames("prompt");
+    let main_frame = frames
+        .iter()
+        .find(|f| f["streamingBehavior"] == "followUp")
+        .expect("main frame");
+    let steer_frame = h.steer_frames().pop().expect("steer frame");
+    assert_eq!(
+        notice_lines(main_frame["message"].as_str().unwrap()),
+        ["nudge owner_turns=10"]
+    );
+    let steer_lines = notice_lines(steer_frame["message"].as_str().unwrap());
+    assert!(
+        steer_lines
+            .iter()
+            .any(|l| l.starts_with("changed kind=updated path=\"system/persona.md\" ")),
+        "{steer_lines:?}"
+    );
+    assert!(nudge_lines(steer_frame["message"].as_str().unwrap()).is_empty());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn restart_moves_the_marks() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([COMPACT])
+        .with_memory(h.memory());
+    owner_prompt(&h, &manager, KEY_A, "rm-1", "compact-now").await;
+    h.change_persona("v2-marker");
+    owner_prompt(&h, &manager, KEY_A, "rm-2", "two").await;
+
+    assert_eq!(h.append_flags().len(), 2);
+    let messages = h.prompt_messages();
+    assert_eq!(notice_lines(&messages[1]), ["compaction count=1"]);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn no_memory_means_no_notice() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_extra_env([COMPACT]);
+    for (n, body) in ["compact-now", "two", "three"].into_iter().enumerate() {
+        owner_prompt(&h, &manager, KEY_A, &format!("nm-{n}"), body).await;
+    }
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 3);
+    assert!(messages.iter().all(|m| !m.contains(memory::NOTICE_BEGIN)));
+    manager.shutdown_all().await;
+}

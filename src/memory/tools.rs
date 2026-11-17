@@ -25,7 +25,8 @@ fn schema(value: Value) -> Map<String, Value> {
 
 /// The sentence every write tool description ends with.
 const WRITE_RULES: &str = "`reason` is required: one line saying why. Writes work only while you \
-     answer an owner message; the change shows in the memory block from your next start.";
+     answer an owner message; the memory block is pinned for this session, so a change shows in \
+     it only after the conversation is compacted or the owner runs moraebot memory refresh.";
 
 /// The optional claim arguments every write tool takes.
 const CLAIM_KEYS: [&str; 3] = ["source", "user_quote", "quote_message"];

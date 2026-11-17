@@ -744,6 +744,9 @@ pub struct OmpManager {
     /// `results` reaches this.
     results_expected: AtomicU64,
     pin: Mutex<Option<Pin>>,
+    /// What the lead was last told; set at the first start with memory. Lock order: gate,
+    /// store, marks.
+    marks: Mutex<Option<notice::Watermarks>>,
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
     gate: SteerGate,
@@ -780,6 +783,7 @@ impl OmpManager {
             lead_state: Arc::new(watch::channel(LeadState::default()).0),
             results_expected: AtomicU64::new(0),
             pin: Mutex::new(None),
+            marks: Mutex::new(None),
             live: Default::default(),
             lead_kill: Default::default(),
             gate: Default::default(),
@@ -919,7 +923,7 @@ impl OmpManager {
         });
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
-            text: text.to_owned(),
+            text: self.with_notices(text, Some(row_id)),
             timeout: self.turn_timeout,
             behavior: StreamingBehavior::FollowUp,
             done,
@@ -984,9 +988,7 @@ impl OmpManager {
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
             || matches!(steered, Some((_, Outcome::NeedsCheck { .. })));
-        if lost
-            && let Some(current) = live.take()
-        {
+        if lost && let Some(current) = live.take() {
             tracing::warn!(
                 conversation = %key,
                 row = row_id,
@@ -1026,7 +1028,7 @@ impl OmpManager {
         }
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
-            text: text.to_owned(),
+            text: self.with_notices(text, None),
             // A backstop only: `prompt` always ends the steer wait first.
             timeout: self.turn_timeout.saturating_mul(2),
             behavior: StreamingBehavior::Steer,
@@ -1055,6 +1057,36 @@ impl OmpManager {
     fn kill_lead(&self) {
         if let Some(group) = lock(&self.lead_kill).as_ref() {
             group.kill();
+        }
+    }
+
+    /// With memory, an owner input (`text`) with the notices since the marks inserted after
+    /// its tag line, advancing the marks; any other input, or nothing to say, is `text`
+    /// unchanged. `owner_row` is the main turn's row (nudge counted), `None` for a steer.
+    fn with_notices(&self, text: &str, owner_row: Option<i64>) -> String {
+        if self.memory.is_none() || !lead::parse_tag(text).is_some_and(|tag| tag.message.is_some())
+        {
+            return text.to_owned();
+        }
+        let compactions = self.lead_state.borrow().compactions;
+        let now = (self.clock)();
+        let collected = {
+            let store = lock(&self.store);
+            let mut marks = lock(&self.marks);
+            let Some(marks) = marks.as_mut() else {
+                return text.to_owned();
+            };
+            notice::collect(&store, marks, compactions, now, owner_row)
+        };
+        match collected {
+            Ok(notices) => match notice::block(&notices) {
+                Some(block) => notice::insert(text, &block),
+                None => text.to_owned(),
+            },
+            Err(e) => {
+                tracing::warn!(code = e.code, "memory notices unavailable");
+                text.to_owned()
+            }
         }
     }
 
@@ -1238,6 +1270,24 @@ impl OmpManager {
                 text: append,
                 compactions,
             });
+            let head = lock(&self.store).memory_head();
+            match head {
+                Ok(head) => {
+                    let now = (self.clock)();
+                    let mut marks = lock(&self.marks);
+                    match marks.as_mut() {
+                        None => {
+                            *marks = Some(notice::Watermarks::at_pin(head, now, compactions));
+                        }
+                        Some(marks) => marks.repin(head, now),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    code = memory::E_MEMORY_HISTORY,
+                    detail = e.code(),
+                    "memory notice marks not moved"
+                ),
+            }
             match std::fs::remove_file(notice::refresh_file(&self.config.home)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
