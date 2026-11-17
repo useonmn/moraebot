@@ -6,7 +6,8 @@
 //! lead and its lanes run different scripts from one environment. When
 //! FAKE_OMP_LOG is set, the process appends a trace line at startup
 //! (`START pid=<pid> argv=<json>`), a line with the environment variable NAMES
-//! only (`ENV <names>`), and then every received stdin line.
+//! only (`ENV <names>`), and then every received stdin line. When
+//! PI_CONFIG_FILES is set, a `CONFIG_FILES <value>` line follows the `ENV` line.
 //!
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
@@ -113,6 +114,9 @@ fn main() {
         let mut names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
         names.sort();
         log_line(path, &format!("ENV {}", names.join(" ")));
+        if let Some(value) = std::env::var_os("PI_CONFIG_FILES") {
+            log_line(path, &format!("CONFIG_FILES {}", value.to_string_lossy()));
+        }
     }
 
     let stdout = io::stdout();
