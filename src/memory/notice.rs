@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use super::history::{self, Committed};
 use super::home::MemoryError;
+use super::render::{self, Pressure};
 use super::{
-    E_MEMORY_HISTORY, EXPIRES_KEY, MAX_NOTICE_PATHS, MAX_ONBOARDING_TURNS, MEMORY_DIR,
-    NOTICE_BEGIN, NOTICE_END, NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD, frontmatter,
-    guard,
+    E_MEMORY_HISTORY, E_MEMORY_PRESSURE, EXPIRES_KEY, MAX_NOTICE_PATHS, MAX_ONBOARDING_TURNS,
+    MEMORY_DIR, NOTICE_BEGIN, NOTICE_END, NUDGE_EVERY, REFRESH_FILE, SOUL_PATHS, WRITER_LEAD,
+    frontmatter, guard,
 };
 use crate::store::{AgreementRow, MemoryChangeRow, Store, StoreError};
 
@@ -60,6 +61,8 @@ pub struct Notices {
     pub agreements: Vec<AgreementRow>,
     /// The owner turn number of a running onboarding, within `MAX_ONBOARDING_TURNS`.
     pub onboarding: Option<i64>,
+    /// The estimate, when it reached the budget and that was not shown yet.
+    pub pressure: Option<Pressure>,
 }
 
 /// What the lead was last told: the newest commit id, the expiry instant and the compaction count.
@@ -68,6 +71,8 @@ pub struct Watermarks {
     pub commit: i64,
     pub expiry: i64,
     pub compactions: u64,
+    /// Whether the over-budget line was already shown since the estimate last reached the budget.
+    pub pressure_told: bool,
 }
 
 impl Watermarks {
@@ -77,6 +82,7 @@ impl Watermarks {
             commit: head,
             expiry: now,
             compactions,
+            pressure_told: false,
         }
     }
 
@@ -114,9 +120,20 @@ pub fn collect(
         .map_err(history_error)?
         .flatten()
         .filter(|n| (1..=MAX_ONBOARDING_TURNS).contains(n));
+    let all_agreements = store.agreements().map_err(history_error)?;
     let agreements = store.unnoticed_flags().map_err(history_error)?;
     let ids: Vec<i64> = agreements.iter().map(|a| a.id).collect();
     store.mark_flags_noticed(&ids).map_err(history_error)?;
+    let pressure = render::pressure(&committed, &all_agreements, now);
+    let tell = pressure.over() && !marks.pressure_told;
+    if tell {
+        tracing::warn!(
+            code = E_MEMORY_PRESSURE,
+            tokens = pressure.tokens,
+            budget = pressure.budget,
+            "system memory over its size budget"
+        );
+    }
     let notices = Notices {
         compactions: compactions.saturating_sub(marks.compactions),
         owner_turns,
@@ -124,11 +141,13 @@ pub fn collect(
         expired,
         agreements,
         onboarding,
+        pressure: tell.then_some(pressure),
     };
     *marks = Watermarks {
         commit: marks.commit.max(head),
         expiry: marks.expiry.max(now),
         compactions: marks.compactions.max(compactions),
+        pressure_told: pressure.over(),
     };
     Ok(notices)
 }
@@ -259,6 +278,14 @@ pub fn block(notices: &Notices) -> Option<String> {
     if let Some(n) = notices.onboarding {
         lines.push(format!("onboarding turn={n}"));
     }
+    if let Some(p) = notices.pressure {
+        lines.push(format!(
+            "pressure over_budget tokens={} budget={} percent={}",
+            p.tokens,
+            p.budget,
+            p.percent()
+        ));
+    }
     if lines.is_empty() {
         return None;
     }
@@ -291,6 +318,7 @@ mod tests {
     use crate::memory::home::MemoryHome;
     use crate::memory::{IDENTITY, NEEDS_HUMAN_AT, PERSONA, WRITER_HUMAN};
     use crate::store::{Admitted, MemoryCommit, OnboardingState};
+    use tracing_subscriber::fmt::format::FmtSpan;
 
     /// `notes/n.md` expires at unix second 150.
     const EXPIRING: &str = "---\ndescription: a note\nexpires: 1970-01-01T00:02:30Z\n---\nbody\n";
@@ -468,6 +496,7 @@ mod tests {
             expired: vec!["notes/x y.md".to_string()],
             agreements: Vec::new(),
             onboarding: None,
+            pressure: None,
         };
         let expected = concat!(
             "[moraebot memory-notice]\n",
@@ -546,6 +575,7 @@ mod tests {
                 expired: vec!["notes/n.md".to_string()],
                 agreements: Vec::new(),
                 onboarding: None,
+                pressure: None,
             }
         );
         assert_eq!(
@@ -553,7 +583,8 @@ mod tests {
             Watermarks {
                 commit: human,
                 expiry: 200,
-                compactions: 1
+                compactions: 1,
+                pressure_told: false,
             }
         );
 
@@ -570,7 +601,8 @@ mod tests {
             Watermarks {
                 commit: human,
                 expiry: 200,
-                compactions: 1
+                compactions: 1,
+                pressure_told: false,
             }
         );
     }
@@ -598,6 +630,7 @@ mod tests {
             commit: 9,
             expiry: 300,
             compactions: 2,
+            pressure_told: false,
         };
         assert_eq!(marks, expected);
         marks.repin(3, 50);
@@ -834,6 +867,215 @@ mod tests {
         );
         let done = collect(&store, &mut marks, 0, 100, Some(a)).expect("collect");
         assert_eq!(done.onboarding, None);
+    }
+
+    /// Exactly `n` bytes of plain text.
+    fn bytes(n: usize) -> String {
+        "x".repeat(n - 1) + "\n"
+    }
+
+    const AT_BUDGET: Pressure = Pressure {
+        tokens: 30000,
+        budget: 30000,
+    };
+
+    /// Commits `system/p1.md`..`system/p7.md` of 15000 bytes each (105000 bytes).
+    fn commit_seven(store: &mut Store, home: &MemoryHome) {
+        let body = bytes(15000);
+        let paths: Vec<String> = (1..=7).map(|i| format!("system/p{i}.md")).collect();
+        let changes: Vec<(&str, Option<&str>)> = paths
+            .iter()
+            .map(|p| (p.as_str(), Some(body.as_str())))
+            .collect();
+        commit_by(store, home, WRITER_HUMAN, &changes);
+    }
+
+    fn commit_p8(store: &mut Store, home: &MemoryHome, path: &str, n: usize) {
+        commit_by(store, home, WRITER_HUMAN, &[(path, Some(&bytes(n)))]);
+    }
+
+    #[test]
+    fn block_orders_agreement_onboarding_pressure() {
+        let notices = Notices {
+            agreements: vec![flagged(3, 3, "t")],
+            onboarding: Some(2),
+            pressure: Some(AT_BUDGET),
+            ..Default::default()
+        };
+        let expected = concat!(
+            "[moraebot memory-notice]\n",
+            "agreement needs-human id=3 broken=3 text=\"t\"\n",
+            "onboarding turn=2\n",
+            "pressure over_budget tokens=30000 budget=30000 percent=100\n",
+            "[moraebot memory-notice end]\n",
+        );
+        assert_eq!(block(&notices).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn pressure_line_follows_agreements() {
+        let notices = Notices {
+            agreements: vec![flagged(3, 3, "t")],
+            pressure: Some(AT_BUDGET),
+            ..Default::default()
+        };
+        let expected = concat!(
+            "[moraebot memory-notice]\n",
+            "agreement needs-human id=3 broken=3 text=\"t\"\n",
+            "pressure over_budget tokens=30000 budget=30000 percent=100\n",
+            "[moraebot memory-notice end]\n",
+        );
+        assert_eq!(block(&notices).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn block_with_only_pressure_is_some() {
+        let notices = Notices {
+            pressure: Some(Pressure {
+                tokens: 31000,
+                budget: 30000,
+            }),
+            ..Default::default()
+        };
+        let text = block(&notices).expect("block");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                NOTICE_BEGIN,
+                "pressure over_budget tokens=31000 budget=30000 percent=103",
+                NOTICE_END
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_tells_over_budget_once() {
+        let (_dir, mut store, home) = store_fixture();
+        let head = store.memory_head().expect("head");
+        let mut marks = Watermarks::at_pin(head, 100, 0);
+        let step = |store: &Store, marks: &mut Watermarks, want: Option<Pressure>, told: bool| {
+            let notices = collect(store, marks, 0, 100, None).expect("collect");
+            assert_eq!(notices.pressure, want);
+            assert_eq!(marks.pressure_told, told);
+        };
+        commit_seven(&mut store, &home);
+        step(&store, &mut marks, None, false);
+        commit_p8(&mut store, &home, "system/p8.md", 14999);
+        step(&store, &mut marks, None, false);
+        commit_p8(&mut store, &home, "system/p8.md", 15000);
+        step(&store, &mut marks, Some(AT_BUDGET), true);
+        step(&store, &mut marks, None, true);
+        commit_p8(&mut store, &home, "system/p8.md", 14996);
+        step(&store, &mut marks, None, false);
+        commit_p8(&mut store, &home, "system/p8.md", 15000);
+        step(&store, &mut marks, Some(AT_BUDGET), true);
+    }
+
+    #[test]
+    fn notes_files_do_not_count() {
+        let (_dir, mut store, home) = store_fixture();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        commit_seven(&mut store, &home);
+        let first = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(first.pressure, None);
+        commit_p8(&mut store, &home, "notes/p8.md", 15000);
+        let second = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(second.pressure, None);
+        assert!(!marks.pressure_told);
+    }
+
+    #[test]
+    fn pressure_counts_agreements_in_collect() {
+        let (_dir, mut store, home) = store_fixture();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        commit_seven(&mut store, &home);
+        commit_p8(&mut store, &home, "system/p8.md", 14000);
+        let before = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert_eq!(before.pressure, None);
+        for i in 1..=4 {
+            let text = format!("a{i} {}", "z".repeat(237));
+            assert_eq!(text.len(), 240);
+            let new = crate::store::NewAgreement {
+                scope: "project",
+                author: "agent",
+                text: &text,
+                norm: &text,
+                turn_row: 1,
+                reason: "why",
+                claim_json: None,
+            };
+            assert!(matches!(
+                store.add_agreement(&new, 64, 12288).expect("add"),
+                crate::store::AgreementAdded::Added(_)
+            ));
+        }
+        let after = collect(&store, &mut marks, 0, 100, None).expect("collect");
+        let p = after.pressure.expect("over budget");
+        let committed = history::committed(&store).expect("committed");
+        let rows = store.agreements().expect("agreements");
+        assert_eq!(p, render::pressure(&committed, &rows, 100));
+        assert!(p.over());
+    }
+
+    #[test]
+    fn collect_logs_over_budget_once() {
+        let capture = crate::logging::Capture::default();
+        let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
+            None,
+            FmtSpan::NONE,
+            capture.clone(),
+        ));
+        // With a single scoped subscriber, tracing caches a callsite's interest from whichever
+        // thread reaches it first; sibling tests reach the warn callsite on threads without a
+        // subscriber. A second live dispatch makes every registration consult all subscribers,
+        // and the rebuild drops any interest cached before this test's subscriber existed.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tracing::callsite::rebuild_interest_cache();
+        let (_dir, mut store, home) = store_fixture();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        commit_seven(&mut store, &home);
+        collect(&store, &mut marks, 0, 100, None).expect("collect");
+        commit_p8(&mut store, &home, "system/p8.md", 15000);
+        collect(&store, &mut marks, 0, 100, None).expect("collect");
+        collect(&store, &mut marks, 0, 100, None).expect("collect");
+        let contents = capture.contents();
+        let hits: Vec<&str> = contents
+            .lines()
+            .filter(|l| l.contains(E_MEMORY_PRESSURE))
+            .collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("tokens=30000"));
+        assert!(hits[0].contains("budget=30000"));
+        assert!(!hits[0].contains("system/p"));
+    }
+
+    #[test]
+    fn repin_keeps_pressure_told() {
+        let mut marks = Watermarks::at_pin(5, 100, 2);
+        assert!(!marks.pressure_told);
+        marks.pressure_told = true;
+        marks.repin(9, 300);
+        assert!(marks.pressure_told);
+    }
+
+    #[test]
+    fn collect_error_keeps_pressure_told() {
+        let (_dir, mut store, home) = store_fixture();
+        let mut marks = Watermarks::at_pin(store.memory_head().expect("head"), 100, 0);
+        commit_seven(&mut store, &home);
+        commit_p8(&mut store, &home, "system/p8.md", 15000);
+        collect(&store, &mut marks, 0, 100, None).expect("collect");
+        assert!(marks.pressure_told);
+        let before = marks;
+        commit_p8(&mut store, &home, "system/p8.md", 14996);
+        store
+            .exec_for_test("DROP TABLE memory_snapshots")
+            .expect("drop");
+        let err = collect(&store, &mut marks, 0, 100, None).expect_err("broken store");
+        assert_eq!(err.code, E_MEMORY_HISTORY);
+        assert_eq!(marks, before);
+        assert!(marks.pressure_told);
     }
 
     #[test]
