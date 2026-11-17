@@ -988,7 +988,11 @@ impl OmpManager {
         )];
         tools.extend(self.host_tools.iter().cloned());
         if let Some(home) = &self.memory {
-            tools.extend(memory::tools::host_tools(home.clone()));
+            tools.extend(memory::tools::host_tools(
+                home.clone(),
+                Arc::clone(&self.store),
+                Arc::clone(&self.turn),
+            ));
         }
         tools.extend(self.lanes.host_tools());
         let lead_kill = Arc::clone(&self.lead_kill);
