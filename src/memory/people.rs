@@ -86,12 +86,14 @@ pub fn classify(path: &str) -> Option<(&str, PersonFile)> {
     }
 }
 
-/// True for any path under `people/human/`.
+/// True for any path under `people/human/`, in any letter case (the file system may fold it).
 pub fn is_reserved(path: &str) -> bool {
-    path.strip_prefix(PEOPLE_DIR)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .and_then(|rest| rest.strip_prefix(HUMAN_SLUG))
-        .is_some_and(|rest| rest.starts_with('/'))
+    let mut parts = path.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(dir), Some(slug), Some(_))
+            if dir.eq_ignore_ascii_case(PEOPLE_DIR) && slug.eq_ignore_ascii_case(HUMAN_SLUG)
+    )
 }
 
 /// The frontmatter of `text`, the number of lines it spans, and the body lines.
@@ -428,6 +430,8 @@ mod tests {
         }
         assert!(is_reserved("people/human/card.md"));
         assert!(is_reserved("people/human/x.md"));
+        assert!(is_reserved("people/Human/card.md"));
+        assert!(is_reserved("PEOPLE/HUMAN/x.md"));
         assert!(!is_reserved("people/humans/card.md"));
         assert!(!is_reserved("system/human.md"));
     }
