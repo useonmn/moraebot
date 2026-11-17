@@ -21,6 +21,7 @@ use moraebot::gateway::Gateway;
 use moraebot::hints;
 use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lead::{self, LaneResult};
+use moraebot::memory;
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::store::{Admitted, LaneStart, LaneState, State, Store};
 use moraebot::testing::{Call, FakeAdapter};
@@ -2298,15 +2299,33 @@ async fn gateway_appends_lead_guidance_then_messenger_hints() {
     let hints_text = FakeAdapter::new().behavior_hints();
     let flag = "--append-system-prompt=";
 
+    // Each flag ends with the memory block; compare the part before it.
+    let before_memory = |flags: Vec<String>| -> Vec<String> {
+        let marker = format!("\n\n{}", memory::BEGIN);
+        flags
+            .into_iter()
+            .map(|flag| {
+                let at = flag.find(&marker).expect("memory block in the flag");
+                let block = &flag[at + 2..];
+                assert!(block.starts_with(memory::BEGIN));
+                assert!(block.ends_with(&format!("{}\n", memory::END)));
+                flag[..at].to_owned()
+            })
+            .collect()
+    };
+
     let first_line = lead::DEFAULT_GUIDANCE.lines().next().unwrap();
-    let built_in = lead_system_prompt_flags(&dir.path().join("built-in"), None).await;
+    let built_in =
+        before_memory(lead_system_prompt_flags(&dir.path().join("built-in"), None).await);
     assert_eq!(built_in.len(), 1);
     assert!(built_in[0].starts_with(&format!("{flag}{first_line}")));
     assert!(built_in[0].ends_with(&format!("\n\n{hints_text}")));
 
-    let custom = lead_system_prompt_flags(&dir.path().join("custom"), Some("custom lead\n")).await;
+    let custom = before_memory(
+        lead_system_prompt_flags(&dir.path().join("custom"), Some("custom lead\n")).await,
+    );
     assert_eq!(custom, [format!("{flag}custom lead\n\n{hints_text}")]);
 
-    let empty = lead_system_prompt_flags(&dir.path().join("empty"), Some("")).await;
+    let empty = before_memory(lead_system_prompt_flags(&dir.path().join("empty"), Some("")).await);
     assert_eq!(empty, [format!("{flag}{hints_text}")]);
 }

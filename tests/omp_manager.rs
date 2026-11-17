@@ -5,8 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::done;
 use moraebot::files;
+use moraebot::lane;
 use moraebot::lead;
+use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
+use moraebot::memory::{self, frontmatter};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
 use moraebot::store::Store;
 use serde_json::Value;
@@ -872,6 +876,236 @@ async fn argv_unchanged_by_host_tools() {
         "the tool is registered once, right after startup"
     );
     assert_eq!(tools[0]["tools"][0]["name"], omp::SEND_FILE_TOOL);
+    manager.shutdown_all().await;
+}
+
+// --- owner memory in the lead ----------------------------------------------------------
+
+impl Harness {
+    /// The memory home of this harness, with its folders and seeds made.
+    fn memory(&self) -> MemoryHome {
+        let home = MemoryHome::new(&self.config.home);
+        home.ensure_layout().expect("memory layout");
+        home
+    }
+
+    fn write_persona(&self, text: &str) {
+        std::fs::write(
+            self.config
+                .home
+                .join(memory::MEMORY_DIR)
+                .join(memory::PERSONA),
+            text,
+        )
+        .expect("write persona");
+    }
+
+    /// The `--append-system-prompt=` elements of every `START` line, in order.
+    fn append_flags(&self) -> Vec<Vec<String>> {
+        self.log_lines()
+            .iter()
+            .filter(|l| l.starts_with("START pid="))
+            .map(|l| {
+                start_argv(l)
+                    .into_iter()
+                    .filter(|a| a.starts_with("--append-system-prompt"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `(is lane, tool names)` of every `set_host_tools` frame, by the child that got it.
+    fn registered_tools(&self) -> Vec<(bool, Vec<String>)> {
+        let mut lane = false;
+        let mut out = Vec::new();
+        for line in self.log_lines() {
+            if line.starts_with("START pid=") {
+                let argv = start_argv(&line);
+                let at = argv.iter().position(|a| a == "--session-dir").unwrap();
+                lane = argv[at + 1].contains("/lanes/");
+            } else if let Ok(frame) = serde_json::from_str::<Value>(&line) {
+                if frame["type"] == "set_host_tools" {
+                    let names = frame["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|t| t["name"].as_str().unwrap().to_owned())
+                        .collect();
+                    out.push((lane, names));
+                }
+            }
+        }
+        out
+    }
+}
+
+fn persona_seed_body() -> &'static str {
+    frontmatter::parse(PERSONA_SEED).expect("seed parses").body
+}
+
+#[tokio::test]
+async fn lead_argv_ends_with_memory_block() {
+    let h = Harness::new();
+    let manager = h
+        .manager("ok")
+        .with_hints("probe hints".into())
+        .with_memory(h.memory());
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 1);
+    assert_eq!(flags[0].len(), 1, "one append element");
+    let flag = &flags[0][0];
+    assert!(flag.starts_with(&format!(
+        "--append-system-prompt=probe hints\n\n{}",
+        memory::BEGIN
+    )));
+    assert!(flag.ends_with(&format!("{}\n", memory::END)));
+    assert!(flag.contains(persona_seed_body()));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn memory_block_is_rendered_at_each_start() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    let pid = manager.child_pid().await.expect("live child");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+    h.write_persona("---\ndescription: d\n---\nv2-marker\n");
+
+    let lost = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(lost.code(), Some(omp::E_CHILD_LOST));
+    let outcome = bounded(manager.prompt(KEY_A, 3, "third"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: third".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2, "exactly two START lines");
+    assert!(!flags[0][0].contains("v2-marker"));
+    assert!(flags[1][0].contains("v2-marker"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn unusable_memory_file_does_not_block_the_lead() {
+    let h = Harness::new();
+    let home = h.memory();
+    h.write_persona("no frontmatter here\n");
+    let manager = h.manager("ok").with_memory(home);
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let flags = h.append_flags();
+    assert!(flags[0][0].contains(&format!(
+        "path=\"{}\" code=\"{}\"",
+        memory::PERSONA,
+        memory::E_MEMORY_FRONTMATTER
+    )));
+    assert!(!flags[0][0].contains("no frontmatter here"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn lead_registers_memory_tools_lanes_do_not() {
+    let h = Harness::new();
+    let call = serde_json::json!({
+        "tool": lane::LANE_START_TOOL,
+        "arguments": {"task": "t1", "done": "file ."}
+    });
+    let manager = h
+        .manager("tools")
+        .with_extra_env([
+            ("FAKE_OMP_LANE_MODE", "ok".to_owned()),
+            ("FAKE_OMP_TOOL_CALLS", call.to_string()),
+        ])
+        .with_memory(h.memory());
+    let wake = manager.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    bounded(notified).await;
+
+    let registered = h.registered_tools();
+    assert_eq!(registered.len(), 2, "{registered:?}");
+    let (lead_frame_is_lane, lead_names) = &registered[0];
+    assert!(!lead_frame_is_lane);
+    for tool in [memory::MEMORY_LIST_TOOL, memory::MEMORY_READ_TOOL] {
+        assert!(lead_names.iter().any(|n| n == tool), "{lead_names:?}");
+    }
+    let (lane_frame_is_lane, lane_names) = &registered[1];
+    assert!(lane_frame_is_lane);
+    assert_eq!(lane_names, &[done::LANE_DONE_TOOL]);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn memory_read_round_trip_through_the_lead() {
+    let h = Harness::new();
+    let calls = [
+        serde_json::json!({"tool": memory::MEMORY_READ_TOOL, "arguments": {"path": memory::PERSONA}}),
+        serde_json::json!({"tool": memory::MEMORY_READ_TOOL, "arguments": {"path": "../x.md"}}),
+    ]
+    .map(|c| c.to_string())
+    .join("\n");
+    let manager = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", calls)])
+        .with_memory(h.memory());
+    let outcome = bounded(manager.prompt(KEY_A, 1, "run-tools"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: run-tools".into()));
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let read: Value = serde_json::from_str(&results[0].1).expect("memory_read json");
+    assert_eq!(read["body"], persona_seed_body());
+    assert!(results[1].0, "{results:?}");
+    assert!(
+        results[1]
+            .1
+            .starts_with(&format!("{}:", memory::E_MEMORY_PATH)),
+        "{results:?}"
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn no_memory_means_unchanged_argv_and_tools() {
+    let h = Harness::new();
+    let manager = h.manager("ok");
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("START line");
+    assert_eq!(start_argv(&start), expected_argv(&h.config));
+    let registered = h.registered_tools();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(
+        registered[0].1,
+        [
+            omp::SEND_FILE_TOOL,
+            lane::LANE_START_TOOL,
+            lane::LANE_MESSAGE_TOOL,
+            lane::LANE_STATUS_TOOL,
+        ]
+    );
     manager.shutdown_all().await;
 }
 

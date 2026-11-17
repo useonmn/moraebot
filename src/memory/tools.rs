@@ -8,10 +8,7 @@ use super::home::{MemoryError, MemoryHome};
 use super::{
     E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_LIST_TOOL, MEMORY_READ_TOOL,
 };
-
-fn refused(code: &str, reason: &str) -> HostToolError {
-    format!("{code}: {reason}").into()
-}
+use crate::lane::refused;
 
 fn schema(value: Value) -> Map<String, Value> {
     serde_json::from_value(value).expect("memory tool schema is a JSON object")
