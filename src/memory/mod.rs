@@ -15,6 +15,9 @@
 //!
 //! The standing agreements ledger (stored in the inbox database) and its tools live in
 //! `agreements`.
+//!
+//! The first meeting with the owner (the request file, the state in the inbox database and the
+//! lead's finish tool) lives in `onboarding`.
 
 pub mod agreements;
 pub mod frontmatter;
@@ -22,6 +25,7 @@ pub mod guard;
 pub mod history;
 pub mod home;
 pub mod notice;
+pub mod onboarding;
 pub mod provenance;
 pub mod render;
 pub mod tools;
@@ -227,3 +231,15 @@ pub const E_MEMORY_AGREEMENT_FULL: &str = "E_MEMORY_AGREEMENT_FULL";
 pub const E_MEMORY_AGREEMENT_UNKNOWN: &str = "E_MEMORY_AGREEMENT_UNKNOWN";
 /// This agreement's break was already counted in this owner turn.
 pub const E_MEMORY_AGREEMENT_REPEAT: &str = "E_MEMORY_AGREEMENT_REPEAT";
+/// The file under the moraebot home that asks for a first meeting with the owner.
+pub const ONBOARDING_REQUEST_FILE: &str = "onboarding.request";
+/// The lead's host tool that ends the first meeting.
+pub const ONBOARDING_FINISH_TOOL: &str = "onboarding_finish";
+/// How a first meeting can end.
+pub const ONBOARDING_OUTCOMES: [&str; 2] = ["done", "skipped"];
+/// The most owner turns that carry the onboarding notice line.
+pub const MAX_ONBOARDING_TURNS: i64 = 10;
+/// No onboarding is running.
+pub const E_ONBOARDING_STATE: &str = "E_ONBOARDING_STATE";
+/// The onboarding request file could not be written or removed.
+pub const E_ONBOARDING_REQUEST: &str = "E_ONBOARDING_REQUEST";
