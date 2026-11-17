@@ -321,6 +321,38 @@ fn log_records_startup_argv_env_names_and_received_frames() {
     assert!(lines.iter().any(|line| line.contains(r#""type":"prompt""#)));
 }
 
+#[test]
+fn fake_logs_config_files_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (n, value) in [Some("/x/y.yml"), None].into_iter().enumerate() {
+        let log = dir.path().join(format!("fake-omp-{n}.log"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fake-omp"));
+        command
+            .args(["--mode", "rpc", "--no-ui"])
+            .env("FAKE_OMP_MODE", "ok")
+            .env("FAKE_OMP_LOG", &log)
+            .env_remove("PI_CONFIG_FILES");
+        if let Some(value) = value {
+            command.env("PI_CONFIG_FILES", value);
+        }
+        let (client, _events) =
+            Client::spawn(command, ClientOptions::default()).expect("spawn fake-omp");
+        client
+            .prompt_and_wait(&prompt("hi"), DEFAULT_PROMPT_TIMEOUT)
+            .expect("prompt");
+
+        let lines = log_frames(&log);
+        let config_files: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("CONFIG_FILES"))
+            .collect();
+        match value {
+            Some(_) => assert_eq!(config_files, ["CONFIG_FILES /x/y.yml"]),
+            None => assert!(config_files.is_empty(), "{config_files:?}"),
+        }
+    }
+}
+
 /// Spawns fake-omp with extra arguments and environment and keeps the event
 /// receiver.
 fn spawn_env(

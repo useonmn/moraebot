@@ -324,6 +324,26 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
 }
 
 #[tokio::test]
+async fn lane_child_gets_the_overlay() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+
+    let starts = h.lane_starts();
+    assert_eq!(starts.len(), 1);
+    let expected = format!(
+        "CONFIG_FILES {}",
+        omp::overlay_path(&h.config).to_string_lossy()
+    );
+    let lines = h.log_lines();
+    assert!(
+        lines[starts[0]..].iter().any(|l| *l == expected),
+        "{lines:?}"
+    );
+    omp.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn lane_start_does_not_wait_for_the_lane() {
     let h = Harness::new();
     let omp = h.manager("hang", &[lane_start("t1")]);

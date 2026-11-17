@@ -15,9 +15,11 @@
 
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -73,6 +75,17 @@ pub const EMPTY_REPLY: &str = "(empty reply)";
 
 /// omp reads this variable as its session folder; it must never override `--session-dir`.
 const SESSION_DIR_OVERRIDE: &str = "PI_CODING_AGENT_SESSION_DIR";
+
+/// omp layers the config files named in this variable over its own config.
+pub const CONFIG_FILES_ENV: &str = "PI_CONFIG_FILES";
+/// File name of the omp config overlay in `<home>/omp`.
+pub const OVERLAY_FILE: &str = "config-overlay.yml";
+/// Overlay bytes: omp's own memory and autolearn are off for every moraebot child. `off`
+/// is quoted so a YAML 1.1 reader cannot turn it into `false`.
+pub const OMP_OVERLAY: &str = "memory:\n  backend: \"off\"\nautolearn:\n  enabled: false\n";
+
+/// Counter for overlay temp file names, so concurrent spawns never share one.
+static OVERLAY_TMP: AtomicU64 = AtomicU64::new(0);
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Absolute path, so a `kill` shim earlier in PATH cannot intercept the group kill.
@@ -327,9 +340,43 @@ pub(crate) fn private_dir(path: &Path) -> std::io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
+/// `<home>/omp/config-overlay.yml`.
+pub fn overlay_path(config: &Config) -> PathBuf {
+    config.home.join("omp").join(OVERLAY_FILE)
+}
+
+/// Makes sure the overlay file holds exactly `OMP_OVERLAY` (folder `0o700`, file `0o600`,
+/// written to a temp file and renamed over the target) and returns its absolute path. omp
+/// would resolve a relative path against the `--cwd` work dir, so the path is absolute even
+/// when `config.home` is relative.
+pub fn ensure_overlay(config: &Config) -> std::io::Result<PathBuf> {
+    let path = overlay_path(config);
+    let dir = config.home.join("omp");
+    private_dir(&dir)?;
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == OMP_OVERLAY.as_bytes()) {
+        return std::path::absolute(&path);
+    }
+    let n = OVERLAY_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".config-overlay.{}.{n}.tmp", std::process::id()));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(OMP_OVERLAY.as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::path::absolute(&path)
+}
+
 /// The omp command for one child: `args`, stderr appended to `stderr_path` (mode
 /// `0o600`), and the filtered environment plus `extra_env`. The lead and every lane use
-/// it, so all children get exactly the same environment.
+/// it, so all children get exactly the same environment. `CONFIG_FILES_ENV` is set last
+/// to the overlay from `ensure_overlay`, so it replaces any inherited or extra value and
+/// omp's own memory stays off; an overlay that cannot be written fails the spawn.
 pub(crate) fn child_command(
     config: &Config,
     args: Vec<OsString>,
@@ -344,11 +391,13 @@ pub(crate) fn child_command(
         .append(true)
         .mode(0o600)
         .open(stderr_path)?;
+    let overlay = ensure_overlay(config)?;
     let mut command = Command::new(&config.omp_path);
     command
         .args(args)
         .env_clear()
         .envs(check_env(extra_env))
+        .env(CONFIG_FILES_ENV, overlay)
         .stderr(Stdio::from(stderr));
     Ok(command)
 }

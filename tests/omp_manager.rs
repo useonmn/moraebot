@@ -94,6 +94,15 @@ impl Harness {
             .collect()
     }
 
+    /// Values of the `CONFIG_FILES` lines the fake logged, in order.
+    fn config_files(&self) -> Vec<String> {
+        self.log_lines()
+            .iter()
+            .filter_map(|l| l.strip_prefix("CONFIG_FILES "))
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn set_session(&self, session_id: &str) {
         self.store
             .lock()
@@ -190,6 +199,78 @@ async fn argv_is_exact_and_env_drops_only_discord_names() {
             .as_deref(),
         Some("fake-session-1")
     );
+    manager.shutdown_all().await;
+}
+
+fn assert_overlay_file(path: &Path) {
+    assert_eq!(
+        std::fs::read(path).expect("overlay"),
+        omp::OMP_OVERLAY.as_bytes()
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(path), 0o600);
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+}
+
+#[tokio::test]
+async fn lead_gets_the_overlay_env_and_file() {
+    let h = Harness::new();
+    let manager = h.manager("ok");
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let overlay = omp::overlay_path(&h.config);
+    assert_eq!(h.config_files(), [overlay.to_string_lossy()]);
+    assert_overlay_file(&overlay);
+    let lines = h.log_lines();
+    let start = lines
+        .iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("START line");
+    assert_eq!(start_argv(start), expected_argv(&h.config));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn inherited_config_files_value_is_replaced() {
+    let h = Harness::new();
+    let overlay = omp::overlay_path(&h.config);
+    let folder = overlay.parent().unwrap();
+    std::fs::create_dir_all(folder).unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&overlay, b"memory:\n  backend: local\n").unwrap();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([(omp::CONFIG_FILES_ENV, "/elsewhere.yml")]);
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    assert_eq!(h.config_files(), [overlay.to_string_lossy()]);
+    assert_overlay_file(&overlay);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn overlay_path_is_absolute_for_a_relative_home() {
+    std::fs::create_dir_all("target").unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("qa-mbhome")
+        .tempdir_in("target")
+        .unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let rel = tmp.path().strip_prefix(&cwd).unwrap().to_path_buf();
+    assert!(rel.is_relative());
+    let mut h = Harness::new();
+    h.config.home = rel;
+    let manager = h.manager("ok");
+    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
+
+    let values = h.config_files();
+    assert_eq!(values.len(), 1, "{values:?}");
+    let value = Path::new(&values[0]);
+    assert!(value.is_absolute(), "{value:?}");
+    assert_eq!(value, cwd.join(omp::overlay_path(&h.config)));
     manager.shutdown_all().await;
 }
 
