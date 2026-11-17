@@ -6,12 +6,13 @@ use super::frontmatter::{self, Frontmatter, render_frontmatter};
 use super::guard;
 use super::history::{self, Committed};
 use super::home::{MemoryError, MemoryHome};
+use super::provenance::{self, Claim, ClaimArgs};
 use super::{
-    E_MEMORY_ARGS, E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FRONTMATTER, E_MEMORY_HISTORY,
-    E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH,
-    E_MEMORY_PROTECTED, E_MEMORY_READ_ONLY, MAX_DIRTY_LISTED, MEMORY_CREATE_TOOL,
-    MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
-    MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, WRITER_LEAD,
+    BEGIN, E_MEMORY_ARGS, E_MEMORY_DIRTY, E_MEMORY_EXISTS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER,
+    E_MEMORY_HISTORY, E_MEMORY_NO_MATCH, E_MEMORY_NOOP, E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN,
+    E_MEMORY_PATH, E_MEMORY_PROTECTED, E_MEMORY_READ_ONLY, END, MAX_DIRTY_LISTED, MAX_FILE_BYTES,
+    MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL, MEMORY_RENAME_TOOL,
+    MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL, PROTECTED, WRITER_LEAD,
 };
 use crate::omp::{TurnContext, lock};
 use crate::store::{MemoryChange, MemoryCommit, Store};
@@ -73,8 +74,9 @@ impl Edit {
     }
 }
 
-/// A recorded write: its commit, the tool, the path, for a rename the new path, and the
-/// tool arguments that were split back out of a mis-closed parameter.
+/// A recorded write: its commit, the tool, the path, for a rename the new path, the tool
+/// arguments that were split back out of a mis-closed parameter, and the checked claim when
+/// the write named a `source`.
 #[derive(Debug, PartialEq)]
 pub struct Applied {
     pub commit: i64,
@@ -82,11 +84,13 @@ pub struct Applied {
     pub path: String,
     pub to: Option<String>,
     pub repaired: Vec<String>,
+    pub claim: Option<Claim>,
 }
 
 impl Applied {
-    /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename and
-    /// `"repaired"` when arguments were repaired.
+    /// The tool result: `{"committed", "command", "path"}`, plus `"to"` for a rename,
+    /// `"repaired"` when arguments were repaired, and `"source"`, `"downgraded"` and (when set)
+    /// `"code"` when the write carried a claim.
     pub fn to_json(&self) -> String {
         let mut value = serde_json::json!({
             "committed": self.commit,
@@ -98,6 +102,13 @@ impl Applied {
         }
         if !self.repaired.is_empty() {
             value["repaired"] = serde_json::json!(self.repaired);
+        }
+        if let Some(claim) = &self.claim {
+            value["source"] = serde_json::json!(claim.kind.name());
+            value["downgraded"] = serde_json::json!(claim.downgraded());
+            if let Some(code) = claim.code {
+                value["code"] = serde_json::json!(code);
+            }
         }
         value.to_string()
     }
@@ -113,20 +124,21 @@ fn refused(code: &'static str, detail: impl Into<String>) -> MemoryError {
 /// Checks `edit` against the running turn, the paths, the history and the new text, then
 /// records it as one lead commit and applies it to the working files. The store stays locked
 /// from the origin check to the end, so writers never interleave. A path that looks like a
-/// secret is logged as `-`.
+/// secret is logged as `-`. `claim` is checked and recorded only when it names a `source`.
 pub fn apply(
     store: &Mutex<Store>,
     home: &MemoryHome,
     turn: Option<&TurnContext>,
     edit: Edit,
     reason: &str,
+    claim: &ClaimArgs,
 ) -> Result<Applied, MemoryError> {
     let tool = edit.tool();
     let path = match guard::find_secret(edit.path()) {
         Some(_) => "-".to_string(),
         None => edit.path().to_string(),
     };
-    let result = run(store, home, turn, edit, reason);
+    let result = run(store, home, turn, edit, reason, claim);
     match &result {
         Ok(applied) => {
             tracing::info!(tool, path = %path, commit = applied.commit, "memory write committed");
@@ -142,8 +154,12 @@ fn run(
     turn: Option<&TurnContext>,
     edit: Edit,
     reason: &str,
+    claim: &ClaimArgs,
 ) -> Result<Applied, MemoryError> {
     history::check_reason(reason)?;
+    if let Some(quote) = &claim.user_quote {
+        guard::refuse_secret("user_quote", quote)?;
+    }
 
     let Some(turn) = turn else {
         return Err(refused(E_MEMORY_ORIGIN, "no lead turn is running"));
@@ -180,7 +196,7 @@ fn run(
     check_existence(home, &committed, &edit)?;
     check_read_only(&committed, &edit)?;
 
-    let (changes, previous): (Vec<MemoryChange>, Vec<Option<String>>) =
+    let (mut changes, previous): (Vec<MemoryChange>, Vec<Option<String>>) =
         new_texts(&committed, &edit)?.into_iter().unzip();
     for ((_, text), previous) in changes.iter().zip(&previous) {
         if let Some(text) = text {
@@ -195,12 +211,35 @@ fn run(
         return Err(refused(E_MEMORY_NOOP, "nothing would change"));
     }
 
+    let claim = match claim.source {
+        Some(_) => Some(provenance::verify(&store, turn, claim)?),
+        None => None,
+    };
+    let stamped = !matches!(
+        (&claim, &edit),
+        (_, Edit::Rename { .. } | Edit::Delete { .. }) | (None, Edit::Create { .. })
+    );
+    if stamped {
+        for (_, text) in &mut changes {
+            if let Some(text) = text {
+                let new = match &claim {
+                    Some(claim) => provenance::stamp(text, claim)?,
+                    None => provenance::stamp_unclaimed(text)?,
+                };
+                if claim.is_some() || new != *text {
+                    check_stamped(&new)?;
+                }
+                *text = new;
+            }
+        }
+    }
+
     let commit = MemoryCommit {
         writer: WRITER_LEAD.to_string(),
         reason: reason.to_string(),
         turn_row: Some(turn.row_id),
         conversation_key: Some(turn.conversation_key.clone()),
-        claim_json: None,
+        claim_json: claim.as_ref().map(Claim::to_json),
     };
     let id = history::record(&mut store, home, &commit, &changes)?;
     let tool = edit.tool();
@@ -214,7 +253,25 @@ fn run(
         path,
         to,
         repaired: Vec::new(),
+        claim,
     })
+}
+
+/// The content checks of `history::check_text` for a text the engine stamped, without the
+/// provenance comparison: the stamp may carry owner words that hold a sentinel or, once
+/// escaped, match the secret table.
+fn check_stamped(text: &str) -> Result<(), MemoryError> {
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(refused(E_MEMORY_FILE, "too large"));
+    }
+    if text.contains('\0') {
+        return Err(refused(E_MEMORY_FILE, "contains NUL"));
+    }
+    if text.contains(BEGIN) || text.contains(END) {
+        return Err(refused(E_MEMORY_FILE, "contains a memory block sentinel"));
+    }
+    parse(text)?;
+    guard::refuse_secret("text", text)
 }
 
 /// Step 3: every named path is plain ASCII and passes the path rules, a path that would newly
@@ -477,9 +534,10 @@ mod tests {
 
     use super::*;
     use crate::memory::home::HUMAN_SEED;
+    use crate::memory::provenance::{Kind, Source};
     use crate::memory::{
-        E_MEMORY_FILE, E_MEMORY_PROVENANCE, E_MEMORY_SECRET, END, HUMAN, MAX_FILE_BYTES,
-        MAX_REASON_CHARS, PERSONA,
+        E_MEMORY_PROVENANCE, E_MEMORY_QUOTE_APPROVAL, E_MEMORY_QUOTE_MISSING, E_MEMORY_SECRET,
+        HUMAN, MAX_REASON_CHARS, PERSONA, PROVENANCE_KEY,
     };
     use crate::store::{Admitted, LaneStart, LaneState, MemoryCommitRow};
 
@@ -499,13 +557,44 @@ mod tests {
 
     impl Fx {
         fn apply(&self, edit: Edit) -> Result<Applied, MemoryError> {
+            self.claimed(edit, ClaimArgs::default())
+        }
+
+        fn claimed(&self, edit: Edit, claim: ClaimArgs) -> Result<Applied, MemoryError> {
             apply(
                 &self.store,
                 &self.home,
                 Some(&turn(OWNER_ROW)),
                 edit,
                 REASON,
+                &claim,
             )
+        }
+
+        /// The `provenance` value of a working file.
+        fn provenance(&self, rel: &str) -> Option<String> {
+            let text = self.file(rel).expect("file");
+            let parsed = frontmatter::parse(&text).expect("frontmatter");
+            parsed.frontmatter.get(PROVENANCE_KEY).map(str::to_owned)
+        }
+
+        /// The parsed `claim_json` of the last commit, if it has one.
+        fn last_claim(&self) -> Option<serde_json::Value> {
+            let last = self.commits().pop().expect("commit");
+            last.commit
+                .claim_json
+                .map(|json| serde_json::from_str(&json).expect("claim json"))
+        }
+
+        /// Admits an owner row of `k1` by the turn row's author and returns its id.
+        fn owner_row(&self, message_id: &str, text: &str) -> i64 {
+            match lock(&self.store)
+                .admit("test", message_id, "k1", "chan1", "111", text)
+                .expect("admit")
+            {
+                Admitted::New(id) => id,
+                Admitted::Duplicate => panic!("duplicate row"),
+            }
         }
 
         fn commits(&self) -> Vec<MemoryCommitRow> {
@@ -736,6 +825,7 @@ mod tests {
                     path: path.to_string(),
                     to: to.map(str::to_string),
                     repaired: vec![],
+                    claim: None,
                 }
             );
             let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -763,9 +853,11 @@ mod tests {
             path: "notes/a.md".to_string(),
             to: None,
             repaired: vec![],
+            claim: None,
         };
         let plain: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
         assert!(plain.get("repaired").is_none(), "{plain}");
+        assert!(plain.get("source").is_none(), "{plain}");
 
         applied.repaired = vec!["new_string".to_string()];
         let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
@@ -774,6 +866,20 @@ mod tests {
         assert_eq!(json["command"], plain["command"]);
         assert_eq!(json["path"], plain["path"]);
         assert_eq!(json.as_object().expect("object").len(), 4, "{json}");
+
+        applied.claim = Some(Claim::plain(Source::Agent));
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["source"], "agent");
+        assert_eq!(json["downgraded"], false);
+        assert!(json.get("code").is_none(), "{json}");
+        assert_eq!(json.as_object().expect("object").len(), 6, "{json}");
+
+        applied.claim = Some(Claim::plain(Source::User));
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert_eq!(json["source"], "agent");
+        assert_eq!(json["downgraded"], true);
+        assert_eq!(json["code"], E_MEMORY_QUOTE_MISSING);
+        assert_eq!(json.as_object().expect("object").len(), 7, "{json}");
     }
 
     #[test]
@@ -878,9 +984,29 @@ mod tests {
         reason: &str,
         code: &str,
     ) -> MemoryError {
+        assert_claim_refused(fx, row, edit, reason, &ClaimArgs::default(), code)
+    }
+
+    /// `assert_refused` for an edit that carries `claim`.
+    fn assert_claim_refused(
+        fx: &Fx,
+        row: Option<i64>,
+        edit: Edit,
+        reason: &str,
+        claim: &ClaimArgs,
+        code: &str,
+    ) -> MemoryError {
         let before = (bytes_under(fx.home.root()), fx.commits().len());
         let turn = row.map(turn);
-        let err = apply(&fx.store, &fx.home, turn.as_ref(), edit.clone(), reason).expect_err(code);
+        let err = apply(
+            &fx.store,
+            &fx.home,
+            turn.as_ref(),
+            edit.clone(),
+            reason,
+            claim,
+        )
+        .expect_err(code);
         assert_eq!(err.code, code, "{edit:?}");
         let after = (bytes_under(fx.home.root()), fx.commits().len());
         assert_eq!(after, before, "{code} {edit:?}");
@@ -1345,6 +1471,242 @@ mod tests {
             E_MEMORY_DIRTY,
         );
         assert_refused(&fx, None, create("notes/c.md", "x"), "", E_MEMORY_ARGS);
+
+        let secret_quote = user(&format!("ok {}", sk_key()), OWNER_ROW);
+        assert_claim_refused(
+            &fx,
+            None,
+            create("notes/c.md", "x"),
+            REASON,
+            &secret_quote,
+            E_MEMORY_SECRET,
+        );
+        let err = assert_claim_refused(
+            &fx,
+            owner,
+            create("notes/c.md", "x"),
+            &secret_reason,
+            &secret_quote,
+            E_MEMORY_SECRET,
+        );
+        assert!(err.detail.starts_with("reason:"), "{}", err.detail);
+        let fx = fx_with(&[("notes/ro.md", RO)]);
+        assert_claim_refused(
+            &fx,
+            owner,
+            replace("notes/ro.md", "body", "changed"),
+            REASON,
+            &source(Source::Agent),
+            E_MEMORY_READ_ONLY,
+        );
+    }
+
+    fn source(source: Source) -> ClaimArgs {
+        ClaimArgs {
+            source: Some(source),
+            ..ClaimArgs::default()
+        }
+    }
+
+    fn user(quote: &str, message: i64) -> ClaimArgs {
+        ClaimArgs {
+            source: Some(Source::User),
+            user_quote: Some(quote.to_string()),
+            quote_message: Some(message),
+        }
+    }
+
+    /// The kind word of a `provenance` value: the text before its first `:`.
+    fn kind_of(value: Option<String>) -> String {
+        let value = value.expect("provenance");
+        value.split_once(':').expect("kind prefix").0.to_string()
+    }
+
+    #[test]
+    fn no_source_keeps_the_m3_bytes() {
+        let fx = fx();
+        let applied = fx.apply(create("notes/c.md", "hello\n")).expect("create");
+        assert_eq!(
+            fx.file("notes/c.md"),
+            Some(render_frontmatter(&Frontmatter::with_description("new note")) + "hello\n")
+        );
+        assert_eq!(fx.last_claim(), None);
+        assert_eq!(applied.claim, None);
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert!(json.get("source").is_none(), "{json}");
+        assert!(json.get("downgraded").is_none(), "{json}");
+    }
+
+    #[test]
+    fn agent_and_inferred_claims_are_stamped() {
+        let fx = fx();
+        let applied = fx
+            .claimed(create("notes/c.md", "tea"), source(Source::Agent))
+            .expect("create");
+        assert_eq!(applied.claim, Some(Claim::plain(Source::Agent)));
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "agent");
+        let claim = fx.last_claim().expect("claim");
+        assert_eq!(claim["source"], "agent");
+        assert_eq!(claim["downgraded"], false);
+        fx.claimed(
+            replace("notes/c.md", "tea", "green tea"),
+            source(Source::Inferred),
+        )
+        .expect("replace");
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "inferred");
+        assert_eq!(fx.last_claim().expect("claim")["source"], "inferred");
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn quoted_claim_then_agent_edit_is_mixed() {
+        let fx = fx();
+        let applied = fx
+            .claimed(create("notes/c.md", "tea"), user("hi", OWNER_ROW))
+            .expect("create");
+        let claim = applied.claim.expect("claim");
+        assert_eq!(claim.kind, Kind::Quoted);
+        assert_eq!(claim.code, Some(E_MEMORY_QUOTE_APPROVAL));
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "quoted");
+        let stored = fx.last_claim().expect("claim");
+        assert_eq!(stored["source"], "quoted");
+        assert_eq!(stored["code"], E_MEMORY_QUOTE_APPROVAL);
+        assert_eq!(stored["downgraded"], true);
+        fx.claimed(insert_at("notes/c.md", 1, "more"), source(Source::Agent))
+            .expect("insert");
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "mixed");
+    }
+
+    #[test]
+    fn legacy_provenance_becomes_mixed() {
+        let fx = fx();
+        fx.claimed(replace("notes/p.md", "body", "BODY"), source(Source::Agent))
+            .expect("claimed replace");
+        assert_eq!(kind_of(fx.provenance("notes/p.md")), "mixed");
+
+        let fx = fx_with(&[]);
+        fx.apply(replace("notes/p.md", "body", "BODY"))
+            .expect("plain replace");
+        assert_eq!(
+            fx.file("notes/p.md").as_deref(),
+            Some("---\ndescription: kept\nprovenance: owner\n---\nBODY\n")
+        );
+        assert_eq!(fx.last_claim(), None);
+    }
+
+    #[test]
+    fn rename_and_delete_record_claim_without_stamp() {
+        let fx = fx();
+        fx.claimed(rename("notes/p.md", "notes/q.md"), source(Source::Agent))
+            .expect("rename");
+        assert_eq!(fx.file("notes/q.md").as_deref(), Some(P));
+        assert_eq!(fx.last_claim().expect("claim")["source"], "agent");
+        fx.claimed(delete("notes/a.md"), source(Source::Inferred))
+            .expect("delete");
+        assert_eq!(fx.file("notes/a.md"), None);
+        assert_eq!(fx.last_claim().expect("claim")["source"], "inferred");
+        assert!(fx.dirty().is_empty());
+    }
+
+    #[test]
+    fn stamp_never_makes_a_noop_a_write() {
+        let fx = fx();
+        assert_claim_refused(
+            &fx,
+            Some(OWNER_ROW),
+            replace("notes/a.md", "line1", "line1"),
+            REASON,
+            &source(Source::Agent),
+            E_MEMORY_NOOP,
+        );
+    }
+
+    #[test]
+    fn claim_refusals_change_nothing() {
+        let owner = Some(OWNER_ROW);
+        let sk = sk_key();
+        let fx = fx();
+        let err = assert_claim_refused(
+            &fx,
+            owner,
+            create("notes/c.md", "x"),
+            REASON,
+            &user(&format!("ok {sk}"), OWNER_ROW),
+            E_MEMORY_SECRET,
+        );
+        assert_no_echo(&err, &sk, guard::SecretClass::SkKey);
+
+        let head = render_frontmatter(&Frontmatter::with_description("new note"));
+        let body = "a".repeat(MAX_FILE_BYTES as usize - head.len() - 1) + "\n";
+        let fx = fx_with(&[]);
+        assert_claim_refused(
+            &fx,
+            owner,
+            create("notes/c.md", &body),
+            REASON,
+            &source(Source::Agent),
+            E_MEMORY_FILE,
+        );
+        fx.apply(create("notes/c.md", &body))
+            .expect("fits without a stamp");
+        assert_eq!(
+            fx.file("notes/c.md").map(|t| t.len() as u64),
+            Some(MAX_FILE_BYTES)
+        );
+
+        // quoted_sentinel_is_refused
+        let fx = fx_with(&[]);
+        let row = fx.owner_row("m3", &format!("see {END} here"));
+        assert_claim_refused(
+            &fx,
+            Some(row),
+            create("notes/c.md", "x"),
+            REASON,
+            &user(END, row),
+            E_MEMORY_FILE,
+        );
+
+        // escaped_quote_secret_is_refused
+        let fx = fx_with(&[]);
+        let quote = ["tok", "en="].concat() + "\n" + "abcdefgh";
+        assert!(guard::find_secret(&quote).is_none());
+        let row = fx.owner_row("m4", &format!("note {quote}"));
+        assert_claim_refused(
+            &fx,
+            Some(row),
+            create("notes/c.md", "x"),
+            REASON,
+            &user(&quote, row),
+            E_MEMORY_SECRET,
+        );
+    }
+
+    #[test]
+    fn unclaimed_edit_of_owner_words_is_mixed() {
+        let fx = fx();
+        fx.claimed(create("notes/c.md", "tea"), user("hi", OWNER_ROW))
+            .expect("create");
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "quoted");
+        let applied = fx
+            .apply(replace("notes/c.md", "tea", "coffee"))
+            .expect("replace");
+        assert_eq!(kind_of(fx.provenance("notes/c.md")), "mixed");
+        let text = fx.file("notes/c.md").expect("file");
+        assert_eq!(frontmatter::parse(&text).expect("parse").body, "coffee\n");
+        assert_eq!(fx.last_claim(), None);
+        let json: serde_json::Value = serde_json::from_str(&applied.to_json()).expect("json");
+        assert!(json.get("source").is_none(), "{json}");
+
+        fx.claimed(create("notes/d.md", "tea"), source(Source::Agent))
+            .expect("agent create");
+        let before = fx.file("notes/d.md").expect("file");
+        fx.apply(describe("notes/d.md", "changed"))
+            .expect("describe");
+        assert_eq!(
+            fx.file("notes/d.md"),
+            Some(before.replacen("description: new note", "description: changed", 1))
+        );
+        assert_eq!(kind_of(fx.provenance("notes/d.md")), "agent");
     }
 
     /// Two owner-turn writers released together by a barrier, each creating one of `paths`.
@@ -1357,7 +1719,14 @@ mod tests {
                 let (barrier, edit) = (Arc::clone(&barrier), create(path, "x"));
                 std::thread::spawn(move || {
                     barrier.wait();
-                    apply(&store, &home, Some(&turn(OWNER_ROW)), edit, REASON)
+                    apply(
+                        &store,
+                        &home,
+                        Some(&turn(OWNER_ROW)),
+                        edit,
+                        REASON,
+                        &ClaimArgs::default(),
+                    )
                 })
             })
             .collect();

@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::frontmatter;
 use super::home::{MemoryError, MemoryHome};
+use super::provenance::{ClaimArgs, Source};
 use super::write::{Edit, apply};
 use super::{
     E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL,
@@ -26,14 +27,36 @@ fn schema(value: Value) -> Map<String, Value> {
 const WRITE_RULES: &str = "`reason` is required: one line saying why. Writes work only while you \
      answer an owner message; the change shows in the memory block from your next start.";
 
-/// A write tool schema: every property in `properties` is required, nothing else is allowed.
-fn write_schema(properties: Value) -> Map<String, Value> {
-    let required: Vec<String> = properties
-        .as_object()
-        .expect("write tool properties are a JSON object")
-        .keys()
-        .cloned()
-        .collect();
+/// The optional claim arguments every write tool takes.
+const CLAIM_KEYS: [&str; 3] = ["source", "user_quote", "quote_message"];
+
+/// A write tool schema: every property in `properties` is required, the optional claim
+/// arguments are added, and nothing else is allowed.
+fn write_schema(mut properties: Value) -> Map<String, Value> {
+    let object = properties
+        .as_object_mut()
+        .expect("write tool properties are a JSON object");
+    let required: Vec<String> = object.keys().cloned().collect();
+    object.insert(
+        "source".to_owned(),
+        json!({
+            "type": "string",
+            "enum": ["user", "agent", "inferred"],
+            "description": "Where the words come from: user (the owner's reply approved your proposal), agent (your own suggestion) or inferred (your conclusion)."
+        }),
+    );
+    object.insert(
+        "user_quote".to_owned(),
+        text("With source user: the owner's exact words that approved the proposal."),
+    );
+    object.insert(
+        "quote_message".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "description": "With source user: the message id from the tag line of the owner's message."
+        }),
+    );
     schema(json!({
         "type": "object",
         "properties": properties,
@@ -312,10 +335,48 @@ fn strip_closing_tag(text: &str) -> &str {
     }
 }
 
-/// The edit and the reason a write tool's arguments ask for.
-fn edit(tool: &str, args: &Value) -> Result<(Edit, String), HostToolError> {
+/// The claim arguments of a write tool call.
+fn claim_args(f: &Map<String, Value>) -> Result<ClaimArgs, HostToolError> {
+    let source =
+        match f.get("source") {
+            None => None,
+            Some(value) => Some(value.as_str().and_then(Source::parse).ok_or_else(|| {
+                refused(E_MEMORY_ARGS, "`source` must be user, agent or inferred")
+            })?),
+        };
+    let user_quote = match f.get("user_quote") {
+        None => None,
+        Some(Value::String(quote)) => Some(quote.clone()),
+        Some(_) => return Err(refused(E_MEMORY_ARGS, "`user_quote` must be a string")),
+    };
+    let quote_message = match f.get("quote_message") {
+        None => None,
+        Some(value) => Some(value.as_i64().filter(|n| *n >= 1).ok_or_else(|| {
+            refused(
+                E_MEMORY_ARGS,
+                "`quote_message` must be an integer of at least 1",
+            )
+        })?),
+    };
+    if source != Some(Source::User) && (user_quote.is_some() || quote_message.is_some()) {
+        return Err(refused(
+            E_MEMORY_ARGS,
+            "`user_quote` and `quote_message` need source user",
+        ));
+    }
+    Ok(ClaimArgs {
+        source,
+        user_quote,
+        quote_message,
+    })
+}
+
+/// The edit, the reason and the claim arguments a write tool's arguments ask for.
+fn edit(tool: &str, args: &Value) -> Result<(Edit, String, ClaimArgs), HostToolError> {
     let unknown = || refused(E_MEMORY_ARGS, "unknown memory tool");
-    let f = fields(args, properties(tool).ok_or_else(unknown)?)?;
+    let mut allowed = properties(tool).ok_or_else(unknown)?.to_vec();
+    allowed.extend(CLAIM_KEYS);
+    let f = fields(args, &allowed)?;
     let owned = |key: &str| string(f, key).map(str::to_owned);
     let edit = match tool {
         MEMORY_CREATE_TOOL => Edit::Create {
@@ -346,7 +407,7 @@ fn edit(tool: &str, args: &Value) -> Result<(Edit, String), HostToolError> {
         },
         _ => return Err(unknown()),
     };
-    Ok((edit, owned("reason")?))
+    Ok((edit, owned("reason")?, claim_args(f)?))
 }
 
 /// A write tool call: parses `args` for `tool`, applies the edit as one lead commit for
@@ -370,8 +431,8 @@ pub fn write(
             "memory tool arguments repaired"
         );
     }
-    let (edit, reason) = edit(tool, &args).inspect_err(args_refused(tool))?;
-    apply(store, home, turn.as_ref(), edit, &reason)
+    let (edit, reason, claim) = edit(tool, &args).inspect_err(args_refused(tool))?;
+    apply(store, home, turn.as_ref(), edit, &reason, &claim)
         .map(|mut applied| {
             applied.repaired = repaired;
             applied.to_json()
@@ -448,7 +509,9 @@ mod tests {
     use super::*;
     use crate::memory::frontmatter::{Frontmatter, render_frontmatter};
     use crate::memory::history;
-    use crate::memory::{E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH, MAX_FILE_BYTES};
+    use crate::memory::{
+        E_MEMORY_NOT_FOUND, E_MEMORY_ORIGIN, E_MEMORY_PATH, E_MEMORY_QUOTE_APPROVAL, MAX_FILE_BYTES,
+    };
     use crate::store::{Admitted, MemoryCommitRow};
 
     const WRITE_TOOLS: [&str; 6] = [
@@ -883,5 +946,138 @@ mod tests {
             assert_eq!(commit_rows(&store).len(), before, "{marker}");
             assert_eq!(file(&memory, "notes/a.md"), with_frontmatter(SEED_BODY));
         }
+    }
+
+    #[test]
+    fn write_schemas_take_optional_claim() {
+        let specs = write_specs();
+        assert_eq!(specs.len(), WRITE_TOOLS.len());
+        for (name, _, own) in specs {
+            let schema = write_schema(own);
+            let props = &schema["properties"];
+            assert_eq!(props["source"]["type"], "string", "{name}");
+            assert_eq!(
+                props["source"]["enum"],
+                json!(["user", "agent", "inferred"]),
+                "{name}"
+            );
+            assert_eq!(props["user_quote"]["type"], "string", "{name}");
+            assert_eq!(props["quote_message"]["type"], "integer", "{name}");
+            assert_eq!(props["quote_message"]["minimum"], 1, "{name}");
+            let mut required: Vec<&str> = schema["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .map(|v| v.as_str().expect("key"))
+                .collect();
+            required.sort_unstable();
+            let mut own = properties(name).expect("write tool").to_vec();
+            own.sort_unstable();
+            assert_eq!(required, own, "{name}");
+            for key in CLAIM_KEYS {
+                assert!(!required.contains(&key), "{name} {key}");
+            }
+            assert_eq!(schema["additionalProperties"], Value::Bool(false), "{name}");
+        }
+    }
+
+    #[test]
+    fn claim_arguments_are_checked() {
+        let (_dir, memory, store, turn) = seeded();
+        let before = commit_rows(&store).len();
+        let with = |extra: Value| {
+            let mut args =
+                json!({"path": "notes/c.md", "description": "d", "body": "b", "reason": "r"});
+            for (key, value) in extra.as_object().expect("object") {
+                args[key] = value.clone();
+            }
+            args
+        };
+        let cases = [
+            json!({"source": "owner"}),
+            json!({"source": 1}),
+            json!({"user_quote": "yes"}),
+            json!({"quote_message": 1}),
+            json!({"source": "agent", "user_quote": "yes"}),
+            json!({"source": "user", "user_quote": "yes", "quote_message": "1"}),
+            json!({"source": "user", "user_quote": "yes", "quote_message": 0}),
+            json!({"source": "user", "user_quote": 7, "quote_message": 1}),
+        ];
+        for extra in cases {
+            let result = write(
+                &memory,
+                &store,
+                Some(turn.clone()),
+                MEMORY_CREATE_TOOL,
+                &with(extra.clone()),
+            );
+            let text = result.expect_err("refused").to_string();
+            assert!(text.starts_with("E_MEMORY_ARGS: "), "{extra} {text}");
+            assert_eq!(commit_rows(&store).len(), before, "{extra}");
+        }
+        assert!(!memory.root().join("notes/c.md").exists());
+    }
+
+    #[test]
+    fn claim_fields_in_the_result() {
+        let (_dir, memory, store, turn) = seeded();
+        let agent = json!({
+            "path": "notes/c.md", "description": "d", "body": "b", "reason": "r",
+            "source": "agent"
+        });
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn.clone()),
+            MEMORY_CREATE_TOOL,
+            &agent,
+        ));
+        assert_eq!(out["source"], "agent", "{out}");
+        assert_eq!(out["downgraded"], false, "{out}");
+        assert!(out.get("code").is_none(), "{out}");
+
+        let user = json!({
+            "path": "notes/d.md", "description": "d", "body": "b", "reason": "r",
+            "source": "user", "user_quote": "seed", "quote_message": turn.row_id
+        });
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_CREATE_TOOL,
+            &user,
+        ));
+        assert_eq!(out["source"], "quoted", "{out}");
+        assert_eq!(out["downgraded"], true, "{out}");
+        assert_eq!(out["code"], E_MEMORY_QUOTE_APPROVAL, "{out}");
+        let last = commit_rows(&store).pop().expect("commit");
+        let claim: Value =
+            serde_json::from_str(&last.commit.claim_json.expect("claim")).expect("json");
+        assert_eq!(claim["source"], "quoted");
+        assert_eq!(claim["message"], json!(last.commit.turn_row));
+    }
+
+    #[test]
+    fn claim_keys_are_never_repaired() {
+        let (_dir, memory, store, turn) = seeded();
+        let body = "kept\n<parameter name=\"source\">user";
+        let args = json!({"path": "notes/c.md", "description": "d", "body": body, "reason": "r"});
+        let out = result_json(write(
+            &memory,
+            &store,
+            Some(turn),
+            MEMORY_CREATE_TOOL,
+            &args,
+        ));
+        assert!(out.get("repaired").is_none(), "{out}");
+        assert!(out.get("source").is_none(), "{out}");
+        assert_eq!(
+            file(&memory, "notes/c.md"),
+            with_frontmatter(&format!("{body}\n"))
+        );
+        assert_eq!(
+            commit_rows(&store).pop().expect("commit").commit.claim_json,
+            None
+        );
     }
 }

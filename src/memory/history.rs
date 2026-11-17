@@ -292,6 +292,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::memory::provenance::ClaimArgs;
     use crate::memory::{E_MEMORY_SECRET, HUMAN, PERSONA};
 
     const NOTE: &str = "---\ndescription: a note\n---\nv2-marker\n";
@@ -699,8 +700,15 @@ mod tests {
             description: "c".to_string(),
             body: "c".to_string(),
         };
-        crate::memory::write::apply(&store, &home, Some(&turn), edit, "after accept")
-            .expect("lead write after accept");
+        crate::memory::write::apply(
+            &store,
+            &home,
+            Some(&turn),
+            edit,
+            "after accept",
+            &ClaimArgs::default(),
+        )
+        .expect("lead write after accept");
     }
 
     #[test]
