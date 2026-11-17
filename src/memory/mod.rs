@@ -7,11 +7,14 @@
 //! rendered from the recorded text.
 //!
 //! Guards (`read_only`, `expires`, the secret table) live in `guard`.
+//!
+//! Where a write's words came from (claims, the provenance stamp) lives in `provenance`.
 
 pub mod frontmatter;
 pub mod guard;
 pub mod history;
 pub mod home;
+pub mod provenance;
 pub mod render;
 pub mod tools;
 pub mod write;
@@ -88,6 +91,30 @@ pub const NOT_INDEXED: [&str; 2] = [SYSTEM_DIR, "skills"];
 pub const READ_ONLY_KEY: &str = "read_only";
 /// The frontmatter key that holds a file's expiry time.
 pub const EXPIRES_KEY: &str = "expires";
+/// The frontmatter key that records where a file's words came from.
+pub const PROVENANCE_KEY: &str = "provenance";
+/// The longest owner quote a claim may carry, in characters.
+pub const MAX_QUOTE_CHARS: usize = 300;
+/// Whole owner messages that approve the lead's last proposal.
+pub const APPROVALS: [&str; 17] = [
+    "응",
+    "네",
+    "예",
+    "좋아",
+    "그래",
+    "지워",
+    "지워줘",
+    "삭제해",
+    "삭제해줘",
+    "진행해",
+    "yes",
+    "ok",
+    "okay",
+    "do it",
+    "go ahead",
+    "delete it",
+    "yes delete it",
+];
 
 /// The memory folders or seeds could not be made.
 pub const E_MEMORY_LAYOUT: &str = "E_MEMORY_LAYOUT";
@@ -128,3 +155,18 @@ pub const E_MEMORY_READ_ONLY: &str = "E_MEMORY_READ_ONLY";
 pub const E_MEMORY_SECRET: &str = "E_MEMORY_SECRET";
 /// The file's `expires` has passed, so it is not rendered.
 pub const E_MEMORY_EXPIRED: &str = "E_MEMORY_EXPIRED";
+/// `source` is `user` but `user_quote` or `quote_message` is missing, or the quote is blank.
+pub const E_MEMORY_QUOTE_MISSING: &str = "E_MEMORY_QUOTE_MISSING";
+/// The quote is longer than `MAX_QUOTE_CHARS`.
+pub const E_MEMORY_QUOTE_LONG: &str = "E_MEMORY_QUOTE_LONG";
+/// The quoted row does not exist, is not an owner message, is in another conversation or has
+/// another author.
+pub const E_MEMORY_QUOTE_ROW: &str = "E_MEMORY_QUOTE_ROW";
+/// The quoted row is neither the turn's row nor steered into it.
+pub const E_MEMORY_QUOTE_TURN: &str = "E_MEMORY_QUOTE_TURN";
+/// The quote does not occur in the row's text.
+pub const E_MEMORY_QUOTE_TEXT: &str = "E_MEMORY_QUOTE_TEXT";
+/// The quote is from the row but is not the whole text or not an approval.
+pub const E_MEMORY_QUOTE_APPROVAL: &str = "E_MEMORY_QUOTE_APPROVAL";
+/// An approval with no lead reply right before it.
+pub const E_MEMORY_QUOTE_PROPOSAL: &str = "E_MEMORY_QUOTE_PROPOSAL";
