@@ -5,8 +5,11 @@
 //! Writes go through the memory host tools; each one is recorded in the inbox database
 //! (`memory_commits`, `memory_snapshots`) before the working files change, and the block is
 //! rendered from the recorded text.
+//!
+//! Guards (`read_only`, `expires`, the secret table) live in `guard`.
 
 pub mod frontmatter;
+pub mod guard;
 pub mod history;
 pub mod home;
 pub mod render;
@@ -77,6 +80,15 @@ pub const WRITER_IMPORT: &str = "import";
 /// Files that cannot be deleted or renamed.
 pub const PROTECTED: [&str; 2] = [PERSONA, HUMAN];
 
+/// The largest notes index element, in bytes (markers not counted).
+pub const MAX_INDEX_BYTES: usize = 40 * 1024;
+/// Top-level folders the notes index leaves out.
+pub const NOT_INDEXED: [&str; 2] = [SYSTEM_DIR, "skills"];
+/// The frontmatter key that marks a file the lead cannot change.
+pub const READ_ONLY_KEY: &str = "read_only";
+/// The frontmatter key that holds a file's expiry time.
+pub const EXPIRES_KEY: &str = "expires";
+
 /// The memory folders or seeds could not be made.
 pub const E_MEMORY_LAYOUT: &str = "E_MEMORY_LAYOUT";
 /// Missing or invalid frontmatter.
@@ -110,3 +122,9 @@ pub const E_MEMORY_PROTECTED: &str = "E_MEMORY_PROTECTED";
 pub const E_MEMORY_HISTORY: &str = "E_MEMORY_HISTORY";
 /// A working file could not be written or removed.
 pub const E_MEMORY_WRITE: &str = "E_MEMORY_WRITE";
+/// The file is marked `read_only` and the lead cannot change it.
+pub const E_MEMORY_READ_ONLY: &str = "E_MEMORY_READ_ONLY";
+/// The text, path or reason looks like a secret.
+pub const E_MEMORY_SECRET: &str = "E_MEMORY_SECRET";
+/// The file's `expires` has passed, so it is not rendered.
+pub const E_MEMORY_EXPIRED: &str = "E_MEMORY_EXPIRED";
