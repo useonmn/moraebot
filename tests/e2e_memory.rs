@@ -1371,3 +1371,141 @@ async fn onboarding_through_the_gateway() {
         })
     );
 }
+
+/// The lines of one prompt's notice block that start with `pressure `.
+fn pressure_lines(prompt: &str) -> Vec<&str> {
+    prompt
+        .lines()
+        .skip_while(|line| *line != memory::NOTICE_BEGIN)
+        .take_while(|line| *line != memory::NOTICE_END)
+        .filter(|line| line.starts_with("pressure "))
+        .collect()
+}
+
+/// The value of attribute `name` in one `<pressure ...>` line.
+fn pressure_attr<'a>(line: &'a str, name: &str) -> &'a str {
+    let start = format!(" {name}=\"");
+    let at = line.find(&start).expect("attribute present") + start.len();
+    let len = line[at..].find('"').expect("attribute closes");
+    &line[at..at + len]
+}
+
+#[tokio::test]
+async fn memory_pressure_through_the_gateway() {
+    const PRESSURE_LINE: &str = "<pressure tokens=\"";
+    let mut rig = Rig::new();
+    // 105000 bytes of system/ files before the first start: 28 bytes of frontmatter, 14971
+    // `y`s and a newline each.
+    let filler = format!("---\ndescription: filler\n---\n{}\n", "y".repeat(14971));
+    assert_eq!(filler.len(), 15000);
+    let system = rig.memory_root().join(memory::SYSTEM_DIR);
+    std::fs::create_dir_all(&system).expect("system dir");
+    for n in 1..=7 {
+        std::fs::write(system.join(format!("p{n}.md")), &filler).expect("write filler");
+    }
+    let call = json!({
+        "tool": memory::MEMORY_CREATE_TOOL,
+        "arguments": {
+            "path": "system/p8.md",
+            "description": "filler",
+            "body": format!("{}\n", "y".repeat(15200)),
+            "reason": "r",
+            "source": "agent"
+        }
+    })
+    .to_string();
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &call)],
+        )
+        .expect("open gateway"),
+    );
+    // Turn 1: under the budget; the lead writes one more file and crosses it.
+    adapter.inject(dm("1300000000000000051", "run-tools")).await;
+    bounded(adapter.wait_for_send(1)).await;
+    // Turn 2: the crossing is told once.
+    adapter.inject(dm("1300000000000000052", "hi")).await;
+    bounded(adapter.wait_for_send(2)).await;
+    // Turn 3: still over the budget, already told.
+    adapter.inject(dm("1300000000000000053", "again")).await;
+    bounded(adapter.wait_for_send(3)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids and counts only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(leads.len(), 1, "a lead write does not restart the lead");
+    let flags = append_flags(&leads[0].2);
+    assert_eq!(flags.len(), 1, "one append element");
+    let lines: Vec<&str> = flags[0].lines().collect();
+    let at: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(PRESSURE_LINE))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(at.len(), 1, "one pressure line in the block");
+    let line = lines[at[0]];
+    let tokens: usize = pressure_attr(line, "tokens").parse().expect("tokens");
+    println!("block pressure tokens={tokens}");
+    assert_eq!(pressure_attr(line, "budget"), "30000");
+    assert!((24000..30000).contains(&tokens), "tokens={tokens}");
+    assert_eq!(pressure_attr(line, "code"), memory::E_MEMORY_PRESSURE);
+    assert_eq!(lines[at[0] + 1], "</memory_metadata>");
+
+    let frames: Vec<Value> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let results: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "host_tool_result")
+        .collect();
+    println!("host_tool_results={}", results.len());
+    assert_eq!(results.len(), 1);
+    assert_ne!(results[0]["isError"], true, "{}", results[0]);
+
+    let prompts: Vec<&str> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "prompt")
+        .map(|frame| frame["message"].as_str().expect("prompt message"))
+        .collect();
+    println!("prompts={}", prompts.len());
+    assert_eq!(prompts.len(), 3, "three lead prompts");
+    let told = pressure_lines(prompts[1]);
+    assert_eq!(told.len(), 1, "{:?}", prompts[1]);
+    let fields: Vec<&str> = told[0].split(' ').collect();
+    assert_eq!(fields.len(), 5, "{fields:?}");
+    assert_eq!(fields[..2], ["pressure", "over_budget"]);
+    let t2: usize = fields[2]
+        .strip_prefix("tokens=")
+        .expect("tokens field")
+        .parse()
+        .expect("tokens");
+    println!("notice pressure tokens={t2}");
+    assert_eq!(fields[3], "budget=30000");
+    let percent: usize = fields[4]
+        .strip_prefix("percent=")
+        .expect("percent field")
+        .parse()
+        .expect("percent");
+    assert!(t2 >= 30000, "tokens={t2}");
+    assert_eq!(percent, t2 * 100 / 30000);
+    for at in [0, 2] {
+        assert!(
+            !prompts[at]
+                .lines()
+                .any(|line| line.starts_with("pressure ")),
+            "prompt {at}: {:?}",
+            prompts[at]
+        );
+    }
+}
