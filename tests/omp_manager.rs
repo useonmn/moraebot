@@ -1118,6 +1118,7 @@ async fn lead_registers_memory_tools_lanes_do_not() {
     assert!(!lead_frame_is_lane);
     assert_eq!(lead_names[0], omp::SEND_FILE_TOOL, "{lead_names:?}");
     assert_eq!(&lead_names[1..9], &MEMORY_TOOLS, "{lead_names:?}");
+    assert_eq!(&lead_names[9..11], &AGREEMENT_TOOLS, "{lead_names:?}");
     let (lane_frame_is_lane, lane_names) = &registered[1];
     assert!(lane_frame_is_lane);
     assert_eq!(lane_names, &[done::LANE_DONE_TOOL]);
@@ -1168,6 +1169,12 @@ const MEMORY_TOOLS: [&str; 8] = [
     memory::MEMORY_DELETE_TOOL,
     memory::MEMORY_RENAME_TOOL,
     memory::MEMORY_UPDATE_DESCRIPTION_TOOL,
+];
+
+/// The agreement tools, registered right after the memory tools.
+const AGREEMENT_TOOLS: [&str; 2] = [
+    memory::MEMORY_AGREEMENT_RECORD_TOOL,
+    memory::MEMORY_AGREEMENT_BREAK_TOOL,
 ];
 
 impl Harness {
@@ -2585,6 +2592,184 @@ async fn restart_moves_the_marks() {
     assert_eq!(h.append_flags().len(), 2);
     let messages = h.prompt_messages();
     assert_eq!(notice_lines(&messages[1]), ["compaction count=1"]);
+    manager.shutdown_all().await;
+}
+
+fn record_call() -> Value {
+    tool_call(
+        memory::MEMORY_AGREEMENT_RECORD_TOOL,
+        serde_json::json!({"scope": "global", "text": "never push to main", "reason": "r"}),
+    )
+}
+
+fn break_call() -> Value {
+    tool_call(
+        memory::MEMORY_AGREEMENT_BREAK_TOOL,
+        serde_json::json!({"id": 1, "reason": "r"}),
+    )
+}
+
+/// The JSON of a tool result that is not an error.
+fn ok_json(result: &(bool, String)) -> Value {
+    assert!(!result.0, "{result:?}");
+    serde_json::from_str(&result.1).expect("tool result json")
+}
+
+fn agreement_lines(message: &str) -> Vec<&str> {
+    notice_lines(message)
+        .into_iter()
+        .filter(|l| l.starts_with("agreement "))
+        .collect()
+}
+
+#[tokio::test]
+async fn agreement_record_and_break_through_the_lead() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[record_call(), break_call()]);
+    for id in ["a1", "a2", "a3"] {
+        owner_prompt(&h, &manager, KEY_A, id, "run-tools").await;
+    }
+    owner_prompt(&h, &manager, KEY_A, "a4", "hi").await;
+    owner_prompt(&h, &manager, KEY_A, "a5", "again").await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 6, "{results:?}");
+    let recorded = ok_json(&results[0]);
+    assert_eq!(recorded["agreement"], 1, "{recorded}");
+    assert_eq!(recorded["author"], "agent", "{recorded}");
+    assert_eq!(ok_json(&results[1])["broken"], 1);
+    assert!(
+        refused_with(&results[2], memory::E_MEMORY_AGREEMENT_EXISTS),
+        "{results:?}"
+    );
+    assert_eq!(ok_json(&results[3])["broken"], 2);
+    assert!(
+        refused_with(&results[4], memory::E_MEMORY_AGREEMENT_EXISTS),
+        "{results:?}"
+    );
+    assert_eq!(
+        ok_json(&results[5]),
+        serde_json::json!({"agreement": 1, "broken": 3, "needs_human": true, "flagged": true})
+    );
+
+    let messages = h.prompt_messages();
+    assert_eq!(messages.len(), 5);
+    assert_eq!(
+        agreement_lines(&messages[3]),
+        ["agreement needs-human id=1 broken=3 text=\"never push to main\""]
+    );
+    for n in [0, 1, 2, 4] {
+        assert!(agreement_lines(&messages[n]).is_empty(), "{}", messages[n]);
+    }
+    assert_eq!(h.append_flags().len(), 1, "exactly one START line");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn owner_quoted_agreement_is_human_through_the_lead() {
+    let h = Harness::new();
+    let (_, r) = proposal_then_answer(&h, "yes");
+    let call = tool_call(
+        memory::MEMORY_AGREEMENT_RECORD_TOOL,
+        serde_json::json!({
+            "scope": "global",
+            "text": "never push to main",
+            "reason": "r",
+            "source": "user",
+            "user_quote": "yes",
+            "quote_message": r,
+        }),
+    );
+    let manager = h.memory_tools_manager(&[call]);
+    bounded(manager.prompt(KEY_A, r, "run-tools")).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(ok_json(&results[0])["author"], "human");
+    let rows = h.store.lock().unwrap().agreements().expect("agreements");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].author, "human");
+    manager.shutdown_all().await;
+}
+
+fn boundaries_create(claim: Value) -> Value {
+    let mut arguments = serde_json::json!({
+        "path": memory::BOUNDARIES,
+        "description": "don't-rules",
+        "body": "- never force push\n",
+        "reason": "r",
+    });
+    for (key, value) in claim.as_object().expect("claim object") {
+        arguments[key] = value.clone();
+    }
+    tool_call(memory::MEMORY_CREATE_TOOL, arguments)
+}
+
+#[tokio::test]
+async fn boundaries_write_needs_the_quote_through_the_lead() {
+    let h = Harness::new();
+    let manager =
+        h.memory_tools_manager(&[boundaries_create(serde_json::json!({"source": "agent"}))]);
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_QUOTE),
+        "{results:?}"
+    );
+    assert_eq!(h.memory_commits().len(), 1, "the import only");
+    assert!(!h.memory_file(memory::BOUNDARIES).exists());
+    manager.shutdown_all().await;
+
+    let h = Harness::new();
+    let (_, r) = proposal_then_answer(&h, "yes");
+    let approved = boundaries_create(
+        serde_json::json!({"source": "user", "user_quote": "yes", "quote_message": r}),
+    );
+    let manager = h.memory_tools_manager(&[approved]);
+    bounded(manager.prompt(KEY_A, r, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(ok_json(&results[0])["soul_edit"], true);
+    assert!(h.memory_file(memory::BOUNDARIES).exists());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn agreements_file_is_refused_through_the_lead() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[create_call(memory::AGREEMENTS_FILE)]);
+    bounded(manager.prompt(KEY_A, 1, "run-tools")).await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        refused_with(&results[0], memory::E_MEMORY_AGREEMENT),
+        "{results:?}"
+    );
+    assert!(!h.memory_file(memory::AGREEMENTS_FILE).exists());
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn agreements_show_after_refresh() {
+    let h = Harness::new();
+    let manager = h.memory_tools_manager(&[record_call()]);
+    owner_prompt(&h, &manager, KEY_A, "b1", "run-tools").await;
+    std::fs::write(notice::refresh_file(&h.config.home), "").expect("refresh request");
+    owner_prompt(&h, &manager, KEY_A, "b2", "hi").await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(ok_json(&results[0])["agreement"], 1);
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2, "exactly two START lines");
+    assert!(!flags[0][0].contains("<agreements>\n"));
+    assert!(flags[1][0].contains("<agreements>\n"));
+    assert!(
+        flags[1][0]
+            .lines()
+            .any(|line| line == "- #1 [global] [agent] never push to main")
+    );
     manager.shutdown_all().await;
 }
 

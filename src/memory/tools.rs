@@ -1,19 +1,21 @@
-//! The lead's memory host tools: two read tools over the working files and six write
-//! tools that go through the write engine.
+//! The lead's memory host tools: two read tools over the working files, six write
+//! tools that go through the write engine, and the two agreement tools.
 
 use std::sync::{Arc, Mutex};
 
 use omp_rpc::{HostTool, HostToolError, ToolLoadMode};
 use serde_json::{Map, Value, json};
 
+use super::agreements::{self, Record};
 use super::frontmatter;
 use super::home::{MemoryError, MemoryHome};
 use super::provenance::{ClaimArgs, Source};
 use super::write::{Edit, apply};
 use super::{
-    E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL,
-    MEMORY_INSERT_TOOL, MEMORY_LIST_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL,
-    MEMORY_STR_REPLACE_TOOL, MEMORY_UPDATE_DESCRIPTION_TOOL,
+    E_MEMORY_ARGS, E_MEMORY_FILE, E_MEMORY_FRONTMATTER, MEMORY_AGREEMENT_BREAK_TOOL,
+    MEMORY_AGREEMENT_RECORD_TOOL, MEMORY_CREATE_TOOL, MEMORY_DELETE_TOOL, MEMORY_INSERT_TOOL,
+    MEMORY_LIST_TOOL, MEMORY_READ_TOOL, MEMORY_RENAME_TOOL, MEMORY_STR_REPLACE_TOOL,
+    MEMORY_UPDATE_DESCRIPTION_TOOL,
 };
 use crate::lane::refused;
 use crate::omp::{TurnContext, lock};
@@ -157,8 +159,50 @@ fn write_specs() -> [(&'static str, String, Value); 6] {
     ]
 }
 
-/// The lead's memory tools: `memory_list` and `memory_read`, then the six write tools.
-/// A write handler reads `turn` when it is called, so it sees the running turn.
+/// The allowed properties of `memory_agreement_record`.
+const RECORD_KEYS: [&str; 6] = [
+    "scope",
+    "text",
+    "reason",
+    "source",
+    "user_quote",
+    "quote_message",
+];
+
+/// The allowed properties of `memory_agreement_break`.
+const BREAK_KEYS: [&str; 2] = ["id", "reason"];
+
+fn record_schema() -> Map<String, Value> {
+    write_schema(json!({
+        "scope": {
+            "type": "string",
+            "enum": ["global", "project"],
+            "description": "Where the agreement holds: global (everywhere) or project (this project)."
+        },
+        "text": text("The agreement in one line."),
+        "reason": text("Why this agreement is recorded, in one line.")
+    }))
+}
+
+fn break_schema() -> Map<String, Value> {
+    schema(json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The #id of the agreement you broke."
+            },
+            "reason": text("How you broke it, in one line.")
+        },
+        "required": ["id", "reason"],
+        "additionalProperties": false
+    }))
+}
+
+/// The lead's memory tools: `memory_list` and `memory_read`, the six write tools, then
+/// `memory_agreement_record` and `memory_agreement_break`. A write or agreement handler reads
+/// `turn` when it is called, so it sees the running turn.
 pub fn host_tools(
     home: MemoryHome,
     store: Arc<Mutex<Store>>,
@@ -213,6 +257,36 @@ pub fn host_tools(
             .load_mode(ToolLoadMode::Essential),
         );
     }
+    let (record_store, record_turn) = (Arc::clone(&store), Arc::clone(&turn));
+    tools.push(
+        HostTool::new(
+            MEMORY_AGREEMENT_RECORD_TOOL,
+            "Record a standing agreement with the owner: one line of at most 240 characters, \
+             scope global or project. With source user and the owner's approving quote it \
+             becomes the owner's agreement; otherwise it is yours. You cannot reword, lower or \
+             remove agreements. Works only while you answer an owner message.",
+            record_schema(),
+            move |arguments, _| {
+                let context = lock(&record_turn).clone();
+                record_agreement(&record_store, context, &Value::Object(arguments)).map(Into::into)
+            },
+        )
+        .load_mode(ToolLoadMode::Essential),
+    );
+    tools.push(
+        HostTool::new(
+            MEMORY_AGREEMENT_BREAK_TOOL,
+            "Report that you broke agreement #id in this turn. Each agreement counts once per \
+             owner message; at 3 breaks it is marked NEEDS-HUMAN. Works only while you answer \
+             an owner message.",
+            break_schema(),
+            move |arguments, _| {
+                let context = lock(&turn).clone();
+                break_agreement(&store, context, &Value::Object(arguments)).map(Into::into)
+            },
+        )
+        .load_mode(ToolLoadMode::Essential),
+    );
     tools
 }
 
@@ -439,6 +513,48 @@ pub fn write(
             applied.to_json()
         })
         .map_err(|e| refused(e.code, &e.detail))
+}
+
+/// The `Record` a `memory_agreement_record` call asks for.
+fn record_args(args: &Value) -> Result<Record, HostToolError> {
+    let f = fields(args, &RECORD_KEYS)?;
+    let owned = |key: &str| string(f, key).map(str::to_owned);
+    Ok(Record {
+        scope: owned("scope")?,
+        text: owned("text")?,
+        reason: owned("reason")?,
+        claim: claim_args(f)?,
+    })
+}
+
+/// `memory_agreement_record`: parses `args` and records one agreement for `turn`; the
+/// result JSON or a `<CODE>: <detail>` refusal.
+pub fn record_agreement(
+    store: &Mutex<Store>,
+    turn: Option<TurnContext>,
+    args: &Value,
+) -> Result<String, HostToolError> {
+    let req = record_args(args).inspect_err(args_refused(MEMORY_AGREEMENT_RECORD_TOOL))?;
+    agreements::record(store, turn.as_ref(), &req).map_err(|e| refused(e.code, &e.detail))
+}
+
+/// The agreement id and the reason a `memory_agreement_break` call names.
+fn break_args(args: &Value) -> Result<(i64, String), HostToolError> {
+    let f = fields(args, &BREAK_KEYS)?;
+    let id =
+        i64::try_from(line(f, "id")?).map_err(|_| refused(E_MEMORY_ARGS, "`id` is too large"))?;
+    Ok((id, string(f, "reason")?.to_owned()))
+}
+
+/// `memory_agreement_break`: parses `args` and counts one break for `turn`; the result JSON
+/// or a `<CODE>: <detail>` refusal.
+pub fn break_agreement(
+    store: &Mutex<Store>,
+    turn: Option<TurnContext>,
+    args: &Value,
+) -> Result<String, HostToolError> {
+    let (id, reason) = break_args(args).inspect_err(args_refused(MEMORY_AGREEMENT_BREAK_TOOL))?;
+    agreements::break_one(store, turn.as_ref(), id, &reason).map_err(|e| refused(e.code, &e.detail))
 }
 
 /// `memory_list`: a JSON array of `{path, description, bytes}` or `{path, code}`.
@@ -687,6 +803,8 @@ mod tests {
                 MEMORY_DELETE_TOOL,
                 MEMORY_RENAME_TOOL,
                 MEMORY_UPDATE_DESCRIPTION_TOOL,
+                MEMORY_AGREEMENT_RECORD_TOOL,
+                MEMORY_AGREEMENT_BREAK_TOOL,
             ]
         );
         for tool in &tools {
@@ -1079,6 +1197,80 @@ mod tests {
         assert_eq!(
             commit_rows(&store).pop().expect("commit").commit.claim_json,
             None
+        );
+    }
+
+    fn required(schema: &Map<String, Value>) -> Vec<&str> {
+        let mut keys: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|v| v.as_str().expect("key"))
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn agreement_schemas_are_strict() {
+        let record = record_schema();
+        assert_eq!(required(&record), ["reason", "scope", "text"]);
+        for key in CLAIM_KEYS {
+            assert!(record["properties"].get(key).is_some(), "{key}");
+        }
+        assert_eq!(
+            record["properties"]["scope"]["enum"],
+            json!(["global", "project"])
+        );
+        assert_eq!(record["additionalProperties"], Value::Bool(false));
+
+        let brk = break_schema();
+        assert_eq!(brk["required"], json!(["id", "reason"]));
+        assert_eq!(brk["properties"]["id"]["type"], "integer");
+        assert_eq!(brk["properties"]["id"]["minimum"], 1);
+        assert_eq!(brk["additionalProperties"], Value::Bool(false));
+    }
+
+    #[test]
+    fn agreement_args_are_checked() {
+        let (_dir, _memory, store, turn) = store_fixture();
+        let record = json!({"scope": "global", "text": "never push to main", "reason": "r"});
+        let mut extra = record.clone();
+        extra["extra"] = json!("x");
+        let mut missing = record.clone();
+        missing.as_object_mut().unwrap().remove("text");
+        for args in [extra, missing] {
+            let result = record_agreement(&store, Some(turn.clone()), &args);
+            assert_eq!(code_of(result), E_MEMORY_ARGS, "{args}");
+        }
+        for args in [
+            json!({"id": 0, "reason": "r"}),
+            json!({"id": "1", "reason": "r"}),
+            json!({"id": 1, "reason": "r", "extra": 1}),
+        ] {
+            let result = break_agreement(&store, Some(turn.clone()), &args);
+            assert_eq!(code_of(result), E_MEMORY_ARGS, "{args}");
+        }
+        assert!(lock(&store).agreements().expect("agreements").is_empty());
+    }
+
+    #[test]
+    fn agreement_tool_results_are_json() {
+        let (_dir, _memory, store, turn) = store_fixture();
+        let record = json!({"scope": "global", "text": "never push to main", "reason": "r"});
+        let out = result_json(record_agreement(&store, Some(turn.clone()), &record));
+        assert_eq!(
+            out,
+            json!({"agreement": 1, "scope": "global", "author": "agent", "broken": 0, "needs_human": false})
+        );
+        let out = result_json(break_agreement(
+            &store,
+            Some(turn),
+            &json!({"id": 1, "reason": "r"}),
+        ));
+        assert_eq!(
+            out,
+            json!({"agreement": 1, "broken": 1, "needs_human": false, "flagged": false})
         );
     }
 }
