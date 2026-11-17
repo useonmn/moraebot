@@ -1075,3 +1075,140 @@ async fn memory_repin_and_notices_through_the_gateway() {
     );
     assert!(!refresh.exists(), "the restart removed the refresh request");
 }
+
+#[tokio::test]
+async fn agreements_and_boundaries_through_the_gateway() {
+    const RULE: &str = "never push to main";
+    let mut rig = Rig::new();
+    let calls = [
+        json!({
+            "tool": memory::MEMORY_AGREEMENT_RECORD_TOOL,
+            "arguments": {"scope": "global", "text": RULE, "reason": "r"}
+        }),
+        json!({
+            "tool": memory::MEMORY_AGREEMENT_BREAK_TOOL,
+            "arguments": {"id": 1, "reason": "r"}
+        }),
+        json!({
+            "tool": memory::MEMORY_CREATE_TOOL,
+            "arguments": {
+                "path": memory::BOUNDARIES,
+                "description": "b",
+                "body": format!("- {RULE}\n"),
+                "reason": "r",
+                "source": "agent"
+            }
+        }),
+    ]
+    .map(|call| call.to_string())
+    .join("\n");
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(
+        rig.open(
+            dynamic,
+            &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &calls)],
+        )
+        .expect("open gateway"),
+    );
+    // Turns 1-3: each owner message runs the three calls; the break counts once per turn.
+    for (n, id) in [
+        "1300000000000000041",
+        "1300000000000000042",
+        "1300000000000000043",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        adapter.inject(dm(id, "run-tools")).await;
+        bounded(adapter.wait_for_send(n + 1)).await;
+    }
+    // Turn 4: the newly flagged agreement is told to the lead once.
+    adapter.inject(dm("1300000000000000044", "hi")).await;
+    bounded(adapter.wait_for_send(4)).await;
+    // Turn 5: the owner's refresh re-pins the lead with the ledger in its block.
+    let refresh = notice::refresh_file(&rig.config.home);
+    std::fs::write(&refresh, "").expect("refresh request");
+    adapter.inject(dm("1300000000000000045", "again")).await;
+    bounded(adapter.wait_for_send(5)).await;
+    running.stop().await;
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+
+    let leads = rig.tap.starts_of(false);
+    // QA evidence (shown with --nocapture): the lead start pids and counts only.
+    for (_, pid, _) in &leads {
+        println!("lead START pid={pid}");
+    }
+    assert_eq!(leads.len(), 2, "first start, refresh re-pin");
+    let blocks: Vec<&String> = leads
+        .iter()
+        .map(|(_, _, argv)| {
+            let flags = append_flags(argv);
+            assert_eq!(flags.len(), 1, "one append element");
+            flags[0]
+        })
+        .collect();
+    assert!(
+        !blocks[0].contains("<agreements>\n"),
+        "the first pin predates the ledger"
+    );
+    assert!(blocks[1].contains("<agreements>\n"), "the re-pin lists it");
+    let item = format!("- #1 [global] [agent] [broken x3] NEEDS-HUMAN: {RULE}");
+    assert!(
+        blocks[1].lines().any(|line| line == item),
+        "the re-pin shows the flagged item"
+    );
+
+    let frames: Vec<Value> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let prompts: Vec<&str> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "prompt")
+        .map(|frame| frame["message"].as_str().expect("prompt message"))
+        .collect();
+    println!("prompts={}", prompts.len());
+    assert_eq!(prompts.len(), 5, "five lead prompts");
+    let fourth: Vec<&str> = prompts[3].lines().collect();
+    assert_eq!(fourth[1], memory::NOTICE_BEGIN, "{fourth:?}");
+    let line = format!("agreement needs-human id=1 broken=3 text=\"{RULE}\"");
+    assert!(fourth.contains(&line.as_str()), "{fourth:?}");
+    for (at, prompt) in prompts.iter().enumerate() {
+        let count = prompt
+            .lines()
+            .filter(|line| line.starts_with("agreement "))
+            .count();
+        assert_eq!(count, usize::from(at == 3), "prompt {at}: {prompt:?}");
+    }
+
+    let results: Vec<(bool, &str)> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "host_tool_result")
+        .map(|frame| {
+            let text = frame["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            (frame["isError"] == true, text)
+        })
+        .collect();
+    println!("host_tool_results={}", results.len());
+    assert_eq!(results.len(), 9, "{results:?}");
+    for at in [2, 5, 8] {
+        assert!(results[at].0, "{results:?}");
+        assert!(
+            results[at]
+                .1
+                .starts_with(&format!("{}:", memory::E_MEMORY_QUOTE)),
+            "{results:?}"
+        );
+    }
+    assert!(!rig.memory_file(memory::BOUNDARIES).exists());
+
+    let agreements = open_store(&rig).agreements().expect("agreements");
+    assert_eq!(agreements.len(), 1, "{agreements:?}");
+    assert_eq!(agreements[0].broken, 3);
+    assert!(agreements[0].needs_human);
+}
