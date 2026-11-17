@@ -37,7 +37,7 @@ use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory::home::MemoryHome;
-use crate::memory::{self, render};
+use crate::memory::{self, history, render};
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -944,8 +944,21 @@ impl OmpManager {
             .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
         let session_dir = lead_session_dir(&self.config);
-        let append = match self.memory.as_ref().map(render::render) {
-            Some(rendered) => {
+        let append = match &self.memory {
+            Some(home) => {
+                let rendered = {
+                    let mut store = lock(&self.store);
+                    match history::prepare(&mut store, home).and_then(|committed| {
+                        history::dirty(home, &committed)
+                            .map(|dirty| render::render(&committed, &dirty))
+                    }) {
+                        Ok(rendered) => rendered,
+                        Err(e) => {
+                            tracing::warn!(code = e.code, "memory history unavailable");
+                            render::unavailable(e.code)
+                        }
+                    }
+                };
                 for (path, code) in &rendered.problems {
                     tracing::warn!(path = %path, code, "memory file not rendered");
                 }

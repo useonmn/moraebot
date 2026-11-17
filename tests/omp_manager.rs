@@ -10,7 +10,7 @@ use moraebot::files;
 use moraebot::lane;
 use moraebot::lead;
 use moraebot::memory::home::{MemoryHome, PERSONA_SEED};
-use moraebot::memory::{self, frontmatter};
+use moraebot::memory::{self, frontmatter, history};
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
 use moraebot::store::Store;
 use serde_json::Value;
@@ -978,6 +978,8 @@ async fn memory_block_is_rendered_at_each_start() {
         .expect("run kill");
     assert!(killed.success());
     h.write_persona("---\ndescription: d\n---\nv2-marker\n");
+    history::accept(&mut h.store.lock().unwrap(), &h.memory(), &[], "test")
+        .expect("accept the hand edit");
 
     let lost = bounded(manager.prompt(KEY_A, 2, "second"))
         .await
@@ -994,6 +996,48 @@ async fn memory_block_is_rendered_at_each_start() {
     assert_eq!(flags.len(), 2, "exactly two START lines");
     assert!(!flags[0][0].contains("v2-marker"));
     assert!(flags[1][0].contains("v2-marker"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn hand_edit_is_not_projected() {
+    let h = Harness::new();
+    let manager = h.manager("ok").with_memory(h.memory());
+    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    let pid = manager.child_pid().await.expect("live child");
+    h.write_persona("---\ndescription: d\n---\nhand-marker\n");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+
+    let lost = bounded(manager.prompt(KEY_A, 2, "second"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(lost.code(), Some(omp::E_CHILD_LOST));
+    assert_eq!(
+        h.append_flags().len(),
+        1,
+        "a lost child starts no new child"
+    );
+    let outcome = bounded(manager.prompt(KEY_A, 3, "third"))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: third".into()));
+
+    let flags = h.append_flags();
+    assert_eq!(flags.len(), 2, "exactly two START lines");
+    let second = &flags[1][0];
+    assert!(!second.contains("hand-marker"));
+    assert!(second.contains(persona_seed_body()));
+    assert!(second.contains(&format!(
+        "<dirty path=\"{}\" code=\"{}\"/>",
+        memory::PERSONA,
+        memory::E_MEMORY_DIRTY
+    )));
     manager.shutdown_all().await;
 }
 
