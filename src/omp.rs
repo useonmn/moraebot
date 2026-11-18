@@ -34,6 +34,7 @@ use crate::config::Config;
 use crate::files;
 use crate::lane::LaneManager;
 use crate::lead;
+use crate::persona;
 use crate::store::Store;
 
 /// The omp process could not be started or did not become ready.
@@ -680,6 +681,7 @@ impl OmpManager {
     }
 
     /// System prompt text appended to the lead's (guidance and messenger hints); empty = none.
+    /// At each lead start `persona.md` is appended after them (`persona::append`).
     pub fn with_hints(mut self, hints: String) -> Self {
         self.hints = hints;
         self
@@ -873,6 +875,18 @@ impl OmpManager {
         }
     }
 
+    /// The lead's appended system prompt: the hints, then `persona.md` read now. A refused file
+    /// is left out with one warning carrying its code.
+    fn lead_append(&self) -> String {
+        match persona::load(&self.config.home) {
+            Ok(p) => persona::append(&self.hints, p.as_deref()),
+            Err(e) => {
+                tracing::warn!(code = e.code, "persona file not used");
+                self.hints.clone()
+            }
+        }
+    }
+
     fn kill_lead(&self) {
         if let Some(group) = lock(&self.lead_kill).as_ref() {
             group.kill();
@@ -888,7 +902,7 @@ impl OmpManager {
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &session_dir, &self.hints),
+                    omp_args(&self.config, &session_dir, &self.lead_append()),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )

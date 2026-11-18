@@ -8,6 +8,7 @@ use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::files;
 use moraebot::lead;
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
+use moraebot::persona;
 use moraebot::store::Store;
 use serde_json::Value;
 
@@ -247,6 +248,100 @@ async fn no_flag_when_hints_empty() {
             .all(|a| !a.starts_with("--append-system-prompt"))
     );
     manager.shutdown_all().await;
+}
+
+/// Per `START` line in log order, its `--append-system-prompt=` argv elements.
+fn appends(h: &Harness) -> Vec<Vec<String>> {
+    h.log_lines()
+        .iter()
+        .filter(|l| l.starts_with("START pid="))
+        .map(|l| {
+            start_argv(l)
+                .into_iter()
+                .filter(|a| a.starts_with("--append-system-prompt="))
+                .collect()
+        })
+        .collect()
+}
+
+fn save_persona(h: &Harness, name: &str, tone: &str, owner: &str) {
+    let text = persona::render(name, tone, owner).unwrap();
+    persona::save(&h.config.home, &text).unwrap();
+}
+
+#[tokio::test]
+async fn lead_appends_persona_after_hints() {
+    let h = Harness::new();
+    save_persona(
+        &h,
+        "Sora",
+        "short and warm",
+        "Owner 111 likes short replies",
+    );
+    let manager = h.manager("ok").with_hints("H".into());
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let loaded = persona::load(&h.config.home).unwrap();
+    let expected = format!(
+        "--append-system-prompt={}",
+        persona::append("H", loaded.as_deref())
+    );
+    let appends = appends(&h);
+    assert_eq!(appends, vec![vec![expected]]);
+    assert!(appends[0][0].contains("Name: Sora"));
+    bounded(manager.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn persona_change_applies_at_next_start() {
+    let h = Harness::new();
+    save_persona(
+        &h,
+        "Sora",
+        "short and warm",
+        "Owner 111 likes short replies",
+    );
+    let m1 = h.manager("ok");
+    bounded(m1.prompt(KEY_A, 1, "hi")).await;
+    save_persona(&h, "Kai", "", "");
+    bounded(m1.prompt(KEY_B, 2, "again")).await;
+    assert_eq!(
+        h.start_pids().len(),
+        1,
+        "a persona change does not restart the lead"
+    );
+    bounded(m1.shutdown_all()).await;
+
+    let m2 = h.manager("ok");
+    bounded(m2.prompt(KEY_A, 1, "hi")).await;
+    let appends = appends(&h);
+    assert_eq!(appends.len(), 2);
+    let first = appends[0].concat();
+    let second = appends[1].concat();
+    assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
+    assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
+    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn refused_persona_is_left_out() {
+    let h = Harness::new();
+    let secret = ["gl", "pat-"].concat() + &"c".repeat(20);
+    std::fs::write(
+        persona::path(&h.config.home),
+        format!("Name: X\nOwner: {secret}"),
+    )
+    .unwrap();
+    let manager = h.manager("ok").with_hints("H".into());
+    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    assert_eq!(
+        appends(&h),
+        vec![vec!["--append-system-prompt=H".to_owned()]]
+    );
+    assert_eq!(
+        persona::load(&h.config.home).unwrap_err().code,
+        persona::E_PERSONA_SECRET
+    );
+    bounded(manager.shutdown_all()).await;
 }
 
 #[tokio::test]
