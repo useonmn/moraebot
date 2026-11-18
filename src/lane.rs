@@ -60,6 +60,7 @@ use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
 };
+use crate::secret;
 use crate::store::{LaneClose, LaneMessage, LaneStart, LaneState, Store};
 use crate::worktree::{self, Cleanup, WorktreeError};
 
@@ -97,6 +98,9 @@ pub const E_LANE_CLOSED: &str = "E_LANE_CLOSED";
 
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;
+
+/// A lane progress note is cut to this many characters.
+pub const REPORT_CHARS: usize = 200;
 
 /// One registered lane worker: its child's process group once spawned, and its thread.
 struct LaneChild {
@@ -278,6 +282,48 @@ fn refused(code: &str, reason: &str) -> HostToolError {
 
 fn schema(value: Value) -> Map<String, Value> {
     serde_json::from_value(value).expect("lane tool schema is a JSON object")
+}
+
+/// A lane's progress note made safe to post: secrets become `[secret]`, each path in `paths`
+/// becomes its mark (in order), `@` becomes U+FF20 so no mention fires, whitespace runs become
+/// one space, and the result is cut to `REPORT_CHARS` characters.
+pub fn news_text(raw: &str, paths: &[(&Path, &str)]) -> String {
+    let mut rest = raw;
+    let mut text = String::new();
+    while let Some(found) = secret::find_secret(rest) {
+        text.push_str(&rest[..found.start]);
+        text.push_str("[secret]");
+        rest = &rest[found.end..];
+    }
+    text.push_str(rest);
+
+    for &(path, mark) in paths {
+        if !path.is_absolute() || path.parent().is_none() {
+            continue;
+        }
+        let path = path.to_string_lossy();
+        let path = path.trim_end_matches('/');
+        let mut out = String::new();
+        let mut last = 0;
+        for (at, _) in text.match_indices(path) {
+            let end = at + path.len();
+            if text[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '/' || c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
+            {
+                out.push_str(&text[last..at]);
+                out.push_str(mark);
+                last = end;
+            }
+        }
+        out.push_str(&text[last..]);
+        text = out;
+    }
+
+    text = text.replace('@', "\u{FF20}");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.chars().take(REPORT_CHARS).collect()
 }
 
 impl LaneManager {
@@ -1523,5 +1569,53 @@ mod tests {
         assert!(elapsed <= STALL_AFTER + WATCH_TICK, "elapsed {elapsed:?}");
         assert_eq!(count, 1);
         assert_eq!(row.expect("row").message_id, "1:1:stalled:1");
+    }
+
+    #[test]
+    fn news_text_cleans_secrets_paths_and_mentions() {
+        let paths = [
+            (Path::new("/qa/work"), "."),
+            (Path::new("/qa/qa-user"), "~"),
+        ];
+        let at = '\u{FF20}';
+        let cases: [(String, String); 11] = [
+            ("built /qa/work/src/a.rs".into(), "built ./src/a.rs".into()),
+            (
+                "read /qa/qa-user/notes.txt".into(),
+                "read ~/notes.txt".into(),
+            ),
+            (
+                "ping @everyone and <@111>".into(),
+                format!("ping {at}everyone and <{at}111>"),
+            ),
+            (
+                format!("key password={}", "q".repeat(12)),
+                "key [secret]".into(),
+            ),
+            (
+                format!("use sk-{} now", "q".repeat(24)),
+                "use [secret] now".into(),
+            ),
+            ("a\n\n  b\tc ".into(), "a b c".into()),
+            ("x".repeat(500), "x".repeat(REPORT_CHARS)),
+            ("  \n ".into(), String::new()),
+            ("/qa/workshop".into(), "/qa/workshop".into()),
+            ("/qa/qa-userx/a".into(), "/qa/qa-userx/a".into()),
+            ("in '/qa/work' and /qa/work".into(), "in '.' and .".into()),
+        ];
+        for (i, (input, expected)) in cases.iter().enumerate() {
+            assert_eq!(news_text(input, &paths), *expected, "case {i}");
+        }
+
+        assert_eq!(news_text("/ only", &[(Path::new("/"), ".")]), "/ only");
+        assert_eq!(
+            news_text("network ok", &[(Path::new("work"), ".")]),
+            "network ok"
+        );
+        assert_eq!(
+            news_text("built /qa/work/a.rs", &[(Path::new("/qa/work/"), ".")]),
+            "built ./a.rs"
+        );
+        assert_eq!(news_text("a b", &[(Path::new(""), ".")]), "a b");
     }
 }
