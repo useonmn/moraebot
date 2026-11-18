@@ -72,6 +72,8 @@ pub const E_LANE_LIMIT: &str = "E_LANE_LIMIT";
 pub const E_LANE_INTERRUPTED: &str = "E_LANE_INTERRUPTED";
 /// moraebot is shutting down and starts no new lane.
 pub const E_LANE_STOPPING: &str = "E_LANE_STOPPING";
+/// The lane was closed with `lane_close` and takes no more work.
+pub const E_LANE_CLOSED: &str = "E_LANE_CLOSED";
 
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;
@@ -452,6 +454,9 @@ impl LaneManager {
                         E_LANE_LIMIT,
                         &format!("{MAX_RUNNING_LANES} lanes are already running"),
                     ));
+                }
+                LaneMessage::Closed => {
+                    return Err(refused(E_LANE_CLOSED, "the lane is closed"));
                 }
             }
         };

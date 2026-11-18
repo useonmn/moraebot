@@ -179,6 +179,10 @@ pub struct LaneRow {
     pub done: Option<String>,
     /// The canonical git checkout the lane's worktree comes from; `None` = the shared work folder.
     pub repo: Option<String>,
+    /// Set once by `lane_close`; a closed lane takes no more prompts.
+    pub closed: bool,
+    /// The reason the lead gave when it first closed the lane.
+    pub close_reason: Option<String>,
 }
 
 /// Result of [`Store::start_lane`].
@@ -200,6 +204,18 @@ pub enum LaneMessage {
     Unknown,
     Busy,
     Limit,
+    /// The lane was closed with `lane_close`.
+    Closed,
+}
+
+/// Result of [`Store::close_lane`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneClose {
+    /// The lane is closed (now or before); its canonical repo, if any.
+    Closed { repo: Option<String> },
+    Unknown,
+    /// The lane is running; nothing changed.
+    Busy,
 }
 
 /// Where the first meeting with the owner stands.
@@ -293,7 +309,9 @@ CREATE TABLE IF NOT EXISTS lanes(
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     done TEXT,
-    repo TEXT
+    repo TEXT,
+    closed_at TEXT,
+    close_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS onboarding(
     id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -306,7 +324,7 @@ CREATE TABLE IF NOT EXISTS onboarding(
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 8] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
@@ -315,6 +333,8 @@ const ADDED_COLUMNS: [(&str, &str, &str); 8] = [
     ("inbox", "steered_into", "INTEGER"),
     ("lanes", "done", "TEXT"),
     ("lanes", "repo", "TEXT"),
+    ("lanes", "closed_at", "TEXT"),
+    ("lanes", "close_reason", "TEXT"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -381,7 +401,7 @@ fn hold_queued_sql(conversations: &str) -> String {
 const COLS: &str = "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error, attachments, files_ready, out_files, text_sent, origin, steered_into";
 
 const LANE_COLS: &str =
-    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, done, repo";
+    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, done, repo, closed_at, close_reason";
 
 fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
     let state: String = r.get(3)?;
@@ -400,6 +420,8 @@ fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
         notice_sent: r.get::<_, i64>(7)? != 0,
         done: r.get(8)?,
         repo: r.get(9)?,
+        closed: r.get::<_, Option<String>>(10)?.is_some(),
+        close_reason: r.get(11)?,
     })
 }
 
@@ -1000,12 +1022,17 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state: Option<String> = tx
-            .query_row("SELECT state FROM lanes WHERE id = ?1", [id], |r| r.get(0))
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT state, closed_at FROM lanes WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?;
-        match state.as_deref() {
+        match row {
             None => return Ok(LaneMessage::Unknown),
-            Some("running") => return Ok(LaneMessage::Busy),
+            Some((_, Some(_))) => return Ok(LaneMessage::Closed),
+            Some((state, None)) if state == "running" => return Ok(LaneMessage::Busy),
             Some(_) => {}
         }
         if running_lanes(&tx)? >= max_running {
@@ -1021,6 +1048,36 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(LaneMessage::Seq(seq))
+    }
+
+    /// Marks a lane that is not running as closed, in one transaction; a second call keeps the
+    /// first time and reason.
+    pub fn close_lane(&mut self, id: i64, reason: &str) -> Result<LaneClose, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT state, repo FROM lanes WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, repo)) = row else {
+            return Ok(LaneClose::Unknown);
+        };
+        if state == "running" {
+            return Ok(LaneClose::Busy);
+        }
+        tx.execute(
+            &format!(
+                "UPDATE lanes SET closed_at = COALESCE(closed_at, {NOW}), close_reason = COALESCE(close_reason, ?2), updated_at = {NOW}
+                 WHERE id = ?1"
+            ),
+            params![id, reason],
+        )?;
+        tx.commit()?;
+        Ok(LaneClose::Closed { repo })
     }
 
     pub fn lane(&self, id: i64) -> Result<Option<LaneRow>, StoreError> {
@@ -2004,6 +2061,8 @@ mod tests {
                     notice_sent: true,
                     done: None,
                     repo: None,
+                    closed: false,
+                    close_reason: None,
                 }
             );
         }
@@ -2078,6 +2137,43 @@ mod tests {
             let lane = s.lane(1).unwrap().unwrap();
             assert_eq!(lane.repo, None);
             assert_eq!(lane.done.as_deref(), Some("file a"));
+        }
+    }
+
+    #[test]
+    fn l2_database_gains_lanes_close_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        conn.execute_batch("ALTER TABLE lanes ADD COLUMN done TEXT")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE lanes ADD COLUMN repo TEXT")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO lanes(tool_call_id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, created_at, updated_at, done, repo)
+             VALUES ('call-old', ?1, 'old task', 'idle', NULL, 1, NULL, 0, 't', 't', NULL, '/qa/repo')",
+            [K1],
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            let cols: Vec<String> = s
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('lanes')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for c in ["closed_at", "close_reason"] {
+                assert!(cols.iter().any(|x| x == c), "missing column {c}");
+            }
+            let lane = s.lane(1).unwrap().unwrap();
+            assert!(!lane.closed);
+            assert_eq!(lane.close_reason, None);
+            assert_eq!(lane.repo.as_deref(), Some("/qa/repo"));
         }
     }
 
@@ -2269,6 +2365,70 @@ mod tests {
         let row = s.lane(a).unwrap().unwrap();
         assert_eq!(row.state, LaneState::Running);
         assert_eq!(row.prompts, 2);
+    }
+
+    fn closed_at(s: &Store, id: i64) -> Option<String> {
+        s.conn
+            .query_row("SELECT closed_at FROM lanes WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn close_lane_refuses_running_and_unknown_and_keeps_the_first_reason() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert_eq!(s.close_lane(a, "x").unwrap(), LaneClose::Busy);
+        assert!(!s.lane(a).unwrap().unwrap().closed);
+        assert_eq!(s.close_lane(a + 100, "x").unwrap(), LaneClose::Unknown);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        assert_eq!(
+            s.close_lane(a, "first").unwrap(),
+            LaneClose::Closed { repo: None }
+        );
+        let row = s.lane(a).unwrap().unwrap();
+        assert!(row.closed);
+        assert_eq!(row.close_reason.as_deref(), Some("first"));
+        assert_eq!(row.state, LaneState::Idle);
+        let t1 = closed_at(&s, a);
+        assert!(t1.is_some());
+        assert_eq!(
+            s.close_lane(a, "again").unwrap(),
+            LaneClose::Closed { repo: None }
+        );
+        let row = s.lane(a).unwrap().unwrap();
+        assert_eq!(row.close_reason.as_deref(), Some("first"));
+        assert_eq!(closed_at(&s, a), t1);
+        let b = match s
+            .start_lane("call-b", K1, "task", Some("file ."), Some("/qa/repo"), 3)
+            .unwrap()
+        {
+            LaneStart::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        };
+        assert!(s
+            .finish_lane(b, 1, "r", LaneState::Failed, Some("E_X"))
+            .unwrap());
+        assert_eq!(
+            s.close_lane(b, "x").unwrap(),
+            LaneClose::Closed {
+                repo: Some("/qa/repo".into())
+            }
+        );
+    }
+
+    #[test]
+    fn message_lane_refuses_a_closed_lane() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        assert_eq!(
+            s.close_lane(a, "x").unwrap(),
+            LaneClose::Closed { repo: None }
+        );
+        assert_eq!(s.message_lane(a, 3).unwrap(), LaneMessage::Closed);
+        let row = s.lane(a).unwrap().unwrap();
+        assert_eq!(row.state, LaneState::Idle);
+        assert_eq!(row.prompts, 1);
     }
 
     #[test]
