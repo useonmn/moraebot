@@ -35,30 +35,46 @@ pub const E_CHECK_MISSING: &str = "E_CHECK_MISSING";
 pub const E_CHECK_TIMEOUT: &str = "E_CHECK_TIMEOUT";
 /// A command could not start.
 pub const E_CHECK_SPAWN: &str = "E_CHECK_SPAWN";
+/// The text is not in the file.
+pub const E_CHECK_TEXT: &str = "E_CHECK_TEXT";
+/// An existing file cannot be read.
+pub const E_CHECK_READ: &str = "E_CHECK_READ";
 
 /// Bytes of command output kept for a failure detail.
 const OUTPUT_HEAD_BYTES: u64 = 4096;
+/// Bytes read at a time when a file is searched for a text.
+const SCAN_CHUNK: usize = 64 * 1024;
 
 /// One checkable part of a Done line.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Signal {
     /// Runs the argv (no shell); passes on exit code 0.
     Command(Vec<String>),
-    /// Passes when the path exists.
-    File(String),
+    /// Passes when the path exists; with a text, only when the file's bytes contain it.
+    File(String, Option<String>),
 }
 
 impl fmt::Display for Signal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Signal::Command(argv) => write!(f, "command {}", json(argv)),
-            Signal::File(path)
-                if path.contains(|c: char| c.is_whitespace() || ";\"[]".contains(c)) =>
-            {
-                write!(f, "file {}", json(path))
+            Signal::File(path, text) => {
+                write!(f, "file {}", word(path))?;
+                if let Some(text) = text {
+                    write!(f, " contains {}", json(text))?;
+                }
+                Ok(())
             }
-            Signal::File(path) => write!(f, "file {path}"),
         }
+    }
+}
+
+/// The text JSON-quoted when it has whitespace or one of `;"[]`, else bare.
+fn word(text: &str) -> String {
+    if text.contains(|c: char| c.is_whitespace() || ";\"[]".contains(c)) {
+        json(text)
+    } else {
+        text.to_owned()
     }
 }
 
@@ -71,7 +87,7 @@ fn json<T: serde::Serialize + ?Sized>(value: &T) -> String {
 pub struct DoneLine(Vec<Signal>);
 
 impl DoneLine {
-    /// Parses a Dori-mode Done line cut to the `command` and `file` kinds.
+    /// Parses a Done line; [`Signal`] lists the kinds.
     pub fn parse(line: &str) -> Result<DoneLine, SyntaxError> {
         let parts = split(strip_prefix(line));
         if parts.is_empty() {
@@ -117,6 +133,7 @@ pub enum SyntaxReason {
     Unsupported,
     BadArgv,
     BadPath,
+    BadText,
 }
 
 /// A Done line that cannot be checked: the bad part and why.
@@ -139,6 +156,9 @@ impl fmt::Display for SyntaxError {
             }
             SyntaxReason::BadPath => {
                 "file needs one path (quoted if it has spaces) and nothing after it"
+            }
+            SyntaxReason::BadText => {
+                "contains needs one non-empty quoted text and nothing after it"
             }
         };
         write!(f, "{} -> {reason}", self.part)
@@ -203,20 +223,48 @@ fn parse_signal(part: &str) -> Result<Signal, SyntaxReason> {
             _ => Err(SyntaxReason::BadArgv),
         },
         "file" => {
-            let path = if rest.starts_with('"') {
-                serde_json::from_str::<String>(rest).map_err(|_| SyntaxReason::BadPath)?
-            } else if rest.contains(char::is_whitespace) {
-                return Err(SyntaxReason::BadPath);
-            } else {
-                rest.to_owned()
-            };
-            if path.is_empty() {
-                return Err(SyntaxReason::BadPath);
-            }
-            Ok(Signal::File(path))
+            let (path, rest) = take_word(rest).ok_or(SyntaxReason::BadPath)?;
+            let text = take_contains(rest, SyntaxReason::BadPath)?;
+            Ok(Signal::File(path, text))
         }
         "merged" | "closed" | "published" | "url" => Err(SyntaxReason::Unsupported),
         _ => Err(SyntaxReason::Unknown),
+    }
+}
+
+/// Reads one leading JSON value; returns it and the rest without leading whitespace.
+fn take_json<T: serde::de::DeserializeOwned>(text: &str) -> Option<(T, &str)> {
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<T>();
+    let value = stream.next()?.ok()?;
+    Some((value, text[stream.byte_offset()..].trim_start()))
+}
+
+/// Reads one non-empty word: a JSON string, else the text up to the first whitespace.
+fn take_word(text: &str) -> Option<(String, &str)> {
+    let (word, rest) = if text.starts_with('"') {
+        take_json::<String>(text)?
+    } else {
+        let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        (word.to_owned(), rest.trim_start())
+    };
+    (!word.is_empty()).then_some((word, rest))
+}
+
+/// Reads an optional `contains "<text>"` tail. Anything else after the kind's own part is
+/// `bad`; a `contains` without exactly one non-empty JSON string is `BadText`.
+fn take_contains(rest: &str, bad: SyntaxReason) -> Result<Option<String>, SyntaxReason> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let (keyword, text) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(keyword, text)| (keyword, text.trim_start()));
+    if keyword != "contains" {
+        return Err(bad);
+    }
+    match take_json::<String>(text) {
+        Some((text, "")) if !text.is_empty() => Ok(Some(text)),
+        _ => Err(SyntaxReason::BadText),
     }
 }
 
@@ -253,7 +301,7 @@ pub(crate) fn run(
     let mut checks = Vec::with_capacity(line.0.len());
     for signal in &line.0 {
         let (code, detail) = match signal {
-            Signal::File(path) => check_file(path, work_dir, env),
+            Signal::File(path, text) => check_file(path, text.as_deref(), work_dir, env),
             Signal::Command(argv) => check_command(
                 argv,
                 work_dir,
@@ -273,24 +321,64 @@ pub(crate) fn run(
     Ok(checks)
 }
 
-fn check_file(
-    path: &str,
-    work_dir: &Path,
-    env: &[(OsString, OsString)],
-) -> (Option<&'static str>, String) {
+/// `~/` against the env's `HOME`, an absolute path as is, else relative to `work_dir`.
+fn resolve(path: &str, work_dir: &Path, env: &[(OsString, OsString)]) -> PathBuf {
     let home = env.iter().find(|(name, _)| name == "HOME");
-    let resolved: PathBuf = match (path.strip_prefix("~/"), home) {
+    match (path.strip_prefix("~/"), home) {
         (Some(rest), Some((_, home))) => Path::new(home).join(rest),
         _ if Path::new(path).is_absolute() => PathBuf::from(path),
         _ => work_dir.join(path),
-    };
-    if resolved.exists() {
-        (None, "exists".to_owned())
-    } else {
-        (
+    }
+}
+
+fn check_file(
+    path: &str,
+    text: Option<&str>,
+    work_dir: &Path,
+    env: &[(OsString, OsString)],
+) -> (Option<&'static str>, String) {
+    let resolved = resolve(path, work_dir, env);
+    if !resolved.exists() {
+        return (
             Some(E_CHECK_MISSING),
             format!("missing: {}", resolved.display()),
-        )
+        );
+    }
+    match text {
+        None => (None, "exists".to_owned()),
+        Some(text) => check_text(&resolved, text),
+    }
+}
+
+fn check_text(path: &Path, text: &str) -> (Option<&'static str>, String) {
+    match file_contains(path, text) {
+        Ok(true) => (None, "text found".to_owned()),
+        Ok(false) => (Some(E_CHECK_TEXT), "text not found".to_owned()),
+        Err(error) => (Some(E_CHECK_READ), error.kind().to_string()),
+    }
+}
+
+/// Searches the whole file for the bytes of `text` (non-empty), `SCAN_CHUNK` bytes at a
+/// time; the last `text.len() - 1` bytes of a chunk are kept in front of the next one so a
+/// text across a chunk boundary is found.
+fn file_contains(path: &Path, text: &str) -> std::io::Result<bool> {
+    let needle = text.as_bytes();
+    let keep = needle.len() - 1;
+    let mut file = File::open(path)?;
+    let mut chunk = vec![0; SCAN_CHUNK];
+    let mut buffer = Vec::with_capacity(keep + SCAN_CHUNK);
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) => return Ok(false),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(needle.len()).any(|window| window == needle) {
+            return Ok(true);
+        }
+        buffer.drain(..buffer.len().saturating_sub(keep));
     }
 }
 
@@ -501,7 +589,11 @@ mod tests {
     }
 
     fn file(path: &str) -> Signal {
-        Signal::File(path.to_owned())
+        Signal::File(path.to_owned(), None)
+    }
+
+    fn file_text(path: &str, text: &str) -> Signal {
+        Signal::File(path.to_owned(), Some(text.to_owned()))
     }
 
     fn check(signal: &str, code: Option<&'static str>) -> Check {
@@ -647,6 +739,8 @@ mod tests {
             r#"file "a[1]"; file b"#,
             r#"Done = file "with space"; command ["sh","-c","x; y"]"#,
             r#"file ~/x.txt; file "q\"uote"; command ["a"]"#,
+            r#"file report.txt contains "0 failed""#,
+            r#"file "a b" contains "q\"uote;x""#,
         ] {
             let line = DoneLine::parse(text).unwrap();
             assert_eq!(DoneLine::parse(&line.to_string()).unwrap(), line, "{text}");
@@ -654,6 +748,81 @@ mod tests {
         let brackets = DoneLine::parse(r#"file "a[1]"; file b"#).unwrap();
         assert_eq!(brackets.signals(), [file("a[1]"), file("b")]);
         assert_eq!(brackets.to_string(), r#"file "a[1]"; file b"#);
+    }
+
+    #[test]
+    fn parse_accepts_file_contains() {
+        let line = DoneLine::parse(r#"file report.txt contains "0 failed""#).unwrap();
+        assert_eq!(line.signals(), [file_text("report.txt", "0 failed")]);
+        assert_eq!(line.to_string(), r#"file report.txt contains "0 failed""#);
+        let line = DoneLine::parse(r#"file "a b" contains "x;y"; file c"#).unwrap();
+        assert_eq!(line.signals(), [file_text("a b", "x;y"), file("c")]);
+        assert_eq!(line.to_string(), r#"file "a b" contains "x;y"; file c"#);
+    }
+
+    #[test]
+    fn parse_rejects_bad_contains() {
+        use SyntaxReason::*;
+        let cases = [
+            ("file a contains", BadText),
+            (r#"file a contains """#, BadText),
+            ("file a contains x", BadText),
+            (r#"file a contains "x" y"#, BadText),
+            (r#"file a contain "x""#, BadPath),
+        ];
+        for (line, why) in cases {
+            assert_eq!(reason(line), (line.to_owned(), why), "{line}");
+        }
+    }
+
+    #[test]
+    fn file_contains_checks_text() {
+        let d = dirs();
+        std::fs::write(d.work.join("report.txt"), "tests: 0 failed\n").unwrap();
+        std::fs::create_dir(d.work.join("qa-dir")).unwrap();
+        let checks = run_all(
+            &d,
+            vec![
+                file_text("report.txt", "0 failed"),
+                file_text("report.txt", "1 failed"),
+                file_text("gone", "x"),
+                file_text("qa-dir", "x"),
+                file("report.txt"),
+            ],
+            CHECK_TIMEOUT,
+        );
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(
+            codes,
+            [
+                None,
+                Some(E_CHECK_TEXT),
+                Some(E_CHECK_MISSING),
+                Some(E_CHECK_READ),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn text_found_across_a_read_boundary() {
+        let d = dirs();
+        let mut big = vec![b'a'; SCAN_CHUNK - 2];
+        let mut tail = big.clone();
+        big.extend_from_slice(b"NEEDLE");
+        tail.extend_from_slice(b"NEED");
+        std::fs::write(d.work.join("qa-big.txt"), big).unwrap();
+        std::fs::write(d.work.join("qa-tail.txt"), tail).unwrap();
+        let checks = run_all(
+            &d,
+            vec![
+                file_text("qa-big.txt", "NEEDLE"),
+                file_text("qa-tail.txt", "NEEDLE"),
+            ],
+            CHECK_TIMEOUT,
+        );
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(codes, [None, Some(E_CHECK_TEXT)]);
     }
 
     #[test]
