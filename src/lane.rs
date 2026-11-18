@@ -305,6 +305,7 @@ impl LaneManager {
                 &conversation_key,
                 task,
                 Some(&canonical),
+                None,
                 MAX_RUNNING_LANES,
             )
             .map_err(|e| refused(e.code(), &e.to_string()))?;

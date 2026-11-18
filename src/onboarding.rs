@@ -303,7 +303,8 @@ mod tests {
         );
         {
             let mut s = store.lock().unwrap();
-            s.start_lane("call-2", "p:th:111", "t", None, 3).unwrap();
+            s.start_lane("call-2", "p:th:111", "t", None, None, 3)
+                .unwrap();
             assert!(s.finish_lane(1, 1, "r", LaneState::Idle, None).unwrap());
             assert_eq!(s.get(2).unwrap().expect("lane row").origin, "lane");
         }

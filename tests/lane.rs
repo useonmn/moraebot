@@ -648,7 +648,9 @@ async fn lane_without_done_line_gets_no_tool() {
     let h = Harness::new();
     {
         let mut store = h.store.lock().unwrap();
-        let started = store.start_lane("toolu_old", KEY, "t1", None, 3).unwrap();
+        let started = store
+            .start_lane("toolu_old", KEY, "t1", None, None, 3)
+            .unwrap();
         assert_eq!(started, moraebot::store::LaneStart::New(1));
         let text = lead::lane_result(KEY, 1, &lead::LaneResult::Text("old"));
         assert!(
