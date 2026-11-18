@@ -1,5 +1,5 @@
 //! Lane work folders: a lane started with a `repo` works in its own git worktree of that checkout
-//! (moraebot creates it; Dori mode lets the lane create it). Messenger-agnostic.
+//! (moraebot creates it). Messenger-agnostic.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use crate::omp;
 pub const LANES_DIR: &str = ".moraebot-lanes";
 /// A lane's branch is this plus its id.
 pub const BRANCH_PREFIX: &str = "moraebot/lane-";
-/// Kill deadline of one git command (Dori mode command limit).
+/// Kill deadline of one git command.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// git could not run or passed `GIT_TIMEOUT`.
 pub const E_LANE_GIT: &str = "E_LANE_GIT";

@@ -1,5 +1,5 @@
 //! Lane done checks: the Done line a lane starts with, the `lane_done` claim, and the
-//! gateway-run checks of it (Dori mode style). Messenger-agnostic.
+//! gateway-run checks of it. Messenger-agnostic.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use crate::omp;
 
-/// Kill deadline of one `command` signal (Dori mode `COMMAND_TIMEOUT_MS`).
+/// Kill deadline of one `command` signal.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
-/// A check detail is cut to this many characters (Dori mode `short()`).
+/// A check detail is cut to this many characters.
 pub const DETAIL_CHARS: usize = 120;
 /// The host tool a lane calls to claim its work is done.
 pub const LANE_DONE_TOOL: &str = "lane_done";
