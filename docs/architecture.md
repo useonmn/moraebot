@@ -541,11 +541,11 @@ The lane is still running and moraebot does not stop it; its result comes later 
 
 **주기와 기준.** L3 감시와 같은 30초 점검(`WATCH_TICK`)을 씁니다. 감시가 한 번 돌 때마다 `watch_ticks`가 그 시각을 알리고, dispatcher가 그 뒤에 소식을 올립니다. 기준 20분은 dori에서 왔습니다. dori도 `postAfterMin` 20분이 지나야 올리고, 가장 새 보고만 올리며, 같은 보고를 되풀이하지 않고, 경로를 지웁니다. 둘 다 상수이고 설정 항목은 없습니다.
 
-**올리는 모양.** 조용한 대화마다 메시지 하나를 새로 보냅니다(`reply_target`). lane마다 `[lane <id>] <text>` 한 줄이고, 여러 줄은 lane id 순서로 이어 붙입니다. lead turn도, 받은편지함 줄도 만들지 않습니다. 보낸 대상이 없는 대화는 건너뜁니다. 보내기에 성공하면 로그에 `lane news posted` 한 줄(lane 번호만)을 남기고, 실패하면 아무것도 표시하지 않으므로 다음 점검(30초 뒤)에 다시 시도합니다. 로그에는 글, 대화 키, 경로를 넣지 않습니다.
+**올리는 모양.** 조용한 대화에서 lane마다 `[lane <id>] <text>` 한 줄짜리 메시지 하나를 씁니다(`reply_target`, lane id 순서). 처음에는 새로 올리고, 그 뒤로는 그 메시지를 고칩니다(3.17절). lead turn도, 받은편지함 줄도 만들지 않습니다. 보낸 대상이 없는 대화는 건너뜁니다. 메신저가 받아 주면 로그에 `lane news posted` 또는 `lane news edited` 한 줄(lane 번호만)을 남기고, 받아 주지 않으면 아무것도 표시하지 않으므로 다음 점검(30초 뒤)에 다시 시도합니다. 로그에는 글, 대화 키, 경로를 넣지 않습니다.
 
 **같은 글 두 번 없음.** 보낸 뒤 `news_posted`가 lane별로 글의 해시를 적고, `news`는 그 lane에서 이미 올린 글을 다시 내놓지 않습니다. 해시는 일하는 lane 것만 남기고(`news`가 부를 때마다 나머지를 지움), lane마다 64개(`POSTED_PER_LANE`)까지 둡니다. 가득 차면 비우고 다시 넣습니다. 메모는 언제나 지금 일의 `Activity`에서만 오므로, 지운 해시 때문에 예전 메모가 되살아나지는 않습니다.
 
-**dori와 다른 점.** dori는 상태 메시지 하나를 계속 고치고, 보고를 파일에서 읽습니다. moraebot은 매번 새 메시지를 올리고, 보고를 메모리에 둡니다. lane을 재촉하지도 않습니다.
+**dori와 다른 점.** dori는 상태 메시지 하나를 계속 고치고, 보고를 파일에서 읽습니다. moraebot도 lane마다 메시지 하나를 고치지만(3.17절), 보고는 메모리에 둡니다. lane을 재촉하지도 않습니다.
 
 ### 3.16 레인 멈추기 (lanes L3b)
 
@@ -571,6 +571,26 @@ The lane is still running and moraebot does not stop it; its result comes later 
 **거절.** 인자가 틀리면 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`, 모르는 id는 `E_LANE_UNKNOWN`, 닫힌 lane은 `E_LANE_CLOSED`, 일하지 않는 lane은 `E_LANE_IDLE`입니다.
 
 **로그.** 멈추기를 받아들이면 `lane stop requested` 한 줄(lane id와 순번만)을 남깁니다. 결과는 원래의 `lane finished` 줄이 코드와 함께 남깁니다.
+
+### 3.17 진행 소식 고치기 (lanes L4b)
+
+**메신저 쪽.** 메신저 인터페이스(`MessengerAdapter`)에 `edit(target, message_id, text)`가 있습니다. 기본 구현은 고치기를 못 하는 메신저용이라, 아무 요청도 보내지 않고 `E_ADAPTER_EDIT`로 거절합니다. `send`는 원래부터 올린 메시지의 id를 돌려줍니다(Slack은 `<channel>:<ts>`, Discord는 나눠 보낸 마지막 조각의 id). `edit`는 그 id와, `send`에 준 것과 같은 `target`을 받습니다.
+
+**Slack.** id를 `<channel>:<ts>`로 나눠 `chat.update`에 `{channel, ts, text}`를 보냅니다. 글은 `send`와 똑같이 이스케이프합니다. id 모양이 틀리면 요청을 보내지 않습니다. 거절, 모르는 메시지, 속도 제한은 모두 `E_ADAPTER_EDIT`이고, `edit` 안에서 다시 시도하지 않습니다.
+
+**Discord.** serenity로 `/channels/<target>/messages/<id>`에 `{content}`를 PATCH합니다. target이나 id가 Discord id가 아니면 요청을 보내지 않습니다. 어떤 실패든 `E_ADAPTER_EDIT`입니다.
+
+**lane마다 메시지 하나.** L4는 한 대화의 여러 lane 소식을 한 메시지로 묶었지만, 이제는 lane마다 `[lane <id>] <text>` 메시지를 따로 씁니다(lane id 순서). 한 lane의 소식만 바뀌었을 때 그 lane의 메시지만 고칠 수 있기 때문입니다.
+
+**고치고, 안 되면 새로 올리기.** dispatcher의 `deliver_news`는 그 lane에 소식 메시지가 있으면 먼저 고칩니다. 메시지가 없거나 고치기가 실패하면 새로 올리고 새 id를 기억합니다. 메신저가 고치기나 새 글을 받아 줬을 때만 글을 올린 것으로 적고(`news_posted`) 대화에서 말한 것으로 셉니다. 새 글까지 실패하면 예전 id는 그대로 두고, 다음 점검에 다시 고치기부터 해 봅니다. 잠깐 연결이 끊겨 고치기가 실패한 경우에는 옛 메시지가 그대로 남아 메시지가 두 개가 될 수 있습니다.
+
+**id가 사는 곳.** 메시지 id는 올린 글의 해시 옆에 메모리로만 둡니다. 일하는 일이 없는 lane의 id는 `news`가 해시와 함께 지웁니다. 저장소(DB)에는 쓰지 않으므로 다시 시작하면 잊습니다.
+
+**시간.** 바뀌지 않습니다. 고치기도 새로 올리기처럼 대화가 20분 조용할 때만 하고, 고친 것도 말한 것으로 셉니다. 고친 메시지는 있던 자리에 남고 아래로 옮기지 않습니다.
+
+**로그.** 고치면 `lane news edited`, 새로 올리면 `lane news posted` 한 줄(lane 번호만)을 남깁니다. 실패하면 `lane news edit failed`나 `lane news send failed`가 오류 코드와 함께 남습니다.
+
+**테스트.** Discord는 127.0.0.1 가짜 서버로 실제 PATCH 요청을 확인합니다. Slack은 다른 Slack 테스트처럼 프로그램 안의 가짜(`FakeSlackTransport`)로 확인하고 네트워크를 쓰지 않습니다.
 
 ## 4. 상태, 설정, 운영
 
@@ -660,6 +680,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
    - **L3 레인 감시 (완료, 3.14절).** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
    - **L3b 레인 멈추기 (완료, 3.16절).** lead가 일하는 lane의 지금 일을 끊습니다. lane은 열린 채로 남습니다.
    - **L4 진행 소식 (완료, 3.15절).** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
+   - **L4b 진행 소식 고치기 (완료, 3.17절).** lane마다 진행 소식 메시지 하나를 고칩니다(Slack chat.update, Discord 메시지 수정). 고치지 못하면 새로 올립니다.
    - **Done 확인 종류 더하기 (완료, 3.8절).** `url`, `command ... contains`, `file ... contains`를 더해 확인 방법이 다섯 가지가 됩니다.
 
 ## 6. 열린 질문
