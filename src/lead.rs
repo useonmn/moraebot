@@ -219,9 +219,10 @@ mod tests {
         assert_eq!(tag.lane, Some(3));
         assert!(tag.done);
         assert_eq!(tag.failed, None);
-        assert!(text
-            .split_once('\n')
-            .is_some_and(|(_, body)| body.starts_with('t')));
+        assert!(
+            text.split_once('\n')
+                .is_some_and(|(_, body)| body.starts_with('t'))
+        );
     }
 
     #[test]
@@ -289,7 +290,16 @@ mod tests {
         ] {
             assert!(DEFAULT_GUIDANCE.contains(tool), "{tool}");
         }
-        for needle in ["done", "command [", "file <", "url <", "contains \"", "merged <", E_DONE_UNMET, lane::E_LANE_STOPPED] {
+        for needle in [
+            "done",
+            "command [",
+            "file <",
+            "url <",
+            "contains \"",
+            "merged <",
+            E_DONE_UNMET,
+            lane::E_LANE_STOPPED,
+        ] {
             assert!(DEFAULT_GUIDANCE.contains(needle), "{needle}");
         }
     }
@@ -346,18 +356,36 @@ mod tests {
 
     #[test]
     fn parse_tag_reads_stalled_reason() {
-        let tag = parse_tag("[moraebot conversation=p:th:111 lane=1 stalled reason=N_LANE_SPINNING]")
-            .expect("tag");
+        let tag =
+            parse_tag("[moraebot conversation=p:th:111 lane=1 stalled reason=N_LANE_SPINNING]")
+                .expect("tag");
         assert!(tag.stalled);
         assert_eq!(tag.reason.as_deref(), Some(N_LANE_SPINNING));
-        assert_eq!(parse_tag("[moraebot conversation=p:th:111 lane=1 stuck]"), None);
+        assert_eq!(
+            parse_tag("[moraebot conversation=p:th:111 lane=1 stuck]"),
+            None
+        );
 
         let inputs = [
             owner_input("p:th:111", 7, "hi"),
             lane_result("p:th:111", 3, &LaneResult::Text("t")),
             lane_result("p:th:111", 3, &LaneResult::Failed("E_TURN_TIMEOUT")),
-            lane_result("p:th:111", 3, &LaneResult::Done { text: "t", receipt: "r" }),
-            lane_result("p:th:111", 3, &LaneResult::Unmet { text: "t", receipt: "r" }),
+            lane_result(
+                "p:th:111",
+                3,
+                &LaneResult::Done {
+                    text: "t",
+                    receipt: "r",
+                },
+            ),
+            lane_result(
+                "p:th:111",
+                3,
+                &LaneResult::Unmet {
+                    text: "t",
+                    receipt: "r",
+                },
+            ),
         ];
         for input in &inputs {
             let tag = parse_tag(input).expect("tag");
@@ -368,7 +396,12 @@ mod tests {
 
     #[test]
     fn default_guidance_names_stalled_notices() {
-        for needle in [" stalled reason=", N_LANE_QUIET, N_LANE_SPINNING, N_LANE_RETRYING] {
+        for needle in [
+            " stalled reason=",
+            N_LANE_QUIET,
+            N_LANE_SPINNING,
+            N_LANE_RETRYING,
+        ] {
             assert!(DEFAULT_GUIDANCE.contains(needle), "{needle}");
         }
     }

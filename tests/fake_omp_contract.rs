@@ -6,11 +6,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use omp_rpc::{
-    Client, ClientOptions, Error, Event, GetSessionLeaseCommand, HostTool, HostToolError,
-    OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent, RpcNotification,
-    StreamingBehavior, DEFAULT_PROMPT_TIMEOUT,
+    Client, ClientOptions, DEFAULT_PROMPT_TIMEOUT, Error, Event, GetSessionLeaseCommand, HostTool,
+    HostToolError, OpenSessionCommand, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent,
+    RpcNotification, StreamingBehavior,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -224,9 +224,11 @@ fn send_file_round_trip() {
     assert_eq!(turn.assistant_text.as_deref(), Some("echo: hi"));
 
     let lines = log_frames(&log);
-    assert!(lines
-        .iter()
-        .any(|line| line.contains(r#""type":"set_host_tools""#)));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(r#""type":"set_host_tools""#))
+    );
     let results = host_tool_results(&lines);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "host_1");

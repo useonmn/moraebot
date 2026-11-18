@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{
-    params, Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior,
+    Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior, params,
 };
 use serde_json::Value;
 
@@ -212,7 +212,9 @@ pub enum LaneMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneClose {
     /// The lane is closed (now or before); its canonical repo, if any.
-    Closed { repo: Option<String> },
+    Closed {
+        repo: Option<String>,
+    },
     Unknown,
     /// The lane is running; nothing changed.
     Busy,
@@ -400,8 +402,7 @@ fn hold_queued_sql(conversations: &str) -> String {
 }
 const COLS: &str = "id, platform, message_id, conversation_key, author_id, text, state, reply, notice_sent, error, attachments, files_ready, out_files, text_sent, origin, steered_into";
 
-const LANE_COLS: &str =
-    "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, done, repo, closed_at, close_reason";
+const LANE_COLS: &str = "id, conversation_key, task, state, error, prompts, omp_session_id, notice_sent, done, repo, closed_at, close_reason";
 
 fn map_lane(r: &SqlRow<'_>) -> rusqlite::Result<LaneRow> {
     let state: String = r.get(3)?;
@@ -1057,11 +1058,9 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(String, Option<String>)> = tx
-            .query_row(
-                "SELECT state, repo FROM lanes WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT state, repo FROM lanes WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?;
         let Some((state, repo)) = row else {
             return Ok(LaneClose::Unknown);
@@ -1376,9 +1375,10 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'forced'); END;",
             )
             .unwrap();
-        assert!(s
-            .admit("test", "m1", "k1", "chan1", "111", "hello")
-            .is_err());
+        assert!(
+            s.admit("test", "m1", "k1", "chan1", "111", "hello")
+                .is_err()
+        );
         assert_eq!(s.count().unwrap(), 0);
     }
 
@@ -2405,7 +2405,9 @@ mod tests {
 
     fn closed_at(s: &Store, id: i64) -> Option<String> {
         s.conn
-            .query_row("SELECT closed_at FROM lanes WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT closed_at FROM lanes WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap()
     }
 
@@ -2441,9 +2443,10 @@ mod tests {
             LaneStart::New(id) => id,
             other => panic!("expected New, got {other:?}"),
         };
-        assert!(s
-            .finish_lane(b, 1, "r", LaneState::Failed, Some("E_X"))
-            .unwrap());
+        assert!(
+            s.finish_lane(b, 1, "r", LaneState::Failed, Some("E_X"))
+                .unwrap()
+        );
         assert_eq!(
             s.close_lane(b, "x").unwrap(),
             LaneClose::Closed {
@@ -2471,9 +2474,10 @@ mod tests {
     fn finish_lane_inserts_one_result_row_once() {
         let (_d, _p, mut s) = open_tmp();
         let a = new_lane(&mut s, "call-a", K1);
-        assert!(s
-            .finish_lane(a, 1, "result", LaneState::Idle, None)
-            .unwrap());
+        assert!(
+            s.finish_lane(a, 1, "result", LaneState::Idle, None)
+                .unwrap()
+        );
         assert_eq!(s.count().unwrap(), 1);
         let row = s.next_queued().unwrap().unwrap();
         assert_eq!(row.platform, "lane");
@@ -2485,9 +2489,10 @@ mod tests {
         assert!(row.files_ready);
         assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Idle);
         // A forced duplicate changes neither the inbox nor the lane.
-        assert!(!s
-            .finish_lane(a, 1, "again", LaneState::Failed, Some("E_TEST"))
-            .unwrap());
+        assert!(
+            !s.finish_lane(a, 1, "again", LaneState::Failed, Some("E_TEST"))
+                .unwrap()
+        );
         assert_eq!(s.count().unwrap(), 1);
         let lane = s.lane(a).unwrap().unwrap();
         assert_eq!(lane.state, LaneState::Idle);
@@ -2521,7 +2526,15 @@ mod tests {
             )
             .unwrap();
         stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
         })
         .unwrap()
         .collect::<Result<_, _>>()
@@ -2530,7 +2543,15 @@ mod tests {
 
     fn inbox_row(mid: &str, text: &str) -> InboxCols {
         let own = |v: &str| v.to_owned();
-        (own("lane"), own(mid), own(K1), own("lane"), own(text), own("queued"), own("lane"))
+        (
+            own("lane"),
+            own(mid),
+            own(K1),
+            own("lane"),
+            own(text),
+            own("queued"),
+            own("lane"),
+        )
     }
 
     #[test]
@@ -2543,7 +2564,10 @@ mod tests {
         assert!(s.stall_notice(a, 1, 2, "n2").unwrap());
         assert_eq!(
             inbox_cols(&s),
-            vec![inbox_row("1:1:stalled:1", "n1"), inbox_row("1:1:stalled:2", "n2")]
+            vec![
+                inbox_row("1:1:stalled:1", "n1"),
+                inbox_row("1:1:stalled:2", "n2")
+            ]
         );
         assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Running);
         assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
@@ -2568,9 +2592,10 @@ mod tests {
         let r = new_lane(&mut s, "call-r", K1);
         let t = new_lane(&mut s, "call-t", K1);
         let i = new_lane(&mut s, "call-i", K2);
-        assert!(s
-            .finish_lane(t, 1, "cut", LaneState::NeedsCheck, Some("E_TURN_TIMEOUT"))
-            .unwrap());
+        assert!(
+            s.finish_lane(t, 1, "cut", LaneState::NeedsCheck, Some("E_TURN_TIMEOUT"))
+                .unwrap()
+        );
         assert!(s.finish_lane(i, 1, "ok", LaneState::Idle, None).unwrap());
         drop(s);
         let mut s = Store::open(&path).unwrap();
@@ -2640,25 +2665,42 @@ mod tests {
         assert_eq!(s.onboarding().unwrap(), None);
         assert_eq!(onboarding_rows(&s), 0);
         assert_eq!(s.start_onboarding().unwrap(), 0);
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 0));
+        assert_eq!(
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Active, 0)
+        );
         assert_eq!(onboarding_rows(&s), 1);
         assert!(s.finish_onboarding(OnboardingState::Done).unwrap());
         assert!(!s.finish_onboarding(OnboardingState::Done).unwrap());
         assert!(!s.finish_onboarding(OnboardingState::Skipped).unwrap());
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Done, 0));
+        assert_eq!(
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Done, 0)
+        );
         assert_eq!(onboarding_rows(&s), 1);
 
         assert_eq!(new_id(admit(&mut s, "m1", K1)), 1);
         assert_eq!(s.start_onboarding().unwrap(), 1);
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 1));
+        assert_eq!(
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Active, 1)
+        );
         assert_eq!(onboarding_rows(&s), 1);
         assert!(s.finish_onboarding(OnboardingState::Skipped).unwrap());
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Skipped, 1));
         assert_eq!(
-            s.finish_onboarding(OnboardingState::Active).unwrap_err().code(),
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Skipped, 1)
+        );
+        assert_eq!(
+            s.finish_onboarding(OnboardingState::Active)
+                .unwrap_err()
+                .code(),
             E_STORE_INVALID
         );
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Skipped, 1));
+        assert_eq!(
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Skipped, 1)
+        );
         assert_eq!(onboarding_rows(&s), 1);
     }
 
@@ -2711,7 +2753,10 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert!(tables(&s.conn).contains(&"onboarding".to_string()));
         assert_eq!(s.start_onboarding().unwrap(), 0);
-        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 0));
+        assert_eq!(
+            s.onboarding().unwrap(),
+            onboarding_row(OnboardingState::Active, 0)
+        );
     }
 
     #[test]
@@ -2719,12 +2764,18 @@ mod tests {
         let (_d, _p, s) = open_tmp();
         assert!(
             s.conn
-                .execute("INSERT INTO onboarding VALUES (1, 'later', 0, 'x', NULL)", [])
+                .execute(
+                    "INSERT INTO onboarding VALUES (1, 'later', 0, 'x', NULL)",
+                    []
+                )
                 .is_err()
         );
         assert!(
             s.conn
-                .execute("INSERT INTO onboarding VALUES (2, 'active', 0, 'x', NULL)", [])
+                .execute(
+                    "INSERT INTO onboarding VALUES (2, 'active', 0, 'x', NULL)",
+                    []
+                )
                 .is_err()
         );
         assert_eq!(onboarding_rows(&s), 0);

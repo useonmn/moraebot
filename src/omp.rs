@@ -251,7 +251,10 @@ pub(crate) fn map_result(turn: Result<PromptTurn, RpcError>) -> Outcome {
 /// False when omp reported the turn's session not settled (`sessionSettled: false`): a
 /// background job may still wake it, so the lead is not restarted yet. Errors count as settled.
 fn turn_settled(turn: &Result<PromptTurn, RpcError>) -> bool {
-    turn.as_ref().ok().and_then(|t| t.result.as_ref()).is_none_or(|r| r.session_settled)
+    turn.as_ref()
+        .ok()
+        .and_then(|t| t.result.as_ref())
+        .is_none_or(|r| r.session_settled)
 }
 
 /// Exact omp argv (without the program) for one child. Non-empty `hints` become one
@@ -835,9 +838,7 @@ impl OmpManager {
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
             || matches!(steered, Some((_, Outcome::NeedsCheck { .. })));
-        if lost
-            && let Some(current) = live.take()
-        {
+        if lost && let Some(current) = live.take() {
             tracing::warn!(
                 conversation = %key,
                 row = row_id,
@@ -931,12 +932,7 @@ impl OmpManager {
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    omp_args(
-                        &self.config,
-                        &self.config.work_dir,
-                        &session_dir,
-                        &append,
-                    ),
+                    omp_args(&self.config, &self.config.work_dir, &session_dir, &append),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )

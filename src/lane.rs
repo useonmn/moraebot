@@ -303,10 +303,18 @@ enum Claim {
 /// A lane prompt that ran, with its claim state applied.
 enum LaneOutcome {
     Plain(Outcome),
-    Done { text: String, receipt: String },
-    Unmet { text: String, receipt: String },
+    Done {
+        text: String,
+        receipt: String,
+    },
+    Unmet {
+        text: String,
+        receipt: String,
+    },
     /// The lead stopped the job and the kill ended it.
-    Stopped { reason: String },
+    Stopped {
+        reason: String,
+    },
 }
 
 pub struct LaneManager {
@@ -1196,7 +1204,9 @@ impl LaneManager {
             };
             refused(code, why)
         })?;
-        Ok(json!({ "lane_id": id, "stopping": true }).to_string().into())
+        Ok(json!({ "lane_id": id, "stopping": true })
+            .to_string()
+            .into())
     }
 
     /// Forgets `pid` once its command was reaped.
