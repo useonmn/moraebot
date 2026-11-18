@@ -4,8 +4,10 @@
 //! test ends with `shutdown_all`, which releases held lanes.
 
 use std::future::Future;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
@@ -226,6 +228,35 @@ fn has_done_footer(frame: &Value, line: &str) -> bool {
         .unwrap_or_default()
         .lines()
         .any(|l| l == format!("[moraebot] Done = {line}"))
+}
+
+/// Serves exactly `statuses.len()` connections in order on 127.0.0.1: sends each
+/// request's first line on the channel and answers with the next status.
+fn http_server(statuses: &[u16]) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let statuses = statuses.to_vec();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for status in statuses {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new((&stream).take(8192));
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let _ = tx.send(first.trim_end().to_owned());
+            let _ = (&stream).write_all(
+                format!(
+                    "HTTP/1.1 {status} QA\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (base, rx)
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -755,6 +786,57 @@ async fn refused_claim_keeps_the_lane_working_until_it_passes() {
         1,
         "moraebot sent no prompt of its own"
     );
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn done_kinds_accept_a_claim() {
+    let h = Harness::new();
+    std::fs::write(h.marker(), "ready\n").unwrap();
+    let (base, rx) = http_server(&[200]);
+    let out = "all-ok";
+    let line = format!(
+        "file marker contains \"ready\"; command [\"/bin/sh\",\"-c\",\"echo {out}\"] contains \"all-ok\"; url {base}/health"
+    );
+    let omp = h.done_manager(&line, 1);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    assert!(result_tag(&h, 1).done);
+    let text = queued_row(&h, 1).text;
+    let ok = text.lines().filter(|l| l.ends_with("-> ok")).count();
+    assert_eq!(ok, 3, "{text}");
+    assert!(has_done_footer(
+        &h.frames_after_start(0, "prompt")[0],
+        &line
+    ));
+    assert_eq!(rx.recv_timeout(BOUND).unwrap(), "GET /health HTTP/1.1");
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn done_kinds_refuse_with_their_codes() {
+    let h = Harness::new();
+    std::fs::write(h.marker(), "wait\n").unwrap();
+    let (base, rx) = http_server(&[404]);
+    let out = "nope";
+    let line = format!(
+        "file marker contains \"ready\"; command [\"/bin/sh\",\"-c\",\"echo {out}\"] contains \"all-ok\"; url {base}/health"
+    );
+    let omp = h.done_manager(&line, 1);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_refused(&results[0], E_DONE_UNMET);
+    let count = |code: &str| {
+        let needle = format!("-> {code}:");
+        results[0].1.lines().filter(|l| l.contains(&needle)).count()
+    };
+    assert_eq!(count(done::E_CHECK_TEXT), 2, "{results:?}");
+    assert_eq!(count(done::E_CHECK_STATUS), 1, "{results:?}");
+    assert_eq!(result_tag(&h, 1).failed.as_deref(), Some(E_DONE_UNMET));
+    assert!(rx.recv_timeout(BOUND).is_ok());
     bounded(omp.shutdown_all()).await;
 }
 
