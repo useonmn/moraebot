@@ -14,7 +14,6 @@ pub mod lane;
 pub mod launchd;
 pub mod lead;
 pub mod logging;
-pub mod memory;
 pub mod omp;
 pub mod slack;
 pub mod store;

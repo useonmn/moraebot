@@ -404,15 +404,6 @@ impl Config {
         .unwrap_or_default()
     }
 
-    /// The active messenger's channel id as text.
-    pub fn channel_id(&self) -> String {
-        match self.messenger {
-            Platform::Discord => self.discord.as_ref().map(|d| d.channel_id.to_string()),
-            Platform::Slack => self.slack.as_ref().map(|s| s.channel_id.clone()),
-        }
-        .unwrap_or_default()
-    }
-
     /// Runs every check, creating the work folder and the home layout when missing.
     /// Token files are checked for every configured messenger; the inactive one is advisory.
     pub fn checks(&self) -> Vec<Check> {
@@ -781,22 +772,6 @@ mod tests {
         let fx = Fixture::new();
         let text = fx.valid_toml().replace("owner_id = 111\n", "");
         assert_eq!(code(fx.load(&text)), E_OWNER_MISSING);
-    }
-
-    #[test]
-    fn channel_id_follows_the_active_messenger() {
-        let fx = Fixture::new();
-        let mut cfg = fx.load(&fx.valid_toml()).expect("loads");
-        assert_eq!(cfg.channel_id(), "222");
-        cfg.messenger = Platform::Slack;
-        assert_eq!(cfg.channel_id(), "");
-        cfg.slack = Some(SlackConfig {
-            owner_id: "U111".to_string(),
-            channel_id: "C222".to_string(),
-            bot_token_file: fx.token.clone(),
-            app_token_file: fx.token.clone(),
-        });
-        assert_eq!(cfg.channel_id(), "C222");
     }
 
     #[test]
