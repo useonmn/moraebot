@@ -425,36 +425,51 @@ fn file_contains(path: &Path, text: &str) -> std::io::Result<bool> {
 /// Sends one GET to `url` with no redirects, no proxy and `timeout` for the whole request;
 /// the body is not read.
 fn check_url(url: &str, timeout: Duration) -> (Option<&'static str>, String) {
-    // The `lane_done` handler runs on a plain thread with no runtime, so a private one is safe.
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return (Some(E_CHECK_HTTP), error.to_string()),
-    };
-    // The client's timer and connector need the runtime's context already when it is built.
-    let _context = runtime.enter();
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(timeout)
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => return (Some(E_CHECK_HTTP), error.without_url().to_string()),
-    };
-    match runtime.block_on(client.get(url).send()) {
-        Ok(response) => {
+    match http_call(
+        timeout,
+        |client| async move { client.get(url).send().await },
+    ) {
+        Err(detail) => (Some(E_CHECK_HTTP), detail),
+        Ok(Err(error)) => request_failed(error, timeout),
+        Ok(Ok(response)) => {
             let status = response.status();
             let code = (!status.is_success()).then_some(E_CHECK_STATUS);
             (code, format!("status {}", status.as_u16()))
         }
-        Err(error) if error.is_timeout() => (
+    }
+}
+
+/// Runs `call` with a client that follows no redirects, uses no proxy and gives up after
+/// `timeout`; `Err` holds the detail when the runtime or the client cannot be built.
+fn http_call<T, F: std::future::Future<Output = T>>(
+    timeout: Duration,
+    call: impl FnOnce(reqwest::Client) -> F,
+) -> Result<T, String> {
+    // The `lane_done` handler runs on a plain thread with no runtime, so a private one is safe.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    // The client's timer and connector need the runtime's context already when it is built.
+    let _context = runtime.enter();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.without_url().to_string())?;
+    Ok(runtime.block_on(call(client)))
+}
+
+/// Maps a request that got no answer to `E_CHECK_TIMEOUT` or `E_CHECK_HTTP`.
+fn request_failed(error: reqwest::Error, timeout: Duration) -> (Option<&'static str>, String) {
+    if error.is_timeout() {
+        (
             Some(E_CHECK_TIMEOUT),
             format!("no answer after {} s", timeout.as_secs()),
-        ),
-        Err(error) => (Some(E_CHECK_HTTP), error.without_url().to_string()),
+        )
+    } else {
+        (Some(E_CHECK_HTTP), error.without_url().to_string())
     }
 }
 
