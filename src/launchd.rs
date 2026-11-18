@@ -14,9 +14,22 @@ pub const E_LABEL_INVALID: &str = "E_LABEL_INVALID";
 pub const E_PATH_NOT_UTF8: &str = "E_PATH_NOT_UTF8";
 pub const E_PLIST_LINT: &str = "E_PLIST_LINT";
 pub const E_LAUNCHCTL: &str = "E_LAUNCHCTL";
+pub const E_SERVICE_PLATFORM: &str = "E_SERVICE_PLATFORM";
 
 /// The plist `ExitTimeOut`; the reload wait is bounded by it so the two cannot drift apart.
-const EXIT_TIMEOUT_SECS: u64 = 30;
+pub(crate) const EXIT_TIMEOUT_SECS: u64 = 30;
+
+/// `Ok` when `actual` (a `std::env::consts::OS` value) is `wanted`; `E_SERVICE_PLATFORM` otherwise.
+pub(crate) fn require_os(actual: &str, wanted: &str) -> Result<(), ConfigError> {
+    if actual == wanted {
+        Ok(())
+    } else {
+        Err(ConfigError::new(
+            E_SERVICE_PLATFORM,
+            format!("this command needs {wanted}; this system is {actual}"),
+        ))
+    }
+}
 
 pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String, ConfigError> {
     check_label(label)?;
@@ -84,7 +97,7 @@ pub fn render_plist(label: &str, home: &Path, omp_path: &Path) -> Result<String,
 
 /// launchd creates StandardOutPath/StandardErrorPath itself with 0644 and ignores
 /// the plist Umask for them, so the log folder and files are prepared here first.
-fn prepare_log_files(home: &Path) -> Result<(), ConfigError> {
+pub(crate) fn prepare_log_files(home: &Path) -> Result<(), ConfigError> {
     let logs = home.join("logs");
     fs::create_dir_all(&logs)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", logs.display()), &e))?;
@@ -111,6 +124,20 @@ pub fn install(
     dry_run: bool,
     out: &mut impl Write,
 ) -> Result<(), ConfigError> {
+    install_on(std::env::consts::OS, config, env, label, dry_run, out)
+}
+
+fn install_on(
+    os: &str,
+    config: &Config,
+    env: &Env,
+    label: &str,
+    dry_run: bool,
+    out: &mut impl Write,
+) -> Result<(), ConfigError> {
+    if !dry_run {
+        require_os(os, "macos")?;
+    }
     check_label(label)?;
     config.validate()?;
     let domain = format!("gui/{}", current_uid()?);
@@ -146,7 +173,7 @@ pub fn install(
 /// Puts `source` at `binary` without ever copying a file onto itself (that truncates it)
 /// and without leaving a half-written `binary`: copy to a temp file in the same folder,
 /// then rename over the target.
-fn install_binary(source: &Path, binary: &Path) -> Result<(), ConfigError> {
+pub(crate) fn install_binary(source: &Path, binary: &Path) -> Result<(), ConfigError> {
     let source = fs::canonicalize(source)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot resolve {}", source.display()), &e))?;
     let executable = fs::Permissions::from_mode(0o755);
@@ -230,6 +257,11 @@ fn bootout_and_wait(domain: &str, label: &str, hint: &str) -> Result<(), ConfigE
 /// Unloads the job (fine when it is not loaded) and removes its plist (fine when
 /// it is already gone); returns only after launchd has really dropped the job.
 pub fn uninstall(env: &Env, label: &str, out: &mut impl Write) -> Result<(), ConfigError> {
+    uninstall_on(std::env::consts::OS, env, label, out)
+}
+
+fn uninstall_on(os: &str, env: &Env, label: &str, out: &mut impl Write) -> Result<(), ConfigError> {
+    require_os(os, "macos")?;
     check_label(label)?;
     let domain = format!("gui/{}", current_uid()?);
     bootout_and_wait(&domain, label, "retry `moraebot uninstall-launchd`")?;
@@ -238,7 +270,7 @@ pub fn uninstall(env: &Env, label: &str, out: &mut impl Write) -> Result<(), Con
     Ok(())
 }
 
-fn remove_plist(plist_file: &Path) -> Result<(), ConfigError> {
+pub(crate) fn remove_plist(plist_file: &Path) -> Result<(), ConfigError> {
     match fs::remove_file(plist_file) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ConfigError::io(
             E_IO,
@@ -249,7 +281,7 @@ fn remove_plist(plist_file: &Path) -> Result<(), ConfigError> {
     }
 }
 
-fn check_label(label: &str) -> Result<(), ConfigError> {
+pub(crate) fn check_label(label: &str) -> Result<(), ConfigError> {
     let valid = !label.is_empty()
         && label
             .chars()
@@ -278,7 +310,11 @@ fn current_uid() -> Result<String, ConfigError> {
     run_command("id", &["-u"], E_LAUNCHCTL)
 }
 
-fn run_command(program: &str, args: &[&str], code: &'static str) -> Result<String, ConfigError> {
+pub(crate) fn run_command(
+    program: &str,
+    args: &[&str],
+    code: &'static str,
+) -> Result<String, ConfigError> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -296,7 +332,7 @@ fn run_command(program: &str, args: &[&str], code: &'static str) -> Result<Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn utf8(path: &Path) -> Result<&str, ConfigError> {
+pub(crate) fn utf8(path: &Path) -> Result<&str, ConfigError> {
     path.to_str().ok_or_else(|| {
         ConfigError::new(
             E_PATH_NOT_UTF8,
@@ -567,5 +603,50 @@ mod tests {
         let err = install(&config, &env, DEFAULT_LABEL, true, &mut Vec::new())
             .expect_err("refuses a missing omp");
         assert_eq!(err.code, E_OMP_MISSING);
+    }
+
+    #[test]
+    fn require_os_matches_exactly() {
+        require_os("macos", "macos").expect("same system");
+        for (actual, wanted) in [("linux", "macos"), ("macos", "linux")] {
+            assert_eq!(
+                require_os(actual, wanted).expect_err("other system").code,
+                E_SERVICE_PLATFORM,
+                "{actual} {wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_refuses_off_macos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, env) = fixture(&dir);
+        let mut out = Vec::new();
+        let err = install_on("linux", &config, &env, "bad label", false, &mut out)
+            .expect_err("refuses off macOS");
+        assert_eq!(err.code, E_SERVICE_PLATFORM);
+        assert!(out.is_empty());
+        let reach = install_on("linux", &config, &env, "bad label", true, &mut Vec::new())
+            .expect_err("dry run reaches the label check");
+        assert_eq!(reach.code, E_LABEL_INVALID);
+    }
+
+    #[test]
+    fn uninstall_refuses_off_macos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_config, env) = fixture(&dir);
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        fs::create_dir_all(&agents).expect("mkdir LaunchAgents");
+        let plist = agents.join("bad label.plist");
+        fs::write(&plist, "<plist/>").expect("write plist");
+        let mut out = Vec::new();
+        let err =
+            uninstall_on("linux", &env, "bad label", &mut out).expect_err("refuses off macOS");
+        assert_eq!(err.code, E_SERVICE_PLATFORM);
+        assert!(plist.exists());
+        assert_eq!(
+            check_label("bad label").expect_err("bad label").code,
+            E_LABEL_INVALID
+        );
     }
 }
