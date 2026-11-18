@@ -330,7 +330,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 ### 3.8 완료 확인 (slice 5)
 
-**done 줄.** `lane_start`는 `done` 문자열을 꼭 받습니다(Dori mode 문법). 확인 방법은 다섯 가지입니다. `command ["program","arg"]`는 그 프로그램이 종료 코드 0으로 끝나면 통과하고, 뒤에 `contains "글자"`를 붙이면 일반 출력(stdout)에 그 글자도 그대로 있어야 통과합니다. `file <경로>`는 그 경로가 있으면 통과하고, 뒤에 `contains "글자"`를 붙이면 파일 안에 그 글자도 그대로 있어야 통과합니다. `url <주소>`는 그 주소가 200번대로 답하면 통과합니다. 글자는 늘 JSON 문자열로 적습니다. 주소는 `http`, `https`만 받고, 아이디나 비밀번호가 든 주소, 뒤에 무엇이 더 붙은 주소는 받지 않습니다. 잘못된 `contains` 부분은 `BadText`, 잘못된 주소는 `BadUrl`로 밝힙니다. `merged`, `closed`, `published`는 아직 받지 않습니다. 여러 개는 `;`로 잇습니다. `done`이 없거나 비면 `E_LANE_ARGS`, 확인할 수 없는 줄이면 잘못된 부분을 밝혀 `E_DONE_SYNTAX`로 거절합니다. 거절된 호출은 lane을 저장하지도, 자식을 띄우지도 않습니다. 받아들인 줄은 정리된 모양(canonical)으로 `lanes.done` 열에 저장하고 `lane_status`에도 보여 줍니다. 이 열이 없던 slice 4 저장소는 열 때 열이 더해지고, 예전 lane은 done 줄이 없는 lane으로 남습니다(도구도, 안내 꼬리말도 없고 결과는 `result` 표시).
+**done 줄.** `lane_start`는 `done` 문자열을 꼭 받습니다(Dori mode 문법). 확인 방법은 여섯 가지입니다. `command ["program","arg"]`는 그 프로그램이 종료 코드 0으로 끝나면 통과하고, 뒤에 `contains "글자"`를 붙이면 일반 출력(stdout)에 그 글자도 그대로 있어야 통과합니다. `file <경로>`는 그 경로가 있으면 통과하고, 뒤에 `contains "글자"`를 붙이면 파일 안에 그 글자도 그대로 있어야 통과합니다. `url <주소>`는 그 주소가 200번대로 답하면 통과합니다. `merged <주인>/<저장소>#<번호>`(예: `merged acme/app#12`)는 GitHub에 그 PR이 합쳐졌는지 물어 합쳐졌을 때만 통과합니다. 글자는 늘 JSON 문자열로 적습니다. 주소는 `http`, `https`만 받고, 아이디나 비밀번호가 든 주소, 뒤에 무엇이 더 붙은 주소는 받지 않습니다. 잘못된 `contains` 부분은 `BadText`, 잘못된 주소는 `BadUrl`, 잘못된 PR 표기는 `BadPr`로 밝힙니다. `closed`, `published`는 아직 받지 않습니다. 여러 개는 `;`로 잇습니다. `done`이 없거나 비면 `E_LANE_ARGS`, 확인할 수 없는 줄이면 잘못된 부분을 밝혀 `E_DONE_SYNTAX`로 거절합니다. 거절된 호출은 lane을 저장하지도, 자식을 띄우지도 않습니다. 받아들인 줄은 정리된 모양(canonical)으로 `lanes.done` 열에 저장하고 `lane_status`에도 보여 줍니다. 이 열이 없던 slice 4 저장소는 열 때 열이 더해지고, 예전 lane은 done 줄이 없는 lane으로 남습니다(도구도, 안내 꼬리말도 없고 결과는 `result` 표시).
 
 **`lane_done` 도구.** done 줄이 있는 lane은 호스트 도구 `lane_done {evidence}` 하나를 받고, 보내는 프롬프트마다 끝에 done 줄과 완료를 주장하는 방법을 적은 꼬리말이 붙습니다. lane이 일이 끝났다고 보면 증거(한 일과 확인한 방법)를 담아 `lane_done`을 부릅니다. 그러면 moraebot이 그 도구 호출 안에서 모든 확인을 차례로 돌립니다. 확인은 이 호출 안에서만 돕니다.
 
@@ -338,8 +338,11 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 - `command ... contains`는 명령이 0으로 끝난 뒤에만 stdout 파일 전체에서 글자를 찾습니다. 0이 아니면 찾지 않고 위와 같은 코드로 실패합니다. stderr는 보지 않습니다.
 - `file`은 경로가 있는지 봅니다. 상대 경로는 작업 폴더 기준이고, `~/`는 `HOME`으로 풉니다. `contains`가 있으면 파일 전체를 64KiB(`SCAN_CHUNK`)씩 읽으며 바이트로 비교하고, 조각 경계에 걸친 글자도 찾습니다. 크기 제한은 없습니다.
 - `url`은 GET 한 번을 보냅니다. 다른 주소로 넘기는 답(301, 302 등)을 따라가지 않고, 프록시 설정을 쓰지 않으며, 제한 시간은 명령과 같은 `CHECK_TIMEOUT`(120초)입니다. 답의 본문은 읽지 않고 상태 번호만 봅니다. 프로세스를 띄우지 않습니다.
+- `merged`는 `https://api.github.com/repos/<주인>/<저장소>/pulls/<번호>`에 GET 한 번을 보내고 답의 `merged` 값을 봅니다. `url`처럼 다른 주소로 넘기는 답을 따라가지 않고(저장소 이름이 바뀌면 `E_CHECK_STATUS`), 프록시 설정을 쓰지 않으며, 제한 시간은 `CHECK_TIMEOUT`(120초)입니다. `gh` 같은 프로그램은 띄우지 않습니다.
 
-확인 하나의 결과 코드는 통과(코드 없음), `E_CHECK_EXIT`, `E_CHECK_MISSING`, `E_CHECK_TIMEOUT`, `E_CHECK_SPAWN`, `E_CHECK_TEXT`(글자가 없음), `E_CHECK_READ`(있는 파일이나 stdout 파일을 읽을 수 없음), `E_CHECK_STATUS`(주소가 200번대 밖으로 답함, 내용은 `status <번호>`), `E_CHECK_HTTP`(접속, TLS, 주소 찾기 등 요청 자체가 실패) 중 하나입니다. 주소가 제한 시간 안에 답하지 않으면 `E_CHECK_TIMEOUT`입니다. 로그에는 lane id, 확인 개수, 실패 코드만 남기고 증거나 확인 출력은 남기지 않습니다.
+확인 하나의 결과 코드는 통과(코드 없음), `E_CHECK_EXIT`, `E_CHECK_MISSING`, `E_CHECK_TIMEOUT`, `E_CHECK_SPAWN`, `E_CHECK_TEXT`(글자가 없음), `E_CHECK_READ`(있는 파일이나 stdout 파일을 읽을 수 없음), `E_CHECK_STATUS`(주소가 200번대 밖으로 답함, 내용은 `status <번호>`), `E_CHECK_HTTP`(접속, TLS, 주소 찾기 등 요청 자체가 실패, 또는 GitHub 답이 예상한 JSON이 아님), `E_CHECK_UNMERGED`(PR이 아직 합쳐지지 않음), `E_CHECK_NOT_FOUND`(GitHub가 404로 답함, PR이 없거나 토큰으로 볼 수 없는 비공개 저장소), `E_CHECK_AUTH`(GitHub가 토큰을 거절함(401, 403), 또는 토큰을 보낼 수 없음), `E_CHECK_RATE`(GitHub 요청 한도를 다 씀) 중 하나입니다. 주소가 제한 시간 안에 답하지 않으면 `E_CHECK_TIMEOUT`입니다. 로그에는 lane id, 확인 개수, 실패 코드만 남기고 증거나 확인 출력은 남기지 않습니다.
+
+**GitHub 토큰.** `merged`는 확인 환경(`omp::check_env`)에서 `GH_TOKEN`을, 없거나 비면 `GITHUB_TOKEN`을 씁니다. 같은 이름이 여러 번 있으면 마지막 것을 씁니다. 토큰은 요청 머리의 `Authorization`에만 실리고, 결과 내용, 로그, 저장소에는 남지 않습니다. 보이는 ASCII가 아닌 글자가 든 토큰은 요청 없이 `E_CHECK_AUTH`입니다. 토큰이 없으면 토큰 없이 묻습니다. 이때는 공개 저장소만 보이고 GitHub가 한 시간에 60번까지만 받습니다. launchd, systemd 서비스는 PATH와 홈 위치만 넘기므로 토큰이 전달되지 않습니다. 그래서 서비스로 돌리면 공개 저장소만 확인되고, 비공개 저장소는 토큰이 있는 터미널에서 `moraebot run`으로 돌릴 때만 확인됩니다.
 
 **dori와 다른 점.** 글자는 정규식이 아니라 그대로 포함되는지만 봅니다. 명령은 stdout만 보고, 주소는 본문을 보지 않고 상태 번호만 봅니다. dori와 달리 주소 확인에는 120초 제한이 있고, 다른 주소로 넘기는 답을 따라가지 않습니다.
 
@@ -682,6 +685,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
    - **L4 진행 소식 (완료, 3.15절).** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
    - **L4b 진행 소식 고치기 (완료, 3.17절).** lane마다 진행 소식 메시지 하나를 고칩니다(Slack chat.update, Discord 메시지 수정). 고치지 못하면 새로 올립니다.
    - **Done 확인 종류 더하기 (완료, 3.8절).** `url`, `command ... contains`, `file ... contains`를 더해 확인 방법이 다섯 가지가 됩니다.
+   - **GitHub PR 합침 확인 (완료, 3.8절).** `merged <주인>/<저장소>#<번호>`를 더해 확인 방법이 여섯 가지가 됩니다. `closed`, `published`는 아직 받지 않습니다.
 
 ## 6. 열린 질문
 
