@@ -374,13 +374,19 @@ impl Dispatcher {
             let this = Arc::clone(&self);
             async move { this.work_loop(reconnects).await }
         });
+        let watchdog = tokio::spawn({
+            let this = Arc::clone(&self);
+            async move { this.omp.lanes().watch().await }
+        });
         while let Some(event) = inbound.recv().await {
             if let Err(err) = self.handle_event(event).await {
                 tracing::error!(code = err.code(), error = %err, "inbound event not handled");
             }
         }
         worker.abort();
+        watchdog.abort();
         let _ = worker.await;
+        let _ = watchdog.await;
         self.shutdown().await;
         Ok(())
     }

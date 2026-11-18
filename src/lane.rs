@@ -67,6 +67,8 @@ use crate::worktree::{self, Cleanup, WorktreeError};
 pub const MAX_RUNNING_LANES: usize = 3;
 /// A running job with no omp agent event, or no new tool call, for this long is reported to the lead.
 pub const STALL_AFTER: Duration = Duration::from_secs(20 * 60);
+/// How often the watchdog looks at running lanes.
+pub const WATCH_TICK: Duration = Duration::from_secs(30);
 /// Inbox `platform` of rows that carry a lane's result to the lead.
 pub const LANE_PLATFORM: &str = "lane";
 /// Host tool that starts a new lane.
@@ -384,6 +386,16 @@ impl LaneManager {
             self.wake.notify_one();
         }
         written
+    }
+
+    /// Runs `watch_tick` every `WATCH_TICK` (first tick at once) until the task is aborted.
+    pub async fn watch(&self) {
+        let mut tick = tokio::time::interval(WATCH_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            self.watch_tick(tokio::time::Instant::now().into_std());
+        }
     }
 
     /// From now on `lane_start` and `lane_message` refuse with `E_LANE_STOPPING`.
@@ -1428,5 +1440,88 @@ mod tests {
         assert_eq!(a.events, 0);
         assert!(a.note(&agent_start()));
         assert_eq!(a.events, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_reports_on_its_own_tick() {
+        use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("qa-mbhome");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&work_dir).expect("work dir");
+        let config = Config {
+            messenger: Platform::Discord,
+            work_dir,
+            omp_path: PathBuf::from("/qa/omp"),
+            home: home.clone(),
+            access_mode: AccessMode::OwnerOnly,
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("secrets").join("discord.token"),
+            }),
+            slack: None,
+            omp: OmpConfig::default(),
+        };
+        let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");
+        let started = store
+            .start_lane(
+                "call-1",
+                "discord:th:111",
+                "t1",
+                Some("file ."),
+                None,
+                MAX_RUNNING_LANES,
+            )
+            .expect("start lane");
+        assert!(matches!(started, LaneStart::New(1)));
+        let manager = Arc::new(LaneManager::new(
+            config,
+            Arc::new(Mutex::new(store)),
+            Arc::default(),
+            Duration::from_secs(365 * 24 * 60 * 60),
+        ));
+        let activity = Arc::new(Mutex::new(Activity::default()));
+        lock(&activity).note(&agent_start());
+        lock(&manager.inner).children.insert(
+            1,
+            LaneChild {
+                kill: None,
+                worker: std::thread::spawn(|| {}),
+                seq: 1,
+                conversation_key: "discord:th:111".into(),
+                activity,
+            },
+        );
+        let wake = manager.wake();
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let m = Arc::clone(&manager);
+            async move { m.watch().await }
+        });
+        let woke = tokio::time::timeout(STALL_AFTER + 2 * WATCH_TICK, notified)
+            .await
+            .is_ok();
+        let elapsed = start.elapsed();
+        task.abort();
+        let _ = task.await;
+        let child = lock(&manager.inner).children.remove(&1).expect("child");
+        child.worker.join().expect("worker joins");
+        let (count, row) = {
+            let store = lock(&manager.store);
+            (store.count().expect("count"), store.get(1).expect("get"))
+        };
+
+        assert!(woke);
+        assert!(elapsed >= STALL_AFTER, "elapsed {elapsed:?}");
+        assert!(elapsed <= STALL_AFTER + WATCH_TICK, "elapsed {elapsed:?}");
+        assert_eq!(count, 1);
+        assert_eq!(row.expect("row").message_id, "1:1:stalled:1");
     }
 }
