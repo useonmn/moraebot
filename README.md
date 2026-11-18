@@ -272,9 +272,9 @@ Owner: Owner 111 likes short replies
 
 `Name:` is always there. `Tone:` and `Owner:` appear only when you gave them. The tool refuses a file over 2048 bytes, a field with a line break, and anything that looks like a key, token or password. It also works only while the lead is answering one of your messages. Say "skip" and the lead ends the first conversation without writing the file.
 
-The persona applies the next time moraebot starts (a reboot, `moraebot install-launchd` again, or the lead restarting after it stopped). The running lead isn't restarted, and it remembers the conversation it just had, so you can keep talking in the meantime. At each start the lead gets the file's text after its other hints. Only the lead gets it; lanes don't.
+The persona applies from your next message. Before each turn the lead reads `persona.md` again; when the text changed, moraebot closes the idle lead and starts it again on the same session, so it keeps the conversation and answers your message with the new persona. This happens only between turns, never while the lead is working, and only when the text really changed. If omp reports that the last turn left background work pending, the restart waits until a turn ends with nothing pending, so that message is still answered with the old persona. The restart adds a short pause (about 0.2 s in a bare test setup; more with many plugins). Only the lead gets the persona; lanes don't, and running lanes keep working.
 
-You can edit `persona.md` by hand. The same rules apply when it's read: a file that's over 2048 bytes, holds secret-like text, or isn't a plain UTF-8 file is left out and the log gets one line with a code (`E_PERSONA_SIZE`, `E_PERSONA_SECRET` or `E_PERSONA_READ`), never the text. Delete the file to drop the persona.
+You can edit `persona.md` by hand. They're checked before every turn. The same rules apply when it's read: a file that's over 2048 bytes, holds secret-like text, or isn't a plain UTF-8 file is left out and the log gets one line with a code (`E_PERSONA_SIZE`, `E_PERSONA_SECRET` or `E_PERSONA_READ`), never the text. Delete the file to drop the persona from the next message on.
 
 To run the first conversation again, or to start it on a home you already use:
 
