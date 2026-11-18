@@ -41,8 +41,21 @@ pub const E_CHECK_TEXT: &str = "E_CHECK_TEXT";
 pub const E_CHECK_READ: &str = "E_CHECK_READ";
 /// The URL answered with a status outside 200-299.
 pub const E_CHECK_STATUS: &str = "E_CHECK_STATUS";
-/// The URL request failed (connect, TLS, DNS or client setup).
+/// The request failed (connect, TLS, DNS or client setup), or GitHub's answer was not the expected JSON.
 pub const E_CHECK_HTTP: &str = "E_CHECK_HTTP";
+/// The pull request exists but is not merged.
+pub const E_CHECK_UNMERGED: &str = "E_CHECK_UNMERGED";
+/// GitHub answered 404: no such pull request, or a private repo the token cannot see.
+pub const E_CHECK_NOT_FOUND: &str = "E_CHECK_NOT_FOUND";
+/// GitHub refused the token (401 or 403), or the token cannot be sent.
+pub const E_CHECK_AUTH: &str = "E_CHECK_AUTH";
+/// GitHub's request limit is used up.
+pub const E_CHECK_RATE: &str = "E_CHECK_RATE";
+
+/// The GitHub REST API every merged check asks.
+const GITHUB_API: &str = "https://api.github.com";
+const API_AGENT: &str = concat!("moraebot/", env!("CARGO_PKG_VERSION"));
+const API_VERSION: &str = "2022-11-28";
 
 /// Bytes of command output kept for a failure detail.
 const OUTPUT_HEAD_BYTES: u64 = 4096;
@@ -59,6 +72,16 @@ pub enum Signal {
     File(String, Option<String>),
     /// One GET with no redirects and no proxy; passes on a 200-299 status.
     Url(String),
+    /// One GitHub API read; passes when the pull request is merged.
+    Merged(Pull),
+}
+
+/// A GitHub pull request: `<owner>/<repo>#<number>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pull {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
 }
 
 impl fmt::Display for Signal {
@@ -73,6 +96,9 @@ impl fmt::Display for Signal {
                 contains(f, text.as_deref())
             }
             Signal::Url(url) => write!(f, "url {}", word(url)),
+            Signal::Merged(pull) => {
+                write!(f, "merged {}/{}#{}", pull.owner, pull.repo, pull.number)
+            }
         }
     }
 }
@@ -151,6 +177,7 @@ pub enum SyntaxReason {
     BadPath,
     BadText,
     BadUrl,
+    BadPr,
 }
 
 /// A Done line that cannot be checked: the bad part and why.
@@ -165,7 +192,7 @@ impl fmt::Display for SyntaxError {
         let reason = match self.reason {
             SyntaxReason::Empty => "empty Done line",
             SyntaxReason::Unknown => {
-                "unknown signal; use command [\"program\",\"arg\"], file <path> or url <address>"
+                "unknown signal; use command [\"program\",\"arg\"], file <path>, url <address> or merged <owner>/<repo>#<number>"
             }
             SyntaxReason::Unsupported => "this signal kind is not supported yet",
             SyntaxReason::BadArgv => {
@@ -179,6 +206,9 @@ impl fmt::Display for SyntaxError {
             }
             SyntaxReason::BadUrl => {
                 "url needs one http or https address with a host, no user or password, and nothing after it"
+            }
+            SyntaxReason::BadPr => {
+                "merged needs owner/repo#number (a GitHub pull request) and nothing after it"
             }
         };
         write!(f, "{} -> {reason}", self.part)
@@ -260,9 +290,44 @@ fn parse_signal(part: &str) -> Result<Signal, SyntaxReason> {
                 .then_some(Signal::Url(url))
                 .ok_or(SyntaxReason::BadUrl)
         }
-        "merged" | "closed" | "published" => Err(SyntaxReason::Unsupported),
+        "merged" => parse_pull(rest)
+            .map(Signal::Merged)
+            .ok_or(SyntaxReason::BadPr),
+        "closed" | "published" => Err(SyntaxReason::Unsupported),
         _ => Err(SyntaxReason::Unknown),
     }
+}
+
+/// Reads `<owner>/<repo>#<number>` with GitHub's name rules; nothing may follow it.
+fn parse_pull(text: &str) -> Option<Pull> {
+    if text.split_once(char::is_whitespace).is_some() {
+        return None;
+    }
+    let (owner, rest) = text.split_once('/')?;
+    let (repo, number) = rest.split_once('#')?;
+    let owner_ok = !owner.is_empty()
+        && !owner.starts_with('-')
+        && owner.len() <= 39
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let repo_ok = !repo.is_empty()
+        && repo.len() <= 100
+        && repo != "."
+        && repo != ".."
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    let number_ok = !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && !number.starts_with('0');
+    if !(owner_ok && repo_ok && number_ok) {
+        return None;
+    }
+    let number = number.parse::<u64>().ok().filter(|&number| number != 0)?;
+    Some(Pull {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        number,
+    })
 }
 
 /// Reads one leading JSON value; returns it and the rest without leading whitespace.
@@ -351,6 +416,7 @@ pub(crate) fn run(
                 }
             }
             Signal::Url(url) => check_url(url, timeout),
+            Signal::Merged(pull) => check_merged(pull, env, GITHUB_API, timeout),
         };
         checks.push(Check {
             signal: signal.to_string(),
@@ -437,6 +503,103 @@ fn check_url(url: &str, timeout: Duration) -> (Option<&'static str>, String) {
             (code, format!("status {}", status.as_u16()))
         }
     }
+}
+
+/// The part of GitHub's pull request answer a merged check reads.
+#[derive(serde::Deserialize)]
+struct PullState {
+    merged: bool,
+    state: String,
+}
+
+/// Asks `api` once whether `pull` is merged, with the GitHub token of `env` if it has one.
+fn check_merged(
+    pull: &Pull,
+    env: &[(OsString, OsString)],
+    api: &str,
+    timeout: Duration,
+) -> (Option<&'static str>, String) {
+    let Ok(token) = github_token(env) else {
+        return (Some(E_CHECK_AUTH), "token is not usable".to_owned());
+    };
+    let url = format!(
+        "{api}/repos/{}/{}/pulls/{}",
+        pull.owner, pull.repo, pull.number
+    );
+    let answer = http_call(timeout, |client| async move {
+        let mut request = client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, API_AGENT)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let rate = rate_limited(response.headers());
+        let state = if status.is_success() {
+            Some(response.json::<PullState>().await)
+        } else {
+            None
+        };
+        Ok::<_, reqwest::Error>((status, rate, state))
+    });
+    let (status, rate, state) = match answer {
+        Err(detail) => return (Some(E_CHECK_HTTP), detail),
+        Ok(Err(error)) => return request_failed(error, timeout),
+        Ok(Ok(answer)) => answer,
+    };
+    match state {
+        Some(Ok(state)) if state.merged => return (None, "merged".to_owned()),
+        Some(Ok(state)) => {
+            return (
+                Some(E_CHECK_UNMERGED),
+                format!("not merged, state {}", state.state),
+            );
+        }
+        Some(Err(error)) if error.is_timeout() => return request_failed(error, timeout),
+        Some(Err(_)) => return (Some(E_CHECK_HTTP), "bad answer".to_owned()),
+        None => {}
+    }
+    let code = match status.as_u16() {
+        404 if token.is_none() => {
+            return (Some(E_CHECK_NOT_FOUND), "status 404, no token".to_owned());
+        }
+        404 => E_CHECK_NOT_FOUND,
+        429 => E_CHECK_RATE,
+        403 if rate => E_CHECK_RATE,
+        401 | 403 => E_CHECK_AUTH,
+        _ => E_CHECK_STATUS,
+    };
+    (Some(code), format!("status {}", status.as_u16()))
+}
+
+/// The GitHub token of `env`: `GH_TOKEN`, else `GITHUB_TOKEN` (an empty one is skipped; the
+/// last entry of a name counts). `Err` when it is not visible ASCII, so it cannot be sent.
+fn github_token(env: &[(OsString, OsString)]) -> Result<Option<&str>, ()> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        let Some((_, value)) = env.iter().rev().find(|(key, _)| key == name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let value = value.to_str().ok_or(())?;
+        if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+            return Err(());
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// GitHub's answer says its request limit is used up.
+fn rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("x-ratelimit-remaining")
+        .is_some_and(|value| value == "0")
+        || headers.contains_key(reqwest::header::RETRY_AFTER)
 }
 
 /// Runs `call` with a client that follows no redirects, uses no proxy and gives up after
@@ -784,6 +947,65 @@ mod tests {
         (base, release)
     }
 
+    /// Serves exactly `answers.len()` connections in order on 127.0.0.1: sends each request
+    /// head (the request line, then each header line with its name lower-cased) on the
+    /// channel and answers with the next `(status, extra header lines, body)`.
+    fn github_server(
+        answers: &[(u16, &'static str, &'static str)],
+    ) -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let answers = answers.to_vec();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, extra, body) in answers {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new((&stream).take(8192));
+                let mut head: Vec<String> = Vec::new();
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let kept = match trimmed.split_once(':') {
+                        Some((name, value)) if !head.is_empty() => {
+                            format!("{}:{value}", name.to_ascii_lowercase())
+                        }
+                        _ => trimmed.to_owned(),
+                    };
+                    head.push(kept);
+                    line.clear();
+                }
+                let _ = tx.send(head);
+                let _ = (&stream).write_all(
+                    format!(
+                        "HTTP/1.1 {status} QA\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (base, rx)
+    }
+
+    /// The value of the first `name: value` header line of a request head.
+    fn header<'a>(request: &'a [String], name: &str) -> Option<&'a str> {
+        request
+            .iter()
+            .skip(1)
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+    }
+
+    fn pull(owner: &str, repo: &str, number: u64) -> Pull {
+        Pull {
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            number,
+        }
+    }
+
     fn reason(line: &str) -> (String, SyntaxReason) {
         let error = DoneLine::parse(line).unwrap_err();
         (error.part, error.reason)
@@ -854,7 +1076,6 @@ mod tests {
             ("", "", Empty),
             ("Done = ; ", "", Empty),
             ("wat x", "wat x", Unknown),
-            ("merged acme/app#1", "merged acme/app#1", Unsupported),
             ("closed a/b#2", "closed a/b#2", Unsupported),
             ("published p@1", "published p@1", Unsupported),
             ("command []", "command []", BadArgv),
@@ -890,6 +1111,7 @@ mod tests {
             r#"file "a b" contains "q\"uote;x""#,
             r#"command ["sh","-c","x"] contains "a;b""#,
             r#"url http://127.0.0.1:8080/health; file a contains "b""#,
+            r#"merged acme/app#7; file a contains "b""#,
         ] {
             let line = DoneLine::parse(text).unwrap();
             assert_eq!(DoneLine::parse(&line.to_string()).unwrap(), line, "{text}");
@@ -1106,6 +1328,186 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(checks[0].code, Some(E_CHECK_TIMEOUT));
+        drop(release);
+    }
+
+    #[test]
+    fn parse_accepts_merged() {
+        let line = DoneLine::parse("merged acme/app#111").unwrap();
+        assert_eq!(line.signals(), [Signal::Merged(pull("acme", "app", 111))]);
+        assert_eq!(line.to_string(), "merged acme/app#111");
+        let line = DoneLine::parse("merged Acme-1/my.app_x#222; file a").unwrap();
+        assert_eq!(
+            line.signals(),
+            [Signal::Merged(pull("Acme-1", "my.app_x", 222)), file("a")]
+        );
+        assert_eq!(line.to_string(), "merged Acme-1/my.app_x#222; file a");
+    }
+
+    #[test]
+    fn parse_rejects_bad_prs() {
+        for line in [
+            "merged",
+            "merged acme/app",
+            "merged acme#1",
+            "merged /app#1",
+            "merged acme/#1",
+            "merged acme/app#",
+            "merged acme/app#0",
+            "merged acme/app#01",
+            "merged acme/app#1x",
+            "merged -acme/app#1",
+            "merged acme/..#1",
+            "merged acme/app/x#1",
+            "merged acme/app#1 x",
+            r#"merged "acme/app#1""#,
+            "merged https://github.com/acme/app/pull/1",
+            "merged acme/app#99999999999999999999",
+        ] {
+            assert_eq!(
+                reason(line),
+                (line.to_owned(), SyntaxReason::BadPr),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_reads_the_merged_flag() {
+        let (base, rx) = github_server(&[
+            (200, "", r#"{"merged":true,"state":"closed"}"#),
+            (200, "", r#"{"merged":false,"state":"open"}"#),
+            (200, "", r#"{"merged":false,"state":"closed","title":"x"}"#),
+        ]);
+        let codes: Vec<_> = (0..3)
+            .map(|_| check_merged(&pull("acme", "app", 111), &[], &base, CHECK_TIMEOUT).0)
+            .collect();
+        assert_eq!(
+            codes,
+            [None, Some(E_CHECK_UNMERGED), Some(E_CHECK_UNMERGED)]
+        );
+        for _ in 0..3 {
+            let head = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert_eq!(head[0], "GET /repos/acme/app/pulls/111 HTTP/1.1");
+            assert!(
+                header(&head, "user-agent").is_some_and(|agent| agent.starts_with("moraebot/")),
+                "{head:?}"
+            );
+            assert_eq!(header(&head, "accept"), Some("application/vnd.github+json"));
+            assert_eq!(header(&head, "x-github-api-version"), Some("2022-11-28"));
+            assert_eq!(header(&head, "authorization"), None);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn merged_maps_failures_to_codes() {
+        let (base, rx) = github_server(&[
+            (404, "", ""),
+            (401, "", ""),
+            (403, "", ""),
+            (403, "x-ratelimit-remaining: 0\r\n", ""),
+            (429, "", ""),
+            (403, "retry-after: 60\r\n", ""),
+            (500, "", ""),
+            (301, "location: /repositories/1/pulls/111\r\n", ""),
+            (200, "", "not json"),
+        ]);
+        let codes: Vec<_> = (0..9)
+            .map(|_| check_merged(&pull("acme", "app", 111), &[], &base, CHECK_TIMEOUT).0)
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                Some(E_CHECK_NOT_FOUND),
+                Some(E_CHECK_AUTH),
+                Some(E_CHECK_AUTH),
+                Some(E_CHECK_RATE),
+                Some(E_CHECK_RATE),
+                Some(E_CHECK_RATE),
+                Some(E_CHECK_STATUS),
+                Some(E_CHECK_STATUS),
+                Some(E_CHECK_HTTP),
+            ]
+        );
+        for _ in 0..9 {
+            rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn merged_sends_the_token_only_in_its_header() {
+        let os = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect()
+        };
+        let merged = r#"{"merged":true,"state":"closed"}"#;
+        let (base, rx) = github_server(&[(401, "", ""), (200, "", merged), (200, "", merged)]);
+        let target = pull("acme", "app", 111);
+        let next = || rx.recv_timeout(Duration::from_secs(30)).unwrap();
+
+        let env = os(&[
+            ("GH_TOKEN", "qa-not-a-token-111"),
+            ("GITHUB_TOKEN", "qa-not-a-token-222"),
+        ]);
+        let (code, detail) = check_merged(&target, &env, &base, CHECK_TIMEOUT);
+        assert_eq!(code, Some(E_CHECK_AUTH));
+        assert!(!detail.contains("qa-not-a-token"));
+        assert_eq!(
+            header(&next(), "authorization"),
+            Some("Bearer qa-not-a-token-111")
+        );
+
+        let env = os(&[("GH_TOKEN", ""), ("GITHUB_TOKEN", "qa-not-a-token-222")]);
+        assert_eq!(check_merged(&target, &env, &base, CHECK_TIMEOUT).0, None);
+        assert_eq!(
+            header(&next(), "authorization"),
+            Some("Bearer qa-not-a-token-222")
+        );
+
+        let env = os(&[
+            ("GITHUB_TOKEN", "qa-not-a-token-111"),
+            ("GITHUB_TOKEN", "qa-not-a-token-222"),
+        ]);
+        assert_eq!(check_merged(&target, &env, &base, CHECK_TIMEOUT).0, None);
+        assert_eq!(
+            header(&next(), "authorization"),
+            Some("Bearer qa-not-a-token-222")
+        );
+
+        let env = os(&[("GH_TOKEN", "qa bad")]);
+        assert_eq!(
+            check_merged(&target, &env, &base, CHECK_TIMEOUT).0,
+            Some(E_CHECK_AUTH)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn merged_unreachable_is_an_http_failure() {
+        let (code, _) = check_merged(
+            &pull("acme", "app", 111),
+            &[],
+            "http://127.0.0.1:0",
+            CHECK_TIMEOUT,
+        );
+        assert_eq!(code, Some(E_CHECK_HTTP));
+    }
+
+    /// Time-limit exception: the 1 s timeout is the behavior under test.
+    #[test]
+    fn merged_timeout_gives_check_timeout() {
+        let (base, release) = silent_server();
+        let (code, _) = check_merged(
+            &pull("acme", "app", 111),
+            &[],
+            &base,
+            Duration::from_secs(1),
+        );
+        assert_eq!(code, Some(E_CHECK_TIMEOUT));
         drop(release);
     }
 
