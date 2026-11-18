@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::done::{self, Ran, RunOpts};
+use crate::done::{self, Check, Ran, RunOpts, Stopped};
 use crate::omp;
 
 /// Folder in the work folder that holds the lanes' worktrees.
@@ -20,6 +20,14 @@ pub const E_LANE_GIT: &str = "E_LANE_GIT";
 pub const E_LANE_REPO: &str = "E_LANE_REPO";
 /// The lane's worktree could not be created.
 pub const E_LANE_WORKTREE: &str = "E_LANE_WORKTREE";
+/// A lane worktree has changes to tracked files that are not committed.
+pub const E_CHECK_UNCOMMITTED: &str = "E_CHECK_UNCOMMITTED";
+/// A lane worktree's HEAD has commits that are on no remote.
+pub const E_CHECK_UNPUSHED: &str = "E_CHECK_UNPUSHED";
+/// A lane worktree's git state could not be read.
+pub const E_CHECK_GIT: &str = "E_CHECK_GIT";
+/// Appended after the Done footer of a lane with a repo.
+pub const GIT_FOOTER: &str = "\n[moraebot] This lane works in its own git worktree. Before lane_done, commit your changes to tracked files and push your branch (for example git push origin HEAD) if the repo has a remote. moraebot refuses the claim while tracked changes are uncommitted or commits are on no remote; new untracked files do not count.";
 
 /// `<work_dir>/.moraebot-lanes/lane-<lane_id>`.
 pub fn folder(work_dir: &Path, lane_id: i64) -> PathBuf {
@@ -49,6 +57,15 @@ fn failed(code: &'static str, detail: impl Into<String>) -> WorktreeError {
         code,
         detail: detail.into(),
     }
+}
+
+/// The environment of moraebot's own git commands: never prompt, never take an optional lock
+/// (status stays read-only).
+fn git_env(env: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+    let mut env = env.to_vec();
+    env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+    env
 }
 
 fn args(parts: &[&OsStr]) -> Vec<OsString> {
@@ -90,8 +107,7 @@ pub(crate) fn ensure(
     mut started: impl FnMut(u32) -> bool,
     mut ended: impl FnMut(u32),
 ) -> Result<(), WorktreeError> {
-    let mut env = opts.env.to_vec();
-    env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    let env = git_env(opts.env);
     let opts = RunOpts {
         out_dir: opts.out_dir,
         env: &env,
@@ -262,6 +278,157 @@ fn verify(
         return Err(failed(E_LANE_WORKTREE, "not finished"));
     }
     Ok(git_dir)
+}
+
+/// Reads the git state of lane worktree `folder` for a `lane_done` claim: tracked changes not
+/// committed, and commits of HEAD on no remote (only when a remote exists). Untracked files never
+/// count. Any read that fails gives exactly one `E_CHECK_GIT` check. `started`/`ended` see every
+/// git pid as in [`done::run_command`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn git_checks(
+    folder: &Path,
+    opts: &RunOpts<'_>,
+    mut started: impl FnMut(u32) -> bool,
+    mut ended: impl FnMut(u32),
+) -> Result<Vec<Check>, Stopped> {
+    let env = git_env(opts.env);
+    let opts = RunOpts {
+        out_dir: opts.out_dir,
+        env: &env,
+        timeout: opts.timeout,
+    };
+    let git = OsStr::new("git");
+    let dash_c = OsStr::new("-C");
+    let unreadable = |detail: String| {
+        vec![Check {
+            signal: "git state".to_owned(),
+            code: Some(E_CHECK_GIT),
+            detail: done::short(&detail),
+        }]
+    };
+
+    // 1. The folder is its own top level (a lost `.git` link resolves to an outer checkout).
+    let ran = done::run_command(
+        git,
+        &args(&[
+            dash_c,
+            folder.as_os_str(),
+            OsStr::new("rev-parse"),
+            OsStr::new("--show-toplevel"),
+        ]),
+        folder,
+        &opts,
+        &mut started,
+        &mut ended,
+    )?;
+    if !matches!(ran, Ran::Exited(0)) {
+        return Ok(unreadable(git_detail(&ran, &opts)));
+    }
+    let lines = stdout_lines(opts.out_dir);
+    let top = lines.first().map(std::fs::canonicalize);
+    let same = match (top, std::fs::canonicalize(folder)) {
+        (Some(Ok(top)), Ok(folder)) => top == folder,
+        _ => false,
+    };
+    if !same {
+        return Ok(unreadable("not the lane folder".into()));
+    }
+
+    // 2. Changes to tracked files, staged or not; untracked files are not listed.
+    let ran = done::run_command(
+        git,
+        &args(&[
+            dash_c,
+            folder.as_os_str(),
+            OsStr::new("status"),
+            OsStr::new("--porcelain"),
+            OsStr::new("--untracked-files=no"),
+        ]),
+        folder,
+        &opts,
+        &mut started,
+        &mut ended,
+    )?;
+    if !matches!(ran, Ran::Exited(0)) {
+        return Ok(unreadable(git_detail(&ran, &opts)));
+    }
+    let changed = stdout_lines(opts.out_dir)
+        .iter()
+        .filter(|line| !line.is_empty())
+        .count();
+    let committed = if changed > 0 {
+        Check {
+            signal: "git committed".to_owned(),
+            code: Some(E_CHECK_UNCOMMITTED),
+            detail: format!("{changed} tracked files changed"),
+        }
+    } else {
+        Check {
+            signal: "git committed".to_owned(),
+            code: None,
+            detail: "clean".to_owned(),
+        }
+    };
+
+    // 3. Whether any remote is configured.
+    let ran = done::run_command(
+        git,
+        &args(&[dash_c, folder.as_os_str(), OsStr::new("remote")]),
+        folder,
+        &opts,
+        &mut started,
+        &mut ended,
+    )?;
+    if !matches!(ran, Ran::Exited(0)) {
+        return Ok(unreadable(git_detail(&ran, &opts)));
+    }
+    if stdout_lines(opts.out_dir).iter().all(String::is_empty) {
+        let pushed = Check {
+            signal: "git pushed (no remote)".to_owned(),
+            code: None,
+            detail: "no remote".to_owned(),
+        };
+        return Ok(vec![committed, pushed]);
+    }
+
+    // 4. Commits of HEAD on no remote-tracking ref (no upstream needed).
+    let ran = done::run_command(
+        git,
+        &args(&[
+            dash_c,
+            folder.as_os_str(),
+            OsStr::new("rev-list"),
+            OsStr::new("--count"),
+            OsStr::new("HEAD"),
+            OsStr::new("--not"),
+            OsStr::new("--remotes"),
+        ]),
+        folder,
+        &opts,
+        &mut started,
+        &mut ended,
+    )?;
+    if !matches!(ran, Ran::Exited(0)) {
+        return Ok(unreadable(git_detail(&ran, &opts)));
+    }
+    let lines = stdout_lines(opts.out_dir);
+    let Some(unpushed) = lines.first().and_then(|line| line.parse::<u64>().ok()) else {
+        return Ok(unreadable("bad commit count".into()));
+    };
+    let pushed = if unpushed > 0 {
+        Check {
+            signal: "git pushed".to_owned(),
+            code: Some(E_CHECK_UNPUSHED),
+            detail: format!("{unpushed} commits on no remote"),
+        }
+    } else {
+        Check {
+            signal: "git pushed".to_owned(),
+            code: None,
+            detail: "pushed".to_owned(),
+        }
+    };
+    Ok(vec![committed, pushed])
 }
 
 #[cfg(test)]
@@ -651,5 +818,247 @@ mod tests {
             PathBuf::from("/w/.moraebot-lanes/lane-7")
         );
         assert_eq!(branch(7), "moraebot/lane-7");
+    }
+
+    /// A local bare repo `<dir>/qa-remote.git` as `origin` of `repo`, with `main` pushed.
+    fn qa_remote(dir: &Path, repo: &Path) -> PathBuf {
+        git(
+            dir,
+            &[
+                "init".as_ref(),
+                "-q".as_ref(),
+                "--bare".as_ref(),
+                "qa-remote.git".as_ref(),
+            ],
+        );
+        let remote = dir.join("qa-remote.git");
+        git(
+            repo,
+            &[
+                "remote".as_ref(),
+                "add".as_ref(),
+                "origin".as_ref(),
+                remote.as_os_str(),
+            ],
+        );
+        git(
+            repo,
+            &[
+                "push".as_ref(),
+                "-q".as_ref(),
+                "origin".as_ref(),
+                "main".as_ref(),
+            ],
+        );
+        remote
+    }
+
+    fn commit_all(folder: &Path, message: &str) {
+        git(
+            folder,
+            &[
+                "-c".as_ref(),
+                "user.name=qa".as_ref(),
+                "-c".as_ref(),
+                "user.email=qa@example.invalid".as_ref(),
+                "commit".as_ref(),
+                "-q".as_ref(),
+                "-am".as_ref(),
+                message.as_ref(),
+            ],
+        );
+    }
+
+    /// Lane 1's worktree of `repo`, made by `ensure`.
+    fn lane_worktree(dir: &Path, repo: &Path) -> PathBuf {
+        ensure_counted(dir, repo, 1, &real_path(), &mut (0, 0)).expect("lane worktree");
+        lane_folder(dir, 1)
+    }
+
+    /// The codes of `git_checks` on `folder` with `GIT_TIMEOUT` and counting closures.
+    fn check_codes(
+        dir: &Path,
+        folder: &Path,
+        path: &OsStr,
+        counts: &mut (u32, u32),
+    ) -> Vec<Option<&'static str>> {
+        let (out, env) = (out(dir), env(dir, path));
+        let (mut started, mut ended) = (0, 0);
+        let checks = git_checks(
+            folder,
+            &opts(&out, &env, GIT_TIMEOUT),
+            |_| {
+                started += 1;
+                true
+            },
+            |_| ended += 1,
+        )
+        .expect("not stopped");
+        counts.0 += started;
+        counts.1 += ended;
+        checks.iter().map(|check| check.code).collect()
+    }
+
+    #[test]
+    fn git_checks_pass_on_a_clean_pushed_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        let mut counts = (0, 0);
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut counts),
+            [None, None]
+        );
+        assert_eq!(counts, (4, 4));
+    }
+
+    #[test]
+    fn git_checks_refuse_uncommitted_tracked_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "changed").unwrap();
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_UNCOMMITTED), None]
+        );
+        git(&folder, &["add".as_ref(), "tracked.txt".as_ref()]);
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_UNCOMMITTED), None]
+        );
+    }
+
+    #[test]
+    fn git_checks_ignore_untracked_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("qa-new.txt"), "n").unwrap();
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn git_checks_refuse_unpushed_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "y").unwrap();
+        commit_all(&folder, "lane");
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [None, Some(E_CHECK_UNPUSHED)]
+        );
+        git(
+            &folder,
+            &[
+                "push".as_ref(),
+                "-q".as_ref(),
+                "origin".as_ref(),
+                "moraebot/lane-1".as_ref(),
+            ],
+        );
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn git_checks_without_a_remote_check_only_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "y").unwrap();
+        commit_all(&folder, "lane");
+        let mut counts = (0, 0);
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut counts),
+            [None, None]
+        );
+        assert_eq!(counts, (3, 3));
+        std::fs::write(folder.join("tracked.txt"), "z").unwrap();
+        assert_eq!(
+            check_codes(dir, &folder, &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_UNCOMMITTED), None]
+        );
+    }
+
+    #[test]
+    fn git_checks_report_unreadable_state() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+
+        // 1. A git that starts and exits 1 (the macOS xcrun stub).
+        let stub = fake_git(
+            dir,
+            "qa-stubgit",
+            "echo 'xcrun: error: qa stub' >&2; exit 1",
+        );
+        let mut counts = (0, 0);
+        assert_eq!(
+            check_codes(dir, &folder, stub.as_os_str(), &mut counts),
+            [Some(E_CHECK_GIT)]
+        );
+        assert_eq!(counts, (1, 1));
+
+        // 2. A folder outside any checkout.
+        require_git();
+        let plain = dir.join("qa-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            check_codes(dir, &plain, &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_GIT)]
+        );
+
+        // 3. A folder inside a checkout but not its top level.
+        let sub = repo.join("qa-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            check_codes(dir, &sub, &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_GIT)]
+        );
+
+        // 4. A folder that does not exist.
+        assert_eq!(
+            check_codes(dir, &dir.join("qa-missing"), &real_path(), &mut (0, 0)),
+            [Some(E_CHECK_GIT)]
+        );
+    }
+
+    #[test]
+    fn git_checks_stop_when_started_refuses() {
+        require_git();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+        let (out, env) = (out(dir), env(dir, &real_path()));
+        let (mut started, mut ended) = (0, 0);
+        let result = git_checks(
+            &folder,
+            &opts(&out, &env, GIT_TIMEOUT),
+            |_| {
+                started += 1;
+                false
+            },
+            |_| ended += 1,
+        );
+        assert_eq!(result, Err(Stopped));
+        assert_eq!((started, ended), (1, 1));
     }
 }
