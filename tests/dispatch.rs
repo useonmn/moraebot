@@ -226,6 +226,21 @@ impl Harness {
             .collect()
     }
 
+    fn edits(&self) -> Vec<(String, String, String)> {
+        self.adapter
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Edit {
+                    channel,
+                    message_id,
+                    text,
+                } => Some((channel, message_id, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn threads_created(&self) -> usize {
         self.adapter
             .calls()
@@ -2794,28 +2809,151 @@ async fn lane_news_clock_restarts_on_a_reply() {
 }
 
 #[tokio::test]
-async fn lane_news_combines_lanes_of_one_conversation() {
+async fn lane_news_is_one_message_per_lane() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
     let t0 = Instant::now();
-    let n = news(&[
-        (1, NEWS_KEY, "a1"),
-        (2, "fake:th:555", "b1"),
-        (3, NEWS_KEY, "a3"),
-    ]);
-    let posted = h.dispatcher.post_news(n, t0).await;
+    let a = h
+        .dispatcher
+        .post_news(
+            news(&[
+                (1, NEWS_KEY, "a1"),
+                (2, "fake:th:555", "b1"),
+                (3, NEWS_KEY, "a3"),
+            ]),
+            t0,
+        )
+        .await;
+    let b = h.dispatcher.post_news(Vec::new(), t0 + WATCH_TICK).await;
+    let c = h
+        .dispatcher
+        .post_news(
+            news(&[(1, NEWS_KEY, "a1b"), (3, NEWS_KEY, "a3b")]),
+            t0 + WATCH_TICK + NEWS_AFTER,
+        )
+        .await;
     let sends = h.sends();
+    let edits = h.edits();
     h.close().await;
 
-    assert_eq!(posted, 2);
+    assert_eq!([a, b, c], [3, 0, 2]);
     assert_eq!(
         sends,
         [
+            ("444".to_owned(), news_line(1, "a1")),
+            ("555".to_owned(), news_line(2, "b1")),
+            ("444".to_owned(), news_line(3, "a3")),
+        ]
+    );
+    assert_eq!(
+        edits,
+        [
             (
                 "444".to_owned(),
-                format!("{}\n{}", news_line(1, "a1"), news_line(3, "a3"))
+                "fake-msg-1".to_owned(),
+                news_line(1, "a1b")
             ),
-            ("555".to_owned(), news_line(2, "b1")),
+            (
+                "444".to_owned(),
+                "fake-msg-3".to_owned(),
+                news_line(3, "a3b")
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lane_news_edits_the_lane_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    let a = h
+        .dispatcher
+        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0)
+        .await;
+    let step2 = news(&[(1, NEWS_KEY, "qa step 2")]);
+    let b = h.dispatcher.post_news(step2.clone(), t0 + WATCH_TICK).await;
+    let c = h
+        .dispatcher
+        .post_news(step2, t0 + WATCH_TICK + NEWS_AFTER)
+        .await;
+    let d = h
+        .dispatcher
+        .post_news(
+            news(&[(1, NEWS_KEY, "qa step 3")]),
+            t0 + 2 * WATCH_TICK + NEWS_AFTER,
+        )
+        .await;
+    let sends = h.sends();
+    let edits = h.edits();
+    h.close().await;
+
+    assert_eq!([a, b, c, d], [1, 0, 1, 0]);
+    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+    assert_eq!(
+        edits,
+        [(
+            "444".to_owned(),
+            "fake-msg-1".to_owned(),
+            news_line(1, "qa step 2")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn lane_news_posts_again_when_the_edit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    let a = h
+        .dispatcher
+        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0)
+        .await;
+    let b = h.dispatcher.post_news(Vec::new(), t0 + WATCH_TICK).await;
+    h.adapter.fail_next_edit();
+    let c = h
+        .dispatcher
+        .post_news(
+            news(&[(1, NEWS_KEY, "qa step 2")]),
+            t0 + WATCH_TICK + NEWS_AFTER,
+        )
+        .await;
+    let d = h
+        .dispatcher
+        .post_news(Vec::new(), t0 + 2 * WATCH_TICK + NEWS_AFTER)
+        .await;
+    let e = h
+        .dispatcher
+        .post_news(
+            news(&[(1, NEWS_KEY, "qa step 3")]),
+            t0 + 2 * WATCH_TICK + 2 * NEWS_AFTER,
+        )
+        .await;
+    let sends = h.sends();
+    let edits = h.edits();
+    h.close().await;
+
+    assert_eq!([a, b, c, d, e], [1, 0, 1, 0, 1]);
+    assert_eq!(
+        sends,
+        [
+            ("444".to_owned(), news_line(1, "qa step 1")),
+            ("444".to_owned(), news_line(1, "qa step 2")),
+        ]
+    );
+    assert_eq!(
+        edits,
+        [
+            (
+                "444".to_owned(),
+                "fake-msg-1".to_owned(),
+                news_line(1, "qa step 2")
+            ),
+            (
+                "444".to_owned(),
+                "fake-msg-2".to_owned(),
+                news_line(1, "qa step 3")
+            ),
         ]
     );
 }

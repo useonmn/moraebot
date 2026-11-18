@@ -46,9 +46,10 @@
 //! channel when the DM fails), or in the channel when the request says so.
 //!
 //! Lane news: after every lane watchdog tick, the newest unposted progress note of each
-//! running lane is posted as one new message per conversation that had no owner message,
-//! delivered reply or posted news for [`NEWS_AFTER`]; the lead is not involved. A failed
-//! send is tried again on the next tick.
+//! running lane is delivered in every conversation that had no owner message, delivered
+//! reply or delivered news for [`NEWS_AFTER`]; the lead is not involved. Each lane has one
+//! news message: the first note is posted, later notes edit it, and a failed edit posts a
+//! new one. A note the messenger did not accept is tried again on the next tick.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1049,11 +1050,11 @@ impl Dispatcher {
     }
 
     /// One news step at tick time `now`: every conversation's quiet clock is updated, then
-    /// each conversation of `news` that is quiet for [`NEWS_AFTER`] gets one message with a
-    /// line per lane; the posted texts are marked. Returns the number of messages the
-    /// messenger accepted.
+    /// each lane of `news` whose conversation is quiet for [`NEWS_AFTER`] gets its note
+    /// delivered by [`Self::deliver_news`]; delivered texts are marked. Returns the number of
+    /// notes the messenger accepted.
     pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
-        let groups = {
+        let due: Vec<LaneNews> = {
             let mut talk = self.talk.lock().expect("talk lock");
             for t in talk.values_mut() {
                 if t.seen.is_none_or(|(count, _)| count != t.said) {
@@ -1065,53 +1066,61 @@ impl Dispatcher {
                     || t.seen
                         .is_some_and(|(_, since)| now.saturating_duration_since(since) < NEWS_AFTER)
             });
-            let mut groups: Vec<(String, Vec<LaneNews>)> = Vec::new();
-            for item in news {
-                match groups
-                    .iter_mut()
-                    .find(|(key, _)| *key == item.conversation_key)
-                {
-                    Some((_, lines)) => lines.push(item),
-                    None => groups.push((item.conversation_key.clone(), vec![item])),
-                }
-            }
-            groups.retain(|(key, _)| {
-                reply_target(key).is_some()
-                    && talk.get(key).is_none_or(|t| {
-                        t.seen.is_some_and(|(_, since)| {
-                            now.saturating_duration_since(since) >= NEWS_AFTER
+            news.into_iter()
+                .filter(|n| {
+                    reply_target(&n.conversation_key).is_some()
+                        && talk.get(&n.conversation_key).is_none_or(|t| {
+                            t.seen.is_some_and(|(_, since)| {
+                                now.saturating_duration_since(since) >= NEWS_AFTER
+                            })
                         })
-                    })
-            });
-            groups
+                })
+                .collect()
         };
 
         let mut sent = 0;
-        for (key, lines) in groups {
-            let Some(target) = reply_target(&key) else {
+        for n in due {
+            let Some(target) = reply_target(&n.conversation_key) else {
                 continue;
             };
-            let text = lines
-                .iter()
-                .map(|n| news_line(n.lane_id, &n.text))
-                .collect::<Vec<_>>()
-                .join("\n");
-            match self.adapter.send(target, &text).await {
-                Ok(_) => {
-                    for n in &lines {
-                        self.lanes().news_posted(n.lane_id, &n.text);
-                    }
-                    self.talked(&key);
-                    sent += 1;
-                    let ids: Vec<i64> = lines.iter().map(|n| n.lane_id).collect();
-                    tracing::info!(lanes = ?ids, "lane news posted");
-                }
-                Err(err) => {
-                    tracing::warn!(code = err.code, "lane news send failed");
-                }
+            if self
+                .deliver_news(target, n.lane_id, &news_line(n.lane_id, &n.text))
+                .await
+            {
+                self.lanes().news_posted(n.lane_id, &n.text);
+                self.talked(&n.conversation_key);
+                sent += 1;
             }
         }
         sent
+    }
+
+    /// Edits the news message of `lane_id` to `line`, or posts `line` as a new message when
+    /// the lane has none or the edit failed, and remembers the new id. Returns whether the
+    /// messenger accepted it.
+    async fn deliver_news(&self, target: &str, lane_id: i64, line: &str) -> bool {
+        if let Some(message_id) = self.lanes().news_message(lane_id) {
+            match self.adapter.edit(target, &message_id, line).await {
+                Ok(()) => {
+                    tracing::info!(lane = lane_id, "lane news edited");
+                    return true;
+                }
+                Err(err) => {
+                    tracing::warn!(lane = lane_id, code = err.code, "lane news edit failed")
+                }
+            }
+        }
+        match self.adapter.send(target, line).await {
+            Ok(sent) => {
+                self.lanes().set_news_message(lane_id, &sent.message_id);
+                tracing::info!(lane = lane_id, "lane news posted");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(lane = lane_id, code = err.code, "lane news send failed");
+                false
+            }
+        }
     }
 
     /// Posts lane news after every lane watchdog tick until the task is aborted.
