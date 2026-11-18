@@ -119,7 +119,7 @@ It asks a few questions, in order:
 
 Then it creates `~/.moraebot` (mode `700`), writes `~/.moraebot/config.toml`, and runs the same checks as `check-config`. If a config already exists, it asks before overwriting it. The default answer is No.
 
-When it writes a new config, `init` also leaves a small request file, `~/.moraebot/onboarding.request`, and when every check passes it prints the next steps last: `check-config`, `install-launchd` (or `moraebot run` to try it in the terminal), then message the bot. The next time moraebot starts, it says hello in the channel and begins the first conversation (see First conversation). Keeping your old config, or running `moraebot setup`, leaves no request.
+When it writes a new config, `init` also leaves a small request file, `~/.moraebot/onboarding.request`, and when every check passes it prints the next steps last: `check-config`, `install-launchd` (or `moraebot run` to try it in the terminal), then message the bot. The next time moraebot starts, it says hello to you in a DM (in the channel if the DM fails) and begins the first conversation (see First conversation). Keeping your old config, or running `moraebot setup`, leaves no request.
 
 ### 6. Change or add a messenger
 
@@ -258,7 +258,9 @@ The lead controls lanes only through four tools moraebot gives it: `lane_start`,
 
 ## First conversation
 
-The first time moraebot starts after `moraebot init`, it posts one fixed hello in the configured channel. It sends that hello only once. If sending fails, it doesn't try again, and restarting doesn't repeat it.
+The first time moraebot starts after `moraebot init`, it sends you one fixed hello in a DM. When the DM can't be opened or the send fails, the same hello goes once to the configured channel instead. Nothing is retried, and restarting doesn't repeat it.
+
+Reply in that DM: the whole first conversation stays in one conversation there. On Discord the bot can DM you only while you share its server and your privacy settings allow DMs from server members; otherwise the hello goes to the channel.
 
 When you reply, the lead asks one thing per message: what to call it, how it should talk to you (tone, length, language), and a few basics about you. While this runs, each of your messages reaches the lead with an extra second line, `[moraebot onboarding turn=<n>]`, for your first 10 messages. After the 10th the line stops, but the lead can still finish.
 
@@ -280,13 +282,14 @@ To run the first conversation again, or to start it on a home you already use:
 
 ```sh
 moraebot onboarding
+moraebot onboarding --greet channel
 ```
 
-It writes the request file, prints `{"onboarding":"requested"}` and changes nothing else. Restart moraebot and the hello comes at the next start. Add `--config <path>` for a different config.
+It writes the request file with one word, `dm` (the default) or `channel`, prints `{"onboarding":"requested","greet":"dm"}` (or `"channel"`) and changes nothing else. Restart moraebot and the hello comes at the next start: in your DM for `dm`, in the configured channel for `--greet channel`. An empty request file left by an older version means DM. Add `--config <path>` for a different config.
 
 Files involved:
 
-- `~/.moraebot/onboarding.request`: left by `init` or `moraebot onboarding`, removed at the start that sends the hello.
+- `~/.moraebot/onboarding.request`: left by `init` or `moraebot onboarding`, holding one word, `dm` or `channel`. It's removed at the start that sends the hello.
 - `~/.moraebot/persona.md`: the saved persona.
 - The `onboarding` table in `~/.moraebot/inbox.sqlite`: one row saying whether the first conversation is running, done or skipped.
 
@@ -343,7 +346,7 @@ After installing, check these by hand once:
 - [ ] **A lane with a repo pushes before it is done.** Ask for a change in a git repo that has a remote, and check that the branch `moraebot/lane-<id>` is on the remote when the lead reports the lane done.
 - [ ] **The lead closes a finished repo lane.** After a repo lane is reported done, ask the lead to close it. Check that `.moraebot-lanes/lane-<id>` is gone and the branch `moraebot/lane-<id>` still exists.
 - [ ] **Follow-up while it works.** While the lead is still answering in a thread, send a second message in that thread. You get one reply that covers both.
-- [ ] **First conversation.** After `moraebot init` and the first start, the bot says hello in its channel once. Answer its questions (or reply skip), then restart moraebot and check that it uses the name you gave it.
+- [ ] **First conversation.** After `moraebot init` and the first start, the bot says hello once in a DM (in its channel if the DM fails). Answer its questions (or reply skip), then restart moraebot and check that it uses the name you gave it.
 - [ ] **omp works under launchd or systemd.** launchd or systemd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:

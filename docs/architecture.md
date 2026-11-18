@@ -360,7 +360,11 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **시작.** `moraebot init`이 새 설정을 쓰면 `<홈>/onboarding.request` 파일(권한 0600)을 남깁니다. 이미 쓰던 홈에서는 `moraebot onboarding`이 같은 파일을 만들고 `{"onboarding":"requested"}`를 출력합니다. 이 명령은 저장소를 열지 않습니다.
 
-**인사 한 번.** 디스패처가 켜질 때(`startup`) 요청 파일이 있으면, `onboarding` 표의 줄을 `active`로 만들고 파일을 지운 뒤, 설정된 채널에 정해진 인사(`N_ONBOARDING_HELLO`)를 한 번 보냅니다. 파일을 지우지 못하면 `E_ONBOARDING_REQUEST`를 로그에 남기고 인사하지 않습니다. 보내기가 실패해도 다시 보내지 않습니다. 파일이 없으면 아무 일도 없습니다.
+`moraebot onboarding --greet dm|channel`은 요청 파일에 `dm` 또는 `channel` 낱말 하나를 쓰고, 출력에 `"greet"` 값을 함께 넣습니다. 기본은 `dm`이고, `moraebot init`도 `dm`을 씁니다.
+
+**인사 한 번.** 디스패처가 켜질 때(`startup`) 요청 파일이 있으면, 먼저 파일의 낱말을 읽습니다(`dm`/`channel`, 비었거나 모르는 낱말은 `dm`). 그다음 `onboarding` 표의 줄을 `active`로 만들고 파일을 지운 뒤, 정해진 인사(`N_ONBOARDING_HELLO`)를 보냅니다. `dm`이면 `open_dm`으로 주인 DM을 열어(Slack은 사용자 id 그대로, Discord는 `create_dm_channel`) 그곳에 보내고, 열기나 보내기가 실패하면 설정된 채널에 한 번 보냅니다. `channel`이면 채널에만 보냅니다. 파일을 지우지 못하면 `E_ONBOARDING_REQUEST`를 로그에 남기고 인사하지 않습니다. 두 곳 다 실패해도 다시 보내지 않습니다. 파일이 없으면 아무 일도 없습니다.
+
+**주인 DM.** 어댑터의 `open_dm(user_id)`는 그 사용자와 봇의 DM으로 보낼 대상을 돌려줍니다. 열 수 없거나 DM이 없는 메신저면 `E_ADAPTER_DM`입니다. 주인이 DM에서 답하면 그 대화(`<메신저>:dm:<채널id>`)에서 첫 만남이 이어지고, 표시 줄 번호는 대화와 상관없이 시작 뒤 주인 메시지 수로 셉니다.
 
 **표시 줄.** 첫 만남이 진행 중(`active`)이면 주인 메시지의 lead 입력 두 번째 줄에 `[moraebot onboarding turn=<n>]`이 붙습니다. `n`은 시작 뒤 주인 메시지 수(이번 것 포함)이고, 1부터 `MAX_TURNS`(10)까지만 붙습니다. 끼워 넣은 메시지(steer)와 lane 결과에는 붙지 않습니다. lead 기본 안내문이 이 줄을 보면 무엇을 물을지 알려 줍니다.
 
