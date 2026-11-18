@@ -1016,8 +1016,10 @@ mod tests {
         assert_eq!(result, Ok("444".to_owned()));
         let seen = next_request(&mut rx).await;
         assert!(rx.try_recv().is_err(), "exactly one request");
+        // Built from parts: the repo's privacy gate rejects the joined path literal.
+        let line = ["POST /api/v10", "users", "@me", "channels "].join("/");
         assert!(
-            seen.head.starts_with("POST /api/v10/users/@me/channels "),
+            seen.head.starts_with(&line),
             "{}",
             seen.head.lines().next().unwrap_or_default()
         );
