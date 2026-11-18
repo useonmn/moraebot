@@ -21,6 +21,7 @@ use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
 use crate::omp::OmpManager;
+use crate::onboarding;
 use crate::store::{Store, StoreError};
 
 /// File name of the inbox database inside the home folder.
@@ -82,6 +83,9 @@ impl Gateway {
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
         let omp = OmpManager::new(config.clone(), Arc::clone(&store))
             .with_hints(lead::system_prompt(&guidance, &hints));
+        let tools =
+            onboarding::host_tools(Arc::clone(&store), config.home.clone(), omp.turn_context());
+        let omp = omp.with_host_tools(tools);
         Ok(Self {
             config: config.clone(),
             adapter,

@@ -8,8 +8,9 @@ use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::files;
 use moraebot::lead;
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
+use moraebot::onboarding;
 use moraebot::persona;
-use moraebot::store::Store;
+use moraebot::store::{Admitted, OnboardingRow, OnboardingState, Store};
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -1062,6 +1063,104 @@ async fn turn_context_is_set_during_the_turn() {
     assert_eq!(tools[0]["tools"][1]["name"], "ctx_probe");
     assert_eq!(*context.lock().unwrap(), None, "cleared after the turn");
     manager.shutdown_all().await;
+}
+
+/// A `tools` lead that makes `calls` (one JSON line each) and has the onboarding tool.
+fn onboarding_manager(h: &Harness, calls: &[Value]) -> OmpManager {
+    let lines: Vec<String> = calls.iter().map(Value::to_string).collect();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", lines.join("\n"))]);
+    let tools = onboarding::host_tools(
+        Arc::clone(&h.store),
+        h.config.home.clone(),
+        m.turn_context(),
+    );
+    m.with_host_tools(tools)
+}
+
+/// Admits a claimed owner row on `KEY_A` and returns its id.
+fn owner_row(h: &Harness, message_id: &str, text: &str) -> i64 {
+    let mut store = h.store.lock().unwrap();
+    let Admitted::New(id) = store
+        .admit("discord", message_id, KEY_A, "222", "111", text)
+        .expect("admit owner row")
+    else {
+        panic!("owner row is new");
+    };
+    assert!(store.claim(id).unwrap());
+    id
+}
+
+fn finish_done_call() -> Value {
+    serde_json::json!({
+        "tool": onboarding::FINISH_TOOL,
+        "arguments": {
+            "outcome": "done",
+            "name": "Sora",
+            "tone": "short and warm",
+            "owner": "Owner 111 likes short replies"
+        }
+    })
+}
+
+#[tokio::test]
+async fn onboarding_finish_through_the_lead() {
+    let h = Harness::new();
+    assert_eq!(h.store.lock().unwrap().start_onboarding().unwrap(), 2);
+    let r = owner_row(&h, "m-on-1", "run-tools");
+    assert_eq!(r, 3);
+    let m = onboarding_manager(&h, &[finish_done_call()]);
+    bounded(m.prompt(KEY_A, r, &lead::owner_input(KEY_A, r, "run-tools"))).await;
+
+    let tools = h.frames("set_host_tools");
+    assert_eq!(tools.len(), 1);
+    let names: Vec<&str> = tools[0]["tools"]
+        .as_array()
+        .expect("tool list")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&onboarding::FINISH_TOOL), "{names:?}");
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].0, "{results:?}");
+    let result: Value = serde_json::from_str(&results[0].1).expect("result json");
+    assert_eq!(
+        result,
+        serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_start"})
+    );
+    assert_eq!(
+        std::fs::read_to_string(persona::path(&h.config.home)).expect("persona file"),
+        persona::render("Sora", "short and warm", "Owner 111 likes short replies").unwrap()
+    );
+    assert_eq!(
+        h.store.lock().unwrap().onboarding().unwrap(),
+        Some(OnboardingRow {
+            state: OnboardingState::Done,
+            after_row: 2
+        })
+    );
+    assert_eq!(h.start_pids().len(), 1);
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn onboarding_finish_refusal_reaches_the_lead() {
+    let h = Harness::new();
+    let r = owner_row(&h, "m-on-1", "run-tools");
+    let m = onboarding_manager(&h, &[finish_done_call()]);
+    bounded(m.prompt(KEY_A, r, &lead::owner_input(KEY_A, r, "run-tools"))).await;
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].0, "{results:?}");
+    assert!(
+        results[0].1.starts_with(onboarding::E_ONBOARDING_STATE),
+        "{results:?}"
+    );
+    assert!(!persona::path(&h.config.home).exists());
+    m.shutdown_all().await;
 }
 
 #[tokio::test]
