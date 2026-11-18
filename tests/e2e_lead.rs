@@ -1091,8 +1091,8 @@ fn lead_appends(tap: &LogTap) -> Vec<Vec<String>> {
 
 /// (h) The first meeting end to end: a request greets once in the channel, the first two
 /// owner turns carry the mark, `onboarding_finish` saves `persona.md` and ends the
-/// onboarding (no more marks, no restart), and the next gateway's lead starts with the
-/// persona appended.
+/// onboarding (no more marks), the lead restarts with the persona before the next turn,
+/// and the next gateway's lead starts with it too.
 #[tokio::test]
 async fn onboarding_through_the_gateway() {
     let mut rig = Rig::discord();
@@ -1188,11 +1188,19 @@ async fn onboarding_through_the_gateway() {
         .collect();
     assert_eq!(messages, [Some(1), Some(2), Some(3), Some(4)]);
 
-    assert_eq!(rig.tap.lead_pids().len(), 2, "one lead per gateway run");
+    assert_eq!(
+        rig.tap.lead_pids().len(),
+        3,
+        "a restart for the new persona, then one lead for the second run"
+    );
     let appends = lead_appends(&rig.tap);
-    assert_eq!(appends.len(), 2);
+    assert_eq!(appends.len(), 3);
     assert!(!appends[0].concat().contains("Name: Sora"));
-    assert!(appends[1].concat().contains("Name: Sora"));
+    assert!(
+        appends[1..]
+            .iter()
+            .all(|a| a.concat().contains("Name: Sora"))
+    );
     assert_eq!(
         std::fs::read_to_string(persona::path(&rig.config.home)).expect("persona file"),
         persona::render("Sora", "short and warm", "Owner 111 likes short replies").unwrap()

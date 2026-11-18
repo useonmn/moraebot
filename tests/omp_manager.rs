@@ -292,35 +292,203 @@ async fn lead_appends_persona_after_hints() {
     bounded(manager.shutdown_all()).await;
 }
 
-#[tokio::test]
-async fn persona_change_applies_at_next_start() {
-    let h = Harness::new();
-    save_persona(
-        &h,
-        "Sora",
-        "short and warm",
-        "Owner 111 likes short replies",
-    );
-    let m1 = h.manager("ok");
-    bounded(m1.prompt(KEY_A, 1, "hi")).await;
-    save_persona(&h, "Kai", "", "");
-    bounded(m1.prompt(KEY_B, 2, "again")).await;
-    assert_eq!(
-        h.start_pids().len(),
-        1,
-        "a persona change does not restart the lead"
-    );
-    bounded(m1.shutdown_all()).await;
+fn save_sora(h: &Harness) {
+    save_persona(h, "Sora", "short and warm", "Owner 111 likes short replies");
+}
 
-    let m2 = h.manager("ok");
-    bounded(m2.prompt(KEY_A, 1, "hi")).await;
+#[tokio::test]
+async fn persona_change_restarts_the_lead_before_the_next_turn() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok");
+    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    save_persona(&h, "Kai", "", "");
+    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let pids = h.start_pids();
+    let first_alive = pids.first().map(|p| alive(*p));
+    let leases = h.frames("get_session_lease");
+    let rest: Vec<Vec<String>> = h
+        .log_lines()
+        .iter()
+        .filter(|l| l.starts_with("START pid="))
+        .map(|l| {
+            start_argv(l)
+                .into_iter()
+                .filter(|a| !a.starts_with("--append-system-prompt="))
+                .collect()
+        })
+        .collect();
     let appends = appends(&h);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(r1, Outcome::Reply("echo: hi".into()));
+    assert_eq!(r2, Outcome::Reply("echo: again".into()));
+    assert_eq!(pids.len(), 2);
+    assert_eq!(first_alive, Some(false));
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        leases[0]["sessionIds"],
+        serde_json::json!(["fake-session-1"])
+    );
+    assert_eq!(rest.len(), 2);
+    for argv in &rest {
+        assert_eq!(argv, &expected_argv(&h.config));
+    }
     assert_eq!(appends.len(), 2);
     let first = appends[0].concat();
     let second = appends[1].concat();
     assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
     assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
-    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn unchanged_persona_keeps_the_lead() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok");
+    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    save_sora(&h);
+    bounded(m.prompt(KEY_B, 2, "again")).await;
+    bounded(m.prompt(KEY_A, 3, "more")).await;
+    let pids = h.start_pids();
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(pids.len(), 1);
+}
+
+#[tokio::test]
+async fn removed_persona_restarts_without_it() {
+    let h = Harness::new();
+    save_sora(&h);
+    let first = format!(
+        "--append-system-prompt={}",
+        persona::append("H", persona::load(&h.config.home).unwrap().as_deref())
+    );
+    let m = h.manager("ok").with_hints("H".into());
+    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    std::fs::remove_file(persona::path(&h.config.home)).unwrap();
+    bounded(m.prompt(KEY_B, 2, "again")).await;
+    let appends = appends(&h);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(
+        appends,
+        vec![vec![first], vec!["--append-system-prompt=H".to_owned()]]
+    );
+}
+
+#[tokio::test]
+async fn refused_persona_change_restarts_without_it() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok").with_hints("H".into());
+    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    let secret = ["gl", "pat-"].concat() + &"c".repeat(20);
+    std::fs::write(
+        persona::path(&h.config.home),
+        format!("Name: X\nOwner: {secret}"),
+    )
+    .unwrap();
+    bounded(m.prompt(KEY_B, 2, "again")).await;
+    bounded(m.prompt(KEY_A, 3, "more")).await;
+    let appends = appends(&h);
+    let code = persona::load(&h.config.home).unwrap_err().code;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(appends.len(), 2);
+    assert!(appends[0][0].contains("Name: Sora"));
+    assert_eq!(appends[1], vec!["--append-system-prompt=H".to_owned()]);
+    assert_eq!(code, persona::E_PERSONA_SECRET);
+}
+
+#[tokio::test]
+async fn onboarding_finish_applies_from_the_next_turn() {
+    let h = Harness::new();
+    h.store.lock().unwrap().start_onboarding().unwrap();
+    let r1 = owner_row(&h, "m-on-1", "run-tools");
+    let m = onboarding_manager(&h, &[finish_done_call()]);
+    bounded(m.prompt(KEY_A, r1, &lead::owner_input(KEY_A, r1, "run-tools"))).await;
+    let after_first = h.start_pids().len();
+    let r2 = owner_row(&h, "m-on-2", "again");
+    bounded(m.prompt(KEY_A, r2, &lead::owner_input(KEY_A, r2, "again"))).await;
+    let pids = h.start_pids();
+    let appends = appends(&h);
+    let tools = h.frames("set_host_tools");
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(after_first, 1);
+    assert_eq!(pids.len(), 2);
+    assert!(!appends[0].concat().contains("Name: Sora"));
+    assert!(appends[1].concat().contains("Name: Sora"));
+    assert_eq!(tools.len(), 2);
+    for frame in &tools {
+        let names: Vec<&str> = frame["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&onboarding::FINISH_TOOL), "{names:?}");
+    }
+}
+
+#[tokio::test]
+async fn unsettled_session_defers_the_restart_until_settled() {
+    let mut h = Harness::new();
+    h.config.omp_path = unsettled_once_wrapper(h.dir.path());
+    save_sora(&h);
+    let m = h.manager("ok");
+    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    save_persona(&h, "Kai", "", "");
+    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let after_second = h.start_pids().len();
+    let r3 = bounded(m.prompt(KEY_A, 3, "more")).await.main.outcome;
+    let pids = h.start_pids();
+    let appends = appends(&h);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(r1, Outcome::Reply("echo: hi".into()));
+    assert_eq!(r2, Outcome::Reply("echo: again".into()));
+    assert_eq!(r3, Outcome::Reply("echo: more".into()));
+    assert_eq!(after_second, 1);
+    assert_eq!(pids.len(), 2);
+    assert_eq!(appends.len(), 2);
+    let first = appends[0].concat();
+    let second = appends[1].concat();
+    assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
+    assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
+}
+
+#[tokio::test]
+async fn failed_restart_reports_the_start_failure_then_starts_again() {
+    let mut h = Harness::new();
+    let marker = h.dir.path().join("refuse-start");
+    h.config.omp_path = refusing_wrapper(h.dir.path(), &marker);
+    save_sora(&h);
+    let m = h.manager("ok");
+    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    std::fs::write(&marker, "").unwrap();
+    save_persona(&h, "Kai", "", "");
+    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let after_fail = h.start_pids();
+    let first_alive = after_fail.first().map(|p| alive(*p));
+    let child_after_fail = m.child_pid().await;
+    std::fs::remove_file(&marker).unwrap();
+    let r3 = bounded(m.prompt(KEY_A, 3, "more")).await.main.outcome;
+    let pids = h.start_pids();
+    let appends = appends(&h);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(r1, Outcome::Reply("echo: hi".into()));
+    assert!(matches!(r2, Outcome::Failed { .. }), "{r2:?}");
+    assert_eq!(r2.code(), Some(omp::E_OMP_SPAWN));
+    assert_eq!(after_fail.len(), 1);
+    assert_eq!(first_alive, Some(false));
+    assert_eq!(child_after_fail, None);
+    assert_eq!(r3, Outcome::Reply("echo: more".into()));
+    assert_eq!(pids.len(), 2);
+    assert_eq!(appends.len(), 2);
+    assert!(appends[1].concat().contains("Name: Kai"));
 }
 
 #[tokio::test]
@@ -431,6 +599,36 @@ fn coded_error_wrapper(root: &Path) -> PathBuf {
     let body = format!(
         r#"#!/bin/sh
 '{fake}' "$@" | awk '{{ sub(/"message":"fake provider failure"/, "\"code\":\"provider_error\",\"message\":\"fake provider failure\""); print; fflush() }}'
+"#
+    );
+    std::fs::write(&script, body).expect("write wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    script
+}
+
+/// Each child's first `prompt_result` reports `sessionSettled: false`; later ones are unchanged.
+fn unsettled_once_wrapper(root: &Path) -> PathBuf {
+    let script = root.join("omp-unsettled-once.sh");
+    let fake = env!("CARGO_BIN_EXE_fake-omp");
+    let body = format!(
+        r#"#!/bin/sh
+'{fake}' "$@" | awk '{{ if (!n && sub(/"sessionSettled":true/, "\"sessionSettled\":false")) n = 1; print; fflush() }}'
+"#
+    );
+    std::fs::write(&script, body).expect("write wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    script
+}
+
+/// Exits before omp's `ready` frame while `marker` exists, so the child start fails.
+fn refusing_wrapper(root: &Path, marker: &Path) -> PathBuf {
+    let script = root.join("omp-refusing.sh");
+    let fake = env!("CARGO_BIN_EXE_fake-omp");
+    let marker = marker.display();
+    let body = format!(
+        r#"#!/bin/sh
+if [ -e '{marker}' ]; then exit 3; fi
+exec '{fake}' "$@"
 "#
     );
     std::fs::write(&script, body).expect("write wrapper");

@@ -2,7 +2,9 @@
 //!
 //! The lead child is never closed because the next input belongs to another
 //! conversation: each input names its own conversation (see `lead`), and the reply
-//! stays with the row that asked. Its session folder is `<home>/lead/session` and its
+//! stays with the row that asked. Before every turn `persona.md` is read again; when the
+//! lead's appended system prompt changed, the idle child is closed and started again on
+//! the same session. Its session folder is `<home>/lead/session` and its
 //! omp session id is stored under `lead::LEAD_SESSION`. Lane children are owned by
 //! `lane.rs` and built with the same plumbing (`child_command`, `open_child`).
 //!
@@ -244,6 +246,12 @@ pub(crate) fn map_result(turn: Result<PromptTurn, RpcError>) -> Outcome {
         }
         Err(error) => Outcome::needs_check(E_CHILD_LOST, error),
     }
+}
+
+/// False when omp reported the turn's session not settled (`sessionSettled: false`): a
+/// background job may still wake it, so the lead is not restarted yet. Errors count as settled.
+fn turn_settled(turn: &Result<PromptTurn, RpcError>) -> bool {
+    turn.as_ref().ok().and_then(|t| t.result.as_ref()).is_none_or(|r| r.session_settled)
 }
 
 /// Exact omp argv (without the program) for one child. Non-empty `hints` become one
@@ -562,6 +570,10 @@ struct Live {
     requests: mpsc::Sender<PromptRequest>,
     worker: JoinHandle<()>,
     sent_files: SentFiles,
+    /// The appended system prompt this child was started with.
+    append: String,
+    /// False while the last turn ended with work still pending (`sessionSettled: false`).
+    settled: bool,
 }
 
 impl Live {
@@ -682,7 +694,7 @@ impl OmpManager {
     }
 
     /// System prompt text appended to the lead's (guidance and messenger hints); empty = none.
-    /// At each lead start `persona.md` is appended after them (`persona::append`).
+    /// Before every lead turn `persona.md` is read and appended after them (`persona::append`); a changed text restarts the lead between turns.
     pub fn with_hints(mut self, hints: String) -> Self {
         self.hints = hints;
         self
@@ -724,11 +736,21 @@ impl OmpManager {
     /// Sends `text` (row `row_id` of conversation `key`) to the lead and waits for the
     /// turn, including a message steered into it, then reports the group with the files
     /// queued by `send_file` during it. One lead turn runs at a time. The child is closed
-    /// only when an outcome is `NeedsCheck` (timeout or lost child).
+    /// when an outcome is `NeedsCheck` (timeout or lost child), or before a turn when the
+    /// lead's appended system prompt changed and the last turn's session settled.
     pub async fn prompt(&self, key: &str, row_id: i64, text: &str) -> GroupReport {
         let mut live = self.live.lock().await;
+        // Between turns: the live mutex is held, so no turn or steer is open here.
+        let (append, refused) = self.lead_append();
+        if let Some(old) = live.take_if(|current| current.settled && current.append != append) {
+            tracing::info!("lead system prompt changed; restarting the omp lead between turns");
+            old.close(&self.lead_kill).await;
+        }
         if live.is_none() {
-            match self.start().await {
+            if let Some(code) = refused {
+                tracing::warn!(code, "persona file not used");
+            }
+            match self.start(append).await {
                 Ok(started) => *live = Some(started),
                 Err(outcome) => {
                     return GroupReport {
@@ -775,6 +797,7 @@ impl OmpManager {
         // Close the gate: no steer joins this turn from here on.
         let steer = lock(&self.gate).take().and_then(|turn| turn.steer);
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
+        let mut settled = turn_settled(&main);
         let main = map_result(main);
 
         let mut killed = false;
@@ -791,7 +814,11 @@ impl OmpManager {
                     map_result(result.await.unwrap_or(Err(RpcError::Closed)))
                 } else {
                     match tokio::time::timeout(self.turn_timeout, &mut result).await {
-                        Ok(turn) => map_result(turn.unwrap_or(Err(RpcError::Closed))),
+                        Ok(turn) => {
+                            let turn = turn.unwrap_or(Err(RpcError::Closed));
+                            settled &= turn_settled(&turn);
+                            map_result(turn)
+                        }
                         Err(_) => {
                             self.kill_lead();
                             killed = true;
@@ -818,6 +845,10 @@ impl OmpManager {
                 "closing omp lead child"
             );
             current.close(&self.lead_kill).await;
+        }
+        if let Some(current) = live.as_mut() {
+            // A pending background job may still wake this session; restart only once it settled.
+            current.settled = settled;
         }
         *lock(&self.turn) = None;
         self.running.send_replace(None);
@@ -877,14 +908,11 @@ impl OmpManager {
     }
 
     /// The lead's appended system prompt: the hints, then `persona.md` read now. A refused file
-    /// is left out with one warning carrying its code.
-    fn lead_append(&self) -> String {
+    /// is left out and its code is returned, so the caller logs it once per start.
+    fn lead_append(&self) -> (String, Option<&'static str>) {
         match persona::load(&self.config.home) {
-            Ok(p) => persona::append(&self.hints, p.as_deref()),
-            Err(e) => {
-                tracing::warn!(code = e.code, "persona file not used");
-                self.hints.clone()
-            }
+            Ok(p) => (persona::append(&self.hints, p.as_deref()), None),
+            Err(e) => (self.hints.clone(), Some(e.code)),
         }
     }
 
@@ -894,7 +922,7 @@ impl OmpManager {
         }
     }
 
-    async fn start(&self) -> Result<Live, Outcome> {
+    async fn start(&self, append: String) -> Result<Live, Outcome> {
         let previous_session = lock(&self.store)
             .session_id(lead::LEAD_SESSION)
             .map_err(|e| Outcome::failed(e.code(), e))?;
@@ -907,7 +935,7 @@ impl OmpManager {
                         &self.config,
                         &self.config.work_dir,
                         &session_dir,
-                        &self.lead_append(),
+                        &append,
                     ),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
@@ -983,6 +1011,8 @@ impl OmpManager {
             requests,
             worker,
             sent_files,
+            append,
+            settled: true,
         })
     }
 }
