@@ -488,6 +488,38 @@ moraebot은 `git fetch`도 `git push`도 하지 않습니다. 컴퓨터에 있�
 
 **dori와 다른 점.** dori도 닫을 때 `--force` 없는 `git worktree remove`를 쓰고, 지우기가 거절되면 기록만 남기고 닫기는 계속합니다. dori는 자기가 가진 worktree의 git 상태를 읽을 수 없거나 올리지 않은 커밋이 있으면 닫기 자체를 막지만, moraebot은 lane을 닫고 폴더만 남깁니다.
 
+### 3.14 레인 감시 (lanes L3)
+
+**살아 있다는 신호.** lane 자식이 보내는 omp agent 이벤트(`Event::Notification(RpcNotification::RpcAgentEvent(_))`) 하나하나를 그 일의 `Activity`에 셉니다. 짝 없는 응답, 읽지 못한 프레임, agent 이벤트가 아닌 알림은 세지 않습니다. 이벤트를 받는 길에서는 시계를 읽지 않고 숫자만 올립니다.
+
+**진행.** `ToolExecutionStart` 가운데 (도구 이름, 인자) 쌍이 이 일에서 처음 나온 것만 진행으로 셉니다. 같은 호출을 되풀이하면 이벤트는 늘어도 진행은 늘지 않습니다. 마지막 이벤트가 `AutoRetryStart`이면 "재시도 중"으로 표시합니다.
+
+**세 가지 이유.**
+
+| 코드 | 경우 |
+|---|---|
+| `N_LANE_QUIET` | 20분 동안 agent 이벤트가 하나도 없음 |
+| `N_LANE_RETRYING` | 20분 동안 조용하고, 마지막 이벤트가 `AutoRetryStart`(모델 서비스 실패 뒤 재시도) |
+| `N_LANE_SPINNING` | 이벤트는 오는데 20분 동안 새 도구 호출이 없음 |
+
+**주기와 기준.** 30초마다(`WATCH_TICK`) 돌고 있는 lane을 하나씩 보고, 기준은 20분(`STALL_AFTER`)입니다. 둘 다 상수이고 설정 항목은 없습니다. 숫자는 dori에서 왔습니다. dori의 `watch`도 30초마다 돌고, 멈춤(hung)과 오래됨(stale) 기준이 둘 다 20분이며, dori도 lane을 죽이지 않습니다. 첫 점검은 시계를 시작하기만 하고, 그 뒤 점검에서 숫자가 바뀌었으면 그때 시각을 적습니다.
+
+**멈춤 한 번에 알림 한 번.** 알린 뒤에는 새 도구 호출이 생겨 그 멈춤이 끝날 때까지 다시 알리지 않습니다. 같은 lane이 다시 20분 멈추면 새 멈춤으로 보고 다시 한 번 알립니다. 알림은 나중에 지우지 않으므로 lead는 "멈춘 것 같다" 다음에 결과를 차례로 읽습니다.
+
+**알림이 가는 길.** lane 결과와 같습니다. 받은편지함에 한 줄(`platform`, `origin`, `author_id`가 모두 `lane`, `message_id`는 `<id>:<seq>:stalled:<episode>`)을 넣고 dispatcher를 깨웁니다. `message_id`가 유일하므로 경합이 있어도 멈춤 하나에 한 줄입니다. lane의 저장 상태는 `running` 그대로입니다. 글은 세 줄입니다.
+
+```text
+[moraebot conversation=<key> lane=<id> stalled reason=<N_LANE_...>]
+[moraebot] stall quiet_minutes=<n> idle_minutes=<n> tool_calls=<n> new_calls=<n> last_tool=<이름 또는 ->
+The lane is still running and moraebot does not stop it; its result comes later as its own input.
+```
+
+`lead::parse_tag`가 `stalled`와 `reason=`을 읽고, lead의 기본 역할 글이 이 태그와 세 코드를 설명합니다. 도구 인자, 경로, lane이 쓴 글, lane의 일 내용은 넣지 않습니다. 비밀이 들어 있을 수 있기 때문입니다. 알림을 쓰면 로그에 `lane looks stalled` 한 줄(lane id, 순번, 코드, 멈춤 번호)을 남깁니다.
+
+**꺼지는 때.** turn 시간 제한이 20분 이하이면 시간 제한이 먼저 끝내므로 감시하지 않습니다. 게이트웨이가 꺼지는 중일 때, 그리고 돌고 있는 자식이 없는 lane(쉬는 lane, 끝난 lane, 닫힌 lane)도 보지 않습니다. 감시는 lane을 멈추거나 재촉하거나 상태를 바꾸지 않습니다.
+
+**dori와 다른 점.** dori는 터미널 화면과 파일 변경으로 진행을 보고, 15분 조용하면 lane에 재촉 글을 넣습니다. moraebot은 omp의 이벤트 흐름을 읽고 새 도구 호출을 진행으로 세며, L3에서는 재촉하지 않고 lead에게 알리기만 합니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -573,7 +605,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
    - **L1 레인 작업 폴더.** `repo`를 받은 lane은 자기 git worktree에서 일합니다(3.11절).
    - **L2 올리지 않은 작업 검사 (완료).** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다(3.12절).
    - **L2b 레인 닫기와 폴더 정리 (완료).** lead가 lane을 닫으면 L2 검사를 거친 뒤 lane 폴더를 지웁니다. 브랜치는 남깁니다(3.13절).
-   - **L3 레인 감시.** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
+   - **L3 레인 감시 (완료, 3.14절).** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
    - **L4 진행 소식.** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
 
 ## 6. 열린 질문
