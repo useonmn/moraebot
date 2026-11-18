@@ -35,9 +35,9 @@ pub const E_CHECK_MISSING: &str = "E_CHECK_MISSING";
 pub const E_CHECK_TIMEOUT: &str = "E_CHECK_TIMEOUT";
 /// A command could not start.
 pub const E_CHECK_SPAWN: &str = "E_CHECK_SPAWN";
-/// The text is not in the file.
+/// The text is not in the file or the command's stdout.
 pub const E_CHECK_TEXT: &str = "E_CHECK_TEXT";
-/// An existing file cannot be read.
+/// An existing file or a command's stdout file cannot be read.
 pub const E_CHECK_READ: &str = "E_CHECK_READ";
 
 /// Bytes of command output kept for a failure detail.
@@ -48,8 +48,9 @@ const SCAN_CHUNK: usize = 64 * 1024;
 /// One checkable part of a Done line.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Signal {
-    /// Runs the argv (no shell); passes on exit code 0.
-    Command(Vec<String>),
+    /// Runs the argv (no shell); passes on exit code 0; with a text, only when the whole
+    /// stdout also contains it (stderr is never searched).
+    Command(Vec<String>, Option<String>),
     /// Passes when the path exists; with a text, only when the file's bytes contain it.
     File(String, Option<String>),
 }
@@ -57,15 +58,23 @@ pub enum Signal {
 impl fmt::Display for Signal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Signal::Command(argv) => write!(f, "command {}", json(argv)),
+            Signal::Command(argv, text) => {
+                write!(f, "command {}", json(argv))?;
+                contains(f, text.as_deref())
+            }
             Signal::File(path, text) => {
                 write!(f, "file {}", word(path))?;
-                if let Some(text) = text {
-                    write!(f, " contains {}", json(text))?;
-                }
-                Ok(())
+                contains(f, text.as_deref())
             }
         }
+    }
+}
+
+/// Writes the ` contains "<text>"` tail of a signal that has a text.
+fn contains(f: &mut fmt::Formatter<'_>, text: Option<&str>) -> fmt::Result {
+    match text {
+        Some(text) => write!(f, " contains {}", json(text)),
+        None => Ok(()),
     }
 }
 
@@ -216,9 +225,10 @@ fn parse_signal(part: &str) -> Result<Signal, SyntaxReason> {
         .split_once(char::is_whitespace)
         .map_or((part, ""), |(head, rest)| (head, rest.trim()));
     match head {
-        "command" => match serde_json::from_str::<Vec<String>>(rest) {
-            Ok(argv) if !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()) => {
-                Ok(Signal::Command(argv))
+        "command" => match take_json::<Vec<String>>(rest) {
+            Some((argv, rest)) if !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()) => {
+                let text = take_contains(rest, SyntaxReason::BadArgv)?;
+                Ok(Signal::Command(argv, text))
             }
             _ => Err(SyntaxReason::BadArgv),
         },
@@ -302,15 +312,21 @@ pub(crate) fn run(
     for signal in &line.0 {
         let (code, detail) = match signal {
             Signal::File(path, text) => check_file(path, text.as_deref(), work_dir, env),
-            Signal::Command(argv) => check_command(
-                argv,
-                work_dir,
-                out_dir,
-                env,
-                timeout,
-                &mut started,
-                &mut ended,
-            )?,
+            Signal::Command(argv, text) => {
+                let ran = check_command(
+                    argv,
+                    work_dir,
+                    out_dir,
+                    env,
+                    timeout,
+                    &mut started,
+                    &mut ended,
+                )?;
+                match text {
+                    Some(text) if ran.0.is_none() => check_text(&out_dir.join("stdout"), text),
+                    _ => ran,
+                }
+            }
         };
         checks.push(Check {
             signal: signal.to_string(),
@@ -585,7 +601,14 @@ mod tests {
     use std::time::Duration;
 
     fn cmd(argv: &[&str]) -> Signal {
-        Signal::Command(argv.iter().map(|arg| arg.to_string()).collect())
+        Signal::Command(argv.iter().map(|arg| arg.to_string()).collect(), None)
+    }
+
+    fn cmd_text(argv: &[&str], text: &str) -> Signal {
+        Signal::Command(
+            argv.iter().map(|arg| arg.to_string()).collect(),
+            Some(text.to_owned()),
+        )
     }
 
     fn file(path: &str) -> Signal {
@@ -693,7 +716,7 @@ mod tests {
     fn parse_splits_only_outside_quotes_and_brackets() {
         let line = DoneLine::parse(r#"command ["sh","-c","a; b"]; file "x;y""#).unwrap();
         assert_eq!(line.signals(), [cmd(&["sh", "-c", "a; b"]), file("x;y")]);
-        let Signal::Command(argv) = &line.signals()[0] else {
+        let Signal::Command(argv, _) = &line.signals()[0] else {
             panic!("not a command");
         };
         assert_eq!(argv[2], "a; b");
@@ -723,6 +746,11 @@ mod tests {
                 BadArgv,
             ),
             ("command a b", "command a b", BadArgv),
+            (
+                r#"command ["a"] contains"#,
+                r#"command ["a"] contains"#,
+                BadText,
+            ),
             ("file", "file", BadPath),
             ("file a b", "file a b", BadPath),
             ("file ok; wat x; file b", "wat x", Unknown),
@@ -741,6 +769,7 @@ mod tests {
             r#"file ~/x.txt; file "q\"uote"; command ["a"]"#,
             r#"file report.txt contains "0 failed""#,
             r#"file "a b" contains "q\"uote;x""#,
+            r#"command ["sh","-c","x"] contains "a;b""#,
         ] {
             let line = DoneLine::parse(text).unwrap();
             assert_eq!(DoneLine::parse(&line.to_string()).unwrap(), line, "{text}");
@@ -758,6 +787,48 @@ mod tests {
         let line = DoneLine::parse(r#"file "a b" contains "x;y"; file c"#).unwrap();
         assert_eq!(line.signals(), [file_text("a b", "x;y"), file("c")]);
         assert_eq!(line.to_string(), r#"file "a b" contains "x;y"; file c"#);
+    }
+
+    #[test]
+    fn parse_accepts_command_contains() {
+        let text = r#"command ["cargo","test"] contains "0 failed""#;
+        let line = DoneLine::parse(text).unwrap();
+        assert_eq!(line.signals(), [cmd_text(&["cargo", "test"], "0 failed")]);
+        assert_eq!(line.to_string(), text);
+    }
+
+    #[test]
+    fn command_contains_reads_stdout_only() {
+        let d = dirs();
+        let checks = run_all(
+            &d,
+            vec![
+                cmd_text(&["/bin/sh", "-c", "echo all-ok"], "all-ok"),
+                cmd_text(&["/bin/sh", "-c", "echo nope"], "all-ok"),
+                cmd_text(&["/bin/sh", "-c", "echo all-ok >&2"], "all-ok"),
+                cmd_text(&["/bin/sh", "-c", "echo all-ok; exit 1"], "all-ok"),
+                cmd_text(
+                    &[
+                        "/bin/sh",
+                        "-c",
+                        "head -c 70000 /dev/zero | tr '\\0' a; echo all-ok",
+                    ],
+                    "all-ok",
+                ),
+            ],
+            CHECK_TIMEOUT,
+        );
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(
+            codes,
+            [
+                None,
+                Some(E_CHECK_TEXT),
+                Some(E_CHECK_TEXT),
+                Some(E_CHECK_EXIT),
+                None
+            ]
+        );
     }
 
     #[test]
