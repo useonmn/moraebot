@@ -247,15 +247,16 @@ pub(crate) fn map_result(turn: Result<PromptTurn, RpcError>) -> Outcome {
 }
 
 /// Exact omp argv (without the program) for one child. Non-empty `hints` become one
-/// `--append-system-prompt=<hints>` element; message text never goes into argv.
-pub fn omp_args(config: &Config, session_dir: &Path, hints: &str) -> Vec<OsString> {
+/// `--append-system-prompt=<hints>` element; message text never goes into argv. `cwd` is
+/// the work folder for the lead and for a lane without a repo, else the lane's worktree.
+pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
         .collect();
     args.push(session_dir.into());
     args.push("--cwd".into());
-    args.push(config.work_dir.clone().into());
+    args.push(cwd.into());
     args.push("--approval-mode".into());
     args.push("yolo".into());
     if !hints.is_empty() {
@@ -902,7 +903,12 @@ impl OmpManager {
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &session_dir, &self.lead_append()),
+                    omp_args(
+                        &self.config,
+                        &self.config.work_dir,
+                        &session_dir,
+                        &self.lead_append(),
+                    ),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )

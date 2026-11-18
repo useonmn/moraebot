@@ -20,9 +20,15 @@
 //! Shutdown kills every lane child first, then every running check, then waits until
 //! each killed check was reaped: a check's refusal never reaches a live lane, so a turn
 //! cut during a check is always left for `recover_on_start`.
+//!
+//! A lane started with `repo` works in its own git worktree,
+//! `<work dir>/.moraebot-lanes/lane-<id>` on branch `moraebot/lane-<id>`, created before
+//! its first child starts and reused by later prompts; its git commands are tracked and
+//! killed on shutdown like Done checks.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -39,6 +45,7 @@ use crate::omp::{
     lock,
 };
 use crate::store::{LaneMessage, LaneStart, LaneState, Store};
+use crate::worktree::{self, WorktreeError};
 
 /// Most lanes that may run a turn at the same time.
 pub const MAX_RUNNING_LANES: usize = 3;
@@ -80,7 +87,7 @@ struct LaneSet {
     /// Set by `stop_accepting`: no lane starts and no child is kept from then on.
     stopping: bool,
     children: HashMap<i64, LaneChild>,
-    /// Running check pids -> `(lane id, seq)` of the job whose `lane_done` call started it.
+    /// Running check and git pids -> `(lane id, seq)` of the job that started it.
     checks: HashMap<u32, (i64, i64)>,
 }
 
@@ -92,6 +99,14 @@ struct Job {
     text: String,
     previous_session: Option<String>,
     done: Option<DoneLine>,
+    /// The canonical git checkout of the lane's worktree; `None` = the shared work folder.
+    repo: Option<PathBuf>,
+}
+
+/// Where a job's Done checks run (`work`) and write their output (`out`).
+struct CheckDirs {
+    work: PathBuf,
+    out: PathBuf,
 }
 
 /// What the lane's `lane_done` calls of one job established; the last call decides.
@@ -222,7 +237,8 @@ impl LaneManager {
             HostTool::new(
                 LANE_START_TOOL,
                 "Start a lane: a separate agent that works on `task` in the background, in \
-                 the same work folder. `task` must be self-contained; the lane does not see \
+                 the shared work folder, or with `repo` in its own git worktree. `task` must \
+                 be self-contained; the lane does not see \
                  the conversation. `done` is the Done line moraebot checks when the lane \
                  claims it is done. Returns the lane id at once; the lane's result comes \
                  back to you later as a new message.",
@@ -233,6 +249,10 @@ impl LaneManager {
                         "done": {
                             "type": "string",
                             "description": "Done line: `command [...]` and/or `file <path>`, joined with `;`."
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "Optional: a git checkout (absolute, ~/..., or relative to the work folder). The lane then works in its own worktree of it."
                         }
                     },
                     "required": ["task", "done"],
@@ -291,6 +311,10 @@ impl LaneManager {
         let line = DoneLine::parse(line)
             .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
         let canonical = line.to_string();
+        let repo = self.repo_arg(arguments)?;
+        let repo_text = repo
+            .as_deref()
+            .map(|repo| repo.to_string_lossy().into_owned());
         let conversation_key = lock(&self.turn)
             .as_ref()
             .map(|turn| turn.conversation_key.clone())
@@ -305,7 +329,7 @@ impl LaneManager {
                 &conversation_key,
                 task,
                 Some(&canonical),
-                None,
+                repo_text.as_deref(),
                 MAX_RUNNING_LANES,
             )
             .map_err(|e| refused(e.code(), &e.to_string()))?;
@@ -320,6 +344,7 @@ impl LaneManager {
                         text: task.to_owned(),
                         previous_session: None,
                         done: Some(line),
+                        repo,
                     },
                 );
                 id
@@ -337,6 +362,32 @@ impl LaneManager {
             json!({ "lane_id": id })
         )
         .into())
+    }
+
+    /// `lane_start`'s optional `repo`: missing or `null` is `None`; otherwise a non-empty
+    /// string naming an existing folder (`~/` from `HOME`, absolute, else relative to the
+    /// work folder), returned canonical.
+    fn repo_arg(&self, arguments: &Map<String, Value>) -> Result<Option<PathBuf>, HostToolError> {
+        let repo = match arguments.get("repo") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(value) => value
+                .as_str()
+                .filter(|repo| !repo.trim().is_empty())
+                .ok_or_else(|| refused(E_LANE_ARGS, "repo must be a non-empty string"))?,
+        };
+        let not_a_folder = || refused(worktree::E_LANE_REPO, "repo is not an existing folder");
+        let path = match repo.strip_prefix("~/") {
+            Some(rest) => {
+                PathBuf::from(std::env::var_os("HOME").ok_or_else(not_a_folder)?).join(rest)
+            }
+            None if Path::new(repo).is_absolute() => PathBuf::from(repo),
+            None => self.config.work_dir.join(repo),
+        };
+        let canonical = std::fs::canonicalize(path).map_err(|_| not_a_folder())?;
+        if !canonical.is_dir() {
+            return Err(not_a_folder());
+        }
+        Ok(Some(canonical))
     }
 
     fn lane_message(
@@ -380,6 +431,7 @@ impl LaneManager {
                     text: text.to_owned(),
                     previous_session: lane.omp_session_id,
                     done: line,
+                    repo: lane.repo.map(PathBuf::from),
                 },
                 LaneMessage::Unknown => {
                     return Err(refused(E_LANE_UNKNOWN, "no lane has this id"));
@@ -430,6 +482,7 @@ impl LaneManager {
                     "error": lane.error,
                     "prompts": lane.prompts,
                     "done": lane.done,
+                    "repo": lane.repo,
                     "task": lane.task.chars().take(STATUS_TASK_CHARS).collect::<String>(),
                 })
             })
@@ -504,12 +557,82 @@ impl LaneManager {
         }
     }
 
-    /// The `lane_done` tool of one job: its handler checks `line` and records the claim.
+    /// Registers `pid` (a check or git command) as running for job `(id, seq)`; `false`
+    /// when moraebot is stopping, the call was cancelled or the job is no longer current.
+    fn track(&self, pid: u32, (id, seq): (i64, i64), cancelled: bool) -> bool {
+        let mut set = lock(&self.inner);
+        let current = set.children.get(&id).is_some_and(|child| child.seq == seq);
+        if set.stopping || cancelled || !current {
+            return false;
+        }
+        set.checks.insert(pid, (id, seq));
+        self.pids.send_modify(|pids| pids.push(pid));
+        true
+    }
+
+    /// Forgets `pid` once its command was reaped.
+    fn untrack(&self, pid: u32) {
+        let mut set = lock(&self.inner);
+        set.checks.remove(&pid);
+        self.pids.send_modify(|pids| pids.retain(|p| *p != pid));
+    }
+
+    /// `<work dir>` canonical (else absolute, else as given): the base of lane worktrees.
+    fn lanes_root(&self) -> PathBuf {
+        std::fs::canonicalize(&self.config.work_dir)
+            .or_else(|_| std::path::absolute(&self.config.work_dir))
+            .unwrap_or_else(|_| self.config.work_dir.clone())
+    }
+
+    /// The folder job `job` works in: the work folder, or for a lane with a repo its
+    /// worktree, made sure of by `worktree::ensure` before any child starts.
+    fn job_cwd(&self, job: &Job) -> Result<PathBuf, Outcome> {
+        let Some(repo) = &job.repo else {
+            return Ok(self.config.work_dir.clone());
+        };
+        let (id, seq) = (job.id, job.seq);
+        let folder = worktree::folder(&self.lanes_root(), id);
+        let git_dir = self
+            .config
+            .home
+            .join("lanes")
+            .join(id.to_string())
+            .join("git");
+        let fail = |code: &'static str, detail: String| {
+            tracing::warn!(lane = id, seq, code, "lane worktree is not ready");
+            Outcome::Failed { code, detail }
+        };
+        omp::private_dir(&git_dir).map_err(|e| fail(worktree::E_LANE_WORKTREE, e.to_string()))?;
+        let env = omp::check_env(&self.extra_env);
+        let opts = done::RunOpts {
+            out_dir: &git_dir,
+            env: &env,
+            timeout: worktree::GIT_TIMEOUT,
+        };
+        match worktree::ensure(
+            repo,
+            &folder,
+            id,
+            &opts,
+            |pid| self.track(pid, (id, seq), false),
+            |pid| self.untrack(pid),
+        ) {
+            Ok(()) => Ok(folder),
+            Err(WorktreeError::Failed { code, detail }) => Err(fail(code, detail)),
+            Err(WorktreeError::Stopped) => {
+                Err(fail(E_LANE_STOPPING, "the gateway is stopping".to_owned()))
+            }
+        }
+    }
+
+    /// The `lane_done` tool of one job: its handler checks `line` in `work_dir` and
+    /// records the claim.
     fn lane_done_tool(
         self: &Arc<Self>,
         job: &Job,
         line: &DoneLine,
         claim: &Arc<Mutex<Claim>>,
+        work_dir: &Path,
     ) -> HostTool {
         let (id, seq) = (job.id, job.seq);
         let check_dir = self
@@ -526,6 +649,10 @@ impl LaneManager {
                 "could not create the lane's check folder"
             );
         }
+        let dirs = CheckDirs {
+            work: work_dir.to_path_buf(),
+            out: check_dir,
+        };
         let manager = Arc::clone(self);
         let line = line.clone();
         let claim = Arc::clone(claim);
@@ -545,7 +672,7 @@ impl LaneManager {
                 "additionalProperties": false
             })),
             move |arguments, ctx| {
-                manager.lane_done(&arguments, ctx, (id, seq), &line, &check_dir, &claim)
+                manager.lane_done(&arguments, ctx, (id, seq), &line, &dirs, &claim)
             },
         )
         .load_mode(ToolLoadMode::Essential)
@@ -559,7 +686,7 @@ impl LaneManager {
         ctx: &HostToolContext,
         (id, seq): (i64, i64),
         line: &DoneLine,
-        check_dir: &std::path::Path,
+        dirs: &CheckDirs,
         claim: &Mutex<Claim>,
     ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
         let evidence = arguments
@@ -574,26 +701,12 @@ impl LaneManager {
         }
         let checks = done::run(
             line,
-            &self.config.work_dir,
-            check_dir,
+            &dirs.work,
+            &dirs.out,
             &omp::check_env(&self.extra_env),
             self.check_timeout,
-            |pid| {
-                let cancelled = ctx.is_cancelled();
-                let mut set = lock(&self.inner);
-                let current = set.children.get(&id).is_some_and(|child| child.seq == seq);
-                if set.stopping || cancelled || !current {
-                    return false;
-                }
-                set.checks.insert(pid, (id, seq));
-                self.pids.send_modify(|pids| pids.push(pid));
-                true
-            },
-            |pid| {
-                let mut set = lock(&self.inner);
-                set.checks.remove(&pid);
-                self.pids.send_modify(|pids| pids.retain(|p| *p != pid));
-            },
+            |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
+            |pid| self.untrack(pid),
         );
         let checks = match checks {
             Ok(checks) if !lock(&self.inner).stopping => checks,
@@ -633,13 +746,14 @@ impl LaneManager {
         job: &Job,
         pid: &mut Option<u32>,
     ) -> Result<LaneOutcome, Outcome> {
+        let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
         let session_dir = omp::lane_session_dir(&self.config, job.id);
         let command = omp::private_dir(&session_dir)
             .and_then(|()| {
                 omp::child_command(
                     &self.config,
-                    omp::omp_args(&self.config, &session_dir, ""),
+                    omp::omp_args(&self.config, &cwd, &session_dir, ""),
                     &omp::stderr_log_path(&self.config, &name),
                     &self.extra_env,
                 )
@@ -650,7 +764,7 @@ impl LaneManager {
             })?;
         let claim = Arc::new(Mutex::new(Claim::None));
         let tools = match &job.done {
-            Some(line) => vec![self.lane_done_tool(job, line, &claim)],
+            Some(line) => vec![self.lane_done_tool(job, line, &claim, &cwd)],
             None => Vec::new(),
         };
         let OpenedChild {

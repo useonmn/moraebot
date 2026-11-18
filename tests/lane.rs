@@ -4,7 +4,7 @@
 //! test ends with `shutdown_all`, which releases held lanes.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use moraebot::lane::{
 use moraebot::lead;
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
+use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REPO};
 use serde_json::{Value, json};
 
 const KEY: &str = "discord:th:111";
@@ -897,5 +898,297 @@ async fn lane_status_lists_done_line() {
     let listed: Value = serde_json::from_str(&status.1).expect("status json");
     assert_eq!(listed[0]["lane_id"], 1);
     assert_eq!(listed[0]["done"], "file marker");
+    bounded(omp.shutdown_all()).await;
+}
+
+const GIT_ENV: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+const GIT_REQUIRED: &str = "git is required for the lanes tests";
+
+/// The real `git --version` must run: a missing git fails the test, never skips it.
+fn require_git() {
+    let out = std::process::Command::new("git")
+        .arg("--version")
+        .envs(GIT_ENV)
+        .output()
+        .expect(GIT_REQUIRED);
+    assert!(out.status.success(), "{GIT_REQUIRED}");
+}
+
+/// Runs `git <args>` in `dir` with `GIT_ENV` and a fixed fake author; returns stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=qa", "-c", "user.email=qa@example.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .envs(GIT_ENV)
+        .output()
+        .expect(GIT_REQUIRED);
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).expect("utf-8 git output")
+}
+
+/// `<tmp>/qa-repo` (outside the work folder) with one commit of `tracked.txt`.
+fn qa_repo(h: &Harness) -> PathBuf {
+    let repo = h.dir.path().join("qa-repo");
+    std::fs::create_dir_all(&repo).expect("qa-repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("tracked.txt"), "x").expect("tracked.txt");
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    std::fs::canonicalize(&repo).expect("canonical qa-repo")
+}
+
+fn lane_start_repo(task: &str, done: &str, repo: Value) -> Value {
+    json!({
+        "tool": lane::LANE_START_TOOL,
+        "arguments": {"task": task, "done": done, "repo": repo}
+    })
+}
+
+fn cwd_arg(line: &str) -> String {
+    let argv = start_argv(line);
+    let at = argv.iter().position(|a| a == "--cwd").expect("--cwd");
+    argv[at + 1].clone()
+}
+
+fn lane_folder(h: &Harness, id: i64) -> PathBuf {
+    worktree::folder(&std::fs::canonicalize(&h.config.work_dir).unwrap(), id)
+}
+
+/// The `branch ` lines of `git worktree list --porcelain` in `repo`.
+fn worktree_branches(repo: &Path) -> Vec<String> {
+    git(repo, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter(|l| l.starts_with("branch "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `--cwd` of every lane child, in start order.
+fn lane_cwds(h: &Harness) -> Vec<String> {
+    let lines = h.log_lines();
+    h.lane_starts()
+        .iter()
+        .map(|n| cwd_arg(&lines[*n]))
+        .collect()
+}
+
+/// Waits until the store has `n` lanes that are not running.
+async fn wait_finished_lanes(h: &Harness, omp: &OmpManager, n: usize) {
+    loop {
+        let wake = omp.lane_wake();
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let finished = h
+            .store
+            .lock()
+            .unwrap()
+            .lanes()
+            .unwrap()
+            .iter()
+            .filter(|lane| lane.state != LaneState::Running)
+            .count();
+        if finished >= n {
+            return;
+        }
+        bounded(notified).await;
+    }
+}
+
+#[tokio::test]
+async fn lane_with_repo_works_in_its_own_worktree() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let omp = h
+        .manager(
+            "tools",
+            &[lane_start_repo(
+                "run-lane-tools t1",
+                "file tracked.txt",
+                json!(repo),
+            )],
+        )
+        .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(1))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(
+        lane_cwds(&h),
+        [lane_folder(&h, 1).to_string_lossy().into_owned()]
+    );
+    assert!(
+        worktree_branches(&repo).contains(&"branch refs/heads/moraebot/lane-1".to_owned()),
+        "{:?}",
+        worktree_branches(&repo)
+    );
+    let tag = result_tag(&h, 1);
+    assert!(tag.done, "{tag:?}");
+    assert_eq!(tag.failed, None);
+    assert_eq!(
+        h.lane(1).repo.as_deref(),
+        Some(repo.to_string_lossy().as_ref())
+    );
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn two_lanes_get_separate_worktrees() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let omp = h
+        .manager(
+            "ok",
+            &[
+                lane_start_repo("t1", "file .", json!(repo)),
+                lane_start_repo("t2", "file .", json!(repo)),
+            ],
+        )
+        .with_extra_env(GIT_ENV);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    wait_finished_lanes(&h, &omp, 2).await;
+    let mut cwds = lane_cwds(&h);
+    cwds.sort();
+    assert_eq!(
+        cwds,
+        [1, 2].map(|id| lane_folder(&h, id).to_string_lossy().into_owned())
+    );
+    let branches = worktree_branches(&repo);
+    for id in [1, 2] {
+        assert!(
+            branches.contains(&format!("branch refs/heads/moraebot/lane-{id}")),
+            "{branches:?}"
+        );
+    }
+    for id in [1, 2] {
+        assert_eq!(result_tag(&h, id).failed, None);
+    }
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_without_repo_keeps_the_shared_work_folder() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start("t1")]).with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(
+        lane_cwds(&h),
+        [h.config.work_dir.to_string_lossy().into_owned()]
+    );
+    assert_eq!(h.lane(1).repo, None);
+    assert!(!h.config.work_dir.join(worktree::LANES_DIR).exists());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_start_refuses_a_bad_repo() {
+    let h = Harness::new();
+    let omp = h
+        .manager(
+            "ok",
+            &[
+                lane_start_repo("t", "file .", json!("missing-dir")),
+                lane_start_repo("t", "file .", json!("")),
+                lane_start_repo("t", "file .", json!(5)),
+            ],
+        )
+        .with_extra_env(GIT_ENV);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let r = h.tool_results();
+    assert_eq!(r.len(), 3, "{r:?}");
+    assert_refused(&r[0], E_LANE_REPO);
+    assert_refused(&r[1], E_LANE_ARGS);
+    assert_refused(&r[2], E_LANE_ARGS);
+    assert!(h.store.lock().unwrap().lanes().unwrap().is_empty());
+    assert!(h.lane_starts().is_empty());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn repo_that_is_not_a_git_checkout_fails_the_lane() {
+    require_git();
+    let h = Harness::new();
+    let plain = h.dir.path().join("qa-plain");
+    std::fs::create_dir_all(&plain).expect("qa-plain");
+    let omp = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(plain))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(result_tag(&h, 1).failed.as_deref(), Some(E_LANE_REPO));
+    let lane = h.lane(1);
+    assert_eq!(lane.state, LaneState::Failed);
+    assert_eq!(lane.error.as_deref(), Some(E_LANE_REPO));
+    assert!(h.lane_starts().is_empty());
+    assert!(!lane_folder(&h, 1).exists());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn missing_git_fails_the_lane() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let nogit = h.dir.path().join("qa-nogit");
+    std::fs::create_dir_all(&nogit).expect("qa-nogit");
+    let omp = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV)
+        .with_extra_env([("PATH", nogit.to_string_lossy().into_owned())]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    assert_eq!(result_tag(&h, 1).failed.as_deref(), Some(E_LANE_GIT));
+    assert!(h.lane_starts().is_empty());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_message_reuses_the_lane_worktree() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let m1 = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+
+    let m2 = h
+        .manager(
+            "ok",
+            &[json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}})],
+        )
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m2, 2, "run-tools go").await;
+    let folder = lane_folder(&h, 1).to_string_lossy().into_owned();
+    assert_eq!(lane_cwds(&h), [folder.clone(), folder]);
+    assert_eq!(result_tag(&h, 2).failed, None);
+    let lane_branches = worktree_branches(&repo)
+        .into_iter()
+        .filter(|b| b == "branch refs/heads/moraebot/lane-1")
+        .count();
+    assert_eq!(lane_branches, 1);
+    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_status_lists_repo() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let omp = h
+        .manager(
+            "hang",
+            &[
+                lane_start_repo("t1", "file .", json!(repo)),
+                json!({"tool": lane::LANE_STATUS_TOOL, "arguments": {"lane_id": 1}}),
+            ],
+        )
+        .with_extra_env(GIT_ENV);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let results = h.tool_results();
+    let status = results
+        .iter()
+        .find(|(_, text)| text.starts_with('['))
+        .expect("lane_status result");
+    let listed: Value = serde_json::from_str(&status.1).expect("status json");
+    assert_eq!(listed[0]["repo"], json!(repo.to_string_lossy()));
     bounded(omp.shutdown_all()).await;
 }

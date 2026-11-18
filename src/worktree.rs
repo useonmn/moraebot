@@ -33,11 +33,9 @@ pub fn branch(lane_id: i64) -> String {
 
 /// Empty file written into a lane worktree's own git dir only after a complete `worktree add`:
 /// the stored fact that the folder is a finished worktree made by moraebot.
-#[cfg_attr(not(test), allow(dead_code))]
 const READY_MARKER: &str = "moraebot-ready";
 
 /// Why a lane's worktree is not ready.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum WorktreeError {
     /// A coded failure; `detail` is short and never logged with paths.
@@ -84,7 +82,6 @@ fn git_detail(ran: &Ran, opts: &RunOpts<'_>) -> String {
 /// existing path is only checked with read-only git, never changed or removed; a missing one
 /// is created with `git worktree add -b moraebot/lane-<id> <folder> HEAD` and marked ready.
 /// `started`/`ended` see every git pid as in [`done::run_command`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ensure(
     repo: &Path,
     folder: &Path,
@@ -215,7 +212,6 @@ pub(crate) fn ensure(
 
 /// Read-only check that `folder` is lane `lane_id`'s worktree of the checkout whose common git
 /// dir is `common` (and, with `need_marker`, a finished one); returns the worktree's git dir.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verify(
     folder: &Path,
     lane_id: i64,
