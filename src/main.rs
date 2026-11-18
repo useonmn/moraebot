@@ -11,6 +11,7 @@ use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
+use moraebot::onboarding;
 use moraebot::slack::SlackAdapter;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -32,6 +33,7 @@ Commands:
                                 Install the launchd agent (macOS)
   uninstall-launchd [--label LABEL]
                                 Remove the launchd agent
+  onboarding [--config PATH]    Greet and ask the first-meeting questions again at the next start
   --version, -V                 Print the version
 ";
 
@@ -58,6 +60,9 @@ enum Command {
     UninstallLaunchd {
         label: String,
     },
+    Onboarding {
+        config: Option<PathBuf>,
+    },
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -73,6 +78,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "guide" => parse_messenger(name, rest).map(|messenger| Command::Guide { messenger }),
         "install-launchd" => parse_install_launchd(rest),
         "uninstall-launchd" => parse_uninstall_launchd(rest),
+        "onboarding" => parse_config_flag(rest).map(|config| Command::Onboarding { config }),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -195,6 +201,26 @@ fn uninstall_launchd(env: &Env, label: &str) -> Result<ExitCode, ConfigError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Asks for the first meeting with the owner at the next gateway start by creating the request
+/// file. It never opens the store, so it works while a gateway holds it.
+fn onboarding_request(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigError> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    if let Err(e) = onboarding::request(&config.home) {
+        eprintln!("{}: {}", e.code, e.detail);
+        return Ok(ExitCode::FAILURE);
+    }
+    writeln!(
+        io::stdout().lock(),
+        "{}",
+        serde_json::json!({"onboarding": "requested"})
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Loads and validates the config, starts logging, then serves until a signal.
 fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = match config {
@@ -301,6 +327,7 @@ fn main() -> ExitCode {
             dry_run,
         } => install_launchd(&env, config, &label, dry_run),
         Command::UninstallLaunchd { label } => uninstall_launchd(&env, &label),
+        Command::Onboarding { config } => onboarding_request(&env, config),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -319,6 +346,16 @@ mod tests {
     #[test]
     fn parses_known_commands() {
         assert_eq!(parse_args(&args(&["init"])), Ok(Command::Init));
+        assert_eq!(
+            parse_args(&args(&["onboarding"])),
+            Ok(Command::Onboarding { config: None })
+        );
+        assert_eq!(
+            parse_args(&args(&["onboarding", "--config", "/x"])),
+            Ok(Command::Onboarding {
+                config: Some(PathBuf::from("/x"))
+            })
+        );
         assert_eq!(
             parse_args(&args(&["setup", "slack"])),
             Ok(Command::Setup {
@@ -392,6 +429,7 @@ mod tests {
             &["install-launchd", "--label"],
             &["install-launchd", "extra"],
             &["uninstall-launchd", "--dry-run"],
+            &["onboarding", "extra"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }

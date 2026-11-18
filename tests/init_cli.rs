@@ -80,6 +80,58 @@ fn piped_init_writes_valid_config_and_private_token() {
     );
 }
 
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+#[test]
+fn init_writes_the_onboarding_request() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("qa-mbhome");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+
+    let output = run_init(&home, &input);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).ends_with(moraebot::init::NEXT_STEPS));
+    assert_eq!(mode_of(&home.join("onboarding.request")), 0o600);
+}
+
+#[test]
+fn onboarding_command_writes_the_request() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("qa-mbhome");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+    let request = home.join("onboarding.request");
+    fs::remove_file(&request).expect("init left a request");
+
+    let output = moraebot(&home)
+        .arg("onboarding")
+        .output()
+        .expect("onboarding");
+    assert_eq!(output.status.code(), Some(0));
+    let printed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(printed, serde_json::json!({"onboarding": "requested"}));
+    assert_eq!(mode_of(&request), 0o600);
+    assert!(!home.join("inbox.sqlite").exists());
+}
+
+#[test]
+fn onboarding_command_without_config_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("qa-mbhome");
+    fs::create_dir(&home).expect("mkdir");
+    let output = moraebot(&home)
+        .arg("onboarding")
+        .output()
+        .expect("onboarding");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!home.join("onboarding.request").exists());
+}
+
 #[test]
 fn check_config_fails_on_loose_token_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
