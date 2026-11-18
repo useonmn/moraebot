@@ -302,6 +302,8 @@ pub struct LaneManager {
     events: watch::Sender<u64>,
     /// Count of recorded lane reports (tests wait on it).
     reports: watch::Sender<u64>,
+    /// The time of the last watchdog tick; the dispatcher posts lane news after each.
+    ticks: watch::Sender<Option<Instant>>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
 }
 
@@ -380,6 +382,7 @@ impl LaneManager {
             pids: watch::channel(Vec::new()).0,
             events: watch::channel(0).0,
             reports: watch::channel(0).0,
+            ticks: watch::channel(None).0,
             extra_env: Vec::new(),
         }
     }
@@ -404,6 +407,11 @@ impl LaneManager {
     /// Lane reports recorded since start; a test waits on it before it reads `news`.
     pub fn lane_reports(&self) -> watch::Receiver<u64> {
         self.reports.subscribe()
+    }
+
+    /// Changes after every watchdog tick, carrying that tick's time.
+    pub fn watch_ticks(&self) -> watch::Receiver<Option<Instant>> {
+        self.ticks.subscribe()
     }
 
     /// The newest report of each running job that was not posted for its lane yet, in lane id
@@ -520,7 +528,9 @@ impl LaneManager {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            self.watch_tick(tokio::time::Instant::now().into_std());
+            let now = tokio::time::Instant::now().into_std();
+            self.watch_tick(now);
+            self.ticks.send_replace(Some(now));
         }
     }
 
@@ -1902,5 +1912,26 @@ mod tests {
         assert_eq!(before, [1, 9]);
         assert_eq!(running, [1]);
         assert!(after);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_publishes_each_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let mut ticks = m.watch_ticks();
+        let task = tokio::spawn({
+            let m = Arc::clone(&m);
+            async move { m.watch().await }
+        });
+        let first_seen = tokio::time::timeout(2 * WATCH_TICK, ticks.changed()).await;
+        let first = ticks.borrow_and_update().expect("tick time");
+        let second_seen = tokio::time::timeout(2 * WATCH_TICK, ticks.changed()).await;
+        let second = ticks.borrow_and_update().expect("tick time");
+        task.abort();
+        let _ = task.await;
+
+        assert!(matches!(first_seen, Ok(Ok(()))));
+        assert!(matches!(second_seen, Ok(Ok(()))));
+        assert_eq!(second.duration_since(first), WATCH_TICK);
     }
 }

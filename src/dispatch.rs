@@ -43,9 +43,16 @@
 //!
 //! At startup, an onboarding request left by `moraebot init` or `moraebot onboarding` starts
 //! the first meeting and posts one fixed greeting in the configured channel.
+//!
+//! Lane news: after every lane watchdog tick, the newest unposted progress note of each
+//! running lane is posted as one new message per conversation that had no owner message,
+//! delivered reply or posted news for [`NEWS_AFTER`]; the lead is not involved. A failed
+//! send is tried again on the next tick.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -56,6 +63,7 @@ use crate::adapter::{
 };
 use crate::config::Config;
 use crate::files::{self, OutFile, SavedFile};
+use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
 use crate::omp::{E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST};
@@ -92,6 +100,9 @@ pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
 
 /// Longer replies are cut with a note.
 pub const MAX_REPLY_MESSAGES: usize = 10;
+
+/// A conversation must be this quiet before lane news is posted in it.
+pub const NEWS_AFTER: Duration = Duration::from_secs(20 * 60);
 
 /// The fixed English text of a notice code.
 pub fn notice_text(code: &str) -> &'static str {
@@ -160,6 +171,11 @@ pub fn reply_target(key: &str) -> Option<&str> {
         .or_else(|| key.split_once(":dm:"))
         .map(|(_, id)| id)
         .filter(|id| !id.is_empty())
+}
+
+/// One lane's line in a news message.
+pub fn news_line(lane_id: i64, text: &str) -> String {
+    format!("[lane {lane_id}] {text}")
 }
 
 /// Whether the row opened its own thread: its key is `<platform>:th:<its message id>`.
@@ -259,6 +275,14 @@ pub enum Handled {
     Steered(i64),
 }
 
+/// How often a conversation saw an owner message, a delivered reply or posted news, and
+/// the tick time that count was last seen to change.
+#[derive(Default)]
+struct Talk {
+    said: u64,
+    seen: Option<(u64, Instant)>,
+}
+
 pub struct Dispatcher {
     owner_id: String,
     adapter: Arc<dyn MessengerAdapter>,
@@ -276,6 +300,8 @@ pub struct Dispatcher {
     /// Rows whose reply send failed in this process; re-sent by [`Self::resend_pending`].
     pending: Mutex<Vec<i64>>,
     wake: Notify,
+    /// Talk per conversation key, for lane news.
+    talk: Mutex<HashMap<String, Talk>>,
 }
 
 impl Dispatcher {
@@ -297,6 +323,7 @@ impl Dispatcher {
             admission: tokio::sync::Mutex::new(()),
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
+            talk: Mutex::default(),
         }
     }
 
@@ -378,6 +405,10 @@ impl Dispatcher {
             let this = Arc::clone(&self);
             async move { this.omp.lanes().watch().await }
         });
+        let news = tokio::spawn({
+            let this = Arc::clone(&self);
+            async move { this.news_loop().await }
+        });
         while let Some(event) = inbound.recv().await {
             if let Err(err) = self.handle_event(event).await {
                 tracing::error!(code = err.code(), error = %err, "inbound event not handled");
@@ -385,8 +416,10 @@ impl Dispatcher {
         }
         worker.abort();
         watchdog.abort();
+        news.abort();
         let _ = worker.await;
         let _ = watchdog.await;
+        let _ = news.await;
         self.shutdown().await;
         Ok(())
     }
@@ -498,6 +531,7 @@ impl Dispatcher {
                 }
                 Admitted::New(id) => id,
             };
+            self.talked(key.as_str());
 
             if new_thread {
                 match self
@@ -814,6 +848,7 @@ impl Dispatcher {
                 }
             }
             self.store().mark_text_sent(id)?;
+            self.talked(&row.conversation_key);
         }
 
         let out_files: Vec<OutFile> = match row.out_files.as_deref().map(serde_json::from_str) {
@@ -967,6 +1002,104 @@ impl Dispatcher {
             }
         }
         Ok(())
+    }
+
+    /// Counts one owner message, delivered reply or posted news in `key`; no clock is read.
+    fn talked(&self, key: &str) {
+        self.talk
+            .lock()
+            .expect("talk lock")
+            .entry(key.to_owned())
+            .or_default()
+            .said += 1;
+    }
+
+    /// Conversations whose talk is tracked for lane news; quiet ones are dropped at each news
+    /// step.
+    pub fn talk_len(&self) -> usize {
+        self.talk.lock().expect("talk lock").len()
+    }
+
+    /// The lane manager, for lane news.
+    pub fn lanes(&self) -> &LaneManager {
+        self.omp.lanes()
+    }
+
+    /// One news step at tick time `now`: every conversation's quiet clock is updated, then
+    /// each conversation of `news` that is quiet for [`NEWS_AFTER`] gets one message with a
+    /// line per lane; the posted texts are marked. Returns the number of messages the
+    /// messenger accepted.
+    pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
+        let groups = {
+            let mut talk = self.talk.lock().expect("talk lock");
+            for t in talk.values_mut() {
+                if t.seen.is_none_or(|(count, _)| count != t.said) {
+                    t.seen = Some((t.said, now));
+                }
+            }
+            talk.retain(|key, t| {
+                news.iter().any(|n| n.conversation_key == *key)
+                    || t.seen
+                        .is_some_and(|(_, since)| now.saturating_duration_since(since) < NEWS_AFTER)
+            });
+            let mut groups: Vec<(String, Vec<LaneNews>)> = Vec::new();
+            for item in news {
+                match groups
+                    .iter_mut()
+                    .find(|(key, _)| *key == item.conversation_key)
+                {
+                    Some((_, lines)) => lines.push(item),
+                    None => groups.push((item.conversation_key.clone(), vec![item])),
+                }
+            }
+            groups.retain(|(key, _)| {
+                reply_target(key).is_some()
+                    && talk.get(key).is_none_or(|t| {
+                        t.seen.is_some_and(|(_, since)| {
+                            now.saturating_duration_since(since) >= NEWS_AFTER
+                        })
+                    })
+            });
+            groups
+        };
+
+        let mut sent = 0;
+        for (key, lines) in groups {
+            let Some(target) = reply_target(&key) else {
+                continue;
+            };
+            let text = lines
+                .iter()
+                .map(|n| news_line(n.lane_id, &n.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            match self.adapter.send(target, &text).await {
+                Ok(_) => {
+                    for n in &lines {
+                        self.lanes().news_posted(n.lane_id, &n.text);
+                    }
+                    self.talked(&key);
+                    sent += 1;
+                    let ids: Vec<i64> = lines.iter().map(|n| n.lane_id).collect();
+                    tracing::info!(lanes = ?ids, "lane news posted");
+                }
+                Err(err) => {
+                    tracing::warn!(code = err.code, "lane news send failed");
+                }
+            }
+        }
+        sent
+    }
+
+    /// Posts lane news after every lane watchdog tick until the task is aborted.
+    async fn news_loop(&self) {
+        let mut ticks = self.lanes().watch_ticks();
+        while ticks.changed().await.is_ok() {
+            let now = *ticks.borrow_and_update();
+            if let Some(now) = now {
+                self.post_news(self.lanes().news(), now).await;
+            }
+        }
     }
 
     /// Sends a fixed notice; returns whether the messenger accepted it.

@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use moraebot::access::{DropReason, E_ACCESS_NOT_OWNER};
@@ -16,10 +17,12 @@ use moraebot::dispatch::{
     N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_ONBOARDING_HELLO,
     N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
+use moraebot::dispatch::{NEWS_AFTER, news_line};
 use moraebot::files::{self, OutFile, SavedFile};
 use moraebot::gateway::Gateway;
 use moraebot::hints;
 use moraebot::lane::MAX_RUNNING_LANES;
+use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::onboarding;
@@ -28,6 +31,7 @@ use moraebot::store::{
 };
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -2542,4 +2546,258 @@ async fn finished_onboarding_marks_nothing() {
     assert_eq!(raw.len(), 1);
     assert_eq!(lead::parse_tag(&raw[0]).expect("tag").message, Some(1));
     h.close().await;
+}
+
+const NEWS_KEY: &str = "fake:th:444";
+
+/// Lane news items: (lane id, conversation key, text).
+fn news(items: &[(i64, &str, &str)]) -> Vec<LaneNews> {
+    items
+        .iter()
+        .map(|&(lane_id, key, text)| LaneNews {
+            lane_id,
+            conversation_key: key.to_owned(),
+            text: text.to_owned(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn lane_news_waits_for_a_quiet_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
+    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let mut posted = Vec::new();
+    for at in [
+        t0,
+        t0 + NEWS_AFTER - Duration::from_secs(1),
+        t0 + NEWS_AFTER,
+        t0 + NEWS_AFTER + WATCH_TICK,
+    ] {
+        posted.push(h.dispatcher.post_news(n.clone(), at).await);
+    }
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!(posted, [0, 0, 1, 0]);
+    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+}
+
+#[tokio::test]
+async fn lane_news_counts_quiet_time_before_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
+    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let a = h.dispatcher.post_news(Vec::new(), t0).await;
+    let b = h.dispatcher.post_news(n, t0 + NEWS_AFTER).await;
+    h.close().await;
+
+    assert_eq!([a, b], [0, 1]);
+}
+
+#[tokio::test]
+async fn lane_news_clock_restarts_on_owner_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
+    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let a = h.dispatcher.post_news(n.clone(), t0).await;
+    queued(h.handle(event("4442", OWNER, Some("444"), "more")).await);
+    let b = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    let c = h.dispatcher.post_news(n, t0 + 2 * NEWS_AFTER).await;
+    h.close().await;
+
+    assert_eq!([a, b, c], [0, 0, 1]);
+}
+
+#[tokio::test]
+async fn lane_news_clock_restarts_on_a_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    let started = h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane(
+            "call-1",
+            NEWS_KEY,
+            "t1",
+            Some("file ."),
+            None,
+            MAX_RUNNING_LANES,
+        )
+        .unwrap();
+    let input = lead::lane_result(NEWS_KEY, 1, &LaneResult::Text("r"));
+    let finished = h
+        .store
+        .lock()
+        .unwrap()
+        .finish_lane(1, 1, &input, LaneState::Idle, None)
+        .unwrap();
+    let stepped = h.step().await;
+    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let a = h.dispatcher.post_news(n.clone(), t0).await;
+    let b = h.dispatcher.post_news(n, t0 + NEWS_AFTER).await;
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!(started, LaneStart::New(1));
+    assert!(finished);
+    assert!(stepped);
+    assert_eq!([a, b], [0, 1]);
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0].0, "444");
+    assert!(sends[0].1.starts_with("echo: "));
+    assert_eq!(sends[1], ("444".to_owned(), news_line(1, "qa step 1")));
+}
+
+#[tokio::test]
+async fn lane_news_combines_lanes_of_one_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    let n = news(&[
+        (1, NEWS_KEY, "a1"),
+        (2, "fake:th:555", "b1"),
+        (3, NEWS_KEY, "a3"),
+    ]);
+    let posted = h.dispatcher.post_news(n, t0).await;
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!(posted, 2);
+    assert_eq!(
+        sends,
+        [
+            (
+                "444".to_owned(),
+                format!("{}\n{}", news_line(1, "a1"), news_line(3, "a3"))
+            ),
+            ("555".to_owned(), news_line(2, "b1")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lane_news_failed_send_is_retried_next_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
+    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let a = h.dispatcher.post_news(n.clone(), t0).await;
+    h.adapter.fail_next_send();
+    let b = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    let c = h
+        .dispatcher
+        .post_news(n, t0 + NEWS_AFTER + WATCH_TICK)
+        .await;
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!([a, b, c], [0, 0, 1]);
+    let line = ("444".to_owned(), news_line(1, "qa step 1"));
+    assert_eq!(sends, [line.clone(), line]);
+}
+
+#[tokio::test]
+async fn lane_news_skips_a_key_without_a_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    let n = news(&[(1, "fake:zz:1", "x")]);
+    let a = h.dispatcher.post_news(n.clone(), t0).await;
+    let b = h.dispatcher.post_news(n, t0 + NEWS_AFTER).await;
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!([a, b], [0, 0]);
+    assert!(sends.is_empty());
+}
+
+#[tokio::test]
+async fn lane_news_posts_a_running_lane_report_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::build(
+        dir.path(),
+        "tools",
+        PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+        false,
+        vec![
+            (
+                "FAKE_OMP_TOOL_CALLS",
+                json!({"tool": "lane_start", "arguments": {"task": "run-lane-tools t1", "done": "file ."}})
+                    .to_string(),
+            ),
+            ("FAKE_OMP_LANE_MODE", "tools".into()),
+            (
+                "FAKE_OMP_LANE_TOOL_CALLS",
+                json!({"tool": LANE_REPORT_TOOL, "arguments": {"text": "qa step 1"}}).to_string(),
+            ),
+            ("FAKE_OMP_LANE_HOLD_AFTER_TOOLS", "1".into()),
+        ],
+    );
+    let t0 = Instant::now();
+    queued(
+        h.handle(event("4441", OWNER, Some("444"), "run-tools go"))
+            .await,
+    );
+    let stepped = h.step().await;
+    let reported = bounded(h.dispatcher.lanes().lane_reports().wait_for(|n| *n >= 1))
+        .await
+        .is_ok();
+    let a = h
+        .dispatcher
+        .post_news(h.dispatcher.lanes().news(), t0)
+        .await;
+    let b = h
+        .dispatcher
+        .post_news(h.dispatcher.lanes().news(), t0 + NEWS_AFTER)
+        .await;
+    let left = h.dispatcher.lanes().news();
+    let sends = h.sends();
+    bounded(h.dispatcher.shutdown()).await;
+
+    let line = ("444".to_owned(), news_line(1, "qa step 1"));
+    assert!(stepped);
+    assert!(reported);
+    assert_eq!([a, b], [0, 1]);
+    assert!(left.is_empty());
+    assert_eq!(sends.last(), Some(&line));
+    assert_eq!(sends.iter().filter(|s| **s == line).count(), 1);
+}
+
+#[tokio::test]
+async fn lane_news_forgets_quiet_conversations() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let t0 = Instant::now();
+    queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
+    queued(h.handle(event("4442", OWNER, Some("555"), "hi")).await);
+    let d = &h.dispatcher;
+    let a = d.talk_len();
+    let p1 = d.post_news(Vec::new(), t0).await;
+    let b = d.talk_len();
+    let p2 = d
+        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0 + NEWS_AFTER)
+        .await;
+    let c = d.talk_len();
+    let p3 = d.post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK).await;
+    let dd = d.talk_len();
+    let p4 = d
+        .post_news(Vec::new(), t0 + 2 * NEWS_AFTER + WATCH_TICK)
+        .await;
+    let e = d.talk_len();
+    let sends = h.sends();
+    h.close().await;
+
+    assert_eq!([a, b, c, dd, e], [2, 2, 1, 1, 0]);
+    assert_eq!([p1, p2, p3, p4], [0, 1, 0, 0]);
+    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
 }
