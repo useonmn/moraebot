@@ -1,9 +1,12 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const ASSET: &str = "moraebot-aarch64-apple-darwin.tar.gz";
+const LINUX_X86: &str = "moraebot-x86_64-unknown-linux-gnu.tar.gz";
+const LINUX_ARM: &str = "moraebot-aarch64-unknown-linux-gnu.tar.gz";
 
 fn fake_moraebot(version_line: &str, version_exit: i32) -> Vec<u8> {
     format!(
@@ -18,29 +21,78 @@ fn run_ok(cmd: &mut Command) -> Output {
     output
 }
 
+/// Writes `body` to `path` (mode 755) from a child process, so this test process never holds
+/// a write handle to a file that is executed later (ETXTBSY on Linux).
+fn write_script(path: &Path, body: &str) {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn write_script");
+    child
+        .stdin
+        .take()
+        .expect("write_script stdin")
+        .write_all(body.as_bytes())
+        .expect("write script body");
+    let status = child.wait().expect("wait write_script");
+    assert!(
+        status.success(),
+        "write_script failed for {}",
+        path.display()
+    );
+}
+
 fn publish_release(dir: &Path, binary: &[u8]) {
+    publish_assets(dir, &[(ASSET, binary)]);
+}
+
+/// Writes each archive (holding `moraebot` = the bytes) and one `SHA256SUMS.txt` for all of them.
+fn publish_assets(dir: &Path, assets: &[(&str, &[u8])]) {
     fs::create_dir_all(dir).expect("create release dir");
     let stage = dir.join("stage");
-    fs::create_dir_all(&stage).expect("create stage dir");
-    let exe = stage.join("moraebot");
-    fs::write(&exe, binary).expect("write fake moraebot");
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod fake");
-    run_ok(
-        Command::new("tar")
-            .env("COPYFILE_DISABLE", "1")
-            .arg("-czf")
-            .arg(dir.join(ASSET))
-            .arg("-C")
-            .arg(&stage)
-            .arg("moraebot"),
-    );
-    fs::remove_dir_all(&stage).expect("remove stage dir");
+    for (name, binary) in assets {
+        fs::create_dir_all(&stage).expect("create stage dir");
+        let exe = stage.join("moraebot");
+        fs::write(&exe, binary).expect("write fake moraebot");
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod fake");
+        run_ok(
+            Command::new("tar")
+                .env("COPYFILE_DISABLE", "1")
+                .arg("-czf")
+                .arg(dir.join(name))
+                .arg("-C")
+                .arg(&stage)
+                .arg("moraebot"),
+        );
+        fs::remove_dir_all(&stage).expect("remove stage dir");
+    }
     let sums = run_ok(
         Command::new("shasum")
-            .args(["-a", "256", ASSET])
+            .args(["-a", "256"])
+            .args(assets.iter().map(|(name, _)| *name))
             .current_dir(dir),
     );
     fs::write(dir.join("SHA256SUMS.txt"), sums.stdout).expect("write sums");
+}
+
+/// Publishes the darwin, Linux x86_64 and Linux aarch64 fakes to `latest`; returns them in that order.
+fn publish_all(sb: &Sandbox) -> [Vec<u8>; 3] {
+    let fakes = [
+        fake_moraebot("moraebot 1.0.0", 0),
+        fake_moraebot("moraebot 1.0.1", 0),
+        fake_moraebot("moraebot 1.0.2", 0),
+    ];
+    publish_assets(
+        &sb.latest(),
+        &[
+            (ASSET, &fakes[0]),
+            (LINUX_X86, &fakes[1]),
+            (LINUX_ARM, &fakes[2]),
+        ],
+    );
+    fakes
 }
 
 struct Sandbox {
@@ -51,7 +103,39 @@ impl Sandbox {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(tmp.path().join("user")).expect("create user dir");
-        Self { tmp }
+        fs::create_dir_all(tmp.path().join("shims")).expect("create shims dir");
+        let sb = Self { tmp };
+        sb.platform("Darwin", "arm64", "1");
+        sb
+    }
+
+    fn shims(&self) -> PathBuf {
+        self.root().join("shims")
+    }
+
+    /// Makes install.sh see `uname -s` = `os`, `uname -m` = `machine` and
+    /// `sysctl -n hw.optional.arm64` = `arm64`.
+    fn platform(&self, os: &str, machine: &str, arm64: &str) {
+        write_script(
+            &self.shims().join("uname"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in -s) echo {os} ;; -m) echo {machine} ;; *) echo {os} ;; esac\n"
+            ),
+        );
+        write_script(
+            &self.shims().join("sysctl"),
+            &format!("#!/bin/sh\necho {arm64}\n"),
+        );
+        if os == "Linux" {
+            write_script(
+                &self.shims().join("sha256sum"),
+                "#!/bin/sh\nexec shasum -a 256 \"$@\"\n",
+            );
+        }
+    }
+
+    fn path(&self) -> String {
+        format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.shims().display())
     }
 
     fn root(&self) -> &Path {
@@ -87,7 +171,7 @@ impl Sandbox {
         cmd.arg(script)
             .env_clear()
             .env("HOME", self.root().join("user"))
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("PATH", self.path())
             .env(
                 "MORAEBOT_DOWNLOAD_BASE",
                 format!("file://{}", self.root().join("release").display()),
@@ -188,10 +272,7 @@ fn next_steps_use_the_bare_name_on_path() {
     let output = sb
         .command(None)
         .env("MORAEBOT_INSTALL_DIR", sb.bin_dir())
-        .env(
-            "PATH",
-            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", sb.bin_dir().display()),
-        )
+        .env("PATH", format!("{}:{}", sb.bin_dir().display(), sb.path()))
         .output()
         .expect("run install.sh");
 
@@ -311,4 +392,169 @@ fn default_install_dir_is_user_local_bin() {
     let installed = sb.root().join("user/.local/bin/moraebot");
     assert_eq!(fs::read(installed).expect("read installed"), fake);
     assert!(!sb.installed().exists());
+}
+
+#[test]
+fn linux_picks_the_asset_for_its_arch() {
+    for (machine, index) in [("x86_64", 1), ("amd64", 1), ("aarch64", 2), ("arm64", 2)] {
+        let sb = Sandbox::new();
+        let fakes = publish_all(&sb);
+        sb.platform("Linux", machine, "0");
+
+        let output = sb.install(None);
+
+        assert_eq!(exit_code(&output), Some(0), "{machine}: {output:?}");
+        assert_eq!(
+            fs::read(sb.installed()).expect("read installed"),
+            fakes[index],
+            "{machine}"
+        );
+    }
+}
+
+#[test]
+fn darwin_ignores_uname_m() {
+    let sb = Sandbox::new();
+    sb.platform("Darwin", "x86_64", "1");
+    let fakes = publish_all(&sb);
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), fakes[0]);
+}
+
+#[test]
+fn unsupported_platforms_are_refused() {
+    for (os, machine, arm64) in [
+        ("Linux", "i686", "1"),
+        ("Linux", "armv7l", "1"),
+        ("FreeBSD", "amd64", "1"),
+        ("Darwin", "arm64", "0"),
+        ("Darwin", "x86_64", "0"),
+    ] {
+        let sb = Sandbox::new();
+        publish_all(&sb);
+        sb.platform(os, machine, arm64);
+
+        let output = sb.install(None);
+
+        let case = format!("{os} {machine} {arm64}");
+        assert_eq!(exit_code(&output), Some(1), "{case}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .starts_with("moraebot install error: E_PLATFORM:"),
+            "{case}: {output:?}"
+        );
+        assert!(!sb.installed().exists(), "{case}");
+    }
+}
+
+fn marker_sha256sum(sb: &Sandbox) -> PathBuf {
+    let marker = sb.root().join("sha256sum-used");
+    write_script(
+        &sb.shims().join("sha256sum"),
+        &format!(
+            "#!/bin/sh\ntouch '{}'\nexec shasum -a 256 \"$@\"\n",
+            marker.display()
+        ),
+    );
+    marker
+}
+
+#[test]
+fn linux_checks_with_sha256sum() {
+    let sb = Sandbox::new();
+    sb.platform("Linux", "x86_64", "0");
+    let marker = marker_sha256sum(&sb);
+    publish_all(&sb);
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert!(marker.exists());
+}
+
+#[test]
+fn darwin_checks_with_shasum() {
+    let sb = Sandbox::new();
+    let marker = marker_sha256sum(&sb);
+    publish_all(&sb);
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn linux_bad_checksum_keeps_old_binary() {
+    let sb = Sandbox::new();
+    sb.platform("Linux", "x86_64", "0");
+    let old = fake_moraebot("moraebot 0.9.0", 0);
+    sb.put_existing(&old);
+    publish_all(&sb);
+    fs::write(
+        sb.latest().join("SHA256SUMS.txt"),
+        format!("{}  {LINUX_X86}\n", "0".repeat(64)),
+    )
+    .expect("corrupt sums");
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("moraebot install error: E_CHECKSUM:"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), old);
+    assert!(sb.leftover_temp_files().is_empty());
+
+    // Reach: the same tool accepts the correct sums, so the refusal was a real mismatch.
+    let fakes = publish_all(&sb);
+    let output = sb.install(None);
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), fakes[1]);
+}
+
+#[test]
+fn linux_next_steps_name_install_systemd() {
+    let sb = Sandbox::new();
+    sb.platform("Linux", "x86_64", "0");
+    publish_all(&sb);
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    let cmd = sb.installed().display().to_string();
+    assert_eq!(
+        next_step_lines(&output, &cmd),
+        [
+            format!("  {cmd} init"),
+            format!("  {cmd} check-config"),
+            format!("  {cmd} install-systemd"),
+        ]
+    );
+}
+
+#[test]
+fn background_copy_hint_names_the_platform_service() {
+    for (os, machine, arm64, service) in [
+        ("Darwin", "arm64", "1", "install-launchd"),
+        ("Linux", "x86_64", "0", "install-systemd"),
+    ] {
+        let sb = Sandbox::new();
+        publish_all(&sb);
+        sb.platform(os, machine, arm64);
+        let home = sb.root().join("user/.moraebot");
+        fs::create_dir_all(home.join("bin")).expect("create background bin");
+        fs::write(home.join("bin/moraebot"), "").expect("write background copy");
+        fs::write(home.join("config.toml"), "").expect("write config");
+
+        let output = sb.install(None);
+
+        assert_eq!(exit_code(&output), Some(0), "{os}: {output:?}");
+        let hint = format!("A background copy exists: run \"moraebot {service}\" to update it.");
+        assert!(stdout_lines(&output).contains(&hint), "{os}: {output:?}");
+    }
 }

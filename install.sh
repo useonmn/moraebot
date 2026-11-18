@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install or upgrade moraebot from a GitHub release.
+# Install or upgrade moraebot from a GitHub release (Apple Silicon macOS, Linux x86_64 or aarch64).
 #
 #   curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
 #
@@ -10,9 +10,8 @@
 # Exit codes: 0 installed, 1 any failure (nothing is replaced on failure).
 set -eu
 
-TARGET="aarch64-apple-darwin"
-ASSET="moraebot-$TARGET.tar.gz"
 SUMS="SHA256SUMS.txt"
+PLATFORMS="supported: Apple Silicon macOS, Linux x86_64 or aarch64 with glibc"
 
 E_VERSION="E_VERSION"
 E_PLATFORM="E_PLATFORM"
@@ -47,6 +46,34 @@ download() {
         fail "$E_DOWNLOAD" "could not download $1"
 }
 
+# Sets TARGET, ASSET, SHA256 and SERVICE for this machine, or fails with E_PLATFORM.
+detect_platform() {
+    case "$(uname -s)" in
+        Darwin)
+            [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ] ||
+                fail "$E_PLATFORM" "$PLATFORMS"
+            TARGET="aarch64-apple-darwin"
+            SHA256="shasum -a 256"
+            SERVICE="install-launchd"
+            ;;
+        Linux)
+            case "$(uname -m)" in
+                x86_64 | amd64) TARGET="x86_64-unknown-linux-gnu" ;;
+                aarch64 | arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+                *) fail "$E_PLATFORM" "$PLATFORMS" ;;
+            esac
+            if command -v sha256sum >/dev/null 2>&1; then
+                SHA256="sha256sum"
+            else
+                SHA256="shasum -a 256"
+            fi
+            SERVICE="install-systemd"
+            ;;
+        *) fail "$E_PLATFORM" "$PLATFORMS" ;;
+    esac
+    ASSET="moraebot-$TARGET.tar.gz"
+}
+
 main() {
     version="${MORAEBOT_VERSION:-latest}"
     install_dir="${MORAEBOT_INSTALL_DIR:-$HOME/.local/bin}"
@@ -63,12 +90,9 @@ main() {
         url="$base/download/$version"
     fi
 
-    if [ "$(uname -s)" != "Darwin" ] ||
-        [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" != "1" ]; then
-        fail "$E_PLATFORM" "only Apple Silicon macOS ($TARGET) is supported"
-    fi
+    detect_platform
 
-    for tool in curl tar shasum; do
+    for tool in curl tar "${SHA256%% *}"; do
         command -v "$tool" >/dev/null 2>&1 || fail "$E_MISSING_TOOL" "$tool is required"
     done
 
@@ -83,7 +107,7 @@ main() {
 
     line="$(grep "  $ASSET\$" "$tmp/$SUMS")" ||
         fail "$E_CHECKSUM" "$SUMS has no entry for $ASSET"
-    (cd "$tmp" && printf '%s\n' "$line" | shasum -a 256 -c >/dev/null 2>&1) ||
+    (cd "$tmp" && printf '%s\n' "$line" | $SHA256 -c >/dev/null 2>&1) ||
         fail "$E_CHECKSUM" "checksum mismatch for $ASSET; nothing was installed"
 
     tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot ||
@@ -115,12 +139,12 @@ main() {
     esac
 
     if [ -e "${MORAEBOT_HOME:-$HOME/.moraebot}/bin/moraebot" ]; then
-        printf 'A background copy exists: run "moraebot install-launchd" to update it.\n'
+        printf 'A background copy exists: run "moraebot %s" to update it.\n' "$SERVICE"
     fi
 
     if [ ! -e "${MORAEBOT_HOME:-$HOME/.moraebot}/config.toml" ]; then
-        printf 'Next steps:\n  %s init\n  %s check-config\n  %s install-launchd\nThen send the bot a message in its channel or a DM.\n' \
-            "$cmd" "$cmd" "$cmd"
+        printf 'Next steps:\n  %s init\n  %s check-config\n  %s %s\nThen send the bot a message in its channel or a DM.\n' \
+            "$cmd" "$cmd" "$cmd" "$SERVICE"
     fi
 }
 
