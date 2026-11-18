@@ -200,6 +200,40 @@ pub enum LaneMessage {
     Limit,
 }
 
+/// Where the first meeting with the owner stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingState {
+    Active,
+    Done,
+    Skipped,
+}
+
+impl OnboardingState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "done" => Some(Self::Done),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+/// The onboarding row: its state and the newest inbox row id when it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardingRow {
+    pub state: OnboardingState,
+    pub after_row: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -257,6 +291,13 @@ CREATE TABLE IF NOT EXISTS lanes(
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     done TEXT
+);
+CREATE TABLE IF NOT EXISTS onboarding(
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    state TEXT NOT NULL CHECK(state IN ('active','done','skipped')),
+    after_row INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT
 );
 ";
 
@@ -1086,6 +1127,71 @@ impl Store {
             )
             .optional()?
             .is_some())
+    }
+
+    /// The onboarding row, `None` before the first request.
+    pub fn onboarding(&self) -> Result<Option<OnboardingRow>, StoreError> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT state, after_row FROM onboarding WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(state, after_row)| {
+            OnboardingState::parse(&state)
+                .map(|state| OnboardingRow { state, after_row })
+                .ok_or(StoreError::Invalid("unknown onboarding state"))
+        })
+        .transpose()
+    }
+
+    /// Starts (or restarts) the onboarding after the newest inbox row; returns that row id
+    /// (0 for an empty inbox).
+    pub fn start_onboarding(&self) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            &format!(
+                "INSERT INTO onboarding(id, state, after_row, started_at, ended_at)
+                 VALUES (1, 'active', COALESCE((SELECT MAX(id) FROM inbox), 0), {NOW}, NULL)
+                 ON CONFLICT(id) DO UPDATE SET state = 'active', after_row = excluded.after_row,
+                   started_at = excluded.started_at, ended_at = NULL
+                 RETURNING after_row"
+            ),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Ends a running onboarding as `end` (`Done` or `Skipped`): false when none is running.
+    pub fn finish_onboarding(&self, end: OnboardingState) -> Result<bool, StoreError> {
+        if end == OnboardingState::Active {
+            return Err(StoreError::Invalid("onboarding ends as done or skipped"));
+        }
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE onboarding SET state = ?1, ended_at = {NOW} WHERE id = 1 AND state = 'active'"
+            ),
+            [end.as_str()],
+        )? == 1)
+    }
+
+    /// The owner turn number of `turn_row` in a running onboarding: owner rows after its
+    /// start up to and including `turn_row` that were neither steered into another row nor
+    /// left queued or failed. `None` unless an onboarding is running.
+    pub fn onboarding_turn(&self, turn_row: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM inbox
+                         WHERE origin = 'owner' AND steered_into IS NULL
+                           AND state NOT IN ('queued', 'failed')
+                           AND id > onboarding.after_row AND id <= ?1)
+                 FROM onboarding WHERE id = 1 AND state = 'active'",
+                [turn_row],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 }
 
@@ -2210,5 +2316,111 @@ mod tests {
             s.set_lane_session_id(a + 100, "x").unwrap_err().code(),
             E_STORE_INVALID
         );
+    }
+
+    fn onboarding_rows(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM onboarding", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn onboarding_row(state: OnboardingState, after_row: i64) -> Option<OnboardingRow> {
+        Some(OnboardingRow { state, after_row })
+    }
+
+    #[test]
+    fn onboarding_starts_restarts_and_finishes() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(s.onboarding().unwrap(), None);
+        assert_eq!(onboarding_rows(&s), 0);
+        assert_eq!(s.start_onboarding().unwrap(), 0);
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 0));
+        assert_eq!(onboarding_rows(&s), 1);
+        assert!(s.finish_onboarding(OnboardingState::Done).unwrap());
+        assert!(!s.finish_onboarding(OnboardingState::Done).unwrap());
+        assert!(!s.finish_onboarding(OnboardingState::Skipped).unwrap());
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Done, 0));
+        assert_eq!(onboarding_rows(&s), 1);
+
+        assert_eq!(new_id(admit(&mut s, "m1", K1)), 1);
+        assert_eq!(s.start_onboarding().unwrap(), 1);
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 1));
+        assert_eq!(onboarding_rows(&s), 1);
+        assert!(s.finish_onboarding(OnboardingState::Skipped).unwrap());
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Skipped, 1));
+        assert_eq!(
+            s.finish_onboarding(OnboardingState::Active).unwrap_err().code(),
+            E_STORE_INVALID
+        );
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Skipped, 1));
+        assert_eq!(onboarding_rows(&s), 1);
+    }
+
+    #[test]
+    fn onboarding_turn_counts_owner_turns_after_the_start() {
+        let (_d, _p, mut s) = open_tmp();
+        assert_eq!(s.onboarding_turn(1).unwrap(), None);
+        let r1 = claimed(&mut s, "m1", K1);
+        assert_eq!(s.start_onboarding().unwrap(), r1);
+        let r2 = claimed(&mut s, "m2", K1);
+        let r3 = claimed(&mut s, "m3", K1);
+        let queued = new_id(admit(&mut s, "m4", K2));
+        let failed = claimed(&mut s, "m5", K2);
+        s.mark(failed, State::Failed, Some("E_TEST")).unwrap();
+        let steered = new_id(admit(&mut s, "m6", K1));
+        assert!(s.steer_into(steered, r3).unwrap());
+        let lane = new_lane(&mut s, "call-1", K1);
+        assert!(
+            s.finish_lane(lane, 1, "lane result", LaneState::Idle, None)
+                .unwrap()
+        );
+        let lane_row: i64 = s
+            .conn
+            .query_row("SELECT id FROM inbox WHERE origin = 'lane'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let r8 = claimed(&mut s, "m8", K1);
+        assert_eq!(
+            [r1, r2, r3, queued, failed, steered, lane_row, r8],
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(state_of(&s, queued).0, State::Queued);
+
+        assert_eq!(s.onboarding_turn(r3).unwrap(), Some(2));
+        assert_eq!(s.onboarding_turn(r8).unwrap(), Some(3));
+        assert_eq!(s.onboarding_turn(r1).unwrap(), Some(0));
+        assert!(s.finish_onboarding(OnboardingState::Done).unwrap());
+        assert_eq!(s.onboarding_turn(r8).unwrap(), None);
+    }
+
+    #[test]
+    fn old_database_gets_the_onboarding_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        assert!(!tables(&conn).contains(&"onboarding".to_string()));
+        drop(conn);
+        let s = Store::open(&path).unwrap();
+        assert!(tables(&s.conn).contains(&"onboarding".to_string()));
+        assert_eq!(s.start_onboarding().unwrap(), 0);
+        assert_eq!(s.onboarding().unwrap(), onboarding_row(OnboardingState::Active, 0));
+    }
+
+    #[test]
+    fn onboarding_state_is_checked() {
+        let (_d, _p, s) = open_tmp();
+        assert!(
+            s.conn
+                .execute("INSERT INTO onboarding VALUES (1, 'later', 0, 'x', NULL)", [])
+                .is_err()
+        );
+        assert!(
+            s.conn
+                .execute("INSERT INTO onboarding VALUES (2, 'active', 0, 'x', NULL)", [])
+                .is_err()
+        );
+        assert_eq!(onboarding_rows(&s), 0);
     }
 }
