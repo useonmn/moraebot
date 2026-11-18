@@ -1960,3 +1960,57 @@ async fn lane_stop_kills_a_running_check() {
     assert_eq!(tag.failed.as_deref(), Some(E_LANE_STOPPED));
     assert_eq!(lane.state, LaneState::Failed);
 }
+
+fn stop_call(lane_id: Value, reason: &str) -> Value {
+    json!({"tool": lane::LANE_STOP_TOOL, "arguments": {"lane_id": lane_id, "reason": reason}})
+}
+
+#[tokio::test]
+async fn lane_stop_tool_stops_a_lane_through_the_lead() {
+    let h = Harness::new();
+    let call = |args: Value| json!({"tool": lane::LANE_STOP_TOOL, "arguments": args});
+    let omp = h.manager(
+        "hold_open",
+        &[
+            lane_start("t1"),
+            stop_call(json!(1), "qa"),
+            call(json!({"reason": "x"})),
+            stop_call(json!(1), "  "),
+            stop_call(json!("a"), "x"),
+            stop_call(json!(99), "x"),
+        ],
+    );
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(notified).await;
+    await_no_running_pids(&omp).await;
+    let r = h.tool_results();
+    let row = queued_row(&h, 1);
+    let lane = h.lane(1);
+    let alive: Vec<bool> = (0..h.lane_starts().len())
+        .map(|n| process_exists(h.lane_pid(n)))
+        .collect();
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(r.len(), 6, "{r:?}");
+    assert!(!r[0].0, "{r:?}");
+    assert_eq!(started_id(&r[0].1), 1);
+    assert!(!r[1].0, "{r:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&r[1].1).expect("json"),
+        json!({"lane_id": 1, "stopping": true})
+    );
+    for result in &r[2..=4] {
+        assert_refused(result, E_LANE_ARGS);
+    }
+    assert_refused(&r[5], E_LANE_UNKNOWN);
+    assert_eq!(
+        row.text,
+        lead::lane_result(KEY, 1, &LaneResult::Stopped { reason: "qa" })
+    );
+    assert_eq!(lane.state, LaneState::Failed);
+    assert!(alive.iter().all(|a| !a), "{alive:?}");
+}

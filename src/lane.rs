@@ -43,7 +43,7 @@
 //! not yet posted for their lane; the dispatcher posts them while the lane's conversation is
 //! quiet and calls `news_posted`. Reports live in memory only.
 //!
-//! The lead stops a running job through `stop`: the job is marked stopped, its child's process
+//! The lead stops a running job with the host tool `lane_stop` (`stop`): the job is marked stopped, its child's process
 //! group and the checks it started are killed the way `shutdown_all` kills them, and from then
 //! on the job starts no child and no check. The worker then stores a `failed
 //! code=E_LANE_STOPPED` result and the lane is `failed`, open for `lane_message`. A job that
@@ -91,6 +91,8 @@ pub const LANE_MESSAGE_TOOL: &str = "lane_message";
 pub const LANE_STATUS_TOOL: &str = "lane_status";
 /// Host tool that closes a lane the lead decided is finished.
 pub const LANE_CLOSE_TOOL: &str = "lane_close";
+/// Host tool that stops a running lane's current turn.
+pub const LANE_STOP_TOOL: &str = "lane_stop";
 /// Host tool a lane calls to leave a one-line progress note.
 pub const LANE_REPORT_TOOL: &str = "lane_report";
 
@@ -650,12 +652,13 @@ impl LaneManager {
         }
     }
 
-    /// The four lane tools for the lead child.
+    /// The five lane tools for the lead child.
     pub fn host_tools(self: &Arc<Self>) -> Vec<HostTool> {
         let start = Arc::clone(self);
         let message = Arc::clone(self);
         let status = Arc::clone(self);
         let close = Arc::clone(self);
+        let stop = Arc::clone(self);
         vec![
             HostTool::new(
                 LANE_START_TOOL,
@@ -731,6 +734,25 @@ impl LaneManager {
                     "additionalProperties": false
                 })),
                 move |arguments, ctx| close.lane_close(&arguments, ctx),
+            )
+            .load_mode(ToolLoadMode::Essential),
+            HostTool::new(
+                LANE_STOP_TOOL,
+                "Stop a running lane's current turn at once: moraebot ends the lane's agent; files it \
+                 already wrote stay, work in progress may be lost. Returns at once; the lane's result \
+                 comes back to you later as failed code=E_LANE_STOPPED. The lane stays open: give it \
+                 more work with lane_message after that result, or close it with lane_close. A lane \
+                 that is not running refuses.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "lane_id": {"type": "integer"},
+                        "reason": {"type": "string", "description": "Why the lane is stopped, in a few words."}
+                    },
+                    "required": ["lane_id", "reason"],
+                    "additionalProperties": false
+                })),
+                move |arguments, _| stop.lane_stop(&arguments),
             )
             .load_mode(ToolLoadMode::Essential),
         ]
@@ -1132,6 +1154,33 @@ impl LaneManager {
             result["detail"] = json!(detail);
         }
         Ok(result.to_string().into())
+    }
+
+    /// Handles one `lane_stop` call: checks the arguments and calls `stop`; never waits.
+    fn lane_stop(
+        &self,
+        arguments: &Map<String, Value>,
+    ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        let id = arguments
+            .get("lane_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| refused(E_LANE_ARGS, "lane_id must be an integer"))?;
+        let reason = arguments
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused(E_LANE_ARGS, "reason must be a non-empty string"))?;
+        self.stop(id, reason).map_err(|code| {
+            let why = match code {
+                E_LANE_ARGS => "reason must be a non-empty string",
+                E_LANE_STOPPING => "the gateway is stopping",
+                E_LANE_UNKNOWN => "no lane has this id",
+                E_LANE_CLOSED => "the lane is closed",
+                E_LANE_IDLE => "the lane is not running; its result already came",
+                _ => "could not read the lane",
+            };
+            refused(code, why)
+        })?;
+        Ok(json!({ "lane_id": id, "stopping": true }).to_string().into())
     }
 
     /// Forgets `pid` once its command was reaped.
