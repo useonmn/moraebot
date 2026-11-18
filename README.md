@@ -37,6 +37,8 @@ curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.
 
 This downloads the latest release for Apple Silicon Macs, checks it against the release's SHA-256 checksum, makes sure it runs, and only then puts it at `~/.local/bin/moraebot`. If anything fails, your existing moraebot stays as it was. When `~/.local/bin` isn't on your `PATH` yet, the script prints the line to add to your shell startup file.
 
+On a fresh install (no `~/.moraebot/config.toml` yet) the script ends with `Next steps:`: run `moraebot init`, then `moraebot check-config`, then `moraebot install-launchd`, and send the bot a message. When moraebot isn't on your `PATH`, those lines use its full path. An upgrade prints no next steps.
+
 Two settings change what it does. Put them right before `sh`, not before `curl`:
 
 - `MORAEBOT_VERSION` picks a release instead of the latest one.
@@ -109,6 +111,8 @@ It asks a few questions, in order:
 3. The path to `omp` (found on your `PATH`, you confirm it) and the work folder. Press Enter to accept the default `~/moraebot-work`.
 
 Then it creates `~/.moraebot` (mode `700`), writes `~/.moraebot/config.toml`, and runs the same checks as `check-config`. If a config already exists, it asks before overwriting it. The default answer is No.
+
+When it writes a new config, `init` also leaves a small request file, `~/.moraebot/onboarding.request`, and when every check passes it prints the next steps last: `check-config`, `install-launchd` (or `moraebot run` to try it in the terminal), then message the bot. The next time moraebot starts, it says hello in the channel and begins the first conversation (see First conversation). Keeping your old config, or running `moraebot setup`, leaves no request.
 
 ### 6. Change or add a messenger
 
@@ -214,6 +218,48 @@ One omp, the lead, answers every thread and DM of the active messenger. It knows
 
 The lead controls lanes only through three tools moraebot gives it: `lane_start`, `lane_message` and `lane_status`. Each lane runs a full omp, so three busy lanes cost about as much as four omp sessions.
 
+## First conversation
+
+The first time moraebot starts after `moraebot init`, it posts one fixed hello in the configured channel. It sends that hello only once. If sending fails, it doesn't try again, and restarting doesn't repeat it.
+
+When you reply, the lead asks one thing per message: what to call it, how it should talk to you (tone, length, language), and a few basics about you. While this runs, each of your messages reaches the lead with an extra second line, `[moraebot onboarding turn=<n>]`, for your first 10 messages. After the 10th the line stops, but the lead can still finish.
+
+Once it has your answers, the lead saves them with its `onboarding_finish` tool into `~/.moraebot/persona.md` (mode `600`):
+
+```text
+Name: Sora
+Tone: short and warm
+Owner: Owner 111 likes short replies
+```
+
+`Name:` is always there. `Tone:` and `Owner:` appear only when you gave them. The tool refuses a file over 2048 bytes, a field with a line break, and anything that looks like a key, token or password. It also works only while the lead is answering one of your messages. Say "skip" and the lead ends the first conversation without writing the file.
+
+The persona applies the next time moraebot starts (a reboot, `moraebot install-launchd` again, or the lead restarting after it stopped). The running lead isn't restarted, and it remembers the conversation it just had, so you can keep talking in the meantime. At each start the lead gets the file's text after its other hints. Only the lead gets it; lanes don't.
+
+You can edit `persona.md` by hand. The same rules apply when it's read: a file that's over 2048 bytes, holds secret-like text, or isn't a plain UTF-8 file is left out and the log gets one line with a code (`E_PERSONA_SIZE`, `E_PERSONA_SECRET` or `E_PERSONA_READ`), never the text. Delete the file to drop the persona.
+
+To run the first conversation again, or to start it on a home you already use:
+
+```sh
+moraebot onboarding
+```
+
+It writes the request file, prints `{"onboarding":"requested"}` and changes nothing else. Restart moraebot and the hello comes at the next start. Add `--config <path>` for a different config.
+
+Files involved:
+
+- `~/.moraebot/onboarding.request`: left by `init` or `moraebot onboarding`, removed at the start that sends the hello.
+- `~/.moraebot/persona.md`: the saved persona.
+- The `onboarding` table in `~/.moraebot/inbox.sqlite`: one row saying whether the first conversation is running, done or skipped.
+
+## Memory
+
+moraebot keeps no memory of its own. The lead and the lanes are ordinary omp processes, and they read your own omp settings, the same ones your terminal omp uses. moraebot adds no memory setting for them.
+
+moraebot always runs omp with `--mode rpc`. In that mode omp leaves `memory.backend` at its default, `off`, unless you set it yourself in omp's settings or environment. So if you want omp's memory inside moraebot, turn it on in omp's own settings, then restart moraebot.
+
+When it's on, moraebot's omp and your terminal omp use the same memory. With the hindsight and mnemopi backends the default is per-project, so memories made through moraebot are filed under the work folder's name.
+
 ## Behavior hints
 
 moraebot gives omp a short built-in note about the messenger it's answering in, for example how long a reply may be and which formatting renders. To replace it, write your own text to:
@@ -255,6 +301,7 @@ After installing, check these by hand once:
 - [ ] **Lane result in the same thread.** In a thread, ask for something long, such as a task with several steps. The lead says it started a lane, and later the lane's result is answered in that same thread.
 - [ ] **A lane claims done, a failing Done check is refused, and the lead reports the outcome.** Ask for long work whose Done line can't pass at first, for example a file the lane still has to create. The lane's first claim is refused, it keeps working, and the lead's answer in that thread says whether the lane's checks passed.
 - [ ] **Follow-up while it works.** While the lead is still answering in a thread, send a second message in that thread. You get one reply that covers both.
+- [ ] **First conversation.** After `moraebot init` and the first start, the bot says hello in its channel once. Answer its questions (or reply skip), then restart moraebot and check that it uses the name you gave it.
 - [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
@@ -322,6 +369,8 @@ This version replaces the separate omp per thread or DM with one lead (see Lead 
 - The lead starts with an empty history. It doesn't pick up what earlier per-thread sessions remembered.
 - The old `~/.moraebot/conversations/*/session` folders are kept as they were and are no longer used. Delete them by hand if you don't need them.
 - Your stored messages and settings keep working without any change.
+
+If you're coming from 0.2.0: this version has no memory system of its own. The memory code is kept on the `memory-full` branch. Nothing of the old memory is deleted or moved. `~/.moraebot/memory/`, `~/.moraebot/omp/config-overlay.yml` and the memory tables in the database stay on disk unused, and you can delete them by hand. The first conversation's state carries over as it was. To make a `persona.md`, run `moraebot onboarding` and restart moraebot. omp memory now follows your own omp settings (see Memory).
 
 ## Stop and uninstall
 

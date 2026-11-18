@@ -350,6 +350,46 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **끄기와 재시작.** 꺼지기 시작한 뒤의 `lane_done`은 확인을 시작하지 않고 `E_LANE_STOPPING`으로 거절합니다. `shutdown_all`은 lane 자식을 모두 먼저 죽이고, 그다음 돌고 있는 확인을 죽입니다. 그래서 확인의 거절이 살아 있는 lane에 닿는 일이 없고, 확인 도중 끊긴 턴은 늘 잘린 턴이 됩니다(결과 줄 없음, 다음 시작 때 `E_LANE_INTERRUPTED` 안내 한 번). `shutdown_all`은 죽인 확인이 모두 거둬진 뒤에(`ABORT_JOIN_BOUND`까지) 돌아옵니다. 시간 초과나 자식을 잃어 작업이 먼저 끝나면, 그 작업의 워커가 자기 확인을 죽입니다. 보통 종료에서는 확인 프로세스도, 확인의 프로세스 그룹에 남은 프로세스도 확인이나 게이트웨이보다 오래 살지 않습니다. SIGKILL로 죽은 게이트웨이는 정리하지 못합니다.
 
+### 3.9 첫 만남과 persona (light)
+
+**시작.** `moraebot init`이 새 설정을 쓰면 `<홈>/onboarding.request` 파일(권한 0600)을 남깁니다. 이미 쓰던 홈에서는 `moraebot onboarding`이 같은 파일을 만들고 `{"onboarding":"requested"}`를 출력합니다. 이 명령은 저장소를 열지 않습니다.
+
+**인사 한 번.** 디스패처가 켜질 때(`startup`) 요청 파일이 있으면, `onboarding` 표의 줄을 `active`로 만들고 파일을 지운 뒤, 설정된 채널에 정해진 인사(`N_ONBOARDING_HELLO`)를 한 번 보냅니다. 파일을 지우지 못하면 `E_ONBOARDING_REQUEST`를 로그에 남기고 인사하지 않습니다. 보내기가 실패해도 다시 보내지 않습니다. 파일이 없으면 아무 일도 없습니다.
+
+**표시 줄.** 첫 만남이 진행 중(`active`)이면 주인 메시지의 lead 입력 두 번째 줄에 `[moraebot onboarding turn=<n>]`이 붙습니다. `n`은 시작 뒤 주인 메시지 수(이번 것 포함)이고, 1부터 `MAX_TURNS`(10)까지만 붙습니다. 끼워 넣은 메시지(steer)와 lane 결과에는 붙지 않습니다. lead 기본 안내문이 이 줄을 보면 무엇을 물을지 알려 줍니다.
+
+**저장 도구.** lead는 호스트 도구 `onboarding_finish {outcome, name, tone, owner}`로 첫 만남을 끝냅니다.
+
+| 경우 | 결과 |
+|---|---|
+| 주인 메시지에 답하는 중이 아님 | `E_ONBOARDING_ORIGIN` |
+| 진행 중인 첫 만남이 없음 | `E_ONBOARDING_STATE` |
+| 인자가 잘못됨 | `E_ONBOARDING_ARGS` |
+| 이름이 비었거나 줄바꿈이 있음 | `E_PERSONA_FIELD` |
+| 파일이 2048바이트를 넘음 | `E_PERSONA_SIZE` |
+| 키, 토큰, 비밀번호처럼 보이는 글 | `E_PERSONA_SECRET` |
+| 파일을 쓰지 못함 | `E_PERSONA_WRITE` |
+| `done` | `<홈>/persona.md`(권한 0600)를 쓰고 표를 `done`으로 |
+| `skipped` | 파일은 건드리지 않고 표를 `skipped`로 |
+
+`persona.md`는 `Name:`, `Tone:`, `Owner:` 세 줄입니다. `Tone:`과 `Owner:`는 값이 있을 때만 씁니다.
+
+**lead에 붙이기.** lead가 켜질 때마다 `persona.md`를 새로 읽어 안내문 뒤에 빈 줄, `persona::HEADER`, 파일 내용 순서로 붙입니다. 파일이 없으면 아무것도 붙이지 않습니다. 2048바이트를 넘거나, 비밀처럼 보이거나, 보통 파일이 아니거나, UTF-8이 아니면 붙이지 않고 코드만 로그에 남깁니다. 주인이 손으로 고친 파일에도 같은 규칙을 씁니다. 저장한 내용은 다음에 lead가 켜질 때부터 적용되고, 돌고 있는 lead를 일부러 다시 켜지 않습니다. lane에는 붙이지 않습니다.
+
+**저장소.** `inbox.sqlite`의 `onboarding` 표에는 줄이 많아야 하나입니다(`state`는 `active`/`done`/`skipped`, `after_row`는 시작 때의 마지막 줄 번호). 예전 데이터베이스도 그대로 열립니다.
+
+### 3.10 omp 자체 기억 (light)
+
+moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memory-full` 브랜치에 남아 있습니다.
+
+**주인 설정을 따름.** lead와 lane은 v0.1.0처럼 주인의 omp 설정을 그대로 읽습니다. moraebot은 설정 덮어쓰기 파일도, 기억 관련 환경변수도 넘기지 않습니다. 그래서 주인 터미널의 omp와 같은 기억 저장소를 씁니다(결정 L-D10).
+
+**RPC 모드의 기본값.** moraebot은 omp를 늘 `--mode rpc`로 띄웁니다. 이 모드에서 omp는 `memory.backend`를 기본값 `off`로 둡니다. 주인이 omp 설정이나 환경변수에 직접 켜 둔 경우에만 기억이 동작합니다. 그러니 moraebot 안에서 omp 기억을 쓰려면 omp 쪽 설정에서 켜고 moraebot을 다시 켭니다.
+
+**저장소를 나누지 않는 까닭.** 저장소를 나누는 설정이 기억 방식마다 다릅니다. hindsight는 `hindsight.bankId`(환경변수 `HINDSIGHT_BANK_ID`), mnemopi는 설정 파일의 `mnemopi.bank`/`mnemopi.dbPath`뿐이고, local은 omp의 agent 폴더를 통째로 바꾸는 방법(로그인 정보까지 옮겨짐)밖에 없습니다. 하나로 모두 나눌 수 없고, 나누려면 moraebot이 주인의 기억 설정을 다시 건드려야 합니다. hindsight와 mnemopi는 기본이 "프로젝트별"이라, moraebot에서 생긴 기억은 작업 폴더 이름 아래에 모입니다.
+
+**0.2.0에서 올라올 때.** `~/.moraebot/memory/` 폴더, `~/.moraebot/omp/config-overlay.yml`, 데이터베이스의 기억 표는 지우지도 옮기지도 않고 쓰지 않습니다. 필요 없으면 손으로 지웁니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -428,6 +468,7 @@ launchd는 macOS가 프로그램을 자동으로 켜고, 죽으면 다시 켜 �
    - dori-mode와 달리 화면을 읽지 않고 omp RPC의 결과를 씁니다.
 
    자세한 설계는 이 단계에 들어갈 때 합니다.
+5. **light (v0.3.0).** 0.2.0의 기억 장치를 걷어내고 첫 만남과 `persona.md` 하나만 남깁니다(3.9절). omp 기억은 주인 설정을 따릅니다(3.10절). 기억 코드는 `memory-full` 브랜치에 그대로 두어 나중에 다시 합칠 수 있습니다.
 
 ## 6. 열린 질문
 
