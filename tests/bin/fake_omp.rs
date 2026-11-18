@@ -31,6 +31,8 @@
 //! mode `tools` reads FAKE_OMP_LANE_TOOL_TRIGGER (default `run-lane-tools`) and
 //! FAKE_OMP_LANE_TOOL_CALLS (same line format as FAKE_OMP_TOOL_CALLS) instead of
 //! FAKE_OMP_TOOL_TRIGGER and FAKE_OMP_TOOL_CALLS, which only a lead fake reads.
+//! With FAKE_OMP_LANE_HOLD_AFTER_TOOLS set, a lane fake in mode `tools` writes nothing
+//! after the last scripted call's `host_tool_result` (no final reply), like `hang`.
 //!
 //! Touch on a refused call: FAKE_OMP_TOUCH_ON_TOOL_ERROR=<path> with
 //! FAKE_OMP_TOUCH_AFTER_ERRORS=<n> (default 1) creates `<path>` empty (parents
@@ -310,6 +312,9 @@ impl Fake {
     /// Returns the turn while it still waits for a `host_tool_result`.
     fn advance_tool_turn(&mut self, mut turn: ToolTurn, out: &mut impl Write) -> Option<ToolTurn> {
         let Some(call) = turn.remaining.pop_front() else {
+            if self.lane && std::env::var_os("FAKE_OMP_LANE_HOLD_AFTER_TOOLS").is_some() {
+                return None;
+            }
             finish_echo(&turn.prompt_id, &turn.message, out);
             return None;
         };

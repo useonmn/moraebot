@@ -14,6 +14,7 @@ use moraebot::lane::{
     self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_CLOSED, E_LANE_INTERRUPTED, E_LANE_LIMIT,
     E_LANE_STOPPING, E_LANE_UNKNOWN,
 };
+use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, REPORT_FOOTER};
 use moraebot::lead;
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
@@ -338,8 +339,9 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
     );
     let tools = h.frames_after_start(0, "set_host_tools");
     assert_eq!(tools.len(), 1, "{tools:?}");
-    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
     assert_eq!(tools[0]["tools"][0]["name"], done::LANE_DONE_TOOL);
+    assert_eq!(tools[0]["tools"][1]["name"], LANE_REPORT_TOOL);
     omp.shutdown_all().await;
 }
 
@@ -656,7 +658,7 @@ async fn lane_with_done_line_gets_lane_done() {
         .iter()
         .map(|t| &t["name"])
         .collect();
-    assert_eq!(names, [done::LANE_DONE_TOOL]);
+    assert_eq!(names, [done::LANE_DONE_TOOL, LANE_REPORT_TOOL]);
     let prompts = h.frames_after_start(0, "prompt");
     assert_eq!(prompts.len(), 1, "{prompts:?}");
     assert!(has_done_footer(&prompts[0], "file ."), "{prompts:?}");
@@ -1655,4 +1657,101 @@ async fn watchdog_ignores_finished_lanes() {
 
     assert_eq!(ticks, [0, 0]);
     assert_eq!(h.store.lock().unwrap().count().unwrap(), 1);
+}
+
+/// One scripted `lane_report` call with `text`.
+fn report_call(text: &str) -> String {
+    json!({"tool": lane::LANE_REPORT_TOOL, "arguments": {"text": text}}).to_string()
+}
+
+impl Harness {
+    /// A manager whose lead starts one lane (mode `tools`) that makes `calls`; with `hold`
+    /// the lane writes nothing after its last call's result.
+    fn report_manager(&self, calls: &[String], hold: bool) -> OmpManager {
+        let omp = self
+            .manager("tools", &[lane_start("run-lane-tools t1")])
+            .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", calls.join("\n"))]);
+        if hold {
+            omp.with_extra_env([("FAKE_OMP_LANE_HOLD_AFTER_TOOLS", "1".to_owned())])
+        } else {
+            omp
+        }
+    }
+}
+
+/// Waits until the lanes recorded at least `n` reports.
+async fn await_lane_reports(omp: &OmpManager, n: u64) {
+    bounded(omp.lanes().lane_reports().wait_for(|seen| *seen >= n))
+        .await
+        .expect("reports channel open");
+}
+
+#[tokio::test]
+async fn lane_report_is_news_while_the_lane_runs() {
+    let h = Harness::new();
+    let omp = h.report_manager(&[report_call("qa step 1")], true);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_reports(&omp, 1).await;
+    let news = omp.lanes().news();
+    let state = h.lane(1).state;
+    let tools = h.frames_after_start(0, "set_host_tools");
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(
+        news,
+        [LaneNews {
+            lane_id: 1,
+            conversation_key: KEY.into(),
+            text: "qa step 1".into(),
+        }]
+    );
+    assert_eq!(state, LaneState::Running);
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    let names: Vec<&Value> = tools[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["name"])
+        .collect();
+    assert_eq!(names, [done::LANE_DONE_TOOL, LANE_REPORT_TOOL]);
+}
+
+#[tokio::test]
+async fn lane_report_of_a_finished_lane_is_not_news() {
+    let h = Harness::new();
+    let omp = h.report_manager(&[report_call("qa step 1")], false);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let news = omp.lanes().news();
+    let results: Vec<(bool, String)> = h
+        .tool_results()
+        .into_iter()
+        .filter(|(_, text)| text.starts_with("{\"recorded\""))
+        .collect();
+    let prompts = h.frames_after_start(0, "prompt");
+    bounded(omp.shutdown_all()).await;
+
+    assert!(news.is_empty(), "{news:?}");
+    assert_eq!(results, [(false, r#"{"recorded":true}"#.to_owned())]);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        prompts[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(REPORT_FOOTER),
+        "{prompts:?}"
+    );
+}
+
+#[tokio::test]
+async fn lane_report_refuses_empty_text() {
+    let h = Harness::new();
+    let omp = h.report_manager(&[report_call("  ")], false);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let r = h.lane_tool_results();
+    let news = omp.lanes().news();
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_refused(&r[0], E_LANE_ARGS);
+    assert!(news.is_empty(), "{news:?}");
 }

@@ -37,6 +37,11 @@
 //! name and args, is progress); `watch_tick` reports a job with no event, or no progress, for
 //! `STALL_AFTER` to the lead once per episode as a lane inbox row. moraebot never stops a
 //! lane for it.
+//!
+//! Every lane job also gets `lane_report`: the lane leaves a one-line progress note, cleaned by
+//! `news_text` and kept as the job's newest report in its `Activity`. `news` lists the reports
+//! not yet posted for their lane; the dispatcher posts them while the lane's conversation is
+//! quiet and calls `news_posted`. Reports live in memory only.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -80,6 +85,8 @@ pub const LANE_MESSAGE_TOOL: &str = "lane_message";
 pub const LANE_STATUS_TOOL: &str = "lane_status";
 /// Host tool that closes a lane the lead decided is finished.
 pub const LANE_CLOSE_TOOL: &str = "lane_close";
+/// Host tool a lane calls to leave a one-line progress note.
+pub const LANE_REPORT_TOOL: &str = "lane_report";
 
 /// A lane tool call had missing or invalid arguments.
 pub const E_LANE_ARGS: &str = "E_LANE_ARGS";
@@ -101,6 +108,22 @@ const STATUS_TASK_CHARS: usize = 200;
 
 /// A lane progress note is cut to this many characters.
 pub const REPORT_CHARS: usize = 200;
+
+/// Appended to every lane prompt: ask for progress notes.
+pub const REPORT_FOOTER: &str = "\n[moraebot] At each big step (a milestone reached, a blocker hit), call lane_report with one short line for the owner. moraebot posts the newest line later, only while the conversation is quiet. Keep paths, keys and personal data out of it.";
+
+/// At most this many posted-text hashes are kept per lane; a full set is cleared before the next one.
+pub const POSTED_PER_LANE: usize = 64;
+
+/// One progress note to post: the newest unposted report of a running lane job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneNews {
+    pub lane_id: i64,
+    /// The conversation that started the lane.
+    pub conversation_key: String,
+    /// Already cleaned by `news_text`.
+    pub text: String,
+}
 
 /// One registered lane worker: its child's process group once spawned, and its thread.
 struct LaneChild {
@@ -130,6 +153,8 @@ struct Activity {
     /// Notices sent for this job; the current episode's number once reported.
     episode: u32,
     reported: bool,
+    /// The newest `lane_report` text of this job, cleaned.
+    report: Option<String>,
 }
 
 /// The counters as of the last tick that saw them change, and when.
@@ -224,6 +249,8 @@ struct LaneSet {
     children: HashMap<i64, LaneChild>,
     /// Running check and git pids -> `(lane id, seq)` of the job that started it.
     checks: HashMap<u32, (i64, i64)>,
+    /// Hashes of the report texts posted per lane with a running job (at most `POSTED_PER_LANE` each).
+    posted: HashMap<i64, HashSet<u64>>,
 }
 
 /// One lane prompt for a worker thread.
@@ -273,6 +300,8 @@ pub struct LaneManager {
     pids: watch::Sender<Vec<u32>>,
     /// Count of agent events received from lane children (tests wait on it).
     events: watch::Sender<u64>,
+    /// Count of recorded lane reports (tests wait on it).
+    reports: watch::Sender<u64>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
 }
 
@@ -282,6 +311,12 @@ fn refused(code: &str, reason: &str) -> HostToolError {
 
 fn schema(value: Value) -> Map<String, Value> {
     serde_json::from_value(value).expect("lane tool schema is a JSON object")
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 /// A lane's progress note made safe to post: secrets become `[secret]`, each path in `paths`
@@ -344,6 +379,7 @@ impl LaneManager {
             inner: Mutex::default(),
             pids: watch::channel(Vec::new()).0,
             events: watch::channel(0).0,
+            reports: watch::channel(0).0,
             extra_env: Vec::new(),
         }
     }
@@ -363,6 +399,50 @@ impl LaneManager {
     /// ticks.
     pub fn lane_events(&self) -> watch::Receiver<u64> {
         self.events.subscribe()
+    }
+
+    /// Lane reports recorded since start; a test waits on it before it reads `news`.
+    pub fn lane_reports(&self) -> watch::Receiver<u64> {
+        self.reports.subscribe()
+    }
+
+    /// The newest report of each running job that was not posted for its lane yet, in lane id
+    /// order; posted hashes of lanes without a running job are forgotten first.
+    pub fn news(&self) -> Vec<LaneNews> {
+        let mut guard = lock(&self.inner);
+        let set = &mut *guard;
+        set.posted.retain(|id, _| set.children.contains_key(id));
+        let mut news: Vec<LaneNews> = set
+            .children
+            .iter()
+            .filter_map(|(id, child)| {
+                let text = lock(&child.activity).report.clone()?;
+                if set
+                    .posted
+                    .get(id)
+                    .is_some_and(|p| p.contains(&text_hash(&text)))
+                {
+                    return None;
+                }
+                Some(LaneNews {
+                    lane_id: *id,
+                    conversation_key: child.conversation_key.clone(),
+                    text,
+                })
+            })
+            .collect();
+        news.sort_by_key(|n| n.lane_id);
+        news
+    }
+
+    /// Records that `text` was posted for `lane_id`; `news` never lists it again for that lane.
+    pub fn news_posted(&self, lane_id: i64, text: &str) {
+        let mut set = lock(&self.inner);
+        let posted = set.posted.entry(lane_id).or_default();
+        if posted.len() >= POSTED_PER_LANE {
+            posted.clear();
+        }
+        posted.insert(text_hash(text));
     }
 
     /// Counts `event` of a lane child in its job's `activity`.
@@ -1164,6 +1244,63 @@ impl LaneManager {
         Err(refused(done::E_DONE_UNMET, &done::not_done(&checks)))
     }
 
+    /// The `lane_report` tool of one job: its handler records the job's newest report.
+    fn lane_report_tool(self: &Arc<Self>, job: &Job, activity: &Arc<Mutex<Activity>>) -> HostTool {
+        let (id, seq) = (job.id, job.seq);
+        let manager = Arc::clone(self);
+        let activity = Arc::clone(activity);
+        HostTool::new(
+            LANE_REPORT_TOOL,
+            "Leave a one-line progress note for the owner at a big step: a milestone reached or \
+             a blocker hit. moraebot keeps only your newest note and posts it later in the \
+             owner's conversation while it is quiet. Returns at once.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "One short line."
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            })),
+            move |arguments, _| manager.lane_report(&arguments, (id, seq), &activity),
+        )
+        .load_mode(ToolLoadMode::Essential)
+    }
+
+    /// Handles one `lane_report` call: records the cleaned text as the job's newest report.
+    /// It never posts and never waits.
+    fn lane_report(
+        &self,
+        arguments: &Map<String, Value>,
+        (id, seq): (i64, i64),
+        activity: &Mutex<Activity>,
+    ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        let raw = arguments
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let root = self.lanes_root();
+        let work = std::path::absolute(&self.config.work_dir).ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home_real = home.as_deref().and_then(|h| std::fs::canonicalize(h).ok());
+        let mut paths = vec![(root.as_path(), ".")];
+        paths.extend(work.as_deref().map(|p| (p, ".")));
+        paths.extend(home_real.as_deref().map(|p| (p, "~")));
+        paths.extend(home.as_deref().map(|p| (p, "~")));
+        let text = news_text(raw, &paths);
+        if text.is_empty() {
+            return Err(refused(E_LANE_ARGS, "text must be a non-empty line"));
+        }
+        let chars = text.chars().count();
+        lock(activity).report = Some(text);
+        self.reports.send_modify(|n| *n += 1);
+        tracing::info!(lane = id, seq, chars, "lane report recorded");
+        Ok(json!({"recorded": true}).to_string().into())
+    }
+
     /// `Err` is a failure before the prompt was sent (the child did not open).
     fn run_prompt(
         self: &Arc<Self>,
@@ -1188,10 +1325,11 @@ impl LaneManager {
                 detail: e.to_string(),
             })?;
         let claim = Arc::new(Mutex::new(Claim::None));
-        let tools = match &job.done {
+        let mut tools = match &job.done {
             Some(line) => vec![self.lane_done_tool(job, line, &claim, &cwd)],
             None => Vec::new(),
         };
+        tools.push(self.lane_report_tool(job, activity));
         let OpenedChild {
             client, session_id, ..
         } = omp::open_child(
@@ -1228,13 +1366,14 @@ impl LaneManager {
                 "could not store the lane's omp session id"
             );
         }
-        let message = match (&job.done, &job.repo) {
-            (Some(line), Some(_)) => {
-                job.text.clone() + &done::lane_footer(line) + worktree::GIT_FOOTER
-            }
-            (Some(line), None) => job.text.clone() + &done::lane_footer(line),
-            (None, _) => job.text.clone(),
-        };
+        let mut message = job.text.clone();
+        if let Some(line) = &job.done {
+            message += &done::lane_footer(line);
+        }
+        message += REPORT_FOOTER;
+        if job.done.is_some() && job.repo.is_some() {
+            message += worktree::GIT_FOOTER;
+        }
         let prompt = PromptCommand {
             message,
             images: None,
@@ -1617,5 +1756,151 @@ mod tests {
             "built ./a.rs"
         );
         assert_eq!(news_text("a b", &[(Path::new(""), ".")]), "a b");
+    }
+
+    /// A manager with a Discord config under `dir` (home `qa-mbhome`, work dir `work`); its
+    /// omp path is never run.
+    fn qa_manager(dir: &Path) -> Arc<LaneManager> {
+        use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
+
+        let home = dir.join("qa-mbhome");
+        let work_dir = dir.join("work");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&work_dir).expect("work dir");
+        let config = Config {
+            messenger: Platform::Discord,
+            work_dir,
+            omp_path: PathBuf::from("/qa/omp"),
+            home: home.clone(),
+            access_mode: AccessMode::OwnerOnly,
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("secrets").join("discord.token"),
+            }),
+            slack: None,
+            omp: OmpConfig::default(),
+        };
+        let store = Store::open(&home.join("inbox.sqlite")).expect("store");
+        Arc::new(LaneManager::new(
+            config,
+            Arc::new(Mutex::new(store)),
+            Arc::default(),
+            Duration::from_secs(365 * 24 * 60 * 60),
+        ))
+    }
+
+    /// Registers a dummy running job for lane `id` in conversation `key`; returns its activity.
+    fn qa_child(manager: &LaneManager, id: i64, key: &str) -> Arc<Mutex<Activity>> {
+        let activity = Arc::new(Mutex::new(Activity::default()));
+        lock(&manager.inner).children.insert(
+            id,
+            LaneChild {
+                kill: None,
+                worker: std::thread::spawn(|| {}),
+                seq: 1,
+                conversation_key: key.into(),
+                activity: Arc::clone(&activity),
+            },
+        );
+        activity
+    }
+
+    /// Removes the dummy job of lane `id` and joins its worker.
+    fn qa_drop_child(manager: &LaneManager, id: i64) {
+        let child = lock(&manager.inner).children.remove(&id).expect("child");
+        child.worker.join().expect("worker joins");
+    }
+
+    #[test]
+    fn news_lists_unposted_reports_of_running_lanes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let a1 = qa_child(&m, 1, "discord:th:111");
+        let a2 = qa_child(&m, 2, "discord:th:222");
+        assert!(m.news().is_empty());
+
+        lock(&a1).report = Some("qa step 1".into());
+        assert_eq!(
+            m.news(),
+            [LaneNews {
+                lane_id: 1,
+                conversation_key: "discord:th:111".into(),
+                text: "qa step 1".into(),
+            }]
+        );
+        m.news_posted(1, "qa step 1");
+        assert!(m.news().is_empty());
+
+        lock(&a1).report = Some("qa step 2".into());
+        let news = m.news();
+        assert_eq!(news.len(), 1);
+        assert_eq!((news[0].lane_id, news[0].text.as_str()), (1, "qa step 2"));
+
+        lock(&a1).report = Some("qa step 1".into());
+        assert!(m.news().is_empty());
+
+        lock(&a2).report = Some("qa b".into());
+        assert_eq!(
+            m.news(),
+            [LaneNews {
+                lane_id: 2,
+                conversation_key: "discord:th:222".into(),
+                text: "qa b".into(),
+            }]
+        );
+        qa_drop_child(&m, 2);
+        assert!(m.news().is_empty());
+        qa_drop_child(&m, 1);
+    }
+
+    #[test]
+    fn lane_report_records_the_cleaned_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let a = qa_child(&m, 1, "discord:th:111");
+        let root = m.lanes_root();
+        let args = schema(json!({"text": format!("wrote {}/a.rs\n@here", root.display())}));
+        assert!(m.lane_report(&args, (1, 1), &a).is_ok());
+        let expected = format!("wrote ./a.rs {}here", '\u{FF20}');
+        assert_eq!(lock(&a).report.as_deref(), Some(expected.as_str()));
+        assert_eq!(*m.lane_reports().borrow(), 1);
+
+        assert!(
+            m.lane_report(&schema(json!({"text": "  \n "})), (1, 1), &a)
+                .is_err()
+        );
+        assert!(m.lane_report(&schema(json!({})), (1, 1), &a).is_err());
+        assert_eq!(lock(&a).report.as_deref(), Some(expected.as_str()));
+        assert_eq!(*m.lane_reports().borrow(), 1);
+        qa_drop_child(&m, 1);
+    }
+
+    #[test]
+    fn news_forgets_posted_texts_of_finished_lanes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let _a1 = qa_child(&m, 1, "discord:th:111");
+        for i in 0..=POSTED_PER_LANE {
+            m.news_posted(1, &format!("qa {i}"));
+        }
+        let full = lock(&m.inner).posted[&1].len();
+        m.news_posted(9, "qa x");
+        let keys = |m: &LaneManager| {
+            let mut keys: Vec<i64> = lock(&m.inner).posted.keys().copied().collect();
+            keys.sort_unstable();
+            keys
+        };
+        let before = keys(&m);
+        m.news();
+        let running = keys(&m);
+        qa_drop_child(&m, 1);
+        m.news();
+        let after = lock(&m.inner).posted.is_empty();
+
+        assert_eq!(full, 1);
+        assert_eq!(before, [1, 9]);
+        assert_eq!(running, [1]);
+        assert!(after);
     }
 }
