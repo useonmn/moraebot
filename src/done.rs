@@ -1,7 +1,7 @@
 //! Lane done checks: the Done line a lane starts with, the `lane_done` claim, and the
 //! gateway-run checks of it (Dori mode style). Messenger-agnostic.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -306,17 +306,69 @@ fn check_command(
     let (program, args) = argv
         .split_first()
         .expect("DoneLine::parse rejects an empty argv");
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let opts = RunOpts {
+        out_dir,
+        env,
+        timeout,
+    };
+    Ok(
+        match run_command(program.as_ref(), &args, work_dir, &opts, started, ended)? {
+            Ran::Spawn(detail) => (Some(E_CHECK_SPAWN), detail),
+            Ran::Exited(0) => (None, "exit 0".to_owned()),
+            Ran::Exited(code) => (
+                Some(E_CHECK_EXIT),
+                format!("exit {code}: {}", output_head(out_dir)),
+            ),
+            Ran::Signalled => (Some(E_CHECK_EXIT), "exit signal".to_owned()),
+            Ran::WaitError(error) => (Some(E_CHECK_EXIT), error),
+            Ran::Timeout => (
+                Some(E_CHECK_TIMEOUT),
+                format!("killed after {} s", timeout.as_secs()),
+            ),
+        },
+    )
+}
+
+/// How a command run by [`run_command`] ended.
+pub(crate) enum Ran {
+    Spawn(String),
+    Exited(i32),
+    Signalled,
+    WaitError(String),
+    Timeout,
+}
+
+/// Where a command run by [`run_command`] writes its output, its environment and its kill deadline.
+pub(crate) struct RunOpts<'a> {
+    pub(crate) out_dir: &'a Path,
+    pub(crate) env: &'a [(OsString, OsString)],
+    pub(crate) timeout: Duration,
+}
+
+/// Runs `program` with `args` in `dir` as the leader of its own process group, with exactly
+/// `opts.env`, stdin null and stdout/stderr in `opts.out_dir`. `started(pid)` runs right after
+/// the spawn (`false`: stopping, kill it and return `Stopped`); `ended(pid)` runs once per
+/// started pid after its leader was reaped and its group killed.
+pub(crate) fn run_command(
+    program: &OsStr,
+    args: &[OsString],
+    dir: &Path,
+    opts: &RunOpts<'_>,
+    started: &mut impl FnMut(u32) -> bool,
+    ended: &mut impl FnMut(u32),
+) -> Result<Ran, Stopped> {
     let output = |name: &str| {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(out_dir.join(name))
+            .open(opts.out_dir.join(name))
     };
     let (stdout, stderr) = match (output("stdout"), output("stderr")) {
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-        (Err(error), _) | (_, Err(error)) => return Ok((Some(E_CHECK_SPAWN), error.to_string())),
+        (Err(error), _) | (_, Err(error)) => return Ok(Ran::Spawn(error.to_string())),
     };
     // The waiter thread exists before the command, so a thread that cannot start leaves
     // no process behind; it gets the child over a channel and sends back its wait.
@@ -330,13 +382,13 @@ fn check_command(
             }
         });
     if let Err(error) = waiter {
-        return Ok((Some(E_CHECK_SPAWN), error.to_string()));
+        return Ok(Ran::Spawn(error.to_string()));
     }
     let spawned = Command::new(program)
         .args(args)
-        .current_dir(work_dir)
+        .current_dir(dir)
         .env_clear()
-        .envs(env.iter().cloned())
+        .envs(opts.env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -344,7 +396,7 @@ fn check_command(
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        Err(error) => return Ok((Some(E_CHECK_SPAWN), error.to_string())),
+        Err(error) => return Ok(Ran::Spawn(error.to_string())),
     };
     let pid = child.id();
     if !started(pid) {
@@ -355,7 +407,7 @@ fn check_command(
         return Err(Stopped);
     }
     let _ = child_tx.send(child);
-    let waited = match status_rx.recv_timeout(timeout) {
+    let waited = match status_rx.recv_timeout(opts.timeout) {
         Ok(waited) => Some(waited),
         Err(_) => {
             omp::kill_group(pid);
@@ -369,24 +421,14 @@ fn check_command(
     omp::kill_group(pid);
     ended(pid);
     Ok(match waited {
-        None => (
-            Some(E_CHECK_TIMEOUT),
-            format!("killed after {} s", timeout.as_secs()),
-        ),
-        Some(Err(error)) => (Some(E_CHECK_EXIT), error.to_string()),
-        Some(Ok(status)) => match status.code() {
-            Some(0) => (None, "exit 0".to_owned()),
-            Some(code) => (
-                Some(E_CHECK_EXIT),
-                format!("exit {code}: {}", output_head(out_dir)),
-            ),
-            None => (Some(E_CHECK_EXIT), "exit signal".to_owned()),
-        },
+        None => Ran::Timeout,
+        Some(Err(error)) => Ran::WaitError(error.to_string()),
+        Some(Ok(status)) => status.code().map_or(Ran::Signalled, Ran::Exited),
     })
 }
 
 /// The first bytes of the command's stderr, else of its stdout (lossy UTF-8).
-fn output_head(out_dir: &Path) -> String {
+pub(crate) fn output_head(out_dir: &Path) -> String {
     for name in ["stderr", "stdout"] {
         let mut head = Vec::new();
         if let Ok(file) = File::open(out_dir.join(name)) {
@@ -400,7 +442,7 @@ fn output_head(out_dir: &Path) -> String {
 }
 
 /// Folds whitespace runs to one space and cuts to `DETAIL_CHARS` characters.
-fn short(text: &str) -> String {
+pub(crate) fn short(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
