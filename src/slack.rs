@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::adapter::E_ADAPTER_EDIT;
 use crate::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START,
     E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter, SendResult,
@@ -243,6 +244,11 @@ pub fn post_body(channel: &str, thread_ts: Option<&str>, text: &str) -> Value {
     body
 }
 
+/// The `chat.update` body for the message `ts` in `channel`.
+pub fn update_body(channel: &str, ts: &str, text: &str) -> Value {
+    json!({ "channel": channel, "ts": ts, "text": text })
+}
+
 /// Checks `ok` and returns the field `key`. On `ok: false` the error carries Slack's
 /// `error` string with `code`; a missing field on an ok response is a protocol error.
 fn ok_field(json: &Value, key: &str, code: &'static str) -> Result<String, AdapterError> {
@@ -346,6 +352,7 @@ pub fn complete_upload_body(
 const AUTH_TEST_URL: &str = "https://slack.com/api/auth.test";
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+const UPDATE_MESSAGE_URL: &str = "https://slack.com/api/chat.update";
 const UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
 const COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
 
@@ -393,6 +400,8 @@ pub trait SlackTransport: Send + Sync {
     async fn connect(&self, url: &str) -> Result<Box<dyn SlackSocket>, AdapterError>;
     /// `chat.postMessage` with the bot token.
     async fn post_message(&self, body: Value) -> Result<PostOutcome, AdapterError>;
+    /// `chat.update` with the bot token; `Posted` carries the edited message's `ts`.
+    async fn update_message(&self, body: Value) -> Result<PostOutcome, AdapterError>;
     /// Streams a `url_private_download` file into the new file `dest` with the bot token;
     /// only `FILE_HOST` is allowed and redirects are not followed. `reject_html` refuses a
     /// 2xx `text/html` answer (Slack's login page) with `E_FILE_DENIED`.
@@ -597,6 +606,21 @@ impl SlackTransport for HttpTransport {
         match self
             .call(
                 POST_MESSAGE_URL,
+                &self.bot_token,
+                ApiBody::Json(&body),
+                E_SLACK_API,
+            )
+            .await?
+        {
+            Ok(json) => parse_post_response(&json).map(PostOutcome::Posted),
+            Err(wait) => Ok(PostOutcome::RateLimited(wait)),
+        }
+    }
+
+    async fn update_message(&self, body: Value) -> Result<PostOutcome, AdapterError> {
+        match self
+            .call(
+                UPDATE_MESSAGE_URL,
                 &self.bot_token,
                 ApiBody::Json(&body),
                 E_SLACK_API,
@@ -973,6 +997,13 @@ fn send_error(err: &AdapterError) -> AdapterError {
     }
 }
 
+fn edit_error(err: &AdapterError) -> AdapterError {
+    AdapterError {
+        code: E_ADAPTER_EDIT,
+        message: err.to_string(),
+    }
+}
+
 #[async_trait]
 impl MessengerAdapter for SlackAdapter {
     fn platform(&self) -> &'static str {
@@ -1109,6 +1140,24 @@ impl MessengerAdapter for SlackAdapter {
         Ok(SendResult {
             message_id: file_id,
         })
+    }
+
+    async fn edit(&self, _target: &str, message_id: &str, text: &str) -> Result<(), AdapterError> {
+        let (channel, ts) = match parse_target(message_id) {
+            Ok((channel, Some(ts))) => (channel, ts),
+            _ => {
+                return Err(edit_error(&AdapterError {
+                    code: E_SLACK_ID,
+                    message: "message id must be <channel>:<ts>".to_string(),
+                }));
+            }
+        };
+        let body = update_body(&channel, &ts, &escape_text(text));
+        match self.transport.update_message(body).await {
+            Ok(PostOutcome::Posted(_)) => Ok(()),
+            Ok(PostOutcome::RateLimited(_)) => Err(edit_error(&rate_limited("chat.update"))),
+            Err(err) => Err(edit_error(&err)),
+        }
     }
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {

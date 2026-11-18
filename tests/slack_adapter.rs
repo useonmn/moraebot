@@ -8,11 +8,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use moraebot::adapter::E_ADAPTER_EDIT;
 use moraebot::adapter::{
     AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED,
     InboundAttachment, MessengerAdapter,
 };
 use moraebot::files::{E_FILE_HOST, E_FILE_REMOTE, E_FILE_WRITE, Progress};
+use moraebot::slack::E_SLACK_ID;
 use moraebot::slack::{
     E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, SlackAdapter, SlackTransport,
 };
@@ -287,6 +289,58 @@ async fn api_error_is_send_error() {
     assert_eq!(err.code, E_ADAPTER_SEND);
     assert!(err.message.starts_with(E_SLACK_API));
     assert_eq!(fake.record().posts.len(), 1);
+}
+
+#[tokio::test]
+async fn edit_updates_the_sent_message() {
+    let (fake, adapter) = setup();
+    let sent = adapter.send("C222:1.1", "a").await.unwrap();
+    let edited = adapter.edit("C222:1.1", &sent.message_id, "b < c").await;
+    let record = fake.record();
+    assert_eq!(edited, Ok(()));
+    assert_eq!(sent.message_id, "C222:1.0001");
+    assert_eq!(
+        record.updates,
+        vec![json!({ "channel": "C222", "ts": "1.0001", "text": "b &lt; c" })]
+    );
+    assert_eq!(record.posts.len(), 1);
+}
+
+#[tokio::test]
+async fn edit_of_a_missing_message_is_edit_error() {
+    let (fake, adapter) = setup();
+    fake.fail_next_update("message_not_found");
+    let err = adapter
+        .edit("C222:1.1", "C222:1.0001", "x")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_EDIT);
+    assert!(err.message.starts_with(E_SLACK_API));
+    assert_eq!(fake.record().updates.len(), 1);
+}
+
+#[tokio::test]
+async fn edit_with_a_bad_message_id_makes_no_call() {
+    let (fake, adapter) = setup();
+    for id in ["C222", "", ":1.0001", "C222:"] {
+        let err = adapter.edit("C222:1.1", id, "x").await.unwrap_err();
+        assert_eq!(err.code, E_ADAPTER_EDIT, "id {id:?}");
+        assert!(err.message.starts_with(E_SLACK_ID), "id {id:?}");
+    }
+    assert!(fake.record().updates.is_empty());
+}
+
+#[tokio::test]
+async fn edit_rate_limited_is_edit_error_without_retry() {
+    let (fake, adapter) = setup();
+    fake.rate_limit_next_update();
+    let err = adapter
+        .edit("C222:1.1", "C222:1.0001", "x")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_EDIT);
+    assert!(err.message.starts_with(E_SLACK_RATE));
+    assert_eq!(fake.record().updates.len(), 1);
 }
 
 #[tokio::test]

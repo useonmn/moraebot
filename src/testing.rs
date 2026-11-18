@@ -450,6 +450,8 @@ pub struct SlackRecord {
     pub connected_urls: Vec<String>,
     /// Every `chat.postMessage` body, rate-limited and failed attempts included.
     pub posts: Vec<Value>,
+    /// Every `chat.update` body, failed and rate-limited ones included.
+    pub updates: Vec<Value>,
     /// Every text the adapter wrote on any socket (the acks).
     pub socket_texts: Vec<String>,
     pub pings: usize,
@@ -500,6 +502,8 @@ struct FakeSlackState {
     fail_auth: bool,
     rate_limits: VecDeque<Duration>,
     fail_next_post: bool,
+    fail_next_update: Option<String>,
+    rate_limit_next_update: bool,
     sessions: Vec<mpsc::UnboundedSender<SocketItem>>,
     download_bytes: HashMap<String, Vec<u8>>,
     step_failures: VecDeque<(UploadStep, String)>,
@@ -577,6 +581,20 @@ impl FakeSlackTransport {
     /// The next `post_message` fails with a Slack API error.
     pub fn fail_next_post(&self) {
         self.shared.update(|state| state.fail_next_post = true);
+    }
+
+    /// The next `update_message` records itself, then fails with a Slack API error
+    /// carrying `slack_error`.
+    pub fn fail_next_update(&self, slack_error: &str) {
+        self.shared
+            .update(|state| state.fail_next_update = Some(slack_error.to_owned()));
+    }
+
+    /// The next `update_message` records itself, then answers HTTP 429 with a zero
+    /// Retry-After.
+    pub fn rate_limit_next_update(&self) {
+        self.shared
+            .update(|state| state.rate_limit_next_update = true);
     }
 
     /// The bytes `download` writes for this URL (empty when unset).
@@ -763,6 +781,27 @@ impl SlackTransport for FakeSlackTransport {
                 "{}.0001",
                 state.record.posts.len()
             )))
+        })
+    }
+
+    async fn update_message(&self, body: Value) -> Result<PostOutcome, AdapterError> {
+        self.shared.update(|state| {
+            let ts = body
+                .get("ts")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            state.record.updates.push(body);
+            if std::mem::take(&mut state.rate_limit_next_update) {
+                return Ok(PostOutcome::RateLimited(Duration::ZERO));
+            }
+            if let Some(slack_error) = state.fail_next_update.take() {
+                return Err(AdapterError {
+                    code: E_SLACK_API,
+                    message: slack_error,
+                });
+            }
+            Ok(PostOutcome::Posted(ts))
         })
     }
 
