@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serenity::all::EditMessage;
 use serenity::all::{
     Channel, ChannelId, ChannelType, Client, Context, CreateAttachment, CreateMessage,
     CreateThread, EventHandler, GatewayIntents, Http, Message, MessageId, MessageType, Ready,
@@ -20,6 +21,8 @@ use serenity::all::{
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+use crate::adapter::E_ADAPTER_EDIT;
 
 use crate::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD,
@@ -191,6 +194,37 @@ async fn open_dm_channel(http: &Http, user_id: u64) -> Result<String, AdapterErr
             },
         })?;
     Ok(channel.id.get().to_string())
+}
+
+/// Replaces the text of message `message_id` in `channel_id` through serenity, which
+/// sends the token. Every failure is `E_ADAPTER_EDIT`.
+async fn edit_text(
+    http: &Http,
+    channel_id: u64,
+    message_id: u64,
+    text: &str,
+) -> Result<(), AdapterError> {
+    ChannelId::new(channel_id)
+        .edit_message(
+            http,
+            MessageId::new(message_id),
+            EditMessage::new().content(text),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            let status = match &err {
+                serenity::Error::Http(http_err) => http_err.status_code().map(|s| s.as_u16()),
+                _ => None,
+            };
+            AdapterError {
+                code: E_ADAPTER_EDIT,
+                message: match status {
+                    Some(status) => format!("edit failed with HTTP {status}"),
+                    None => "edit failed".to_owned(),
+                },
+            }
+        })
 }
 
 pub fn guild_location(is_thread: bool, parent_id: Option<u64>) -> Location {
@@ -576,6 +610,16 @@ impl MessengerAdapter for DiscordAdapter {
     ) -> Result<SendResult, AdapterError> {
         let message_id = upload_file(&self.http, parse_id(target)?, path, name).await?;
         Ok(SendResult { message_id })
+    }
+
+    async fn edit(&self, target: &str, message_id: &str, text: &str) -> Result<(), AdapterError> {
+        let ids = parse_id(target)
+            .and_then(|channel| parse_id(message_id).map(|message| (channel, message)));
+        let (channel_id, message_id) = ids.map_err(|err| AdapterError {
+            code: E_ADAPTER_EDIT,
+            message: err.to_string(),
+        })?;
+        edit_text(&self.http, channel_id, message_id, text).await
     }
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
@@ -1284,5 +1328,58 @@ mod tests {
             adapter.start_typing("").await.err().unwrap().code,
             E_DISCORD_ID
         );
+    }
+
+    #[tokio::test]
+    async fn edit_patches_the_message_through_serenity() {
+        let (base, mut rx) = discord_stub(Reply::Status(200, MESSAGE_JSON)).await;
+        let result = tokio::time::timeout(
+            WAIT,
+            edit_text(&loopback_http(&base), CHANNEL, 333, "[lane 1] qa step 2"),
+        )
+        .await
+        .expect("edit in time");
+        let seen = next_request(&mut rx).await;
+        assert_eq!(result, Ok(()));
+        assert!(rx.try_recv().is_err(), "exactly one request");
+        assert!(
+            seen.head
+                .starts_with("PATCH /api/v10/channels/222/messages/333 "),
+            "{}",
+            seen.head.lines().next().unwrap_or_default()
+        );
+        let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(body["content"], "[lane 1] qa step 2");
+    }
+
+    #[tokio::test]
+    async fn edit_of_a_missing_message_is_edit_error() {
+        let (base, mut rx) = discord_stub(Reply::Status(
+            404,
+            r#"{"code":10008,"message":"Unknown Message"}"#,
+        ))
+        .await;
+        let err = tokio::time::timeout(
+            WAIT,
+            edit_text(&loopback_http(&base), CHANNEL, 333, "[lane 1] qa step 2"),
+        )
+        .await
+        .expect("edit in time")
+        .unwrap_err();
+        next_request(&mut rx).await;
+        assert_eq!(err.code, E_ADAPTER_EDIT);
+        assert!(rx.try_recv().is_err(), "exactly one request");
+    }
+
+    #[tokio::test]
+    async fn edit_with_invalid_ids_makes_no_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter =
+            DiscordAdapter::new(&token_file(dir.path(), "TOKEN_SENTINEL_9f3a"), scope()).unwrap();
+        for (target, id) in [("thread-1", "333"), ("222", "0"), ("222", "x")] {
+            let err = adapter.edit(target, id, "x").await.unwrap_err();
+            assert_eq!(err.code, E_ADAPTER_EDIT, "{target} {id}");
+            assert!(err.message.starts_with(E_DISCORD_ID), "{target} {id}");
+        }
     }
 }
