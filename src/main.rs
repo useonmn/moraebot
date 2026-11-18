@@ -275,7 +275,7 @@ fn onboarding_request(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Co
         None => env.default_config_path()?,
     };
     let config = Config::load(&path, env)?;
-    if let Err(e) = onboarding::request(&config.home) {
+    if let Err(e) = onboarding::request(&config.home, onboarding::GreetTarget::Dm) {
         eprintln!("{}: {}", e.code, e.detail);
         return Ok(ExitCode::FAILURE);
     }

@@ -10,7 +10,7 @@ use crate::config::{
     AccessMode, Config, ConfigError, DiscordConfig, E_CHANNEL_MISSING, E_IO, E_OMP_MISSING,
     E_OWNER_MISSING, Env, OmpConfig, Platform, SlackConfig, report_checks,
 };
-use crate::onboarding::{E_ONBOARDING_REQUEST, request};
+use crate::onboarding::{E_ONBOARDING_REQUEST, GreetTarget, request};
 
 pub const E_INIT_EOF: &str = "E_INIT_EOF";
 pub const E_SETUP_NO_CONFIG: &str = "E_SETUP_NO_CONFIG";
@@ -22,8 +22,8 @@ Next steps:
   moraebot check-config     check the setup again at any time
   moraebot install-launchd  keep moraebot running in the background (macOS)
   moraebot run              or run it in this terminal instead
-Then message the bot in its channel or in a DM. At its next start it says hello in the
-channel and asks a few questions about you; reply skip to skip them.
+Then message the bot in its channel or in a DM. At its next start it says hello to you in a DM
+(in the channel if the DM fails) and asks a few questions about you; reply skip to skip them.
 ";
 
 /// `NEXT_STEPS` for Linux, where the background service is the systemd user unit.
@@ -32,8 +32,8 @@ Next steps:
   moraebot check-config     check the setup again at any time
   moraebot install-systemd  keep moraebot running in the background (Linux)
   moraebot run              or run it in this terminal instead
-Then message the bot in its channel or in a DM. At its next start it says hello in the
-channel and asks a few questions about you; reply skip to skip them.
+Then message the bot in its channel or in a DM. At its next start it says hello to you in a DM
+(in the channel if the DM fails) and asks a few questions about you; reply skip to skip them.
 ";
 
 /// The next steps for `os` (a `std::env::consts::OS` value).
@@ -537,7 +537,8 @@ pub fn run<R: BufRead, W: Write>(
         &work_dir,
     )?;
     let outcome = prompter.finish(&config, &config_path, env, tokens)?;
-    request(&config.home).map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
+    request(&config.home, GreetTarget::Dm)
+        .map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
     if outcome == (InitOutcome::Written { checks_ok: true }) {
         write!(prompter.out, "{}", next_steps(std::env::consts::OS))?;
     }
@@ -794,6 +795,11 @@ mod tests {
         assert!(out.ends_with(next_steps(std::env::consts::OS)));
         let request = crate::onboarding::request_file(&fx.dir.path().join("mhome"));
         assert_eq!(mode_of(&request), 0o600);
+        assert_eq!(fs::read_to_string(&request).unwrap(), "dm\n");
+        assert_eq!(
+            crate::onboarding::read_request(&fx.dir.path().join("mhome")),
+            GreetTarget::Dm
+        );
     }
 
     #[test]

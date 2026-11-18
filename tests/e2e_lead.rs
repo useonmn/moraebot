@@ -21,7 +21,7 @@ use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lane::E_LANE_INTERRUPTED;
 use moraebot::lead;
 use moraebot::omp::key_slug;
-use moraebot::onboarding;
+use moraebot::onboarding::{self, GreetTarget};
 use moraebot::persona;
 use moraebot::slack::SlackAdapter;
 use moraebot::store::{LaneState, OnboardingRow, OnboardingState, State, Store};
@@ -1096,7 +1096,7 @@ fn lead_appends(tap: &LogTap) -> Vec<Vec<String>> {
 #[tokio::test]
 async fn onboarding_through_the_gateway() {
     let mut rig = Rig::discord();
-    onboarding::request(&rig.config.home).expect("request onboarding");
+    onboarding::request(&rig.config.home, GreetTarget::Channel).expect("request onboarding");
     let calls = json!({
         "tool": onboarding::FINISH_TOOL,
         "arguments": {

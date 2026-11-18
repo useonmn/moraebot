@@ -42,7 +42,8 @@
 //! the owner gets one notice per reply.
 //!
 //! At startup, an onboarding request left by `moraebot init` or `moraebot onboarding` starts
-//! the first meeting and posts one fixed greeting in the configured channel.
+//! the first meeting and posts one fixed greeting: in the owner's DM (in the configured
+//! channel when the DM fails), or in the channel when the request says so.
 //!
 //! Lane news: after every lane watchdog tick, the newest unposted progress note of each
 //! running lane is posted as one new message per conversation that had no owner message,
@@ -66,7 +67,7 @@ use crate::files::{self, OutFile, SavedFile};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
 use crate::omp::{E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
-use crate::onboarding::{self, E_ONBOARDING_REQUEST};
+use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
 
@@ -92,7 +93,7 @@ pub const N_FILE_NOT_ALLOWED: &str = "N_FILE_NOT_ALLOWED";
 pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
 /// A lane was running when the gateway stopped; it was not resumed.
 pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
-/// The one greeting after an onboarding request, posted in the configured channel.
+/// The one greeting after an onboarding request.
 pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
 
 /// Stored row error: the conversation key has no reply target.
@@ -292,7 +293,8 @@ pub struct Dispatcher {
     work_dir: PathBuf,
     /// The moraebot home: never a source of sent files.
     home: PathBuf,
-    /// The configured channel: the onboarding greeting goes there.
+    /// The configured channel: the onboarding greeting goes there when asked, or when the
+    /// owner's DM fails.
     channel_id: String,
     /// Held while a row is admitted and its thread opened, and while the worker dequeues,
     /// so the worker never picks a row whose thread does not exist yet.
@@ -369,13 +371,16 @@ impl Dispatcher {
     }
 
     /// Starts the onboarding and posts [`N_ONBOARDING_HELLO`] once when a request file is
-    /// present. The file is removed before the greeting; when it cannot be removed nothing
-    /// is sent (no greeting at every start). A failed greeting is not retried.
+    /// present: in the owner's DM unless the request says `channel`, and in the configured
+    /// channel when the DM cannot be opened or the send fails. The file is removed before the
+    /// greeting; when it cannot be removed nothing is sent (no greeting at every start). A
+    /// greeting that failed in both places is not retried.
     async fn greet_if_requested(&self) -> Result<(), StoreError> {
         let path = onboarding::request_file(&self.home);
         if std::fs::symlink_metadata(&path).is_err() {
             return Ok(());
         }
+        let target = onboarding::read_request(&self.home);
         self.store().start_onboarding()?;
         if std::fs::remove_file(&path).is_err() {
             tracing::warn!(
@@ -384,10 +389,28 @@ impl Dispatcher {
             );
             return Ok(());
         }
-        if self.notify(&self.channel_id, N_ONBOARDING_HELLO).await {
-            tracing::info!("onboarding greeting sent");
+        let place = match target {
+            GreetTarget::Dm if self.greet_in_dm().await => Some(GreetTarget::Dm),
+            _ => self
+                .notify(&self.channel_id, N_ONBOARDING_HELLO)
+                .await
+                .then_some(GreetTarget::Channel),
+        };
+        if let Some(place) = place {
+            tracing::info!(place = place.as_str(), "onboarding greeting sent");
         }
         Ok(())
+    }
+
+    /// Opens the owner's DM and sends the greeting there; false when either step fails.
+    async fn greet_in_dm(&self) -> bool {
+        match self.adapter.open_dm(&self.owner_id).await {
+            Ok(target) => self.notify(&target, N_ONBOARDING_HELLO).await,
+            Err(err) => {
+                tracing::warn!(code = err.code, "owner DM not opened for the greeting");
+                false
+            }
+        }
     }
 
     /// Runs startup, then serves inbound events and the worker until `inbound` closes.

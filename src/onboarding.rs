@@ -2,6 +2,7 @@
 //! finish tool.
 
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,25 +43,63 @@ pub struct OnboardingError {
     pub detail: String,
 }
 
+/// Where the first-meeting greeting goes, as written in the request file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreetTarget {
+    /// The owner's DM; the configured channel when the DM fails.
+    Dm,
+    /// The configured channel only.
+    Channel,
+}
+
+impl GreetTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GreetTarget::Dm => "dm",
+            GreetTarget::Channel => "channel",
+        }
+    }
+
+    /// `dm` or `channel`; anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "dm" => Some(GreetTarget::Dm),
+            "channel" => Some(GreetTarget::Channel),
+            _ => None,
+        }
+    }
+}
+
 /// `<home>/onboarding.request`.
 pub fn request_file(home: &Path) -> PathBuf {
     home.join(REQUEST_FILE)
 }
 
-/// Creates or truncates the request file, mode 0600. `E_ONBOARDING_REQUEST` with the io error
-/// kind as detail when it cannot be written.
-pub fn request(home: &Path) -> Result<(), OnboardingError> {
-    OpenOptions::new()
+/// Creates or truncates the request file, mode 0600, holding the greeting target as one word.
+/// `E_ONBOARDING_REQUEST` with the io error kind as detail when it cannot be written.
+pub fn request(home: &Path, target: GreetTarget) -> Result<(), OnboardingError> {
+    let coded = |e: std::io::Error| OnboardingError {
+        code: E_ONBOARDING_REQUEST,
+        detail: format!("{:?}", e.kind()),
+    };
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(request_file(home))
-        .map(|_| ())
-        .map_err(|e| OnboardingError {
-            code: E_ONBOARDING_REQUEST,
-            detail: format!("{:?}", e.kind()),
-        })
+        .map_err(coded)?;
+    file.write_all(format!("{}\n", target.as_str()).as_bytes())
+        .map_err(coded)
+}
+
+/// The greeting target a request asks for: `Channel` only when the file says `channel`; a DM
+/// for `dm`, an empty file from an older version, unknown text or an unreadable file.
+pub fn read_request(home: &Path) -> GreetTarget {
+    std::fs::read_to_string(request_file(home))
+        .ok()
+        .and_then(|text| GreetTarget::parse(text.trim()))
+        .unwrap_or(GreetTarget::Dm)
 }
 
 /// `[moraebot onboarding turn=<turn>]`.
@@ -398,15 +437,50 @@ mod tests {
     }
 
     #[test]
-    fn request_creates_a_private_empty_file() {
+    fn request_creates_a_private_file() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("qa-mbhome");
         std::fs::create_dir(&home).unwrap();
-        request(&home).expect("request");
+        request(&home, GreetTarget::Dm).expect("request");
         let meta = std::fs::metadata(request_file(&home)).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        assert_eq!(meta.len(), 0);
-        request(&home).expect("second request");
+        assert_eq!(
+            std::fs::read_to_string(request_file(&home)).unwrap(),
+            "dm\n"
+        );
+        request(&home, GreetTarget::Dm).expect("second request");
+    }
+
+    #[test]
+    fn request_records_the_greeting_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("qa-mbhome");
+        std::fs::create_dir(&home).unwrap();
+        for target in [GreetTarget::Dm, GreetTarget::Channel] {
+            request(&home, target).expect("request");
+            assert_eq!(
+                std::fs::read_to_string(request_file(&home)).unwrap(),
+                format!("{}\n", target.as_str())
+            );
+            assert_eq!(read_request(&home), target);
+        }
+    }
+
+    #[test]
+    fn read_request_defaults_to_dm() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("qa-mbhome");
+        std::fs::create_dir(&home).unwrap();
+        assert_eq!(read_request(&home), GreetTarget::Dm);
+        for text in [&b""[..], b"thread\n", b"CHANNEL"] {
+            std::fs::write(request_file(&home), text).unwrap();
+            assert_eq!(read_request(&home), GreetTarget::Dm);
+        }
+        std::fs::write(request_file(&home), b"  channel  \n").unwrap();
+        assert_eq!(read_request(&home), GreetTarget::Channel);
+        std::fs::remove_file(request_file(&home)).unwrap();
+        std::fs::create_dir(request_file(&home)).unwrap();
+        assert_eq!(read_request(&home), GreetTarget::Dm);
     }
 
     #[test]
@@ -414,7 +488,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("qa-mbhome");
         std::fs::write(&home, b"x").unwrap();
-        let err = request(&home).expect_err("home is a file");
+        let err = request(&home, GreetTarget::Dm).expect_err("home is a file");
         assert_eq!(err.code, E_ONBOARDING_REQUEST);
     }
 

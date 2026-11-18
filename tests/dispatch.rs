@@ -25,7 +25,7 @@ use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
 use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
-use moraebot::onboarding;
+use moraebot::onboarding::{self, GreetTarget};
 use moraebot::store::{
     Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
 };
@@ -39,6 +39,7 @@ const LIMIT: usize = 2000;
 const OWNER: &str = "111";
 const STRANGER: &str = "222";
 const CHANNEL: &str = "333";
+const OWNER_DM: &str = "dm-111";
 const BOUND: Duration = Duration::from_secs(30);
 const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
 
@@ -2335,9 +2336,25 @@ fn onboarding_row(h: &Harness) -> Option<OnboardingRow> {
 
 fn greeting() -> (String, String) {
     (
+        OWNER_DM.to_owned(),
+        notice_text(N_ONBOARDING_HELLO).to_owned(),
+    )
+}
+
+fn channel_greeting() -> (String, String) {
+    (
         CHANNEL.to_owned(),
         notice_text(N_ONBOARDING_HELLO).to_owned(),
     )
+}
+
+/// How many times the owner's DM was opened.
+fn open_dms(h: &Harness) -> usize {
+    h.adapter
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::OpenDm { user_id } if user_id == OWNER))
+        .count()
 }
 
 /// The `message` of every logged prompt frame, tag line included.
@@ -2351,13 +2368,24 @@ fn raw_prompt_messages(h: &Harness) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn onboarding_request_greets_once_in_the_channel() {
+async fn onboarding_request_greets_once_in_the_owner_dm() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    onboarding::request(&h.config.home).unwrap();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
     bounded(h.dispatcher.startup()).await.unwrap();
 
     assert_eq!(h.sends(), vec![greeting()]);
+    assert_eq!(open_dms(&h), 1);
+    let calls = h.adapter.calls();
+    let opened = calls
+        .iter()
+        .position(|call| matches!(call, Call::OpenDm { .. }))
+        .expect("DM opened");
+    let sent = calls
+        .iter()
+        .position(|call| matches!(call, Call::Send { .. }))
+        .expect("greeting sent");
+    assert!(opened < sent, "the DM is opened before the greeting");
     assert!(
         std::fs::symlink_metadata(onboarding::request_file(&h.config.home)).is_err(),
         "request file removed"
@@ -2372,6 +2400,7 @@ async fn onboarding_request_greets_once_in_the_channel() {
 
     bounded(h.dispatcher.startup()).await.unwrap();
     assert_eq!(h.sends().len(), 1);
+    assert_eq!(open_dms(&h), 1);
     h.close().await;
 }
 
@@ -2390,11 +2419,11 @@ async fn no_request_means_no_greeting() {
 async fn failed_greeting_is_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    onboarding::request(&h.config.home).unwrap();
+    onboarding::request(&h.config.home, GreetTarget::Channel).unwrap();
     h.adapter.fail_next_send();
     bounded(h.dispatcher.startup()).await.unwrap();
 
-    assert_eq!(h.sends(), vec![greeting()]);
+    assert_eq!(h.sends(), vec![channel_greeting()]);
     assert!(std::fs::symlink_metadata(onboarding::request_file(&h.config.home)).is_err());
     assert_eq!(
         onboarding_row(&h).map(|row| row.state),
@@ -2404,6 +2433,113 @@ async fn failed_greeting_is_not_retried() {
     bounded(h.dispatcher.startup()).await.unwrap();
     assert_eq!(h.sends().len(), 1);
     h.close().await;
+}
+
+#[tokio::test]
+async fn channel_request_greets_in_the_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home, GreetTarget::Channel).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![channel_greeting()]);
+    assert_eq!(open_dms(&h), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn failed_dm_greeting_falls_back_to_the_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    h.adapter.fail_next_send();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![greeting(), channel_greeting()]);
+    assert_eq!(
+        onboarding_row(&h).map(|row| row.state),
+        Some(OnboardingState::Active)
+    );
+
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.sends().len(), 2);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn unopened_dm_greets_in_the_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    h.adapter.fail_next_open_dm();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![channel_greeting()]);
+    assert_eq!(open_dms(&h), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn greeting_failing_in_both_places_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    h.adapter.fail_next_open_dm();
+    h.adapter.fail_next_send();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![channel_greeting()]);
+    assert_eq!(open_dms(&h), 1);
+    assert!(std::fs::symlink_metadata(onboarding::request_file(&h.config.home)).is_err());
+    assert_eq!(
+        onboarding_row(&h).map(|row| row.state),
+        Some(OnboardingState::Active)
+    );
+
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.sends().len(), 1);
+    assert_eq!(open_dms(&h), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn old_empty_request_greets_in_the_dm() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    std::fs::write(onboarding::request_file(&h.config.home), b"").unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(h.sends(), vec![greeting()]);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn owner_dm_reply_is_onboarding_turn_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert_eq!(h.sends(), vec![greeting()]);
+
+    let mut ev = channel_msg("1300000000000000201", "hi");
+    ev.is_dm = true;
+    ev.channel_id = "444".into();
+    assert_eq!(queued(h.handle(ev).await), 1);
+    h.drain().await;
+
+    let prompts = h.prompts();
+    let sends = h.sends();
+    let key = h.row(1).conversation_key;
+    h.close().await;
+    assert_eq!(
+        prompts[0]["message"],
+        format!("{}\nhi", onboarding::notice_line(1))
+    );
+    assert_eq!(
+        sends.last().map(|(channel, _)| channel.as_str()),
+        Some("444")
+    );
+    assert_eq!(key, "fake:dm:444");
 }
 
 #[tokio::test]
@@ -2420,7 +2556,7 @@ async fn new_request_restarts_onboarding() {
         assert!(store.finish_onboarding(OnboardingState::Done).unwrap());
     }
 
-    onboarding::request(&h.config.home).unwrap();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
     bounded(h.dispatcher.startup()).await.unwrap();
 
     assert_eq!(
@@ -2455,7 +2591,7 @@ async fn unremovable_request_sends_no_greeting() {
 async fn onboarding_marks_owner_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    onboarding::request(&h.config.home).unwrap();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
     bounded(h.dispatcher.startup()).await.unwrap();
     assert_eq!(h.sends(), vec![greeting()]);
     assert_eq!(
@@ -2498,7 +2634,7 @@ async fn onboarding_marks_owner_inputs() {
 async fn onboarding_mark_stops_after_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    onboarding::request(&h.config.home).unwrap();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
     bounded(h.dispatcher.startup()).await.unwrap();
 
     for n in 0..11 {
