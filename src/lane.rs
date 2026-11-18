@@ -102,6 +102,8 @@ pub const E_LANE_INTERRUPTED: &str = "E_LANE_INTERRUPTED";
 pub const E_LANE_STOPPING: &str = "E_LANE_STOPPING";
 /// The lane was closed with `lane_close` and takes no more work.
 pub const E_LANE_CLOSED: &str = "E_LANE_CLOSED";
+/// The lead stopped the lane's running turn with `lane_stop`.
+pub const E_LANE_STOPPED: &str = "E_LANE_STOPPED";
 
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;

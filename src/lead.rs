@@ -1,6 +1,7 @@
 //! The lead session: role guidance and the envelope that names each input's conversation. Messenger-agnostic.
 
 use crate::done::E_DONE_UNMET;
+use crate::lane::E_LANE_STOPPED;
 
 /// Name passed to `hints::load` for the lead guidance; the override file is `<home>/hints/lead.md`.
 pub const GUIDANCE_NAME: &str = "lead";
@@ -35,6 +36,8 @@ pub enum LaneResult<'a> {
     Done { text: &'a str, receipt: &'a str },
     /// The lane's final text, and its last `lane_done` claim failed; `receipt` lists the checks.
     Unmet { text: &'a str, receipt: &'a str },
+    /// The lead stopped the lane's turn; the reason it gave, already cleaned.
+    Stopped { reason: &'a str },
 }
 
 /// What a stalled-lane notice tells the lead; numbers only, never tool args or paths.
@@ -83,7 +86,7 @@ pub fn owner_input(conversation_key: &str, row_id: i64, body: &str) -> String {
     format!("[moraebot conversation={conversation_key} message={row_id}]\n{body}")
 }
 
-/// The lead input for a lane result: a tag line, then the text (no body for a failure, except `E_DONE_UNMET`).
+/// The lead input for a lane result: a tag line, then the text (no body for a failure, except `E_DONE_UNMET`, `E_LANE_STOPPED`).
 pub fn lane_result(conversation_key: &str, lane_id: i64, result: &LaneResult) -> String {
     match result {
         LaneResult::Text(text) => {
@@ -97,6 +100,9 @@ pub fn lane_result(conversation_key: &str, lane_id: i64, result: &LaneResult) ->
         ),
         LaneResult::Unmet { text, receipt } => format!(
             "[moraebot conversation={conversation_key} lane={lane_id} failed code={E_DONE_UNMET}]\n{text}\n\n[moraebot] The lane's last lane_done claim failed:\n{receipt}"
+        ),
+        LaneResult::Stopped { reason } => format!(
+            "[moraebot conversation={conversation_key} lane={lane_id} failed code={E_LANE_STOPPED}]\n[moraebot] Stopped by the lead: {reason}"
         ),
     }
 }
@@ -232,6 +238,19 @@ mod tests {
         assert_eq!(tag.lane, Some(3));
         assert_eq!(tag.failed.as_deref(), Some(E_DONE_UNMET));
         assert!(!tag.done);
+    }
+
+    #[test]
+    fn stopped_result_tags_failed_with_the_stop_code() {
+        let text = lane_result("p:th:111", 3, &LaneResult::Stopped { reason: "qa stuck" });
+        let tag = parse_tag(&text).expect("tag");
+        assert_eq!(tag.lane, Some(3));
+        assert_eq!(tag.failed.as_deref(), Some(E_LANE_STOPPED));
+        assert!(!tag.done);
+        assert!(!tag.stalled);
+        assert_eq!(tag.conversation, "p:th:111");
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().nth(1).unwrap().ends_with("qa stuck"));
     }
 
     #[test]
