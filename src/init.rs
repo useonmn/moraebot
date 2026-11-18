@@ -26,6 +26,24 @@ Then message the bot in its channel or in a DM. At its next start it says hello 
 channel and asks a few questions about you; reply skip to skip them.
 ";
 
+/// `NEXT_STEPS` for Linux, where the background service is the systemd user unit.
+pub const NEXT_STEPS_LINUX: &str = "\
+Next steps:
+  moraebot check-config     check the setup again at any time
+  moraebot install-systemd  keep moraebot running in the background (Linux)
+  moraebot run              or run it in this terminal instead
+Then message the bot in its channel or in a DM. At its next start it says hello in the
+channel and asks a few questions about you; reply skip to skip them.
+";
+
+/// The next steps for `os` (a `std::env::consts::OS` value).
+pub fn next_steps(os: &str) -> &'static str {
+    match os {
+        "linux" => NEXT_STEPS_LINUX,
+        _ => NEXT_STEPS,
+    }
+}
+
 const DEFAULT_WORK_DIR: &str = "~/moraebot-work";
 const TOKEN_FILE_NAME: &str = "discord.token";
 const SLACK_BOT_TOKEN_FILE_NAME: &str = "slack-bot.token";
@@ -521,7 +539,7 @@ pub fn run<R: BufRead, W: Write>(
     let outcome = prompter.finish(&config, &config_path, env, tokens)?;
     request(&config.home).map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
     if outcome == (InitOutcome::Written { checks_ok: true }) {
-        write!(prompter.out, "{NEXT_STEPS}")?;
+        write!(prompter.out, "{}", next_steps(std::env::consts::OS))?;
     }
     Ok(outcome)
 }
@@ -773,9 +791,21 @@ mod tests {
             result.expect("init runs"),
             InitOutcome::Written { checks_ok: true }
         );
-        assert!(out.ends_with(NEXT_STEPS));
+        assert!(out.ends_with(next_steps(std::env::consts::OS)));
         let request = crate::onboarding::request_file(&fx.dir.path().join("mhome"));
         assert_eq!(mode_of(&request), 0o600);
+    }
+
+    #[test]
+    fn next_steps_follow_the_os() {
+        assert_eq!(next_steps("macos"), NEXT_STEPS);
+        assert_eq!(next_steps("linux"), NEXT_STEPS_LINUX);
+        assert_ne!(NEXT_STEPS_LINUX, NEXT_STEPS);
+        assert!(
+            NEXT_STEPS_LINUX
+                .lines()
+                .any(|l| l.starts_with("  moraebot install-systemd "))
+        );
     }
 
     #[test]
@@ -785,7 +815,7 @@ mod tests {
         fs::write(fx.config_path(), "original").expect("write");
         let (result, out) = fx.run("n\n");
         assert_eq!(result.expect("init runs"), InitOutcome::Kept);
-        assert!(!out.contains(NEXT_STEPS));
+        assert!(!out.contains(next_steps(std::env::consts::OS)));
         assert!(!crate::onboarding::request_file(&fx.dir.path().join("mhome")).exists());
     }
 
@@ -1068,7 +1098,7 @@ mod tests {
             InitOutcome::Written { checks_ok: true }
         );
         assert!(!request.exists());
-        assert!(!out.contains(NEXT_STEPS));
+        assert!(!out.contains(next_steps(std::env::consts::OS)));
     }
 
     #[test]

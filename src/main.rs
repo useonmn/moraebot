@@ -13,9 +13,10 @@ use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::onboarding;
 use moraebot::slack::SlackAdapter;
+use moraebot::systemd;
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Time the gateway gets to stop after a signal; launchd's ExitTimeOut is 30 s.
+/// Time the gateway gets to stop after a signal; launchd's ExitTimeOut and systemd's TimeoutStopSec are 30 s.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(20);
 /// Extra time for closing the messenger connection after the gateway stopped.
 const ADAPTER_SHUTDOWN_BOUND: Duration = Duration::from_secs(4);
@@ -33,6 +34,10 @@ Commands:
                                 Install the launchd agent (macOS)
   uninstall-launchd [--label LABEL]
                                 Remove the launchd agent
+  install-systemd [--config PATH] [--unit NAME] [--dry-run]
+                                Install the systemd user service (Linux)
+  uninstall-systemd [--unit NAME]
+                                Remove the systemd user service
   onboarding [--config PATH]    Greet and ask the first-meeting questions again at the next start
   --version, -V                 Print the version
 ";
@@ -60,6 +65,14 @@ enum Command {
     UninstallLaunchd {
         label: String,
     },
+    InstallSystemd {
+        config: Option<PathBuf>,
+        unit: String,
+        dry_run: bool,
+    },
+    UninstallSystemd {
+        unit: String,
+    },
     Onboarding {
         config: Option<PathBuf>,
     },
@@ -76,8 +89,26 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "init" => Err("init takes no arguments".to_string()),
         "setup" => parse_messenger(name, rest).map(|messenger| Command::Setup { messenger }),
         "guide" => parse_messenger(name, rest).map(|messenger| Command::Guide { messenger }),
-        "install-launchd" => parse_install_launchd(rest),
-        "uninstall-launchd" => parse_uninstall_launchd(rest),
+        "install-launchd" => {
+            parse_service_install(rest, "--label", DEFAULT_LABEL).map(|(config, label, dry_run)| {
+                Command::InstallLaunchd {
+                    config,
+                    label,
+                    dry_run,
+                }
+            })
+        }
+        "uninstall-launchd" => parse_service_name(rest, "--label", DEFAULT_LABEL)
+            .map(|label| Command::UninstallLaunchd { label }),
+        "install-systemd" => parse_service_install(rest, "--unit", systemd::DEFAULT_UNIT).map(
+            |(config, unit, dry_run)| Command::InstallSystemd {
+                config,
+                unit,
+                dry_run,
+            },
+        ),
+        "uninstall-systemd" => parse_service_name(rest, "--unit", systemd::DEFAULT_UNIT)
+            .map(|unit| Command::UninstallSystemd { unit }),
         "onboarding" => parse_config_flag(rest).map(|config| Command::Onboarding { config }),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -101,35 +132,34 @@ fn parse_config_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn parse_install_launchd(args: &[String]) -> Result<Command, String> {
+/// `[--config PATH] [<name_flag> NAME] [--dry-run]` of a service install command:
+/// the config path, the service name (`default` when not given) and the dry-run switch.
+fn parse_service_install(
+    args: &[String],
+    name_flag: &str,
+    default: &str,
+) -> Result<(Option<PathBuf>, String, bool), String> {
     let mut config = None;
-    let mut label = DEFAULT_LABEL.to_string();
+    let mut name = default.to_string();
     let mut dry_run = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--config" => config = Some(PathBuf::from(flag_value(&mut rest, arg)?)),
-            "--label" => label = flag_value(&mut rest, arg)?,
+            flag if flag == name_flag => name = flag_value(&mut rest, arg)?,
             "--dry-run" => dry_run = true,
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
-    Ok(Command::InstallLaunchd {
-        config,
-        label,
-        dry_run,
-    })
+    Ok((config, name, dry_run))
 }
 
-fn parse_uninstall_launchd(args: &[String]) -> Result<Command, String> {
+/// `[<name_flag> NAME]` of a service uninstall command: the service name, `default` when not given.
+fn parse_service_name(args: &[String], name_flag: &str, default: &str) -> Result<String, String> {
     match args {
-        [] => Ok(Command::UninstallLaunchd {
-            label: DEFAULT_LABEL.to_string(),
-        }),
-        [flag, label] if flag == "--label" => Ok(Command::UninstallLaunchd {
-            label: label.clone(),
-        }),
-        [flag] if flag == "--label" => Err("--label needs a value".to_string()),
+        [] => Ok(default.to_string()),
+        [flag, name] if flag == name_flag => Ok(name.clone()),
+        [flag] if flag == name_flag => Err(format!("{name_flag} needs a value")),
         [other, ..] => Err(format!("unexpected argument '{other}'")),
     }
 }
@@ -198,6 +228,42 @@ fn install_launchd(
 
 fn uninstall_launchd(env: &Env, label: &str) -> Result<ExitCode, ConfigError> {
     launchd::uninstall(env, label, &mut io::stdout().lock())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `<config>/systemd/user`, with `<config>` from `XDG_CONFIG_HOME` when it is absolute.
+fn systemd_unit_dir(env: &Env) -> Result<PathBuf, ConfigError> {
+    systemd::unit_dir(
+        env,
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+}
+
+fn install_systemd(
+    env: &Env,
+    config: Option<PathBuf>,
+    unit: &str,
+    dry_run: bool,
+) -> Result<ExitCode, ConfigError> {
+    let path = match config {
+        Some(path) => path,
+        None => env.default_config_path()?,
+    };
+    let config = Config::load(&path, env)?;
+    systemd::install(
+        &config,
+        &systemd_unit_dir(env)?,
+        unit,
+        dry_run,
+        &mut io::stdout().lock(),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn uninstall_systemd(env: &Env, unit: &str) -> Result<ExitCode, ConfigError> {
+    systemd::uninstall(&systemd_unit_dir(env)?, unit, &mut io::stdout().lock())?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -292,7 +358,7 @@ async fn stop_gateway(
 }
 
 fn main() -> ExitCode {
-    // Files this process creates (logs, launchd output) are owner-only.
+    // Files this process creates (logs, launchd or systemd output) are owner-only.
     unsafe { libc::umask(0o077) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
@@ -327,6 +393,12 @@ fn main() -> ExitCode {
             dry_run,
         } => install_launchd(&env, config, &label, dry_run),
         Command::UninstallLaunchd { label } => uninstall_launchd(&env, &label),
+        Command::InstallSystemd {
+            config,
+            unit,
+            dry_run,
+        } => install_systemd(&env, config, &unit, dry_run),
+        Command::UninstallSystemd { unit } => uninstall_systemd(&env, &unit),
         Command::Onboarding { config } => onboarding_request(&env, config),
     };
     result.unwrap_or_else(|err| {
@@ -392,6 +464,41 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_args(&args(&["install-systemd"])),
+            Ok(Command::InstallSystemd {
+                config: None,
+                unit: "moraebot".to_string(),
+                dry_run: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "install-systemd",
+                "--dry-run",
+                "--unit",
+                "moraebot-qa",
+                "--config",
+                "x.toml"
+            ])),
+            Ok(Command::InstallSystemd {
+                config: Some(PathBuf::from("x.toml")),
+                unit: "moraebot-qa".to_string(),
+                dry_run: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["uninstall-systemd"])),
+            Ok(Command::UninstallSystemd {
+                unit: "moraebot".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["uninstall-systemd", "--unit", "moraebot-qa"])),
+            Ok(Command::UninstallSystemd {
+                unit: "moraebot-qa".to_string(),
+            })
+        );
+        assert_eq!(
             parse_args(&args(&["run", "--config", "x.toml"])),
             Ok(Command::Run {
                 config: Some(PathBuf::from("x.toml"))
@@ -429,6 +536,13 @@ mod tests {
             &["install-launchd", "--label"],
             &["install-launchd", "extra"],
             &["uninstall-launchd", "--dry-run"],
+            &["install-systemd", "--unit"],
+            &["install-systemd", "extra"],
+            &["install-systemd", "--label", "x"],
+            &["uninstall-systemd", "--dry-run"],
+            &["uninstall-systemd", "--label", "x"],
+            &["install-launchd", "--unit", "x"],
+            &["uninstall-launchd", "--unit", "x"],
             &["onboarding", "extra"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");

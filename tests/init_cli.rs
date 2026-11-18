@@ -93,7 +93,10 @@ fn init_writes_the_onboarding_request() {
 
     let output = run_init(&home, &input);
     assert_eq!(output.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&output.stdout).ends_with(moraebot::init::NEXT_STEPS));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .ends_with(moraebot::init::next_steps(std::env::consts::OS))
+    );
     assert_eq!(mode_of(&home.join("onboarding.request")), 0o600);
 }
 
