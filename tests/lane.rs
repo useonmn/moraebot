@@ -941,6 +941,22 @@ fn qa_repo(h: &Harness) -> PathBuf {
     std::fs::canonicalize(&repo).expect("canonical qa-repo")
 }
 
+/// `<tmp>/qa-remote.git`, a local bare repo added to `repo` as `origin` with `main` pushed.
+fn qa_remote(h: &Harness, repo: &Path) {
+    git(h.dir.path(), &["init", "-q", "--bare", "qa-remote.git"]);
+    let remote = h.dir.path().join("qa-remote.git");
+    git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("utf-8 path"),
+        ],
+    );
+    git(repo, &["push", "-q", "origin", "main"]);
+}
+
 fn lane_start_repo(task: &str, done: &str, repo: Value) -> Value {
     json!({
         "tool": lane::LANE_START_TOOL,
@@ -1190,5 +1206,123 @@ async fn lane_status_lists_repo() {
         .expect("lane_status result");
     let listed: Value = serde_json::from_str(&status.1).expect("status json");
     assert_eq!(listed[0]["repo"], json!(repo.to_string_lossy()));
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn unpushed_commit_refuses_the_claim_until_pushed() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    qa_remote(&h, &repo);
+    std::fs::write(repo.join("tracked.txt"), "second").expect("tracked.txt");
+    git(&repo, &["commit", "-q", "-am", "second"]);
+    let m1 = h
+        .manager(
+            "tools",
+            &[lane_start_repo(
+                "run-lane-tools t1",
+                "file tracked.txt",
+                json!(repo),
+            )],
+        )
+        .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(1))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    let r = h.lane_tool_results();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_refused(&r[0], E_DONE_UNMET);
+    assert!(r[0].1.contains("-> E_CHECK_UNPUSHED:"), "{r:?}");
+    assert!(!r[0].1.contains("E_CHECK_UNCOMMITTED"), "{r:?}");
+    assert_eq!(result_tag(&h, 1).failed.as_deref(), Some(E_DONE_UNMET));
+    let prompts = h.frames_after_start(0, "prompt");
+    assert!(
+        prompts[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(worktree::GIT_FOOTER),
+        "{prompts:?}"
+    );
+    bounded(m1.shutdown_all()).await;
+
+    git(
+        &lane_folder(&h, 1),
+        &["push", "-q", "origin", "moraebot/lane-1"],
+    );
+    let m2 = h
+        .manager(
+            "tools",
+            &[json!({
+                "tool": lane::LANE_MESSAGE_TOOL,
+                "arguments": {"lane_id": 1, "text": "run-lane-tools again"}
+            })],
+        )
+        .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(1))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    let tag = result_tag(&h, 2);
+    assert!(tag.done, "{tag:?}");
+    assert_eq!(tag.failed, None);
+    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn uncommitted_change_refuses_the_claim_and_runs_the_done_checks() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let m1 = h
+        .manager("ok", &[lane_start_repo("t1", "file marker", json!(repo))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+
+    std::fs::write(lane_folder(&h, 1).join("tracked.txt"), "changed").expect("tracked.txt");
+    let m2 = h
+        .manager(
+            "tools",
+            &[json!({
+                "tool": lane::LANE_MESSAGE_TOOL,
+                "arguments": {"lane_id": 1, "text": "run-lane-tools again"}
+            })],
+        )
+        .with_extra_env([("FAKE_OMP_LANE_TOOL_CALLS", lane_done_calls(1))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    let r = h.lane_tool_results();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_refused(&r[0], E_DONE_UNMET);
+    assert!(r[0].1.contains("-> E_CHECK_UNCOMMITTED:"), "{r:?}");
+    assert!(r[0].1.contains("file marker -> E_CHECK_MISSING"), "{r:?}");
+    assert!(!r[0].1.contains("E_CHECK_UNPUSHED"), "{r:?}");
+    assert_eq!(result_tag(&h, 2).failed.as_deref(), Some(E_DONE_UNMET));
+    bounded(m2.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_without_repo_skips_the_git_checks() {
+    require_git();
+    let h = Harness::new();
+    let work = &h.config.work_dir;
+    git(work, &["init", "-q", "-b", "main"]);
+    std::fs::write(work.join("tracked.txt"), "x").expect("tracked.txt");
+    git(work, &["add", "tracked.txt"]);
+    git(work, &["commit", "-q", "-m", "init"]);
+    std::fs::write(work.join("tracked.txt"), "changed").expect("tracked.txt");
+    let omp = h
+        .done_manager("file tracked.txt", 1)
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let r = h.lane_tool_results();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(!r[0].0, "{r:?}");
+    assert!(result_tag(&h, 1).done);
+    let prompts = h.frames_after_start(0, "prompt");
+    assert!(
+        !prompts[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(worktree::GIT_FOOTER),
+        "{prompts:?}"
+    );
+    assert!(!lane_folder(&h, 1).exists());
     bounded(omp.shutdown_all()).await;
 }

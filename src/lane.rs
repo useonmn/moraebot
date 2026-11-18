@@ -24,7 +24,9 @@
 //! A lane started with `repo` works in its own git worktree,
 //! `<work dir>/.moraebot-lanes/lane-<id>` on branch `moraebot/lane-<id>`, created before
 //! its first child starts and reused by later prompts; its git commands are tracked and
-//! killed on shutdown like Done checks.
+//! killed on shutdown like Done checks. Its `lane_done` claims first read the worktree's git
+//! state: uncommitted tracked changes, and commits on no remote when it has one, refuse the
+//! claim like a failing Done check.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -107,6 +109,9 @@ struct Job {
 struct CheckDirs {
     work: PathBuf,
     out: PathBuf,
+    /// Whether `work` is the lane's own worktree, whose git state is checked before the Done
+    /// signals.
+    git: bool,
 }
 
 /// What the lane's `lane_done` calls of one job established; the last call decides.
@@ -652,6 +657,7 @@ impl LaneManager {
         let dirs = CheckDirs {
             work: work_dir.to_path_buf(),
             out: check_dir,
+            git: job.repo.is_some(),
         };
         let manager = Arc::clone(self);
         let line = line.clone();
@@ -699,19 +705,37 @@ impl LaneManager {
         if lock(&self.inner).stopping {
             return Err(stopping());
         }
-        let checks = done::run(
+        let env = omp::check_env(&self.extra_env);
+        let mut checks = Vec::new();
+        if dirs.git {
+            let opts = done::RunOpts {
+                out_dir: &dirs.out,
+                env: &env,
+                timeout: worktree::GIT_TIMEOUT,
+            };
+            match worktree::git_checks(
+                &dirs.work,
+                &opts,
+                |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
+                |pid| self.untrack(pid),
+            ) {
+                Ok(git) => checks = git,
+                Err(done::Stopped) => return Err(stopping()),
+            }
+        }
+        let signals = done::run(
             line,
             &dirs.work,
             &dirs.out,
-            &omp::check_env(&self.extra_env),
+            &env,
             self.check_timeout,
             |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
             |pid| self.untrack(pid),
         );
-        let checks = match checks {
-            Ok(checks) if !lock(&self.inner).stopping => checks,
+        match signals {
+            Ok(signals) if !lock(&self.inner).stopping => checks.extend(signals),
             _ => return Err(stopping()),
-        };
+        }
         let receipt = done::receipt(evidence, &checks);
         if done::all_passed(&checks) {
             tracing::info!(
@@ -799,9 +823,12 @@ impl LaneManager {
                 "could not store the lane's omp session id"
             );
         }
-        let message = match &job.done {
-            Some(line) => job.text.clone() + &done::lane_footer(line),
-            None => job.text.clone(),
+        let message = match (&job.done, &job.repo) {
+            (Some(line), Some(_)) => {
+                job.text.clone() + &done::lane_footer(line) + worktree::GIT_FOOTER
+            }
+            (Some(line), None) => job.text.clone() + &done::lane_footer(line),
+            (None, _) => job.text.clone(),
         };
         let prompt = PromptCommand {
             message,

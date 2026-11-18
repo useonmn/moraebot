@@ -284,7 +284,6 @@ fn verify(
 /// committed, and commits of HEAD on no remote (only when a remote exists). Untracked files never
 /// count. Any read that fails gives exactly one `E_CHECK_GIT` check. `started`/`ended` see every
 /// git pid as in [`done::run_command`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn git_checks(
     folder: &Path,
     opts: &RunOpts<'_>,
