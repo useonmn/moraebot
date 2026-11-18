@@ -19,6 +19,8 @@ pub const E_ADAPTER_UPLOAD: &str = "E_ADAPTER_UPLOAD";
 pub const E_ADAPTER_UPLOAD_DENIED: &str = "E_ADAPTER_UPLOAD_DENIED";
 /// The owner's DM could not be opened (the messenger refused, or it has no DMs).
 pub const E_ADAPTER_DM: &str = "E_ADAPTER_DM";
+/// A message could not be edited (gone, not allowed, network, rate limit, unknown id, or this messenger cannot edit); the caller may post a new one.
+pub const E_ADAPTER_EDIT: &str = "E_ADAPTER_EDIT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEvent {
@@ -157,6 +159,21 @@ pub trait MessengerAdapter: Send + Sync {
         _name: &str,
     ) -> Result<SendResult, AdapterError> {
         Err(files_unsupported())
+    }
+
+    /// Replaces the text of the message `message_id` (an id `send` returned for `target`)
+    /// with `text`, which fits in one message. Every failure is `E_ADAPTER_EDIT`.
+    /// Messengers that cannot edit keep this default, which makes no call.
+    async fn edit(
+        &self,
+        _target: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<(), AdapterError> {
+        Err(AdapterError {
+            code: E_ADAPTER_EDIT,
+            message: "this messenger cannot edit messages".to_owned(),
+        })
     }
 
     /// A counter that increases on every (re)connect of the messenger, so the core can
@@ -395,5 +412,31 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(send.code, E_ADAPTER_FILES);
+    }
+
+    #[tokio::test]
+    async fn default_edit_is_refused_without_a_call() {
+        assert_eq!(
+            Minimal.edit("t", "1", "x").await.unwrap_err().code,
+            E_ADAPTER_EDIT
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_records_edits_and_injected_edit_failure() {
+        let fake = FakeAdapter::new();
+        let first = fake.edit("444", "fake-msg-1", "a").await;
+        fake.fail_next_edit();
+        let err = fake.edit("444", "fake-msg-1", "b").await.unwrap_err();
+        let third = fake.edit("444", "fake-msg-1", "c").await;
+        let edit = |text: &str| Call::Edit {
+            channel: "444".into(),
+            message_id: "fake-msg-1".into(),
+            text: text.into(),
+        };
+        assert_eq!(first, Ok(()));
+        assert_eq!(err.code, E_ADAPTER_EDIT);
+        assert_eq!(third, Ok(()));
+        assert_eq!(fake.calls(), vec![edit("a"), edit("b"), edit("c")]);
     }
 }

@@ -1,3 +1,4 @@
+use crate::adapter::E_ADAPTER_EDIT;
 use crate::adapter::{
     AdapterError, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_UPLOAD_DENIED, InboundAttachment,
     InboundEvent, MessengerAdapter, SendResult, TypingHandle,
@@ -44,6 +45,11 @@ pub enum Call {
         name: String,
         bytes: u64,
     },
+    Edit {
+        channel: String,
+        message_id: String,
+        text: String,
+    },
 }
 
 /// The test's end of a streamed fetch: send chunks, read the running byte total, drop
@@ -77,6 +83,7 @@ pub struct FakeAdapter {
     sent_count: watch::Sender<usize>,
     fail_next_send: AtomicBool,
     fail_next_open_dm: AtomicBool,
+    fail_next_edit: AtomicBool,
     reconnects: watch::Sender<u64>,
     inbound_tx: mpsc::Sender<InboundEvent>,
     inbound_rx: Mutex<Option<mpsc::Receiver<InboundEvent>>>,
@@ -98,6 +105,7 @@ impl FakeAdapter {
             sent_count: watch::channel(0).0,
             fail_next_send: AtomicBool::new(false),
             fail_next_open_dm: AtomicBool::new(false),
+            fail_next_edit: AtomicBool::new(false),
             reconnects: watch::channel(0).0,
             inbound_tx,
             inbound_rx: Mutex::new(Some(inbound_rx)),
@@ -115,6 +123,11 @@ impl FakeAdapter {
     /// The next `open_dm` fails with `E_ADAPTER_DM`.
     pub fn fail_next_open_dm(&self) {
         self.fail_next_open_dm.store(true, Ordering::SeqCst);
+    }
+
+    /// The next `edit` records its call, then fails with `E_ADAPTER_EDIT`.
+    pub fn fail_next_edit(&self) {
+        self.fail_next_edit.store(true, Ordering::SeqCst);
     }
 
     /// Simulates the messenger connection coming back (a ready or resume event).
@@ -387,6 +400,21 @@ impl MessengerAdapter for FakeAdapter {
         Ok(SendResult {
             message_id: format!("fake-file-{name}"),
         })
+    }
+
+    async fn edit(&self, channel: &str, message_id: &str, text: &str) -> Result<(), AdapterError> {
+        self.record(Call::Edit {
+            channel: channel.to_owned(),
+            message_id: message_id.to_owned(),
+            text: text.to_owned(),
+        });
+        if self.fail_next_edit.swap(false, Ordering::SeqCst) {
+            return Err(AdapterError {
+                code: E_ADAPTER_EDIT,
+                message: "injected edit failure".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
