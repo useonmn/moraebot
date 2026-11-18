@@ -20,4 +20,5 @@ pub mod persona;
 pub mod secret;
 pub mod slack;
 pub mod store;
+pub mod systemd;
 pub mod testing;
