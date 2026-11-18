@@ -1,5 +1,5 @@
 //! The persona file: what the owner chose at the first meeting, appended to the lead's system
-//! prompt at every start.
+//! prompt, read again before every lead turn.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -13,7 +13,7 @@ pub const FILE: &str = "persona.md";
 /// The largest persona file, in bytes.
 pub const MAX_BYTES: usize = 2048;
 /// The line put above the persona text in the lead's system prompt.
-pub const HEADER: &str = "[moraebot persona] What the owner chose at the first meeting: your name, how you talk and a few basics about them. The owner can change it with moraebot onboarding or by editing persona.md in the moraebot home; a change applies the next time moraebot starts.";
+pub const HEADER: &str = "[moraebot persona] What the owner chose at the first meeting: your name, how you talk and a few basics about them. The owner can change it with moraebot onboarding or by editing persona.md in the moraebot home; moraebot starts you again with a changed file before your next turn, and the conversation goes on.";
 /// An empty name or a line break in a field.
 pub const E_PERSONA_FIELD: &str = "E_PERSONA_FIELD";
 /// More than `MAX_BYTES`.

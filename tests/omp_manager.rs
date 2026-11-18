@@ -1326,7 +1326,7 @@ async fn onboarding_finish_through_the_lead() {
     let result: Value = serde_json::from_str(&results[0].1).expect("result json");
     assert_eq!(
         result,
-        serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_start"})
+        serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_turn"})
     );
     assert_eq!(
         std::fs::read_to_string(persona::path(&h.config.home)).expect("persona file"),

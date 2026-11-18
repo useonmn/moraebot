@@ -33,7 +33,7 @@ pub const E_ONBOARDING_STATE: &str = "E_ONBOARDING_STATE";
 /// The keys of the finish tool's arguments, all required.
 const FINISH_KEYS: [&str; 4] = ["outcome", "name", "tone", "owner"];
 /// The finish tool's description for the lead.
-const FINISH_DESCRIPTION: &str = "End the first meeting with the owner. outcome done saves name, tone and owner (short single lines, no keys or passwords) into persona.md, which applies the next time moraebot starts; outcome skipped saves nothing (pass empty strings). Works only while you answer an owner message.";
+const FINISH_DESCRIPTION: &str = "End the first meeting with the owner. outcome done saves name, tone and owner (short single lines, no keys or passwords) into persona.md, which applies from the next turn; outcome skipped saves nothing (pass empty strings). Works only while you answer an owner message.";
 
 /// A coded refusal; `detail` never holds field text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +163,7 @@ fn end_onboarding(
         return Err(not_running());
     }
     let result = if done {
-        serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_start"})
+        serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_turn"})
     } else {
         serde_json::json!({"onboarding": "skipped", "persona": "unchanged"})
     };
@@ -269,7 +269,7 @@ mod tests {
         let out: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             out,
-            serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_start"})
+            serde_json::json!({"onboarding": "done", "persona": "saved", "applies": "next_turn"})
         );
         assert_eq!(
             std::fs::read_to_string(persona::path(&home)).unwrap(),
