@@ -121,6 +121,12 @@ Restart the gateway last:
 launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway
 ```
 
+On Linux:
+
+```sh
+systemctl --user restart moraebot.service
+```
+
 A restart interrupts any task that's running, so the agent warns you first.
 
 Every step needs evidence, such as command output or the test reply in Slack. A step that only "ran" isn't done.

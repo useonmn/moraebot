@@ -48,6 +48,7 @@ moraebot은 Discord로 받은 메시지를 이 컴퓨터의 코딩 에이전트 
 - **Discord 스레드**: Discord 채널 안에서 갈라져 나온 작은 대화방입니다. 이 문서에서 "스레드"만 쓰면 이것을 뜻합니다.
 - **별도 작업 흐름(스레드)**: 프로그램 안에서 다른 일과 따로 도는 작업 단위입니다. Discord 스레드와는 다른 말입니다. 3장과 7장에만 나옵니다.
 - **launchd / LaunchAgent**: launchd는 macOS가 프로그램을 자동으로 켜고 다시 켜 주는 기능입니다. LaunchAgent는 사용자가 로그인했을 때 그 사용자 권한으로 도는 launchd 등록입니다.
+- **systemd / 사용자 서비스**: systemd는 Linux가 프로그램을 자동으로 켜고 다시 켜 주는 기능입니다. 사용자 서비스(`systemctl --user`)는 그 사용자 권한으로 도는 systemd 등록이고, 맥의 LaunchAgent와 짝입니다.
 - **커밋**: git(코드 버전 관리 도구)으로 관리하는 코드의 특정 저장 시점입니다. 커밋으로 고정하면 늘 같은 버전의 코드를 씁니다.
 - **hermes**: 조사한 다른 오픈소스 메신저 봇 프로젝트(hermes-agent)입니다. Discord 연결과 접근 제어를 참고합니다.
 - **dinobot**: 조사한 또 다른 메신저 봇 프로젝트입니다. "먼저 저장하고 처리" 원칙을 참고합니다. 비상업용 라이선스라 코드는 가져오지 않습니다.
@@ -399,7 +400,7 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 ```
 ~/.moraebot/
   config.toml              설정 파일 (사람이 읽고 고치는 파일)
-  bin/moraebot             install-launchd가 복사해 두는 실행 파일 (launchd가 이것을 켬)
+  bin/moraebot             install-launchd 또는 install-systemd가 복사해 두는 실행 파일 (launchd나 systemd가 이것을 켬)
   secrets/discord.token    Discord 봇 토큰 (주인만 읽기, 권한 600)
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록, 허용 사용자, pairing 대기
@@ -433,9 +434,11 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 
 주인 id가 비어 있으면 게이트웨이는 시작하지 않습니다.
 
-### 4.3 맥에서 계속 켜 두기
+### 4.3 계속 켜 두기 (macOS, Linux)
 
 launchd는 macOS가 프로그램을 자동으로 켜고, 죽으면 다시 켜 주는 기능입니다. `~/Library/LaunchAgents/`에 설정 파일(plist) 하나를 두고 `KeepAlive`와 `RunAtLoad`를 켜면, 로그인할 때 시작하고 죽으면 다시 띄웁니다. 이 키의 정확한 동작은 **미검증**입니다. 사용자 로그인 단위(LaunchAgent)로 돌려야 omp가 주인의 홈 폴더와 인증 정보를 쓸 수 있다고 보지만, 근거를 확인하지 못해 **미검증**입니다.
+
+Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 `~/.config/systemd/user/moraebot.service`를 씁니다(`XDG_CONFIG_HOME`이 절대 경로면 그 아래 `systemd/user`). 그다음 `systemctl --user daemon-reload`, `enable`, `restart`를 차례로 실행합니다. 서비스 파일에는 `Restart=always`와 `RestartSec=10`(꺼지면 10초 뒤 다시 켜기), `TimeoutStopSec=30`(맥의 `ExitTimeOut`과 같은 값), `WantedBy=default.target`(로그인하면 켜기)이 들어 있습니다. 사용자 서비스는 로그아웃하면 멈추므로, 로그아웃 뒤에도 돌게 하려면 주인이 `loginctl enable-linger`를 직접 실행합니다. moraebot은 이 명령을 안내만 하고 실행하지 않습니다. 설정 키의 뜻은 systemd 설명서 [systemd.unit(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)와 [systemd.exec(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)를 따릅니다. 실제 Linux 컴퓨터에서의 동작은 **미검증**입니다.
 
 ### 4.4 재시작했을 때
 

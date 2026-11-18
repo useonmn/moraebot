@@ -1,13 +1,14 @@
 # moraebot
 
-moraebot lets you talk to a coding agent on your Mac from a chat app. You send a message in Discord or Slack, moraebot hands it to omp, a coding agent CLI, running on your Mac, and the reply comes back in the same conversation.
+moraebot lets you talk to a coding agent on your Mac or Linux machine from a chat app. You send a message in Discord or Slack, moraebot hands it to omp, a coding agent CLI, running on that machine, and the reply comes back in the same conversation.
 
 ## Status
 
 This is slice 3. It adds files: you can attach files to a message, and omp can send files back.
 
 - Discord or Slack, one at a time. Other messengers come later.
-- macOS only. It runs as a per-user LaunchAgent.
+- Apple Silicon macOS. It runs as a per-user LaunchAgent.
+- Linux x86_64 or aarch64 with glibc 2.35 or newer and OpenSSL 3. It runs as a systemd user service.
 - One owner. Only you can talk to the bot (`access_mode = "owner_only"`).
 - One task at a time. Messages wait in a queue and run in order.
 
@@ -23,11 +24,11 @@ This is slice 3. It adds files: you can attach files to a message, and omp can s
 > - The work folder is not a sandbox. omp can read and change files outside it.
 > - Never share the bot token. Anyone holding it can pretend to be your bot.
 
-The bot only runs while you're logged in to macOS and the Mac is awake.
+The bot only runs while you're logged in to macOS and the Mac is awake. On Linux it runs while you're logged in, or all the time once you turn on linger (see step 8).
 
 ## Install
 
-You'll need macOS, a Discord or Slack account, and omp already installed and working in your terminal.
+You'll need Apple Silicon macOS or Linux (x86_64 or aarch64), a Discord or Slack account, and omp already installed and working in your terminal.
 
 ### 1. Install moraebot
 
@@ -35,9 +36,9 @@ You'll need macOS, a Discord or Slack account, and omp already installed and wor
 curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
 ```
 
-This downloads the latest release for Apple Silicon Macs, checks it against the release's SHA-256 checksum, makes sure it runs, and only then puts it at `~/.local/bin/moraebot`. If anything fails, your existing moraebot stays as it was. When `~/.local/bin` isn't on your `PATH` yet, the script prints the line to add to your shell startup file.
+This picks the macOS or Linux build for your machine, downloads the latest release, checks it against the release's SHA-256 checksum (with `sha256sum`, or `shasum` when that's missing), makes sure it runs, and only then puts it at `~/.local/bin/moraebot`. If anything fails, your existing moraebot stays as it was. When `~/.local/bin` isn't on your `PATH` yet, the script prints the line to add to your shell startup file.
 
-On a fresh install (no `~/.moraebot/config.toml` yet) the script ends with `Next steps:`: run `moraebot init`, then `moraebot check-config`, then `moraebot install-launchd`, and send the bot a message. When moraebot isn't on your `PATH`, those lines use its full path. An upgrade prints no next steps.
+On a fresh install (no `~/.moraebot/config.toml` yet) the script ends with `Next steps:`: run `moraebot init`, then `moraebot check-config`, then `moraebot install-launchd` (`moraebot install-systemd` on Linux), and send the bot a message. When moraebot isn't on your `PATH`, those lines use its full path. An upgrade prints no next steps.
 
 Two settings change what it does. Put them right before `sh`, not before `curl`:
 
@@ -48,7 +49,7 @@ Two settings change what it does. Put them right before `sh`, not before `curl`:
 curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | MORAEBOT_VERSION=v0.1.0 sh
 ```
 
-Download it with curl like this, not with a browser. A file saved by a browser can be flagged by macOS Gatekeeper, and the unsigned binary may then refuse to open.
+On macOS only: download it with curl like this, not with a browser. A file saved by a browser can be flagged by macOS Gatekeeper, and the unsigned binary may then refuse to open.
 
 ### 2. Build from source (optional)
 
@@ -64,6 +65,12 @@ Or use rustup if you prefer:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+On Linux, the build also needs the OpenSSL headers. On Debian or Ubuntu:
+
+```sh
+sudo apt-get install pkg-config libssl-dev
 ```
 
 Then build moraebot:
@@ -198,6 +205,34 @@ moraebot install-launchd
 
 This copies the binary to `~/.moraebot/bin/moraebot`, writes `~/Library/LaunchAgents/dev.moraebot.gateway.plist`, and loads it with `launchctl`. macOS keeps moraebot running from now on and starts it again after a crash or a new login. Add `--dry-run` to print the plist and the `launchctl` commands without running them.
 
+On Linux:
+
+```sh
+moraebot install-systemd
+```
+
+This copies the binary to `~/.moraebot/bin/moraebot`, writes `~/.config/systemd/user/moraebot.service` (under `$XDG_CONFIG_HOME/systemd/user` when that's set to an absolute path), then runs:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable moraebot.service
+systemctl --user restart moraebot.service
+```
+
+systemd starts moraebot again 10 seconds after it stops and starts it when you log in. Add `--dry-run` to print the unit and those commands without running them, and `--unit NAME` to use another unit name than `moraebot`.
+
+A user service stops when you log out. To keep it running after logout, run this once (some machines need admin rights for it):
+
+```sh
+loginctl enable-linger
+```
+
+To see whether it's running:
+
+```sh
+systemctl --user status moraebot.service
+```
+
 You can also run it in the foreground, which is handy for a first try:
 
 ```sh
@@ -280,7 +315,7 @@ The lead also gets a built-in role note: how to read the tag line at the start o
 
 ## Logs
 
-Logs live in `~/.moraebot/logs/`. moraebot writes `moraebot.log` files there, plus the stdout and stderr files that launchd captures. Message text is never written to the logs.
+Logs live in `~/.moraebot/logs/`. moraebot writes `moraebot.log` files there, plus the stdout and stderr files that launchd (macOS) or systemd (Linux) captures, `moraebot.out.log` and `moraebot.err.log`. Message text is never written to the logs.
 
 Warnings and errors from the libraries moraebot uses (for Discord, Slack and the network) appear in the log only as a short line naming the library (libraries that write through the common `log` interface, such as the network library, are named `log`), without their details, so message text, file names, file links and tokens never reach the log.
 
@@ -295,14 +330,14 @@ After installing, check these by hand once:
 
 - [ ] **Real round trip.** Send a short message in the bot's channel. A reply comes back.
 - [ ] **Strangers get nothing.** Send a message from a second Discord account. The bot doesn't reply and doesn't store it.
-- [ ] **Restart notice.** Send something long, then restart moraebot mid-task (`launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway`). After it comes back you get one notice saying the task was interrupted.
+- [ ] **Restart notice.** Send something long, then restart moraebot mid-task (`launchctl kickstart -k gui/$(id -u)/dev.moraebot.gateway`, or `systemctl --user restart moraebot.service` on Linux). After it comes back you get one notice saying the task was interrupted.
 - [ ] **Send a file.** Attach a small file to a message. omp's answer shows it read the file.
 - [ ] **Get a file back.** Ask omp to send you a file from the work folder. It shows up in the same thread, after the reply text.
 - [ ] **Lane result in the same thread.** In a thread, ask for something long, such as a task with several steps. The lead says it started a lane, and later the lane's result is answered in that same thread.
 - [ ] **A lane claims done, a failing Done check is refused, and the lead reports the outcome.** Ask for long work whose Done line can't pass at first, for example a file the lane still has to create. The lane's first claim is refused, it keeps working, and the lead's answer in that thread says whether the lane's checks passed.
 - [ ] **Follow-up while it works.** While the lead is still answering in a thread, send a second message in that thread. You get one reply that covers both.
 - [ ] **First conversation.** After `moraebot init` and the first start, the bot says hello in its channel once. Answer its questions (or reply skip), then restart moraebot and check that it uses the name you gave it.
-- [ ] **omp works under launchd.** launchd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
+- [ ] **omp works under launchd or systemd.** launchd or systemd starts moraebot with a minimal environment, not your shell's. After your first message, check the logs and confirm omp reached its model. If it can't find its credentials or tools, fix that before relying on the bot.
 
 If you use Slack, also check these:
 
@@ -349,13 +384,14 @@ The file name is cleaned up first, so it can't point outside that folder. moraeb
 
 ## Upgrading from an earlier version
 
-Re-run the install line from Install, then `moraebot install-launchd` if you use the background service:
+Re-run the install line from Install, then `moraebot install-launchd` (macOS) or `moraebot install-systemd` (Linux) if you use the background service:
 
 ```sh
 moraebot install-launchd
+moraebot install-systemd
 ```
 
-Run `install-launchd` from a terminal, not by asking the bot. It restarts the bot's own process.
+Run the one for your system from a terminal, not by asking the bot. It restarts the bot's own process.
 
 Files need one more permission than earlier versions asked for. If you set up the bot before this version:
 
@@ -378,7 +414,13 @@ If you're coming from 0.2.0: this version has no memory system of its own. The m
 moraebot uninstall-launchd
 ```
 
-This unloads the LaunchAgent and removes its plist. To remove everything else too:
+This unloads the LaunchAgent and removes its plist. On Linux:
+
+```sh
+moraebot uninstall-systemd
+```
+
+This runs `systemctl --user disable --now moraebot.service`, removes the unit file and reloads systemd. To remove everything else too:
 
 ```sh
 rm -rf ~/.moraebot
