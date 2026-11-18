@@ -15,7 +15,8 @@
 //! under one hold of `inner`, so at most one worker per lane is ever registered and
 //! `shutdown_all` sees every lane child that exists. If omp ever ended a turn while a
 //! `lane_done` call was still running, `run_prompt` waits on the claim lock for that one
-//! check; it holds no lock while it waits, so this is not a deadlock.
+//! check; it holds no lock while it waits, so this is not a deadlock. An `Activity` lock is
+//! taken last and nothing is locked while it is held.
 //!
 //! Shutdown kills every lane child first, then every running check, then waits until
 //! each killed check was reaped: a check's refusal never reaches a live lane, so a turn
@@ -31,21 +32,30 @@
 //! The lead closes a lane that is not running with `lane_close`: the store marks it closed
 //! (no more `lane_message`), and a lane with a repo has its worktree removed only when nothing
 //! would be lost; the branch always stays.
+//!
+//! While a job runs, its omp agent events are counted in an `Activity` (a new tool call, by
+//! name and args, is progress); `watch_tick` reports a job with no event, or no progress, for
+//! `STALL_AFTER` to the lead once per episode as a lane inbox row. moraebot never stops a
+//! lane for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use omp_rpc::{HostTool, HostToolContext, HostToolError, PromptCommand, ToolLoadMode};
+use omp_rpc::{
+    Event, HostTool, HostToolContext, HostToolError, PromptCommand, RpcAgentEvent, RpcNotification,
+    ToolLoadMode,
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
 use crate::config::Config;
 use crate::done::{self, DoneLine};
-use crate::lead::{self, LaneResult};
+use crate::lead::{self, LaneResult, Stalled};
 use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
@@ -55,6 +65,8 @@ use crate::worktree::{self, Cleanup, WorktreeError};
 
 /// Most lanes that may run a turn at the same time.
 pub const MAX_RUNNING_LANES: usize = 3;
+/// A running job with no omp agent event, or no new tool call, for this long is reported to the lead.
+pub const STALL_AFTER: Duration = Duration::from_secs(20 * 60);
 /// Inbox `platform` of rows that carry a lane's result to the lead.
 pub const LANE_PLATFORM: &str = "lane";
 /// Host tool that starts a new lane.
@@ -90,6 +102,113 @@ struct LaneChild {
     worker: JoinHandle<()>,
     /// The prompt (job) this worker runs.
     seq: i64,
+    /// The lane's conversation, for notices.
+    conversation_key: String,
+    /// Counted by the child's event callback, read by `watch_tick`.
+    activity: Arc<Mutex<Activity>>,
+}
+
+/// What a running job's omp agent events showed. The event callback only counts;
+/// `stall` (called by `watch_tick` with the tick's time) keeps the times.
+#[derive(Default)]
+struct Activity {
+    events: u64,
+    /// New tool calls: (name, args) pairs not seen before in this job.
+    progress: u64,
+    tool_calls: u64,
+    calls: HashSet<u64>,
+    /// The last agent event was `AutoRetryStart`.
+    retrying: bool,
+    last_tool: Option<String>,
+    seen: Option<Seen>,
+    /// Notices sent for this job; the current episode's number once reported.
+    episode: u32,
+    reported: bool,
+}
+
+/// The counters as of the last tick that saw them change, and when.
+struct Seen {
+    events: u64,
+    progress: u64,
+    event_at: Instant,
+    progress_at: Instant,
+}
+
+/// One stall to report.
+struct Stall {
+    reason: &'static str,
+    quiet: Duration,
+    idle: Duration,
+    episode: u32,
+}
+
+impl Activity {
+    /// Counts one event of the lane child; `false` for frames that are not agent events.
+    fn note(&mut self, event: &Event) -> bool {
+        let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
+            return false;
+        };
+        self.events += 1;
+        self.retrying = matches!(agent, RpcAgentEvent::AutoRetryStart(_));
+        if let RpcAgentEvent::ToolExecutionStart(start) = agent {
+            self.tool_calls += 1;
+            self.last_tool = Some(start.tool_name.clone());
+            let mut hasher = DefaultHasher::new();
+            start.tool_name.hash(&mut hasher);
+            start.args.as_ref().map(Value::to_string).hash(&mut hasher);
+            if self.calls.insert(hasher.finish()) {
+                self.progress += 1;
+            }
+        }
+        true
+    }
+
+    /// Updates the times from the counters and returns the stall to report, once per
+    /// episode; the first call only starts the clock.
+    fn stall(&mut self, now: Instant) -> Option<Stall> {
+        let Some(seen) = self.seen.as_mut() else {
+            self.seen = Some(Seen {
+                events: self.events,
+                progress: self.progress,
+                event_at: now,
+                progress_at: now,
+            });
+            return None;
+        };
+        if seen.events != self.events {
+            seen.events = self.events;
+            seen.event_at = now;
+        }
+        if seen.progress != self.progress {
+            seen.progress = self.progress;
+            seen.progress_at = now;
+            self.reported = false;
+        }
+        if self.reported {
+            return None;
+        }
+        let quiet = now.saturating_duration_since(seen.event_at);
+        let idle = now.saturating_duration_since(seen.progress_at);
+        let reason = if quiet >= STALL_AFTER {
+            if self.retrying {
+                lead::N_LANE_RETRYING
+            } else {
+                lead::N_LANE_QUIET
+            }
+        } else if idle >= STALL_AFTER {
+            lead::N_LANE_SPINNING
+        } else {
+            return None;
+        };
+        self.reported = true;
+        self.episode += 1;
+        Some(Stall {
+            reason,
+            quiet,
+            idle,
+            episode: self.episode,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +265,8 @@ pub struct LaneManager {
     pub(crate) check_timeout: Duration,
     inner: Mutex<LaneSet>,
     pids: watch::Sender<Vec<u32>>,
+    /// Count of agent events received from lane children (tests wait on it).
+    events: watch::Sender<u64>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
 }
 
@@ -174,6 +295,7 @@ impl LaneManager {
             check_timeout: done::CHECK_TIMEOUT,
             inner: Mutex::default(),
             pids: watch::channel(Vec::new()).0,
+            events: watch::channel(0).0,
             extra_env: Vec::new(),
         }
     }
@@ -187,6 +309,81 @@ impl LaneManager {
     /// reaped.
     pub fn running_pids(&self) -> watch::Receiver<Vec<u32>> {
         self.pids.subscribe()
+    }
+
+    /// Agent events received from lane children since start; a test waits on it before it
+    /// ticks.
+    pub fn lane_events(&self) -> watch::Receiver<u64> {
+        self.events.subscribe()
+    }
+
+    /// Counts `event` of a lane child in its job's `activity`.
+    fn note_event(&self, activity: &Mutex<Activity>, event: &Event) {
+        let agent = lock(activity).note(event);
+        if agent {
+            self.events.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// One watchdog tick at `now`: queues a notice for each running job that looks stalled
+    /// and wakes the dispatcher; returns the number of notices written. Off when the turn
+    /// limit is `STALL_AFTER` or less and while stopping.
+    pub fn watch_tick(&self, now: Instant) -> usize {
+        if self.turn_timeout <= STALL_AFTER {
+            return 0;
+        }
+        let mut written = 0;
+        {
+            let set = lock(&self.inner);
+            if set.stopping {
+                return 0;
+            }
+            for (id, child) in &set.children {
+                let (stall, text) = {
+                    let mut activity = lock(&child.activity);
+                    let Some(stall) = activity.stall(now) else {
+                        continue;
+                    };
+                    let text = lead::lane_stalled(
+                        &child.conversation_key,
+                        *id,
+                        &Stalled {
+                            reason: stall.reason,
+                            quiet_minutes: stall.quiet.as_secs() / 60,
+                            idle_minutes: stall.idle.as_secs() / 60,
+                            tool_calls: activity.tool_calls,
+                            new_calls: activity.progress,
+                            last_tool: activity.last_tool.as_deref(),
+                        },
+                    );
+                    (stall, text)
+                };
+                match lock(&self.store).stall_notice(*id, child.seq, stall.episode, &text) {
+                    Ok(true) => {
+                        written += 1;
+                        tracing::info!(
+                            lane = id,
+                            seq = child.seq,
+                            reason = stall.reason,
+                            episode = stall.episode,
+                            "lane looks stalled"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            lane = id,
+                            code = e.code(),
+                            "could not store a stalled-lane notice"
+                        );
+                    }
+                }
+            }
+        }
+        if written > 0 {
+            self.wake.notify_one();
+        }
+        written
     }
 
     /// From now on `lane_start` and `lane_message` refuse with `E_LANE_STOPPING`.
@@ -538,9 +735,11 @@ impl LaneManager {
         let (id, seq) = (job.id, job.seq);
         let key = job.conversation_key.clone();
         let manager = Arc::clone(self);
+        let activity = Arc::new(Mutex::new(Activity::default()));
+        let worker_activity = Arc::clone(&activity);
         match std::thread::Builder::new()
             .name(format!("omp-lane-{id}"))
-            .spawn(move || manager.run_worker(job))
+            .spawn(move || manager.run_worker(job, worker_activity))
         {
             Ok(worker) => {
                 set.children.insert(
@@ -549,6 +748,8 @@ impl LaneManager {
                         kill: None,
                         worker,
                         seq,
+                        conversation_key: key.clone(),
+                        activity,
                     },
                 );
                 tracing::info!(lane = id, seq, "lane started");
@@ -568,9 +769,9 @@ impl LaneManager {
 
     /// One lane prompt: open the child, send the prompt, map the result, close the
     /// child; then the final section under `inner`.
-    fn run_worker(self: Arc<Self>, job: Job) {
+    fn run_worker(self: Arc<Self>, job: Job, activity: Arc<Mutex<Activity>>) {
         let mut pid = None;
-        let outcome = self.run_prompt(&job, &mut pid);
+        let outcome = self.run_prompt(&job, &mut pid, &activity);
         let written = {
             let mut set = lock(&self.inner);
             let written = self.write_result(&set, job.id, job.seq, &job.conversation_key, outcome);
@@ -910,6 +1111,7 @@ impl LaneManager {
         self: &Arc<Self>,
         job: &Job,
         pid: &mut Option<u32>,
+        activity: &Arc<Mutex<Activity>>,
     ) -> Result<LaneOutcome, Outcome> {
         let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
@@ -955,7 +1157,11 @@ impl LaneManager {
                 child.kill = Some(group);
                 true
             },
-            |_| {},
+            {
+                let watcher = Arc::clone(self);
+                let activity = Arc::clone(activity);
+                move |event: &Event| watcher.note_event(&activity, event)
+            },
         )?;
         if let Err(e) = lock(&self.store).set_lane_session_id(job.id, &session_id) {
             tracing::warn!(
@@ -1069,5 +1275,158 @@ impl LaneManager {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omp_rpc::{
+        AgentStartEvent, AutoRetryEndEvent, AutoRetryStartEvent, ToolExecutionStartEvent,
+    };
+
+    const TICK: Duration = Duration::from_secs(30);
+
+    fn agent(event: RpcAgentEvent) -> Event {
+        Event::Notification(RpcNotification::RpcAgentEvent(event))
+    }
+
+    fn agent_start() -> Event {
+        agent(RpcAgentEvent::AgentStart(AgentStartEvent {
+            resumed_tool_call_ids: None,
+        }))
+    }
+
+    fn tool_start(name: &str, args: Value) -> Event {
+        agent(RpcAgentEvent::ToolExecutionStart(ToolExecutionStartEvent {
+            tool_call_id: "call-1".into(),
+            tool_name: name.into(),
+            args: Some(args),
+            intent: None,
+        }))
+    }
+
+    fn retry_start() -> Event {
+        agent(RpcAgentEvent::AutoRetryStart(AutoRetryStartEvent {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 0,
+            error_message: "qa".into(),
+            error_id: None,
+        }))
+    }
+
+    fn retry_end() -> Event {
+        agent(RpcAgentEvent::AutoRetryEnd(AutoRetryEndEvent {
+            success: true,
+            attempt: 1,
+            final_error: None,
+            retry_errors: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn stall_reports_a_quiet_lane_once_per_episode() {
+        let base = Instant::now();
+        let mut a = Activity::default();
+        a.note(&agent_start());
+        assert!(a.stall(base).is_none());
+        assert!(
+            a.stall(base + STALL_AFTER - Duration::from_secs(1))
+                .is_none()
+        );
+        let first = a.stall(base + STALL_AFTER).expect("first episode");
+        assert_eq!(first.reason, lead::N_LANE_QUIET);
+        assert_eq!(first.episode, 1);
+        assert_eq!(first.quiet, STALL_AFTER);
+        assert!(a.stall(base + 2 * STALL_AFTER).is_none());
+        a.note(&tool_start("bash", json!({"command": "ls"})));
+        assert!(a.stall(base + 2 * STALL_AFTER + TICK).is_none());
+        let second = a
+            .stall(base + 3 * STALL_AFTER + TICK)
+            .expect("second episode");
+        assert_eq!(second.episode, 2);
+        assert_eq!(second.reason, lead::N_LANE_QUIET);
+    }
+
+    #[test]
+    fn stall_reports_spinning_when_calls_repeat() {
+        let base = Instant::now();
+        let mut a = Activity::default();
+        a.note(&tool_start("bash", json!({"command": "ls"})));
+        assert!(a.stall(base).is_none());
+        for k in 1..=40u32 {
+            a.note(&tool_start("bash", json!({"command": "ls"})));
+            let r = a.stall(base + k * TICK);
+            if k < 40 {
+                assert!(r.is_none(), "no stall at tick {k}");
+            } else {
+                let r = r.expect("spinning at tick 40");
+                assert_eq!(r.reason, lead::N_LANE_SPINNING);
+                assert_eq!(r.episode, 1);
+            }
+        }
+        assert_eq!(a.tool_calls, 41);
+        assert_eq!(a.progress, 1);
+        assert_eq!(a.last_tool.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn stall_counts_a_new_call_as_progress() {
+        let base = Instant::now();
+        let mut a = Activity::default();
+        a.note(&tool_start("bash", json!({"command": "ls"})));
+        assert!(a.stall(base).is_none());
+        for k in 1..=40u32 {
+            let args = if k == 20 {
+                json!({"command": "pwd"})
+            } else {
+                json!({"command": "ls"})
+            };
+            a.note(&tool_start("bash", args));
+            assert!(a.stall(base + k * TICK).is_none(), "no stall at tick {k}");
+        }
+        let mut first = None;
+        for k in 41..=60u32 {
+            a.note(&tool_start("bash", json!({"command": "ls"})));
+            if let Some(stall) = a.stall(base + k * TICK) {
+                first = Some((k, stall.reason));
+                break;
+            }
+        }
+        assert_eq!(first, Some((60, lead::N_LANE_SPINNING)));
+        assert_eq!(a.progress, 2);
+    }
+
+    #[test]
+    fn stall_names_an_open_provider_retry() {
+        let base = Instant::now();
+        let mut open = Activity::default();
+        open.note(&agent_start());
+        open.note(&retry_start());
+        assert!(open.stall(base).is_none());
+        let stall = open.stall(base + STALL_AFTER).expect("stall");
+        assert_eq!(stall.reason, lead::N_LANE_RETRYING);
+
+        let mut ended = Activity::default();
+        ended.note(&agent_start());
+        ended.note(&retry_start());
+        ended.note(&retry_end());
+        assert!(ended.stall(base).is_none());
+        let stall = ended.stall(base + STALL_AFTER).expect("stall");
+        assert_eq!(stall.reason, lead::N_LANE_QUIET);
+    }
+
+    #[test]
+    fn note_counts_agent_events_only() {
+        let mut a = Activity::default();
+        let frame = Event::Undecodable {
+            raw: json!({}),
+            error: "qa".into(),
+        };
+        assert!(!a.note(&frame));
+        assert_eq!(a.events, 0);
+        assert!(a.note(&agent_start()));
+        assert_eq!(a.events, 1);
     }
 }

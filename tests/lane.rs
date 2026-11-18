@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::done::{self, E_DONE_SYNTAX, E_DONE_UNMET};
@@ -266,6 +266,25 @@ async fn await_running_pids(omp: &OmpManager) {
     bounded(pids.wait_for(|p| !p.is_empty()))
         .await
         .expect("pid channel open");
+}
+
+/// Waits until the lane children sent at least `n` agent events.
+async fn await_lane_events(omp: &OmpManager, n: u64) {
+    bounded(omp.lanes().lane_events().wait_for(|seen| *seen >= n))
+        .await
+        .expect("events channel open");
+}
+
+/// The `key=value` words of the line that starts with `lead::STALL_LINE`.
+fn stall_fields(text: &str) -> std::collections::HashMap<String, String> {
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix(lead::STALL_LINE))
+        .expect("stall line");
+    line.split(' ')
+        .filter_map(|word| word.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
 }
 
 fn queued_row(h: &Harness, id: i64) -> moraebot::store::InboxRow {
@@ -1513,4 +1532,127 @@ async fn lane_close_keeps_a_worktree_with_untracked_files() {
     assert_eq!(result["worktree"], "kept");
     assert_eq!(result["codes"], json!([E_LANE_REMOVE]));
     assert!(lane_folder(&h, 1).join("qa-new.txt").exists());
+}
+
+#[tokio::test]
+async fn watchdog_reports_a_quiet_lane_once() {
+    let h = Harness::new();
+    let omp = h.manager("hang", &[lane_start("t1")]);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_events(&omp, 1).await;
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let t0 = Instant::now();
+    let lanes = omp.lanes();
+    let ticks = [
+        lanes.watch_tick(t0),
+        lanes.watch_tick(t0 + lane::STALL_AFTER - Duration::from_secs(1)),
+        lanes.watch_tick(t0 + lane::STALL_AFTER),
+        lanes.watch_tick(t0 + 2 * lane::STALL_AFTER),
+    ];
+    let woke = tokio::time::timeout(BOUND, notified).await.is_ok();
+    let state = h.lane(1).state;
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(ticks, [0, 0, 1, 0]);
+    assert!(woke);
+    assert_eq!(state, LaneState::Running);
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 1);
+    let row = queued_row(&h, 1);
+    assert_eq!(row.platform, lane::LANE_PLATFORM);
+    assert_eq!(row.origin, "lane");
+    assert_eq!(row.message_id, "1:1:stalled:1");
+    let tag = lead::parse_tag(&row.text).expect("tagged notice");
+    assert_eq!(tag.conversation, KEY);
+    assert_eq!(tag.lane, Some(1));
+    assert!(tag.stalled);
+    assert_eq!(tag.reason.as_deref(), Some(lead::N_LANE_QUIET));
+    assert_eq!(tag.failed, None);
+    let fields = stall_fields(&row.text);
+    assert_eq!(fields["quiet_minutes"], "20");
+    assert_eq!(fields["tool_calls"], "0");
+    assert_eq!(fields["last_tool"], "-");
+}
+
+#[tokio::test]
+async fn watchdog_counts_repeated_tool_calls_as_one() {
+    let h = Harness::new();
+    let omp = h.manager("spin", &[lane_start("t1")]);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    // agent_start and four tool_execution_start frames.
+    await_lane_events(&omp, 5).await;
+    let t0 = Instant::now();
+    let lanes = omp.lanes();
+    let ticks = [
+        lanes.watch_tick(t0),
+        lanes.watch_tick(t0 + lane::STALL_AFTER),
+    ];
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(ticks, [0, 1]);
+    let row = queued_row(&h, 1);
+    assert_eq!(row.message_id, "1:1:stalled:1");
+    let tag = lead::parse_tag(&row.text).expect("tagged notice");
+    assert_eq!(tag.reason.as_deref(), Some(lead::N_LANE_QUIET));
+    let fields = stall_fields(&row.text);
+    assert_eq!(fields["tool_calls"], "4");
+    assert_eq!(fields["new_calls"], "2");
+    assert_eq!(fields["last_tool"], "read");
+}
+
+#[tokio::test]
+async fn watchdog_is_off_when_the_turn_timeout_is_shorter() {
+    let h = Harness::new();
+    let omp = h
+        .manager("hang", &[lane_start("t1")])
+        .with_turn_timeout(lane::STALL_AFTER);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_events(&omp, 1).await;
+    let t0 = Instant::now();
+    let lanes = omp.lanes();
+    let ticks = [
+        lanes.watch_tick(t0),
+        lanes.watch_tick(t0 + lane::STALL_AFTER),
+        lanes.watch_tick(t0 + 2 * lane::STALL_AFTER),
+    ];
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(ticks, [0, 0, 0]);
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn watchdog_stops_with_the_gateway() {
+    let h = Harness::new();
+    let omp = h.manager("hang", &[lane_start("t1")]);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_events(&omp, 1).await;
+    let t0 = Instant::now();
+    let first = omp.lanes().watch_tick(t0);
+    omp.lanes().stop_accepting();
+    let second = omp.lanes().watch_tick(t0 + lane::STALL_AFTER);
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(first, 0);
+    assert_eq!(second, 0);
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn watchdog_ignores_finished_lanes() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let t0 = Instant::now();
+    let lanes = omp.lanes();
+    let ticks = [
+        lanes.watch_tick(t0),
+        lanes.watch_tick(t0 + lane::STALL_AFTER),
+    ];
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(ticks, [0, 0]);
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 1);
 }

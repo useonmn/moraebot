@@ -49,6 +49,11 @@
 //! Lane mode `hold_open` answers `open_session` with a `fake_held` marker
 //! instead of a response and then writes nothing more. A held fake is released
 //! only by stdin closing or a kill.
+//!
+//! Lane mode `spin` answers a prompt like `hang`, then writes four
+//! `tool_execution_start` frames (three identical `bash` calls with args
+//! `{"command":"ls"}`, then one `read` call with args `{"path":"qa.txt"}`) and
+//! nothing more.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -462,6 +467,7 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
     send(out, &json!({"type": "agent_start"}));
     match mode {
         "hang" => {}
+        "spin" => spin(out),
         "exit1" => std::process::exit(1),
         "error" => {
             send(out, &json!({"type": "agent_end", "messages": []}));
@@ -469,6 +475,20 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
         }
         _ => finish_echo(id, prompt_message(frame), out),
     }
+}
+
+/// Mode `spin`: three identical `bash` tool calls, then one `read` call.
+fn spin(out: &mut impl Write) {
+    for id in ["spin-1", "spin-2", "spin-3"] {
+        send(
+            out,
+            &json!({"type": "tool_execution_start", "toolCallId": id, "toolName": "bash", "args": {"command": "ls"}}),
+        );
+    }
+    send(
+        out,
+        &json!({"type": "tool_execution_start", "toolCallId": "spin-4", "toolName": "read", "args": {"path": "qa.txt"}}),
+    );
 }
 
 /// The prompt's message without a leading `[moraebot ...]` envelope line.
