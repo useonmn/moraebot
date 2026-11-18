@@ -26,6 +26,8 @@ pub const E_CHECK_UNCOMMITTED: &str = "E_CHECK_UNCOMMITTED";
 pub const E_CHECK_UNPUSHED: &str = "E_CHECK_UNPUSHED";
 /// A lane worktree's git state could not be read.
 pub const E_CHECK_GIT: &str = "E_CHECK_GIT";
+/// git refused or failed to remove a lane's worktree (for example untracked files, a locked or unregistered folder).
+pub const E_LANE_REMOVE: &str = "E_LANE_REMOVE";
 /// Appended after the Done footer of a lane with a repo.
 pub const GIT_FOOTER: &str = "\n[moraebot] This lane works in its own git worktree. Before lane_done, commit your changes to tracked files and push your branch (for example git push origin HEAD) if the repo has a remote. moraebot refuses the claim while tracked changes are uncommitted or commits are on no remote; new untracked files do not count.";
 
@@ -428,6 +430,81 @@ pub(crate) fn git_checks(
         }
     };
     Ok(vec![committed, pushed])
+}
+
+/// What [`remove`] did with a lane's worktree.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Cleanup {
+    /// Nothing is at the lane's folder path; no git command ran.
+    Missing,
+    /// `git worktree remove` removed the folder; the branch stays.
+    Removed,
+    /// The folder stays: the codes of the failing checks, or `E_LANE_REMOVE`, and a short detail.
+    Kept {
+        codes: Vec<&'static str>,
+        detail: String,
+    },
+}
+
+/// Removes lane worktree `folder` of the checkout `repo` when nothing would be lost: every
+/// [`git_checks`] check passes and a plain `git worktree remove` (never `--force`, so git itself
+/// refuses untracked files) exits 0. The lane's branch is never deleted. `started`/`ended` see
+/// every git pid as in [`done::run_command`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn remove(
+    repo: &Path,
+    folder: &Path,
+    opts: &RunOpts<'_>,
+    mut started: impl FnMut(u32) -> bool,
+    mut ended: impl FnMut(u32),
+) -> Result<Cleanup, Stopped> {
+    // 1. Nothing to remove.
+    if folder.symlink_metadata().is_err() {
+        return Ok(Cleanup::Missing);
+    }
+
+    // 2. Every check must pass: nothing uncommitted, nothing unpushed, git state readable.
+    let checks = git_checks(folder, opts, &mut started, &mut ended)?;
+    let failing: Vec<&Check> = checks.iter().filter(|check| check.code.is_some()).collect();
+    if !failing.is_empty() {
+        let codes = failing.iter().filter_map(|check| check.code).collect();
+        let details: Vec<&str> = failing.iter().map(|check| check.detail.as_str()).collect();
+        return Ok(Cleanup::Kept {
+            codes,
+            detail: done::short(&details.join("; ")),
+        });
+    }
+
+    // 3. A plain removal; git itself refuses untracked files, locked or unregistered folders.
+    let env = git_env(opts.env);
+    let opts = RunOpts {
+        out_dir: opts.out_dir,
+        env: &env,
+        timeout: opts.timeout,
+    };
+    let ran = done::run_command(
+        OsStr::new("git"),
+        &args(&[
+            OsStr::new("-C"),
+            repo.as_os_str(),
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            folder.as_os_str(),
+        ]),
+        repo,
+        &opts,
+        &mut started,
+        &mut ended,
+    )?;
+    if matches!(ran, Ran::Exited(0)) {
+        Ok(Cleanup::Removed)
+    } else {
+        Ok(Cleanup::Kept {
+            codes: vec![E_LANE_REMOVE],
+            detail: git_detail(&ran, &opts),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1059,5 +1136,201 @@ mod tests {
         );
         assert_eq!(result, Err(Stopped));
         assert_eq!((started, ended), (1, 1));
+    }
+
+    /// `remove` with `GIT_TIMEOUT` and counting closures; adds the counts to `counts`.
+    fn cleanup(
+        dir: &Path,
+        repo: &Path,
+        folder: &Path,
+        path: &OsStr,
+        counts: &mut (u32, u32),
+    ) -> Cleanup {
+        let (out, env) = (out(dir), env(dir, path));
+        let (mut started, mut ended) = (0, 0);
+        let result = remove(
+            repo,
+            folder,
+            &opts(&out, &env, GIT_TIMEOUT),
+            |_| {
+                started += 1;
+                true
+            },
+            |_| ended += 1,
+        )
+        .expect("not stopped");
+        counts.0 += started;
+        counts.1 += ended;
+        result
+    }
+
+    #[test]
+    fn remove_deletes_a_clean_pushed_worktree_and_keeps_the_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        let mut counts = (0, 0);
+        assert_eq!(
+            cleanup(dir, &repo, &folder, &real_path(), &mut counts),
+            Cleanup::Removed
+        );
+        assert_eq!(counts, (5, 5));
+        assert!(!folder.exists());
+        assert_eq!(worktrees(&repo).len(), 1);
+        let branches = git(
+            &repo,
+            &[
+                "branch".as_ref(),
+                "--list".as_ref(),
+                "moraebot/lane-1".as_ref(),
+            ],
+        );
+        assert!(branches.contains("moraebot/lane-1"));
+    }
+
+    #[test]
+    fn remove_without_a_remote_deletes_a_committed_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "y").unwrap();
+        commit_all(&folder, "lane");
+        let mut counts = (0, 0);
+        assert_eq!(
+            cleanup(dir, &repo, &folder, &real_path(), &mut counts),
+            Cleanup::Removed
+        );
+        assert_eq!(counts, (4, 4));
+        assert!(!folder.exists());
+        let subject = git(
+            &repo,
+            &[
+                "log".as_ref(),
+                "-1".as_ref(),
+                "--format=%s".as_ref(),
+                "moraebot/lane-1".as_ref(),
+            ],
+        );
+        assert_eq!(subject, "lane\n");
+    }
+
+    #[test]
+    fn remove_keeps_uncommitted_and_unpushed_work() {
+        // 1. A tracked change that is not committed: no remove command runs.
+        let root1 = tempfile::tempdir().unwrap();
+        let dir = root1.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "changed").unwrap();
+        let mut counts = (0, 0);
+        let Cleanup::Kept { codes, detail } =
+            cleanup(dir, &repo, &folder, &real_path(), &mut counts)
+        else {
+            panic!("expected Kept");
+        };
+        assert_eq!(codes, [E_CHECK_UNCOMMITTED]);
+        assert!(!detail.is_empty());
+        assert_eq!(counts, (4, 4));
+        assert!(folder.exists());
+
+        // 2. A commit on no remote.
+        let root2 = tempfile::tempdir().unwrap();
+        let dir = root2.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("tracked.txt"), "y").unwrap();
+        commit_all(&folder, "lane");
+        let Cleanup::Kept { codes, detail } =
+            cleanup(dir, &repo, &folder, &real_path(), &mut (0, 0))
+        else {
+            panic!("expected Kept");
+        };
+        assert_eq!(codes, [E_CHECK_UNPUSHED]);
+        assert!(!detail.is_empty());
+        assert!(folder.exists());
+    }
+
+    #[test]
+    fn remove_keeps_a_worktree_with_untracked_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        qa_remote(dir, &repo);
+        let folder = lane_worktree(dir, &repo);
+        std::fs::write(folder.join("qa-new.txt"), "n").unwrap();
+        let mut counts = (0, 0);
+        let Cleanup::Kept { codes, detail } =
+            cleanup(dir, &repo, &folder, &real_path(), &mut counts)
+        else {
+            panic!("expected Kept");
+        };
+        assert_eq!(codes, [E_LANE_REMOVE]);
+        assert!(!detail.is_empty());
+        assert_eq!(counts, (5, 5));
+        assert!(folder.join("qa-new.txt").exists());
+    }
+
+    #[test]
+    fn remove_reports_unreadable_git_and_a_missing_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+
+        // 1. A git that starts and exits 1 (the macOS xcrun stub).
+        let stub = fake_git(
+            dir,
+            "qa-stubgit",
+            "echo 'xcrun: error: qa stub' >&2; exit 1",
+        );
+        let mut counts = (0, 0);
+        let Cleanup::Kept { codes, detail } =
+            cleanup(dir, &repo, &folder, stub.as_os_str(), &mut counts)
+        else {
+            panic!("expected Kept");
+        };
+        assert_eq!(codes, [E_CHECK_GIT]);
+        assert!(!detail.is_empty());
+        assert_eq!(counts, (1, 1));
+        assert!(folder.exists());
+
+        // 2. Nothing at the folder path: no git command runs.
+        require_git();
+        let missing = dir.join("qa-missing");
+        let mut counts = (0, 0);
+        assert_eq!(
+            cleanup(dir, &repo, &missing, &real_path(), &mut counts),
+            Cleanup::Missing
+        );
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn remove_stops_when_started_refuses() {
+        require_git();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let folder = lane_worktree(dir, &repo);
+        let (out, env) = (out(dir), env(dir, &real_path()));
+        let (mut started, mut ended) = (0, 0);
+        let result = remove(
+            &repo,
+            &folder,
+            &opts(&out, &env, GIT_TIMEOUT),
+            |_| {
+                started += 1;
+                false
+            },
+            |_| ended += 1,
+        );
+        assert_eq!(result, Err(Stopped));
+        assert_eq!((started, ended), (1, 1));
+        assert!(folder.exists());
     }
 }
