@@ -425,6 +425,33 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 
 **dori와 다른 점.** dori에서는 lane(AI)이 직접 worktree를 만들고, dori는 브랜치 이름으로 그 폴더를 찾아 검사하고 닫을 때 지웁니다. moraebot lane은 명령줄 도구가 없는 백그라운드 프로그램이라 moraebot 코드가 만듭니다. 그래서 이름과 위치가 늘 같습니다. lane 이름을 딴 브랜치, 저장소가 없으면 공유 폴더라는 점은 dori와 같고, 지우기는 moraebot에 "lane 닫기"가 생긴 뒤에 넣습니다.
 
+### 3.12 레인 완료 git 검사 (lanes L2)
+
+**언제 도나.** `repo`로 시작한 lane(자기 worktree가 있는 lane)이 `lane_done`을 부를 때만 돕니다. `worktree::git_checks`가 lane 폴더의 git 상태를 먼저 읽고, 그다음 완료 확인(3.8)을 지금처럼 돌립니다. git 검사에 걸려도 완료 확인은 돌리므로, 거절 하나에 아직 안 된 것이 모두 실립니다. `repo` 없는 lane은 작업 폴더가 git 저장소여도 git 명령을 하나도 돌리지 않습니다.
+
+**네 명령.** 모두 읽기만 하고, 셸 없이 `done::run_command`로 돌립니다. 환경은 완료 확인과 같고, 여기에 `GIT_TERMINAL_PROMPT=0`과 `GIT_OPTIONAL_LOCKS=0`을 더합니다(`git_env`). 명령 하나에 `GIT_TIMEOUT`(120초)이고, pid는 완료 확인처럼 적혀 끄기 때 함께 죽습니다.
+
+1. `git -C <폴더> rev-parse --show-toplevel`: 맨 위 폴더가 lane 폴더와 같아야 합니다.
+2. `git -C <폴더> status --porcelain --untracked-files=no`: 줄이 하나라도 있으면 커밋하지 않은 변경입니다. 스테이지만 한 변경도 셉니다. 새로 만든 파일(추적 안 됨)은 보지 않습니다.
+3. `git -C <폴더> remote`: 원격이 하나도 없으면 4번을 건너뛰고 "올림" 검사는 `git pushed (no remote)`로 통과합니다.
+4. `git -C <폴더> rev-list --count HEAD --not --remotes`: 0보다 크면 HEAD에 어느 원격 브랜치에도 없는 커밋이 있다는 뜻입니다. 업스트림은 필요 없습니다. 어떤 이름으로든 push하면 컴퓨터의 원격 기록이 바뀌어 0이 됩니다.
+
+moraebot은 `git fetch`도 `git push`도 하지 않습니다. 컴퓨터에 있는 원격 기록만 봅니다.
+
+**코드.** 걸린 검사마다 `E_DONE_UNMET` 거절에 `- <검사> -> <CODE>: <내용>` 한 줄이 붙습니다. 통과한 claim의 영수증에는 git 검사가 먼저 나옵니다.
+
+| 코드 | 검사 | 경우 |
+|---|---|---|
+| `E_CHECK_UNCOMMITTED` | `git committed` | 추적하는 파일에 커밋하지 않은 변경이 있음 |
+| `E_CHECK_UNPUSHED` | `git pushed` | 원격이 있는데 HEAD에 어느 원격에도 없는 커밋이 있음 |
+| `E_CHECK_GIT` | `git state` | 네 명령 중 하나가 0으로 끝나지 않음(실행 실패, 시간 초과 포함), 맨 위 폴더가 lane 폴더가 아님, 커밋 수를 읽을 수 없음 |
+
+`E_CHECK_GIT`이면 그 검사 하나만 남고 다른 git 검사는 없습니다. 내용과 로그에는 경로, 브랜치 이름, git 출력을 넣지 않습니다.
+
+**알림.** 완료 줄이 있는 `repo` lane의 안내문에는 완료 안내 뒤에 `worktree::GIT_FOOTER`(커밋하고 브랜치를 올리라는 한 문단)가 붙고, lead 안내문에도 같은 규칙이 한 문장 있습니다.
+
+**dori와 다른 점.** 커밋 안 한 변경과 원격에 없는 커밋을 보고 새 파일은 막지 않는 점, fetch하지 않는 점은 dori와 같습니다. dori는 git 검사에 걸리면 Done 검사를 건너뛰지만 moraebot은 둘 다 돌립니다. dori는 원격이 없는 저장소에서 lane이 끝날 수 없지만 moraebot은 그때 커밋만 봅니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -508,7 +535,8 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 5. **light (v0.3.0).** 0.2.0의 기억 장치를 걷어내고 첫 만남과 `persona.md` 하나만 남깁니다(3.9절). omp 기억은 주인 설정을 따릅니다(3.10절). 기억 코드는 `memory-full` 브랜치에 그대로 두어 나중에 다시 합칠 수 있습니다.
 6. **lane 기능.** 한 번에 하나씩, 앞 것이 동작한 뒤에 다음으로 갑니다.
    - **L1 레인 작업 폴더.** `repo`를 받은 lane은 자기 git worktree에서 일합니다(3.11절).
-   - **L2 올리지 않은 작업 검사.** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다. L1 폴더가 있어야 합니다.
+   - **L2 올리지 않은 작업 검사 (완료).** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다(3.12절).
+   - **L2b 레인 닫기와 폴더 정리.** lead가 lane을 닫으면 L2 검사를 거친 뒤 lane 폴더를 지웁니다. 브랜치는 남깁니다.
    - **L3 레인 감시.** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
    - **L4 진행 소식.** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
 
