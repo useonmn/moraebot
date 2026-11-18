@@ -1,6 +1,6 @@
 use crate::adapter::{
-    AdapterError, E_ADAPTER_SEND, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent,
-    MessengerAdapter, SendResult, TypingHandle,
+    AdapterError, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_UPLOAD_DENIED, InboundAttachment,
+    InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
 use crate::files::{E_FILE_WRITE, Progress};
 use crate::slack::{
@@ -31,6 +31,9 @@ pub enum Call {
     },
     StartTyping {
         channel: String,
+    },
+    OpenDm {
+        user_id: String,
     },
     FetchAttachment {
         reference: String,
@@ -73,6 +76,7 @@ pub struct FakeAdapter {
     files: Mutex<FileScript>,
     sent_count: watch::Sender<usize>,
     fail_next_send: AtomicBool,
+    fail_next_open_dm: AtomicBool,
     reconnects: watch::Sender<u64>,
     inbound_tx: mpsc::Sender<InboundEvent>,
     inbound_rx: Mutex<Option<mpsc::Receiver<InboundEvent>>>,
@@ -93,6 +97,7 @@ impl FakeAdapter {
             files: Mutex::new(FileScript::default()),
             sent_count: watch::channel(0).0,
             fail_next_send: AtomicBool::new(false),
+            fail_next_open_dm: AtomicBool::new(false),
             reconnects: watch::channel(0).0,
             inbound_tx,
             inbound_rx: Mutex::new(Some(inbound_rx)),
@@ -105,6 +110,11 @@ impl FakeAdapter {
 
     pub fn fail_next_send(&self) {
         self.fail_next_send.store(true, Ordering::SeqCst);
+    }
+
+    /// The next `open_dm` fails with `E_ADAPTER_DM`.
+    pub fn fail_next_open_dm(&self) {
+        self.fail_next_open_dm.store(true, Ordering::SeqCst);
     }
 
     /// Simulates the messenger connection coming back (a ready or resume event).
@@ -271,6 +281,20 @@ impl MessengerAdapter for FakeAdapter {
             channel: channel.to_owned(),
         });
         Ok(TypingHandle::new(|| {}))
+    }
+
+    /// The DM target is `dm-<user_id>`.
+    async fn open_dm(&self, user_id: &str) -> Result<String, AdapterError> {
+        self.record(Call::OpenDm {
+            user_id: user_id.to_owned(),
+        });
+        if self.fail_next_open_dm.swap(false, Ordering::SeqCst) {
+            return Err(AdapterError {
+                code: E_ADAPTER_DM,
+                message: "injected open_dm failure".to_owned(),
+            });
+        }
+        Ok(format!("dm-{user_id}"))
     }
 
     async fn fetch_attachment(
@@ -803,6 +827,19 @@ mod tests {
             mime: None,
             reference: AttachmentRef(reference.into()),
         }
+    }
+
+    #[tokio::test]
+    async fn fake_open_dm_records_and_can_fail() {
+        let fake = FakeAdapter::new();
+        assert_eq!(fake.open_dm("111").await, Ok("dm-111".to_owned()));
+        fake.fail_next_open_dm();
+        assert_eq!(fake.open_dm("111").await.unwrap_err().code, E_ADAPTER_DM);
+        assert_eq!(fake.open_dm("111").await, Ok("dm-111".to_owned()));
+        let open = Call::OpenDm {
+            user_id: "111".into(),
+        };
+        assert_eq!(fake.calls(), vec![open.clone(), open.clone(), open]);
     }
 
     #[tokio::test]

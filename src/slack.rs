@@ -23,8 +23,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::adapter::{
-    AdapterError, AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED,
-    InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle, next_backoff,
+    AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START,
+    E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter, SendResult,
+    TypingHandle, next_backoff,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
 use crate::files::{self, E_FILE_REMOTE, Progress};
@@ -1047,6 +1048,18 @@ impl MessengerAdapter for SlackAdapter {
 
     async fn start_typing(&self, _channel: &str) -> Result<TypingHandle, AdapterError> {
         Ok(TypingHandle::new(|| {}))
+    }
+
+    /// `chat.postMessage` with a user id as `channel` posts to the app's DM with that user
+    /// (needs only `chat:write`), so the user id itself is the target.
+    async fn open_dm(&self, user_id: &str) -> Result<String, AdapterError> {
+        if user_id.is_empty() || user_id.contains(':') {
+            return Err(AdapterError {
+                code: E_ADAPTER_DM,
+                message: "not a Slack user id".to_owned(),
+            });
+        }
+        Ok(user_id.to_owned())
     }
 
     async fn fetch_attachment(

@@ -16,13 +16,13 @@ use async_trait::async_trait;
 use serenity::all::{
     Channel, ChannelId, ChannelType, Client, Context, CreateAttachment, CreateMessage,
     CreateThread, EventHandler, GatewayIntents, Http, Message, MessageId, MessageType, Ready,
-    ResumedEvent, ShardManager,
+    ResumedEvent, ShardManager, UserId,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{
-    AdapterError, AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD,
+    AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD,
     E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
     SendResult, TypingHandle, next_backoff, split_reply,
 };
@@ -173,6 +173,24 @@ async fn upload_file(
             }
         })?;
     Ok(message.id.get().to_string())
+}
+
+/// Opens (or finds) the bot's DM channel with `user_id` through serenity and returns its id.
+async fn open_dm_channel(http: &Http, user_id: u64) -> Result<String, AdapterError> {
+    let channel = UserId::new(user_id)
+        .create_dm_channel(http)
+        .await
+        .map_err(|err| AdapterError {
+            code: E_ADAPTER_DM,
+            message: match &err {
+                serenity::Error::Http(http_err) => match http_err.status_code() {
+                    Some(status) => format!("opening the DM failed with HTTP {}", status.as_u16()),
+                    None => "opening the DM failed".to_owned(),
+                },
+                _ => "opening the DM failed".to_owned(),
+            },
+        })?;
+    Ok(channel.id.get().to_string())
 }
 
 pub fn guild_location(is_thread: bool, parent_id: Option<u64>) -> Location {
@@ -532,6 +550,14 @@ impl MessengerAdapter for DiscordAdapter {
         }))
     }
 
+    async fn open_dm(&self, user_id: &str) -> Result<String, AdapterError> {
+        let id = parse_id(user_id).map_err(|err| AdapterError {
+            code: E_ADAPTER_DM,
+            message: err.message,
+        })?;
+        open_dm_channel(&self.http, id).await
+    }
+
     async fn fetch_attachment(
         &self,
         attachment: &InboundAttachment,
@@ -773,6 +799,7 @@ mod tests {
     }
 
     const MESSAGE_JSON: &str = r#"{"id":"333","channel_id":"222","author":{"id":"111","username":"fake","discriminator":"0","avatar":null},"content":"","timestamp":"2026-01-01T00:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#;
+    const DM_CHANNEL_JSON: &str = r#"{"id":"444","type":1,"last_message_id":null,"recipients":[{"id":"111","username":"fake","discriminator":"0","avatar":null}]}"#;
     const WAIT: Duration = Duration::from_secs(30);
 
     /// A loopback HTTP server: every request on every connection is sent to the test and
@@ -977,6 +1004,51 @@ mod tests {
             "test-token-111",
         ] {
             assert!(!text.contains(leak), "leaked {leak}");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_dm_posts_the_recipient_and_returns_the_channel() {
+        let (base, mut rx) = discord_stub(Reply::Status(200, DM_CHANNEL_JSON)).await;
+        let result = tokio::time::timeout(WAIT, open_dm_channel(&loopback_http(&base), OWNER))
+            .await
+            .expect("open in time");
+        assert_eq!(result, Ok("444".to_owned()));
+        let seen = next_request(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "exactly one request");
+        assert!(
+            seen.head.starts_with("POST /api/v10/users/@me/channels "),
+            "{}",
+            seen.head.lines().next().unwrap_or_default()
+        );
+        let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(body, serde_json::json!({ "recipient_id": "111" }));
+    }
+
+    #[tokio::test]
+    async fn refused_open_dm_is_a_dm_error() {
+        let (base, mut rx) = discord_stub(Reply::Status(
+            403,
+            r#"{"message":"Missing Access","code":50001}"#,
+        ))
+        .await;
+        let err = tokio::time::timeout(WAIT, open_dm_channel(&loopback_http(&base), OWNER))
+            .await
+            .expect("open in time")
+            .unwrap_err();
+        assert_eq!(err.code, E_ADAPTER_DM);
+        assert!(err.message.contains("403"));
+        assert!(!err.message.contains("test-token-111"));
+        next_request(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn open_dm_refuses_a_bad_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter =
+            DiscordAdapter::new(&token_file(dir.path(), "test-token-111"), scope()).unwrap();
+        for id in ["0", "x"] {
+            assert_eq!(adapter.open_dm(id).await.unwrap_err().code, E_ADAPTER_DM);
         }
     }
 

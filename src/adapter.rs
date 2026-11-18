@@ -17,6 +17,8 @@ pub const E_ADAPTER_UPLOAD: &str = "E_ADAPTER_UPLOAD";
 /// The messenger permanently refused an upload (missing permission, file too large for
 /// the messenger, unreadable file); the core skips the file.
 pub const E_ADAPTER_UPLOAD_DENIED: &str = "E_ADAPTER_UPLOAD_DENIED";
+/// The owner's DM could not be opened (the messenger refused, or it has no DMs).
+pub const E_ADAPTER_DM: &str = "E_ADAPTER_DM";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEvent {
@@ -122,6 +124,15 @@ pub trait MessengerAdapter: Send + Sync {
     ) -> Result<String, AdapterError>;
 
     async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError>;
+
+    /// The send target of the bot's DM with `user_id`, opened when needed. Messengers
+    /// without DMs keep this default.
+    async fn open_dm(&self, _user_id: &str) -> Result<String, AdapterError> {
+        Err(AdapterError {
+            code: E_ADAPTER_DM,
+            message: "this messenger cannot open a DM".to_owned(),
+        })
+    }
 
     /// Downloads `attachment` into `dest` with no size limit and returns the bytes written.
     /// Calls `progress.record(n)` after every chunk written so the core's stall watchdog
@@ -358,6 +369,11 @@ mod tests {
         async fn start_typing(&self, _: &str) -> Result<TypingHandle, AdapterError> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    async fn default_open_dm_is_unsupported() {
+        assert_eq!(Minimal.open_dm("111").await.unwrap_err().code, E_ADAPTER_DM);
     }
 
     #[tokio::test]

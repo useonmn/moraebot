@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::{
-    AttachmentRef, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED, InboundAttachment,
-    MessengerAdapter,
+    AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED,
+    InboundAttachment, MessengerAdapter,
 };
 use moraebot::files::{E_FILE_HOST, E_FILE_REMOTE, E_FILE_WRITE, Progress};
 use moraebot::slack::{
@@ -217,6 +217,31 @@ async fn send_plain_target_has_no_thread_ts() {
         fake.record().posts,
         vec![json!({ "channel": "D333", "text": "hi" })]
     );
+}
+
+#[tokio::test]
+async fn open_dm_targets_the_user_and_posts_without_thread_ts() {
+    let (fake, adapter) = setup();
+    let target = adapter.open_dm("U111").await.unwrap();
+    assert_eq!(target, "U111");
+    within(WAIT, adapter.send(&target, "hi")).await.unwrap();
+    let posts = fake.record().posts;
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["channel"], "U111");
+    assert_eq!(posts[0]["text"], "hi");
+    assert!(posts[0].get("thread_ts").is_none());
+}
+
+#[tokio::test]
+async fn open_dm_refuses_a_bad_user_id() {
+    let (fake, adapter) = setup();
+    for user_id in ["", "U111:1.1"] {
+        assert_eq!(
+            adapter.open_dm(user_id).await.unwrap_err().code,
+            E_ADAPTER_DM
+        );
+    }
+    assert!(fake.record().posts.is_empty());
 }
 
 #[tokio::test]
