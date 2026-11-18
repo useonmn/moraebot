@@ -31,7 +31,7 @@ pub const E_DONE_UNMET: &str = "E_DONE_UNMET";
 pub const E_CHECK_EXIT: &str = "E_CHECK_EXIT";
 /// A file does not exist.
 pub const E_CHECK_MISSING: &str = "E_CHECK_MISSING";
-/// A command passed `CHECK_TIMEOUT` and was killed.
+/// A command passed its time limit and was killed, or a URL did not answer within it.
 pub const E_CHECK_TIMEOUT: &str = "E_CHECK_TIMEOUT";
 /// A command could not start.
 pub const E_CHECK_SPAWN: &str = "E_CHECK_SPAWN";
@@ -39,6 +39,10 @@ pub const E_CHECK_SPAWN: &str = "E_CHECK_SPAWN";
 pub const E_CHECK_TEXT: &str = "E_CHECK_TEXT";
 /// An existing file or a command's stdout file cannot be read.
 pub const E_CHECK_READ: &str = "E_CHECK_READ";
+/// The URL answered with a status outside 200-299.
+pub const E_CHECK_STATUS: &str = "E_CHECK_STATUS";
+/// The URL request failed (connect, TLS, DNS or client setup).
+pub const E_CHECK_HTTP: &str = "E_CHECK_HTTP";
 
 /// Bytes of command output kept for a failure detail.
 const OUTPUT_HEAD_BYTES: u64 = 4096;
@@ -53,6 +57,8 @@ pub enum Signal {
     Command(Vec<String>, Option<String>),
     /// Passes when the path exists; with a text, only when the file's bytes contain it.
     File(String, Option<String>),
+    /// One GET with no redirects and no proxy; passes on a 200-299 status.
+    Url(String),
 }
 
 impl fmt::Display for Signal {
@@ -66,6 +72,7 @@ impl fmt::Display for Signal {
                 write!(f, "file {}", word(path))?;
                 contains(f, text.as_deref())
             }
+            Signal::Url(url) => write!(f, "url {}", word(url)),
         }
     }
 }
@@ -143,6 +150,7 @@ pub enum SyntaxReason {
     BadArgv,
     BadPath,
     BadText,
+    BadUrl,
 }
 
 /// A Done line that cannot be checked: the bad part and why.
@@ -157,7 +165,7 @@ impl fmt::Display for SyntaxError {
         let reason = match self.reason {
             SyntaxReason::Empty => "empty Done line",
             SyntaxReason::Unknown => {
-                "unknown signal; use command [\"program\",\"arg\"] or file <path>"
+                "unknown signal; use command [\"program\",\"arg\"], file <path> or url <address>"
             }
             SyntaxReason::Unsupported => "this signal kind is not supported yet",
             SyntaxReason::BadArgv => {
@@ -168,6 +176,9 @@ impl fmt::Display for SyntaxError {
             }
             SyntaxReason::BadText => {
                 "contains needs one non-empty quoted text and nothing after it"
+            }
+            SyntaxReason::BadUrl => {
+                "url needs one http or https address with a host, no user or password, and nothing after it"
             }
         };
         write!(f, "{} -> {reason}", self.part)
@@ -237,7 +248,19 @@ fn parse_signal(part: &str) -> Result<Signal, SyntaxReason> {
             let text = take_contains(rest, SyntaxReason::BadPath)?;
             Ok(Signal::File(path, text))
         }
-        "merged" | "closed" | "published" | "url" => Err(SyntaxReason::Unsupported),
+        "url" => {
+            let (url, rest) = take_word(rest).ok_or(SyntaxReason::BadUrl)?;
+            let parsed = reqwest::Url::parse(&url).map_err(|_| SyntaxReason::BadUrl)?;
+            let valid = rest.is_empty()
+                && matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some_and(|host| !host.is_empty())
+                && parsed.username().is_empty()
+                && parsed.password().is_none();
+            valid
+                .then_some(Signal::Url(url))
+                .ok_or(SyntaxReason::BadUrl)
+        }
+        "merged" | "closed" | "published" => Err(SyntaxReason::Unsupported),
         _ => Err(SyntaxReason::Unknown),
     }
 }
@@ -327,6 +350,7 @@ pub(crate) fn run(
                     _ => ran,
                 }
             }
+            Signal::Url(url) => check_url(url, timeout),
         };
         checks.push(Check {
             signal: signal.to_string(),
@@ -395,6 +419,42 @@ fn file_contains(path: &Path, text: &str) -> std::io::Result<bool> {
             return Ok(true);
         }
         buffer.drain(..buffer.len().saturating_sub(keep));
+    }
+}
+
+/// Sends one GET to `url` with no redirects, no proxy and `timeout` for the whole request;
+/// the body is not read.
+fn check_url(url: &str, timeout: Duration) -> (Option<&'static str>, String) {
+    // The `lane_done` handler runs on a plain thread with no runtime, so a private one is safe.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return (Some(E_CHECK_HTTP), error.to_string()),
+    };
+    // The client's timer and connector need the runtime's context already when it is built.
+    let _context = runtime.enter();
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return (Some(E_CHECK_HTTP), error.without_url().to_string()),
+    };
+    match runtime.block_on(client.get(url).send()) {
+        Ok(response) => {
+            let status = response.status();
+            let code = (!status.is_success()).then_some(E_CHECK_STATUS);
+            (code, format!("status {}", status.as_u16()))
+        }
+        Err(error) if error.is_timeout() => (
+            Some(E_CHECK_TIMEOUT),
+            format!("no answer after {} s", timeout.as_secs()),
+        ),
+        Err(error) => (Some(E_CHECK_HTTP), error.without_url().to_string()),
     }
 }
 
@@ -597,6 +657,8 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::ffi::CString;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use std::os::unix::ffi::OsStrExt;
     use std::time::Duration;
 
@@ -658,6 +720,53 @@ mod tests {
             |_| {},
         )
         .unwrap()
+    }
+
+    /// Serves exactly `statuses.len()` connections in order on 127.0.0.1: sends each
+    /// request's first line on the channel and answers with the next status.
+    fn http_server(statuses: &[u16]) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let statuses = statuses.to_vec();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for status in statuses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new((&stream).take(8192));
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                    line.clear();
+                }
+                let _ = tx.send(first.trim_end().to_owned());
+                let _ = (&stream).write_all(
+                    format!(
+                        "HTTP/1.1 {status} QA\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (base, rx)
+    }
+
+    /// Accepts one connection on 127.0.0.1, reads the request and never answers; closes
+    /// when the returned sender is used or dropped.
+    fn silent_server() -> (String, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (release, wait) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new((&stream).take(8192));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let _ = wait.recv();
+        });
+        (base, release)
     }
 
     fn reason(line: &str) -> (String, SyntaxReason) {
@@ -733,11 +842,6 @@ mod tests {
             ("merged acme/app#1", "merged acme/app#1", Unsupported),
             ("closed a/b#2", "closed a/b#2", Unsupported),
             ("published p@1", "published p@1", Unsupported),
-            (
-                "url http://127.0.0.1/",
-                "url http://127.0.0.1/",
-                Unsupported,
-            ),
             ("command []", "command []", BadArgv),
             (r#"command [""]"#, r#"command [""]"#, BadArgv),
             (
@@ -770,6 +874,7 @@ mod tests {
             r#"file report.txt contains "0 failed""#,
             r#"file "a b" contains "q\"uote;x""#,
             r#"command ["sh","-c","x"] contains "a;b""#,
+            r#"url http://127.0.0.1:8080/health; file a contains "b""#,
         ] {
             let line = DoneLine::parse(text).unwrap();
             assert_eq!(DoneLine::parse(&line.to_string()).unwrap(), line, "{text}");
@@ -894,6 +999,99 @@ mod tests {
         );
         let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
         assert_eq!(codes, [None, Some(E_CHECK_TEXT)]);
+    }
+
+    #[test]
+    fn parse_accepts_url_kinds() {
+        let line = DoneLine::parse("url http://127.0.0.1:8080/health").unwrap();
+        assert_eq!(
+            line.signals(),
+            [Signal::Url("http://127.0.0.1:8080/health".to_owned())]
+        );
+        assert_eq!(line.to_string(), "url http://127.0.0.1:8080/health");
+        let line = DoneLine::parse(r#"url "https://example.invalid/a;b""#).unwrap();
+        assert_eq!(
+            line.signals(),
+            [Signal::Url("https://example.invalid/a;b".to_owned())]
+        );
+        assert_eq!(line.to_string(), r#"url "https://example.invalid/a;b""#);
+    }
+
+    #[test]
+    fn parse_rejects_bad_urls() {
+        for line in [
+            "url",
+            "url ftp://127.0.0.1/",
+            "url http://",
+            "url not-a-url",
+            "url http://qa:pw@127.0.0.1/",
+            "url http://127.0.0.1/ x",
+            r#"url http://127.0.0.1/ contains "x""#,
+        ] {
+            assert_eq!(
+                reason(line),
+                (line.to_owned(), SyntaxReason::BadUrl),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_passes_on_2xx_only() {
+        let d = dirs();
+        let (base, rx) = http_server(&[200, 204, 302, 404, 500]);
+        let signals = (0..5)
+            .map(|_| Signal::Url(format!("{base}/health")))
+            .collect();
+        let checks = run_all(&d, signals, CHECK_TIMEOUT);
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(
+            codes,
+            [
+                None,
+                None,
+                Some(E_CHECK_STATUS),
+                Some(E_CHECK_STATUS),
+                Some(E_CHECK_STATUS)
+            ]
+        );
+        let details: Vec<_> = checks[2..]
+            .iter()
+            .map(|check| check.detail.as_str())
+            .collect();
+        assert_eq!(details, ["status 302", "status 404", "status 500"]);
+        for _ in 0..5 {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                "GET /health HTTP/1.1"
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn url_unreachable_is_an_http_failure() {
+        let d = dirs();
+        let checks = run_all(
+            &d,
+            vec![Signal::Url("http://127.0.0.1:0/health".to_owned())],
+            CHECK_TIMEOUT,
+        );
+        assert_eq!(checks[0].code, Some(E_CHECK_HTTP));
+    }
+
+    /// Time-limit exception: the 1 s timeout is the behavior under test.
+    #[test]
+    fn url_timeout_gives_check_timeout() {
+        let d = dirs();
+        let (base, release) = silent_server();
+        let checks = run_all(
+            &d,
+            vec![Signal::Url(format!("{base}/health"))],
+            Duration::from_secs(1),
+        );
+        assert_eq!(checks[0].code, Some(E_CHECK_TIMEOUT));
+        drop(release);
     }
 
     #[test]

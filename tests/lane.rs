@@ -631,7 +631,7 @@ async fn lane_start_requires_a_checkable_done_line() {
         &[
             start(json!({"task": "t1"})),
             start(json!({"task": "t1", "done": "  "})),
-            start(json!({"task": "t1", "done": "url http://127.0.0.1/"})),
+            start(json!({"task": "t1", "done": "published p@1"})),
         ],
     );
     bounded(omp.prompt(KEY, 1, "run-tools go")).await;
