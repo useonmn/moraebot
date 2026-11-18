@@ -1151,6 +1151,42 @@ impl Store {
         Ok(true)
     }
 
+    /// Queues one stalled-lane notice for job `(id, seq)` as a lane inbox row
+    /// (`message_id = "<id>:<seq>:stalled:<episode>"`) without touching the lane's state.
+    /// `Ok(false)` when that row already exists or the lane is no longer running.
+    pub fn stall_notice(
+        &mut self,
+        id: i64,
+        seq: i64,
+        episode: u32,
+        text: &str,
+    ) -> Result<bool, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (key, state): (String, String) = tx
+            .query_row(
+                "SELECT conversation_key, state FROM lanes WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::Invalid("no such lane"))?;
+        if state != LaneState::Running.as_str() {
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            &format!(
+                "INSERT INTO inbox(platform, message_id, conversation_key, author_id, text, state, received_at, updated_at, files_ready, origin)
+                 VALUES (?1, ?2, ?3, 'lane', ?4, 'queued', {NOW}, {NOW}, 1, 'lane')
+                 ON CONFLICT(platform, message_id) DO NOTHING"
+            ),
+            params![LANE_PLATFORM, format!("{id}:{seq}:stalled:{episode}"), key, text],
+        )?;
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+
     /// Lanes a restart interrupted whose notice has not been posted yet.
     pub fn lane_notices(&self) -> Result<Vec<LaneRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
@@ -2472,6 +2508,58 @@ mod tests {
         assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
         assert_eq!(count(&s), before);
         assert_eq!(s.channel_of(K2).unwrap(), None);
+    }
+
+    type InboxCols = (String, String, String, String, String, String, String);
+
+    fn inbox_cols(s: &Store) -> Vec<InboxCols> {
+        let mut stmt = s
+            .conn
+            .prepare(
+                "SELECT platform, message_id, conversation_key, author_id, text, state, origin
+                 FROM inbox ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    fn inbox_row(mid: &str, text: &str) -> InboxCols {
+        let own = |v: &str| v.to_owned();
+        (own("lane"), own(mid), own(K1), own("lane"), own(text), own("queued"), own("lane"))
+    }
+
+    #[test]
+    fn stall_notice_queues_one_row_per_episode_and_keeps_the_lane_running() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert_eq!(a, 1);
+        assert!(s.stall_notice(a, 1, 1, "n1").unwrap());
+        assert!(!s.stall_notice(a, 1, 1, "n1b").unwrap());
+        assert!(s.stall_notice(a, 1, 2, "n2").unwrap());
+        assert_eq!(
+            inbox_cols(&s),
+            vec![inbox_row("1:1:stalled:1", "n1"), inbox_row("1:1:stalled:2", "n2")]
+        );
+        assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Running);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        let rows = inbox_cols(&s);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].1, "1:1");
+    }
+
+    #[test]
+    fn stall_notice_skips_a_lane_that_is_not_running() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        assert!(!s.stall_notice(a, 1, 1, "n1").unwrap());
+        assert_eq!(s.count().unwrap(), 1);
+        assert!(s.stall_notice(a + 100, 1, 1, "n1").is_err());
     }
 
     #[test]
