@@ -297,15 +297,16 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **역할 안내문.** 기본 안내문 `lead::DEFAULT_GUIDANCE`(영어)를 메신저 안내문과 함께 `--append-system-prompt=` 하나로 넘깁니다. 모양은 `<안내문>\n\n<메신저 안내문>`이고, 둘 다 비면 그 인자를 넣지 않습니다. `<홈>/hints/lead.md`가 있으면 기본 안내문을 바꿉니다. 규칙은 메신저 안내문과 같습니다(8192바이트까지, 빈 파일은 끄기, 너무 크면 `E_HINTS_FILE`).
 
-**lane 도구 세 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
+**lane 도구 네 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
 
 | 도구 | 하는 일 |
 |---|---|
 | `lane_start {task, done}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
 | `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
-| `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다 |
+| `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다. 닫힌 lane은 `closed`와 `close_reason`으로 보입니다 |
+| `lane_close {lane_id, reason}` | 일하지 않는 lane을 닫고, `repo` lane이면 폴더 정리를 해 봅니다(3.13) |
 
-거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 일하는 중인 lane을 닫으려 하면 `E_LANE_BUSY`, 닫힌 lane에 `lane_message`는 `E_LANE_CLOSED`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
 
 **결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
 
@@ -421,9 +422,9 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 
 **끄기.** 워커가 돌리는 git 명령은 완료 확인처럼 `LaneSet.checks`에 pid -> `(lane id, 순번)`으로 적힙니다. `shutdown_all`은 lane 자식을 먼저 죽이고, 그다음 git 명령의 그룹을 죽이고 거둘 때까지 기다립니다. 이렇게 끊긴 턴은 결과 줄을 쓰지 않고, 다음 시작 때 `needs_check` / `E_LANE_INTERRUPTED`가 됩니다(3.7). 꺼지는 중이면 git을 시작하지 않고 `E_LANE_STOPPING`으로 끝납니다.
 
-**아직 하지 않는 것.** lane 폴더와 브랜치는 지우지 않습니다. `git worktree prune`도, `.git/info/exclude` 변경도 없습니다. 작업 폴더 자체가 git 저장소면 `.moraebot-lanes/`가 그 저장소에서 "추적 안 됨"으로 보입니다. moraebot이 git 폴더 안에 쓰는 파일은 `moraebot-ready` 하나뿐이고, git이 그 worktree를 지울 때 함께 지워집니다.
+**아직 하지 않는 것.** lane 폴더는 이제 닫을 때 지웁니다(3.13). 브랜치는 지우지 않습니다. `git worktree prune`도, `.git/info/exclude` 변경도 없습니다. 작업 폴더 자체가 git 저장소면 `.moraebot-lanes/`가 그 저장소에서 "추적 안 됨"으로 보입니다. moraebot이 git 폴더 안에 쓰는 파일은 `moraebot-ready` 하나뿐이고, git이 그 worktree를 지울 때 함께 지워집니다.
 
-**dori와 다른 점.** dori에서는 lane(AI)이 직접 worktree를 만들고, dori는 브랜치 이름으로 그 폴더를 찾아 검사하고 닫을 때 지웁니다. moraebot lane은 명령줄 도구가 없는 백그라운드 프로그램이라 moraebot 코드가 만듭니다. 그래서 이름과 위치가 늘 같습니다. lane 이름을 딴 브랜치, 저장소가 없으면 공유 폴더라는 점은 dori와 같고, 지우기는 moraebot에 "lane 닫기"가 생긴 뒤에 넣습니다.
+**dori와 다른 점.** dori에서는 lane(AI)이 직접 worktree를 만들고, dori는 브랜치 이름으로 그 폴더를 찾아 검사하고 닫을 때 지웁니다. moraebot lane은 명령줄 도구가 없는 백그라운드 프로그램이라 moraebot 코드가 만듭니다. 그래서 이름과 위치가 늘 같습니다. lane 이름을 딴 브랜치, 저장소가 없으면 공유 폴더라는 점은 dori와 같습니다. 닫을 때 지우는 방식은 3.13에 있습니다.
 
 ### 3.12 레인 완료 git 검사 (lanes L2)
 
@@ -451,6 +452,41 @@ moraebot은 `git fetch`도 `git push`도 하지 않습니다. 컴퓨터에 있�
 **알림.** 완료 줄이 있는 `repo` lane의 안내문에는 완료 안내 뒤에 `worktree::GIT_FOOTER`(커밋하고 브랜치를 올리라는 한 문단)가 붙고, lead 안내문에도 같은 규칙이 한 문장 있습니다.
 
 **dori와 다른 점.** 커밋 안 한 변경과 원격에 없는 커밋을 보고 새 파일은 막지 않는 점, fetch하지 않는 점은 dori와 같습니다. dori는 git 검사에 걸리면 Done 검사를 건너뛰지만 moraebot은 둘 다 돌립니다. dori는 원격이 없는 저장소에서 lane이 끝날 수 없지만 moraebot은 그때 커밋만 봅니다.
+
+### 3.13 레인 닫기 (lanes L2b)
+
+**누가 닫나.** lane을 닫을지는 lead가 정하고, 호스트 도구 `lane_close {lane_id, reason}`으로 닫습니다. moraebot이 스스로 닫는 일은 없습니다(타이머도, 완료 때 자동 닫기도 없음). 다시 여는 도구도 없습니다. `lane_id`가 정수가 아니거나 `reason`이 비면(공백만 있어도) `E_LANE_ARGS`, 모르는 id는 `E_LANE_UNKNOWN`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`입니다.
+
+**일하는 중이면 거절.** 자식이 돌고 있거나 저장소의 상태가 `running`인 lane은 `E_LANE_BUSY`로 거절하고 아무것도 바꾸지 않습니다. 일하는 lane을 죽이지 않습니다. 결과가 lead에게 돌아온 뒤에 닫으면 됩니다.
+
+**저장.** `lanes` 표에 `closed_at`, `close_reason` 열이 있고, 예전 저장소는 열 때 두 열이 더해집니다. `close_lane`은 한 트랜잭션에서 두 열을 `COALESCE`로 채우므로 다시 닫아도 처음 시각과 이유가 남습니다. 닫힌 lane에 `lane_message`를 보내면 `E_LANE_CLOSED`로 거절합니다. `lane_status`에는 `closed`, `close_reason`으로 계속 보입니다.
+
+**폴더 지우기.** `repo` 없는 lane은 닫기만 하고 git을 하나도 돌리지 않습니다(결과 `worktree: "none"`). `repo` lane은 저장소 잠금(`inner`)을 놓은 뒤 `worktree::remove`를 부릅니다.
+
+1. lane 폴더가 없으면 git을 돌리지 않고 `missing`입니다.
+2. L2의 git 검사(3.12)를 그대로 돌립니다. 하나라도 걸리면 폴더를 남깁니다.
+3. `git -C <repo> worktree remove <폴더>`를 한 번 돌립니다. `--force`는 쓰지 않으므로 추적 안 된 새 파일이 있으면 git이 스스로 거절합니다. 0으로 끝나면 `removed`, 아니면 `E_LANE_REMOVE`로 남깁니다.
+
+결과는 JSON 한 줄 `{lane_id, closed: true, worktree, branch}`이고, 남겼으면 `codes`와 `detail`이 붙습니다. `worktree`는 `none`, `missing`, `removed`, `kept` 중 하나입니다.
+
+| 코드 | 경우 |
+|---|---|
+| `E_CHECK_UNCOMMITTED` | 추적하는 파일에 커밋하지 않은 변경이 있음 |
+| `E_CHECK_UNPUSHED` | 원격이 있는데 어느 원격에도 없는 커밋이 있음 |
+| `E_CHECK_GIT` | git 상태를 읽을 수 없음 |
+| `E_LANE_REMOVE` | `git worktree remove`가 실패함(추적 안 된 파일, 잠긴 worktree 등) |
+| `E_LANE_STOPPING` | 정리 도중 게이트웨이가 꺼지기 시작함 |
+| `E_LANE_WORKTREE` | `<홈>/lanes/<id>/git` 폴더를 준비하지 못함 |
+
+**추적 안 된 파일과 무시된 파일.** 새로 만들고 커밋하지 않은 파일이 있으면 지우면 사라지므로 폴더를 남깁니다(L2의 완료 검사는 이것을 막지 않지만 닫기는 지우는 일이라 더 조심합니다). `.gitignore`에 적힌 파일(빌드 결과물 등)은 폴더와 함께 지워집니다.
+
+**남기는 것.** 브랜치 `moraebot/lane-<id>`는 언제나 남깁니다. 원격이 없는 저장소에서는 커밋이 이 브랜치에 남으므로 잃는 것이 없습니다. `.moraebot-lanes/` 자체, `<홈>/lanes/<id>/`의 세션과 검사 기록도 지우지 않습니다. moraebot은 `git fetch`, `git push`, `git worktree prune`도 하지 않습니다.
+
+**다시 시도.** 폴더를 남긴 lane도 닫힌 상태가 됩니다. 주인이 커밋하거나 올린 뒤 lead가 `lane_close`를 다시 부르면 정리를 다시 해 봅니다.
+
+**끄기.** 닫기의 git 명령도 `LaneSet.checks`에 순번 0으로 적히므로 `shutdown_all`이 함께 죽입니다. 그러면 결과는 `kept`와 `E_LANE_STOPPING`입니다. 로그에는 lane id, `worktree` 값, 코드만 한 줄 남기고 경로, 브랜치, 이유, git 출력은 남기지 않습니다.
+
+**dori와 다른 점.** dori도 닫을 때 `--force` 없는 `git worktree remove`를 쓰고, 지우기가 거절되면 기록만 남기고 닫기는 계속합니다. dori는 자기가 가진 worktree의 git 상태를 읽을 수 없거나 올리지 않은 커밋이 있으면 닫기 자체를 막지만, moraebot은 lane을 닫고 폴더만 남깁니다.
 
 ## 4. 상태, 설정, 운영
 
@@ -536,7 +572,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 6. **lane 기능.** 한 번에 하나씩, 앞 것이 동작한 뒤에 다음으로 갑니다.
    - **L1 레인 작업 폴더.** `repo`를 받은 lane은 자기 git worktree에서 일합니다(3.11절).
    - **L2 올리지 않은 작업 검사 (완료).** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다(3.12절).
-   - **L2b 레인 닫기와 폴더 정리.** lead가 lane을 닫으면 L2 검사를 거친 뒤 lane 폴더를 지웁니다. 브랜치는 남깁니다.
+   - **L2b 레인 닫기와 폴더 정리 (완료).** lead가 lane을 닫으면 L2 검사를 거친 뒤 lane 폴더를 지웁니다. 브랜치는 남깁니다(3.13절).
    - **L3 레인 감시.** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
    - **L4 진행 소식.** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
 
