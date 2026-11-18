@@ -297,7 +297,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **역할 안내문.** 기본 안내문 `lead::DEFAULT_GUIDANCE`(영어)를 메신저 안내문과 함께 `--append-system-prompt=` 하나로 넘깁니다. 모양은 `<안내문>\n\n<메신저 안내문>`이고, 둘 다 비면 그 인자를 넣지 않습니다. `<홈>/hints/lead.md`가 있으면 기본 안내문을 바꿉니다. 규칙은 메신저 안내문과 같습니다(8192바이트까지, 빈 파일은 끄기, 너무 크면 `E_HINTS_FILE`).
 
-**lane 도구 네 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
+**lane 도구 다섯 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
 
 | 도구 | 하는 일 |
 |---|---|
@@ -305,8 +305,9 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 | `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
 | `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다. 닫힌 lane은 `closed`와 `close_reason`으로 보입니다 |
 | `lane_close {lane_id, reason}` | 일하지 않는 lane을 닫고, `repo` lane이면 폴더 정리를 해 봅니다(3.13) |
+| `lane_stop {lane_id, reason}` | 일하는 lane의 지금 일을 바로 끊습니다. lane은 열린 채로 남습니다(3.16) |
 
-거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 일하는 중인 lane을 닫으려 하면 `E_LANE_BUSY`, 닫힌 lane에 `lane_message`는 `E_LANE_CLOSED`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 일하는 중인 lane을 닫으려 하면 `E_LANE_BUSY`, 닫힌 lane에 `lane_message`는 `E_LANE_CLOSED`, 모르는 id는 `E_LANE_UNKNOWN`, 일하지 않는 lane을 끊으려 하면 `E_LANE_IDLE`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
 
 **결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
 
@@ -524,7 +525,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 
 `lead::parse_tag`가 `stalled`와 `reason=`을 읽고, lead의 기본 역할 글이 이 태그와 세 코드를 설명합니다. 도구 인자, 경로, lane이 쓴 글, lane의 일 내용은 넣지 않습니다. 비밀이 들어 있을 수 있기 때문입니다. 알림을 쓰면 로그에 `lane looks stalled` 한 줄(lane id, 순번, 코드, 멈춤 번호)을 남깁니다.
 
-**꺼지는 때.** turn 시간 제한이 20분 이하이면 시간 제한이 먼저 끝내므로 감시하지 않습니다. 게이트웨이가 꺼지는 중일 때, 그리고 돌고 있는 자식이 없는 lane(쉬는 lane, 끝난 lane, 닫힌 lane)도 보지 않습니다. 감시는 lane을 멈추거나 재촉하거나 상태를 바꾸지 않습니다.
+**꺼지는 때.** turn 시간 제한이 20분 이하이면 시간 제한이 먼저 끝내므로 감시하지 않습니다. 게이트웨이가 꺼지는 중일 때, 그리고 돌고 있는 자식이 없는 lane(쉬는 lane, 끝난 lane, 닫힌 lane)도 보지 않습니다. 감시는 lane을 멈추거나 재촉하거나 상태를 바꾸지 않습니다. 멈추기는 lead가 `lane_stop`으로 합니다(3.16절).
 
 **dori와 다른 점.** dori는 터미널 화면과 파일 변경으로 진행을 보고, 15분 조용하면 lane에 재촉 글을 넣습니다. moraebot은 omp의 이벤트 흐름을 읽고 새 도구 호출을 진행으로 세며, L3에서는 재촉하지 않고 lead에게 알리기만 합니다.
 
@@ -545,6 +546,31 @@ The lane is still running and moraebot does not stop it; its result comes later 
 **같은 글 두 번 없음.** 보낸 뒤 `news_posted`가 lane별로 글의 해시를 적고, `news`는 그 lane에서 이미 올린 글을 다시 내놓지 않습니다. 해시는 일하는 lane 것만 남기고(`news`가 부를 때마다 나머지를 지움), lane마다 64개(`POSTED_PER_LANE`)까지 둡니다. 가득 차면 비우고 다시 넣습니다. 메모는 언제나 지금 일의 `Activity`에서만 오므로, 지운 해시 때문에 예전 메모가 되살아나지는 않습니다.
 
 **dori와 다른 점.** dori는 상태 메시지 하나를 계속 고치고, 보고를 파일에서 읽습니다. moraebot은 매번 새 메시지를 올리고, 보고를 메모리에 둡니다. lane을 재촉하지도 않습니다.
+
+### 3.16 레인 멈추기 (lanes L3b)
+
+**누가 정하나.** lead만 정합니다. moraebot은 스스로 lane을 멈추지 않고, 3.14의 감시도 알리기만 합니다. lead의 기본 역할 글은 이렇게 안내합니다. 주인이 시키면 멈추고, `N_LANE_QUIET`나 `N_LANE_SPINNING` 알림 뒤에는 원래 오래 조용한 작업이 아닌 한 짧은 이유와 함께 `lane_stop`을 부르며, `N_LANE_RETRYING` 뒤에는 결과를 기다립니다.
+
+**도구.** `lane_stop {lane_id, reason}`은 `LaneManager::stop`을 부르고 기다리지 않습니다. 받아들이면 곧바로 `{"lane_id":<id>,"stopping":true}`를 돌려줍니다. 이미 멈추는 중인 일에 다시 부르면 같은 JSON을 돌려주고 아무것도 다시 끄지 않습니다.
+
+**끄는 길.** 게이트웨이가 꺼질 때(`shutdown_all`) 쓰는 길을 lane 일 하나에만 씁니다. 일에 멈춤 표시(이유)를 적고, omp 자식의 프로세스 그룹을 SIGKILL로 끄고, 그 일이 띄운 확인 명령과 git 명령도 모두 끕니다. 그 뒤로 이 일은 새 자식을 띄우지 않고(띄우기 콜백이 거절), 새 확인 명령이나 git 명령도 등록하지 않습니다(`track`이 거절). 이 모든 일은 `inner` 잠금 안에서 합니다.
+
+**RPC `abort`를 쓰지 않는 까닭.** moraebot 어디에서도 `abort`를 쓰지 않고, omp가 응답하지 않으면 결국 강제 종료가 또 필요하기 때문입니다. 이미 쓴 파일은 남고(`repo` lane이면 커밋되지 않은 채 폴더에 남음), 그 turn에서 쓰다 만 내용은 사라질 수 있습니다.
+
+**결과 규칙.** 멈춘 일이 잘려서 끝났으면(결과가 `Err`이거나 `NeedsCheck`, 꺼질 때와 같은 기준) 결과 한 줄을 `failed code=E_LANE_STOPPED`로 쓰고, lane 상태를 `failed`(오류 `E_LANE_STOPPED`)로 두고 dispatcher를 깨웁니다. 끄기 전에 스스로 끝난 일은 자기 결과를 그대로 씁니다. 게이트웨이가 꺼지는 중이면 꺼짐이 이깁니다. 잘린 일은 아무것도 쓰지 않고 다음 시작의 `recover_on_start`에 맡깁니다.
+
+```text
+[moraebot conversation=<key> lane=<id> failed code=E_LANE_STOPPED]
+[moraebot] Stopped by the lead: <reason>
+```
+
+이유는 줄바꿈과 빈칸 묶음을 빈칸 하나로 합친 뒤 200자(`STOP_REASON_CHARS`)에서 자릅니다. 다듬은 이유가 비면 `E_LANE_ARGS`로 거절합니다. 이유는 로그에 남기지 않습니다.
+
+**lane은 열린 채로.** 멈춘 lane은 닫히지 않으므로 `lane_message`로 일을 더 줄 수 있고 `lane_close`도 됩니다. omp의 세션 잠금은 운영체제 잠금이라 꺼진 자식이 끝나면 운영체제가 풀어 주므로, 새 자식이 저장된 세션을 다시 열어 같은 기록을 이어 씁니다.
+
+**거절.** 인자가 틀리면 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`, 모르는 id는 `E_LANE_UNKNOWN`, 닫힌 lane은 `E_LANE_CLOSED`, 일하지 않는 lane은 `E_LANE_IDLE`입니다.
+
+**로그.** 멈추기를 받아들이면 `lane stop requested` 한 줄(lane id와 순번만)을 남깁니다. 결과는 원래의 `lane finished` 줄이 코드와 함께 남깁니다.
 
 ## 4. 상태, 설정, 운영
 
@@ -632,6 +658,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
    - **L2 올리지 않은 작업 검사 (완료).** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다(3.12절).
    - **L2b 레인 닫기와 폴더 정리 (완료).** lead가 lane을 닫으면 L2 검사를 거친 뒤 lane 폴더를 지웁니다. 브랜치는 남깁니다(3.13절).
    - **L3 레인 감시 (완료, 3.14절).** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
+   - **L3b 레인 멈추기 (완료, 3.16절).** lead가 일하는 lane의 지금 일을 끊습니다. lane은 열린 채로 남습니다.
    - **L4 진행 소식 (완료, 3.15절).** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
    - **Done 확인 종류 더하기 (완료, 3.8절).** `url`, `command ... contains`, `file ... contains`를 더해 확인 방법이 다섯 가지가 됩니다.
 
