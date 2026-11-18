@@ -933,6 +933,86 @@ async fn unmet_lane_result_reaches_the_lead_with_its_code() {
     rig.tap.assert_no_child_left();
 }
 
+const GIT_ENV: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+const GIT_REQUIRED: &str = "git is required for the lanes tests";
+
+/// `<root>/qa-repo` (outside the work folder) with one commit of `tracked.txt`; returns
+/// its canonical path.
+fn qa_repo(root: &Path) -> PathBuf {
+    let repo = root.join("qa-repo");
+    std::fs::create_dir_all(&repo).expect("qa-repo");
+    std::fs::write(repo.join("tracked.txt"), "x").expect("tracked.txt");
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["add", "tracked.txt"],
+        &["commit", "-q", "-m", "init"],
+    ] {
+        let out = Command::new("git")
+            .args(["-c", "user.name=qa", "-c", "user.email=qa@example.invalid"])
+            .args(args)
+            .current_dir(&repo)
+            .envs(GIT_ENV)
+            .output()
+            .expect(GIT_REQUIRED);
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    std::fs::canonicalize(&repo).expect("canonical qa-repo")
+}
+
+/// (i) A lane started with `repo` works and checks in its own worktree; its accepted
+/// claim reaches the lead as a `done` result answered in the starting thread.
+#[tokio::test]
+async fn lane_with_repo_reports_from_its_worktree_in_the_starting_thread() {
+    let mut rig = Rig::discord();
+    let (adapter, dynamic) = fake_adapter();
+    let repo = qa_repo(&rig.root);
+    let script = json!({"tool": "lane_start", "arguments": {
+        "task": "run-lane-tools t1",
+        "done": "file tracked.txt",
+        "repo": repo,
+    }})
+    .to_string();
+    let mut vars = done_vars(&script, &lane_done_calls(1));
+    vars.extend(GIT_ENV.map(|(name, value)| (name, value.to_owned())));
+    let running = Running::start(rig.gateway(dynamic, &as_pairs(&vars)));
+
+    adapter
+        .inject(in_thread(THREAD, "1300000000000000002", "run-tools please"))
+        .await;
+    rig.tap.wait_for(is_lane_result_prompt).await;
+    bounded(adapter.wait_for_send(2)).await;
+    running.stop().await;
+
+    let sent = sends(&adapter);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent.iter().all(|(target, _)| target == THREAD), "{sent:?}");
+    rig.tap.drain().await;
+    let tags: Vec<lead::Tag> = rig.tap.prompts().iter().filter_map(frame_tag).collect();
+    let lane_tags: Vec<&lead::Tag> = tags.iter().filter(|tag| tag.lane.is_some()).collect();
+    assert_eq!(lane_tags.len(), 1);
+    assert!(lane_tags[0].done, "{:?}", lane_tags[0]);
+    assert_eq!(lane_tags[0].failed, None);
+    assert_eq!(lane_tags[0].conversation, "fake:th:222");
+    let lane = rig
+        .store()
+        .lane(1)
+        .expect("read lane")
+        .expect("lane exists");
+    assert_eq!(lane.repo.as_deref(), Some(repo.to_string_lossy().as_ref()));
+    assert!(
+        rig.config
+            .work_dir
+            .join(".moraebot-lanes")
+            .join("lane-1")
+            .join("tracked.txt")
+            .is_file()
+    );
+    rig.tap.assert_no_child_left();
+}
+
 /// (h) Stopping the gateway while a lane's check runs kills the check and the lane, writes
 /// no lane result, and the next run posts one `N_LANE_INTERRUPTED` in the lane's thread.
 #[tokio::test]
