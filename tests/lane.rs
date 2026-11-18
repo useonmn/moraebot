@@ -11,13 +11,13 @@ use std::time::Duration;
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::done::{self, E_DONE_SYNTAX, E_DONE_UNMET};
 use moraebot::lane::{
-    self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_INTERRUPTED, E_LANE_LIMIT, E_LANE_STOPPING,
-    E_LANE_UNKNOWN,
+    self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_CLOSED, E_LANE_INTERRUPTED, E_LANE_LIMIT,
+    E_LANE_STOPPING, E_LANE_UNKNOWN,
 };
 use moraebot::lead;
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
-use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REPO};
+use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REMOVE, E_LANE_REPO};
 use serde_json::{Value, json};
 
 const KEY: &str = "discord:th:111";
@@ -964,6 +964,16 @@ fn lane_start_repo(task: &str, done: &str, repo: Value) -> Value {
     })
 }
 
+fn lane_close(lane_id: i64, reason: &str) -> Value {
+    json!({"tool": lane::LANE_CLOSE_TOOL, "arguments": {"lane_id": lane_id, "reason": reason}})
+}
+
+/// The JSON of a successful `lane_close` result.
+fn closed(result: &(bool, String)) -> Value {
+    assert!(!result.0, "expected a successful result: {result:?}");
+    serde_json::from_str(&result.1).expect("lane_close json")
+}
+
 fn cwd_arg(line: &str) -> String {
     let argv = start_argv(line);
     let at = argv.iter().position(|a| a == "--cwd").expect("--cwd");
@@ -1325,4 +1335,182 @@ async fn lane_without_repo_skips_the_git_checks() {
     );
     assert!(!lane_folder(&h, 1).exists());
     bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_close_closes_an_idle_lane_without_repo() {
+    let h = Harness::new();
+    let m1 = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+
+    let n = h.tool_results().len();
+    let m2 = h.manager(
+        "ok",
+        &[
+            lane_close(1, "finished"),
+            json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "more"}}),
+            json!({"tool": lane::LANE_STATUS_TOOL, "arguments": {"lane_id": 1}}),
+        ],
+    );
+    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.shutdown_all()).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 3, "{r:?}");
+    let result = closed(&r[0]);
+    assert_eq!(result["lane_id"], 1);
+    assert_eq!(result["closed"], true);
+    assert_eq!(result["worktree"], "none");
+    assert!(result.get("branch").is_none(), "{result}");
+    assert_refused(&r[1], E_LANE_CLOSED);
+    let status: Value = serde_json::from_str(&r[2].1).expect("status json");
+    assert_eq!(status[0]["closed"], true);
+    assert_eq!(status[0]["close_reason"], "finished");
+    assert_eq!(h.lane_starts().len(), 1);
+    assert!(h.lane(1).closed);
+}
+
+#[tokio::test]
+async fn lane_close_refuses_running_unknown_and_bad_args() {
+    let h = Harness::new();
+    let call = |args: Value| json!({"tool": lane::LANE_CLOSE_TOOL, "arguments": args});
+    let omp = h.manager(
+        "hang",
+        &[
+            lane_start("t1"),
+            call(json!({"reason": "x"})),
+            call(json!({"lane_id": 1})),
+            call(json!({"lane_id": 1, "reason": "  "})),
+            call(json!({"lane_id": "a", "reason": "x"})),
+            lane_close(99, "x"),
+            lane_close(1, "x"),
+        ],
+    );
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.shutdown_all()).await;
+    let r = h.tool_results();
+    assert_eq!(r.len(), 7, "{r:?}");
+    for result in &r[1..=4] {
+        assert_refused(result, E_LANE_ARGS);
+    }
+    assert_refused(&r[5], E_LANE_UNKNOWN);
+    assert_refused(&r[6], E_LANE_BUSY);
+    assert!(!h.lane(1).closed);
+}
+
+#[tokio::test]
+async fn lane_close_after_shutdown_is_refused() {
+    let h = Harness::new();
+    let m1 = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+
+    let n = h.tool_results().len();
+    let m2 = h.manager("ok", &[lane_close(1, "x")]);
+    bounded(m2.shutdown_all()).await;
+    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_refused(&r[0], E_LANE_STOPPING);
+    assert!(!h.lane(1).closed);
+}
+
+#[tokio::test]
+async fn lane_close_removes_a_clean_pushed_worktree_and_keeps_the_branch() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    qa_remote(&h, &repo);
+    let m1 = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+
+    let n = h.tool_results().len();
+    let m2 = h
+        .manager("ok", &[lane_close(1, "finished")])
+        .with_extra_env(GIT_ENV);
+    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.shutdown_all()).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 1, "{r:?}");
+    let result = closed(&r[0]);
+    assert_eq!(result["worktree"], "removed");
+    assert_eq!(result["branch"], "moraebot/lane-1");
+    assert!(result.get("codes").is_none(), "{result}");
+    assert!(!lane_folder(&h, 1).exists());
+    assert!(git(&repo, &["branch", "--list", "moraebot/lane-1"]).contains("moraebot/lane-1"));
+    assert!(
+        !worktree_branches(&repo).contains(&"branch refs/heads/moraebot/lane-1".to_owned()),
+        "{:?}",
+        worktree_branches(&repo)
+    );
+}
+
+#[tokio::test]
+async fn lane_close_keeps_unpushed_work_and_retries_after_a_push() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    qa_remote(&h, &repo);
+    let m1 = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+    let folder = lane_folder(&h, 1);
+    std::fs::write(folder.join("tracked.txt"), "y").expect("tracked.txt");
+    git(&folder, &["commit", "-q", "-am", "lane"]);
+
+    let n = h.tool_results().len();
+    let m2 = h
+        .manager("ok", &[lane_close(1, "first")])
+        .with_extra_env(GIT_ENV);
+    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.shutdown_all()).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 1, "{r:?}");
+    let result = closed(&r[0]);
+    assert_eq!(result["worktree"], "kept");
+    assert_eq!(result["codes"], json!(["E_CHECK_UNPUSHED"]));
+    assert_eq!(result["branch"], "moraebot/lane-1");
+    assert!(folder.exists());
+    assert!(h.lane(1).closed);
+
+    git(&folder, &["push", "-q", "origin", "moraebot/lane-1"]);
+    let n = h.tool_results().len();
+    let m3 = h
+        .manager("ok", &[lane_close(1, "again")])
+        .with_extra_env(GIT_ENV);
+    bounded(m3.prompt(KEY, 3, "run-tools go")).await;
+    bounded(m3.shutdown_all()).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(closed(&r[0])["worktree"], "removed");
+    assert!(!folder.exists());
+    assert_eq!(h.lane(1).close_reason.as_deref(), Some("first"));
+}
+
+#[tokio::test]
+async fn lane_close_keeps_a_worktree_with_untracked_files() {
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let m1 = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV);
+    prompt_until_lane_result(&m1, 1, "run-tools go").await;
+    bounded(m1.shutdown_all()).await;
+    std::fs::write(lane_folder(&h, 1).join("qa-new.txt"), "n").expect("qa-new.txt");
+
+    let n = h.tool_results().len();
+    let m2 = h
+        .manager("ok", &[lane_close(1, "finished")])
+        .with_extra_env(GIT_ENV);
+    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.shutdown_all()).await;
+    let r = h.tool_results()[n..].to_vec();
+    assert_eq!(r.len(), 1, "{r:?}");
+    let result = closed(&r[0]);
+    assert_eq!(result["worktree"], "kept");
+    assert_eq!(result["codes"], json!([E_LANE_REMOVE]));
+    assert!(lane_folder(&h, 1).join("qa-new.txt").exists());
 }

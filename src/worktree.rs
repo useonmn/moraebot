@@ -433,7 +433,6 @@ pub(crate) fn git_checks(
 }
 
 /// What [`remove`] did with a lane's worktree.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Cleanup {
     /// Nothing is at the lane's folder path; no git command ran.
@@ -451,7 +450,6 @@ pub(crate) enum Cleanup {
 /// [`git_checks`] check passes and a plain `git worktree remove` (never `--force`, so git itself
 /// refuses untracked files) exits 0. The lane's branch is never deleted. `started`/`ended` see
 /// every git pid as in [`done::run_command`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn remove(
     repo: &Path,
     folder: &Path,

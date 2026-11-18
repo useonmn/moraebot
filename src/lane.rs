@@ -27,6 +27,10 @@
 //! killed on shutdown like Done checks. Its `lane_done` claims first read the worktree's git
 //! state: uncommitted tracked changes, and commits on no remote when it has one, refuse the
 //! claim like a failing Done check.
+//!
+//! The lead closes a lane that is not running with `lane_close`: the store marks it closed
+//! (no more `lane_message`), and a lane with a repo has its worktree removed only when nothing
+//! would be lost; the branch always stays.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -46,8 +50,8 @@ use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
 };
-use crate::store::{LaneMessage, LaneStart, LaneState, Store};
-use crate::worktree::{self, WorktreeError};
+use crate::store::{LaneClose, LaneMessage, LaneStart, LaneState, Store};
+use crate::worktree::{self, Cleanup, WorktreeError};
 
 /// Most lanes that may run a turn at the same time.
 pub const MAX_RUNNING_LANES: usize = 3;
@@ -59,6 +63,8 @@ pub const LANE_START_TOOL: &str = "lane_start";
 pub const LANE_MESSAGE_TOOL: &str = "lane_message";
 /// Host tool that lists lanes and their state.
 pub const LANE_STATUS_TOOL: &str = "lane_status";
+/// Host tool that closes a lane the lead decided is finished.
+pub const LANE_CLOSE_TOOL: &str = "lane_close";
 
 /// A lane tool call had missing or invalid arguments.
 pub const E_LANE_ARGS: &str = "E_LANE_ARGS";
@@ -235,11 +241,12 @@ impl LaneManager {
         }
     }
 
-    /// The three lane tools for the lead child.
+    /// The four lane tools for the lead child.
     pub fn host_tools(self: &Arc<Self>) -> Vec<HostTool> {
         let start = Arc::clone(self);
         let message = Arc::clone(self);
         let status = Arc::clone(self);
+        let close = Arc::clone(self);
         vec![
             HostTool::new(
                 LANE_START_TOOL,
@@ -295,6 +302,26 @@ impl LaneManager {
                     "additionalProperties": false
                 })),
                 move |arguments, _| status.lane_status(&arguments),
+            )
+            .load_mode(ToolLoadMode::Essential),
+            HostTool::new(
+                LANE_CLOSE_TOOL,
+                "Close a lane you decided is finished or no longer needed. A running lane refuses; a \
+                 closed lane takes no more lane_message. For a lane with `repo`, moraebot removes its \
+                 worktree folder only when every change is committed and pushed (with no remote, \
+                 committed) and git can remove it cleanly; otherwise the folder is kept and the result \
+                 lists codes. The branch always stays. Calling it again on a closed lane retries the \
+                 folder cleanup.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "lane_id": {"type": "integer"},
+                        "reason": {"type": "string", "description": "Why the lane is closed, in a few words."}
+                    },
+                    "required": ["lane_id", "reason"],
+                    "additionalProperties": false
+                })),
+                move |arguments, ctx| close.lane_close(&arguments, ctx),
             )
             .load_mode(ToolLoadMode::Essential),
         ]
@@ -494,6 +521,8 @@ impl LaneManager {
                     "done": lane.done,
                     "repo": lane.repo,
                     "task": lane.task.chars().take(STATUS_TASK_CHARS).collect::<String>(),
+                    "closed": lane.closed,
+                    "close_reason": lane.close_reason,
                 })
             })
             .collect();
@@ -578,6 +607,113 @@ impl LaneManager {
         set.checks.insert(pid, (id, seq));
         self.pids.send_modify(|pids| pids.push(pid));
         true
+    }
+
+    /// Registers `pid` (a `lane_close` git command of lane `id`) under seq 0, which no job
+    /// uses; `false` when moraebot is stopping or the call was cancelled.
+    fn track_close(&self, pid: u32, id: i64, cancelled: bool) -> bool {
+        let mut set = lock(&self.inner);
+        if set.stopping || cancelled {
+            return false;
+        }
+        set.checks.insert(pid, (id, 0));
+        self.pids.send_modify(|pids| pids.push(pid));
+        true
+    }
+
+    /// Closes a lane that is not running, then removes its worktree when nothing would be
+    /// lost. No git command runs while `inner` is held.
+    fn lane_close(
+        &self,
+        arguments: &Map<String, Value>,
+        ctx: &HostToolContext,
+    ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        let id = arguments
+            .get("lane_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| refused(E_LANE_ARGS, "lane_id must be an integer"))?;
+        let reason = arguments
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .ok_or_else(|| refused(E_LANE_ARGS, "reason must be a non-empty string"))?;
+        let busy = || {
+            refused(
+                E_LANE_BUSY,
+                "the lane is still running; wait for its result",
+            )
+        };
+        let repo = {
+            let set = lock(&self.inner);
+            if set.stopping {
+                return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
+            }
+            if set.children.contains_key(&id) {
+                return Err(busy());
+            }
+            match lock(&self.store)
+                .close_lane(id, reason)
+                .map_err(|e| refused(e.code(), &e.to_string()))?
+            {
+                LaneClose::Closed { repo } => repo,
+                LaneClose::Unknown => return Err(refused(E_LANE_UNKNOWN, "no lane has this id")),
+                LaneClose::Busy => return Err(busy()),
+            }
+        };
+        let (word, codes, detail, branch) = match repo {
+            None => ("none", Vec::new(), None, None),
+            Some(repo) => {
+                let folder = worktree::folder(&self.lanes_root(), id);
+                let git_dir = self
+                    .config
+                    .home
+                    .join("lanes")
+                    .join(id.to_string())
+                    .join("git");
+                let cleanup = match omp::private_dir(&git_dir) {
+                    Err(e) => Cleanup::Kept {
+                        codes: vec![worktree::E_LANE_WORKTREE],
+                        detail: done::short(&e.to_string()),
+                    },
+                    Ok(()) => {
+                        let env = omp::check_env(&self.extra_env);
+                        let opts = done::RunOpts {
+                            out_dir: &git_dir,
+                            env: &env,
+                            timeout: worktree::GIT_TIMEOUT,
+                        };
+                        worktree::remove(
+                            Path::new(&repo),
+                            &folder,
+                            &opts,
+                            |pid| self.track_close(pid, id, ctx.is_cancelled()),
+                            |pid| self.untrack(pid),
+                        )
+                        .unwrap_or_else(|done::Stopped| Cleanup::Kept {
+                            codes: vec![E_LANE_STOPPING],
+                            detail: "the gateway is stopping".to_owned(),
+                        })
+                    }
+                };
+                let branch = Some(worktree::branch(id));
+                match cleanup {
+                    Cleanup::Missing => ("missing", Vec::new(), None, branch),
+                    Cleanup::Removed => ("removed", Vec::new(), None, branch),
+                    Cleanup::Kept { codes, detail } => ("kept", codes, Some(detail), branch),
+                }
+            }
+        };
+        tracing::info!(lane = id, worktree = word, codes = ?codes, "lane closed");
+        let mut result = json!({ "lane_id": id, "closed": true, "worktree": word });
+        if let Some(branch) = branch {
+            result["branch"] = json!(branch);
+        }
+        if let Some(detail) = detail {
+            result["codes"] = json!(codes);
+            result["detail"] = json!(detail);
+        }
+        Ok(result.to_string().into())
     }
 
     /// Forgets `pid` once its command was reaped.
