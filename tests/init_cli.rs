@@ -98,17 +98,17 @@ fn init_writes_the_onboarding_request() {
             .ends_with(moraebot::init::next_steps(std::env::consts::OS))
     );
     assert_eq!(mode_of(&home.join("onboarding.request")), 0o600);
+    assert_eq!(
+        fs::read_to_string(home.join("onboarding.request")).expect("request"),
+        "dm\n"
+    );
 }
 
 #[test]
 fn onboarding_command_writes_the_request() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("qa-mbhome");
-    let omp = fake_executable(tmp.path());
-    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
-    assert!(run_init(&home, &input).status.success());
+    let home = home_without_request(tmp.path());
     let request = home.join("onboarding.request");
-    fs::remove_file(&request).expect("init left a request");
 
     let output = moraebot(&home)
         .arg("onboarding")
@@ -117,9 +117,60 @@ fn onboarding_command_writes_the_request() {
     assert_eq!(output.status.code(), Some(0));
     let printed: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout is JSON");
-    assert_eq!(printed, serde_json::json!({"onboarding": "requested"}));
+    assert_eq!(
+        printed,
+        serde_json::json!({"onboarding": "requested", "greet": "dm"})
+    );
     assert_eq!(mode_of(&request), 0o600);
+    assert_eq!(fs::read_to_string(&request).expect("request"), "dm\n");
     assert!(!home.join("inbox.sqlite").exists());
+}
+
+/// A home set up by `init` whose onboarding request was removed again.
+fn home_without_request(tmp: &Path) -> std::path::PathBuf {
+    let home = tmp.join("qa-mbhome");
+    let omp = fake_executable(tmp);
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+    fs::remove_file(home.join("onboarding.request")).expect("init left a request");
+    home
+}
+
+#[test]
+fn onboarding_command_can_greet_in_the_channel() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = home_without_request(tmp.path());
+
+    let output = moraebot(&home)
+        .args(["onboarding", "--greet", "channel", "--config"])
+        .arg(home.join("config.toml"))
+        .output()
+        .expect("onboarding");
+    assert_eq!(output.status.code(), Some(0));
+    let printed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        printed,
+        serde_json::json!({"onboarding": "requested", "greet": "channel"})
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("onboarding.request")).expect("request"),
+        "channel\n"
+    );
+}
+
+#[test]
+fn onboarding_command_refuses_an_unknown_place() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = home_without_request(tmp.path());
+
+    let output = moraebot(&home)
+        .args(["onboarding", "--greet", "thread", "--config"])
+        .arg(home.join("config.toml"))
+        .output()
+        .expect("onboarding");
+    assert_ne!(output.status.code(), Some(0));
+    assert!(!home.join("onboarding.request").exists());
 }
 
 #[test]

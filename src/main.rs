@@ -11,7 +11,7 @@ use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
-use moraebot::onboarding;
+use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,7 +38,8 @@ Commands:
                                 Install the systemd user service (Linux)
   uninstall-systemd [--unit NAME]
                                 Remove the systemd user service
-  onboarding [--config PATH]    Greet and ask the first-meeting questions again at the next start
+  onboarding [--greet dm|channel] [--config PATH]
+                                Greet (in a DM by default) and ask the first-meeting questions again at the next start
   --version, -V                 Print the version
 ";
 
@@ -75,6 +76,7 @@ enum Command {
     },
     Onboarding {
         config: Option<PathBuf>,
+        greet: GreetTarget,
     },
 }
 
@@ -109,7 +111,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         ),
         "uninstall-systemd" => parse_service_name(rest, "--unit", systemd::DEFAULT_UNIT)
             .map(|unit| Command::UninstallSystemd { unit }),
-        "onboarding" => parse_config_flag(rest).map(|config| Command::Onboarding { config }),
+        "onboarding" => parse_onboarding(rest),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -130,6 +132,33 @@ fn parse_config_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
         [flag] if flag == "--config" => Err("--config needs a path".to_string()),
         [other, ..] => Err(format!("unexpected argument '{other}'")),
     }
+}
+
+/// `[--config PATH] [--greet dm|channel]` of `onboarding`, each flag at most once, in any order;
+/// the greeting goes to the owner's DM when `--greet` is not given.
+fn parse_onboarding(args: &[String]) -> Result<Command, String> {
+    let mut config = None;
+    let mut greet = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--config" if config.is_some() => return Err("--config given twice".to_string()),
+            "--config" => {
+                let path = rest.next().ok_or("--config needs a path")?;
+                config = Some(PathBuf::from(path));
+            }
+            "--greet" if greet.is_some() => return Err("--greet given twice".to_string()),
+            "--greet" => {
+                let value = rest.next().ok_or("--greet needs dm or channel")?;
+                greet = Some(GreetTarget::parse(value).ok_or("--greet must be dm or channel")?);
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    Ok(Command::Onboarding {
+        config,
+        greet: greet.unwrap_or(GreetTarget::Dm),
+    })
 }
 
 /// `[--config PATH] [<name_flag> NAME] [--dry-run]` of a service install command:
@@ -268,21 +297,26 @@ fn uninstall_systemd(env: &Env, unit: &str) -> Result<ExitCode, ConfigError> {
 }
 
 /// Asks for the first meeting with the owner at the next gateway start by creating the request
-/// file. It never opens the store, so it works while a gateway holds it.
-fn onboarding_request(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigError> {
+/// file holding where the greeting goes. It never opens the store, so it works while a gateway
+/// holds it.
+fn onboarding_request(
+    env: &Env,
+    config: Option<PathBuf>,
+    greet: GreetTarget,
+) -> Result<ExitCode, ConfigError> {
     let path = match config {
         Some(path) => path,
         None => env.default_config_path()?,
     };
     let config = Config::load(&path, env)?;
-    if let Err(e) = onboarding::request(&config.home, onboarding::GreetTarget::Dm) {
+    if let Err(e) = onboarding::request(&config.home, greet) {
         eprintln!("{}: {}", e.code, e.detail);
         return Ok(ExitCode::FAILURE);
     }
     writeln!(
         io::stdout().lock(),
         "{}",
-        serde_json::json!({"onboarding": "requested"})
+        serde_json::json!({"onboarding": "requested", "greet": greet.as_str()})
     )?;
     Ok(ExitCode::SUCCESS)
 }
@@ -399,7 +433,7 @@ fn main() -> ExitCode {
             dry_run,
         } => install_systemd(&env, config, &unit, dry_run),
         Command::UninstallSystemd { unit } => uninstall_systemd(&env, &unit),
-        Command::Onboarding { config } => onboarding_request(&env, config),
+        Command::Onboarding { config, greet } => onboarding_request(&env, config, greet),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -420,14 +454,38 @@ mod tests {
         assert_eq!(parse_args(&args(&["init"])), Ok(Command::Init));
         assert_eq!(
             parse_args(&args(&["onboarding"])),
-            Ok(Command::Onboarding { config: None })
+            Ok(Command::Onboarding {
+                config: None,
+                greet: GreetTarget::Dm
+            })
         );
         assert_eq!(
             parse_args(&args(&["onboarding", "--config", "/x"])),
             Ok(Command::Onboarding {
-                config: Some(PathBuf::from("/x"))
+                config: Some(PathBuf::from("/x")),
+                greet: GreetTarget::Dm
             })
         );
+        assert_eq!(
+            parse_args(&args(&["onboarding", "--greet", "channel"])),
+            Ok(Command::Onboarding {
+                config: None,
+                greet: GreetTarget::Channel
+            })
+        );
+        for order in [
+            &["onboarding", "--greet", "dm", "--config", "/x"],
+            &["onboarding", "--config", "/x", "--greet", "dm"],
+        ] {
+            assert_eq!(
+                parse_args(&args(order)),
+                Ok(Command::Onboarding {
+                    config: Some(PathBuf::from("/x")),
+                    greet: GreetTarget::Dm
+                }),
+                "{order:?}"
+            );
+        }
         assert_eq!(
             parse_args(&args(&["setup", "slack"])),
             Ok(Command::Setup {
@@ -544,6 +602,10 @@ mod tests {
             &["install-launchd", "--unit", "x"],
             &["uninstall-launchd", "--unit", "x"],
             &["onboarding", "extra"],
+            &["onboarding", "--greet"],
+            &["onboarding", "--greet", "thread"],
+            &["onboarding", "--greet", "dm", "--greet", "channel"],
+            &["onboarding", "--config", "/x", "--config", "/y"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
