@@ -11,9 +11,11 @@ use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
 use moraebot::config::{AccessMode, Config, OmpConfig, Platform, SlackConfig};
+use moraebot::dispatch::{N_ONBOARDING_HELLO, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lead;
-use moraebot::slack::{DEFAULT_HINTS, SlackAdapter};
+use moraebot::onboarding::{self, GreetTarget};
+use moraebot::slack::{DEFAULT_HINTS, SlackAdapter, escape_text};
 use moraebot::store::{State, Store};
 use moraebot::testing::{FakeSlackSession, FakeSlackTransport};
 use serde_json::{Value, json};
@@ -91,6 +93,16 @@ impl LogTap {
 
     fn prompts(&self) -> usize {
         self.seen.iter().filter(|line| is_prompt(line)).count()
+    }
+
+    /// The `message` of every prompt frame seen so far.
+    fn prompt_messages(&self) -> Vec<String> {
+        self.seen
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|frame| frame["type"] == "prompt")
+            .map(|frame| frame["message"].as_str().unwrap_or_default().to_owned())
+            .collect()
     }
 
     /// The argv of every fake-omp start, as logged.
@@ -305,6 +317,36 @@ async fn owner_dm_is_answered_in_the_dm_without_thread_ts() {
     running.stop().await;
     assert_eq!(rig.row_state(1), State::Done);
     rig.tap.wait_for_prompts(1).await;
+    rig.assert_no_child_left();
+}
+
+#[tokio::test]
+async fn slack_greeting_goes_to_the_owner_dm_and_the_reply_is_turn_1() {
+    let mut rig = Rig::new();
+    onboarding::request(&rig.config.home, GreetTarget::Dm).unwrap();
+    let (running, session) = rig.start("ok").await;
+    rig.wait_for_posts(1).await;
+    let greeting = rig.fake.record().posts[0].clone();
+    assert_eq!(greeting["channel"], OWNER);
+    assert!(greeting.get("thread_ts").is_none());
+    assert_eq!(
+        greeting["text"],
+        escape_text(notice_text(N_ONBOARDING_HELLO))
+    );
+
+    session.frame(message_frame("e1", OWNER, DM, "5.5", "Mina"));
+    rig.wait_for_posts(2).await;
+    let reply = rig.fake.record().posts[1].clone();
+    assert_eq!(reply["channel"], DM);
+    assert!(reply.get("thread_ts").is_none());
+
+    rig.tap.wait_for_prompts(1).await;
+    running.stop().await;
+    assert_eq!(rig.row_state(1), State::Done);
+    let messages = rig.tap.prompt_messages();
+    assert_eq!(messages.len(), 1);
+    let turn_1 = onboarding::notice_line(1);
+    assert!(messages[0].lines().any(|line| line == turn_1));
     rig.assert_no_child_left();
 }
 
