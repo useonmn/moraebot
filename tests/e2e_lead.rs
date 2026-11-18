@@ -13,14 +13,18 @@ use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
 use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, SlackConfig};
-use moraebot::dispatch::{N_LANE_INTERRUPTED, N_UNSUPPORTED_INPUT, notice_text};
+use moraebot::dispatch::{
+    N_LANE_INTERRUPTED, N_ONBOARDING_HELLO, N_UNSUPPORTED_INPUT, notice_text,
+};
 use moraebot::done::{self, E_DONE_UNMET};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lane::E_LANE_INTERRUPTED;
 use moraebot::lead;
 use moraebot::omp::key_slug;
+use moraebot::onboarding;
+use moraebot::persona;
 use moraebot::slack::SlackAdapter;
-use moraebot::store::{LaneState, State, Store};
+use moraebot::store::{LaneState, OnboardingRow, OnboardingState, State, Store};
 use moraebot::testing::{Call, FakeAdapter, FakeSlackTransport};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -985,4 +989,139 @@ async fn shutdown_during_a_check_leaves_no_process_and_the_next_run_posts_one_no
     assert_eq!(rig.tap.lane_pids().len(), 1, "the lane was not restarted");
     assert_eq!(rig.tap.check_pids(), vec![check_pid], "no check ran again");
     rig.tap.assert_no_child_left();
+}
+
+/// The `--append-system-prompt=` elements of each lead (non-lane) start, in log order.
+fn lead_appends(tap: &LogTap) -> Vec<Vec<String>> {
+    tap.seen
+        .iter()
+        .filter_map(|line| line.strip_prefix("START pid="))
+        .map(|rest| {
+            let (_, argv) = rest.split_once(" argv=").expect("argv");
+            serde_json::from_str::<Vec<String>>(argv).expect("argv is JSON")
+        })
+        .filter(|argv| !argv.iter().any(|arg| arg.contains("/lanes/")))
+        .map(|argv| {
+            argv.into_iter()
+                .filter(|arg| arg.starts_with("--append-system-prompt="))
+                .collect()
+        })
+        .collect()
+}
+
+/// (h) The first meeting end to end: a request greets once in the channel, the first two
+/// owner turns carry the mark, `onboarding_finish` saves `persona.md` and ends the
+/// onboarding (no more marks, no restart), and the next gateway's lead starts with the
+/// persona appended.
+#[tokio::test]
+async fn onboarding_through_the_gateway() {
+    let mut rig = Rig::discord();
+    onboarding::request(&rig.config.home).expect("request onboarding");
+    let calls = json!({
+        "tool": onboarding::FINISH_TOOL,
+        "arguments": {
+            "outcome": "done",
+            "name": "Sora",
+            "tone": "short and warm",
+            "owner": "Owner 111 likes short replies",
+        },
+    })
+    .to_string();
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(rig.gateway(
+        dynamic,
+        &[("FAKE_OMP_MODE", "tools"), ("FAKE_OMP_TOOL_CALLS", &calls)],
+    ));
+
+    bounded(adapter.wait_for_send(1)).await;
+    assert_eq!(
+        adapter.calls()[0],
+        Call::Send {
+            channel: CHANNEL.to_owned(),
+            text: notice_text(N_ONBOARDING_HELLO).to_owned(),
+        }
+    );
+    assert!(!onboarding::request_file(&rig.config.home).exists());
+
+    adapter.inject(dm("1300000000000000051", "hi")).await;
+    bounded(adapter.wait_for_send(2)).await;
+    adapter
+        .inject(dm("1300000000000000052", "I am 111. run-tools"))
+        .await;
+    bounded(adapter.wait_for_send(3)).await;
+    adapter.inject(dm("1300000000000000053", "again")).await;
+    bounded(adapter.wait_for_send(4)).await;
+    running.stop().await;
+
+    let sent = sends(&adapter);
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    assert_eq!(sent[0].0, CHANNEL);
+    assert!(sent[1..].iter().all(|(channel, _)| channel == DM_CHANNEL));
+
+    let (adapter, dynamic) = fake_adapter();
+    let running = Running::start(rig.gateway(dynamic, &[("FAKE_OMP_MODE", "ok")]));
+    adapter.inject(dm("1300000000000000054", "hi")).await;
+    bounded(adapter.wait_for_send(1)).await;
+    running.stop().await;
+    let sent = sends(&adapter);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, DM_CHANNEL);
+
+    rig.tap.drain().await;
+    rig.tap.assert_no_child_left();
+    let results: Vec<Value> = rig
+        .tap
+        .seen
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "host_tool_result")
+        .collect();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_ne!(results[0]["isError"], true, "{results:?}");
+
+    let prompts = rig.tap.prompts();
+    assert_eq!(prompts.len(), 4);
+    let lines: Vec<Vec<String>> = prompts
+        .iter()
+        .map(|frame| {
+            frame["message"]
+                .as_str()
+                .expect("prompt message")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect();
+    assert_eq!(lines[0][1], onboarding::notice_line(1));
+    assert_eq!(lines[1][1], onboarding::notice_line(2));
+    for frame in &lines[2..] {
+        assert!(
+            !frame
+                .iter()
+                .any(|line| line.starts_with("[moraebot onboarding")),
+            "{frame:?}"
+        );
+    }
+    let messages: Vec<Option<i64>> = prompts
+        .iter()
+        .map(|frame| frame_tag(frame).expect("tagged prompt").message)
+        .collect();
+    assert_eq!(messages, [Some(1), Some(2), Some(3), Some(4)]);
+
+    assert_eq!(rig.tap.lead_pids().len(), 2, "one lead per gateway run");
+    let appends = lead_appends(&rig.tap);
+    assert_eq!(appends.len(), 2);
+    assert!(!appends[0].concat().contains("Name: Sora"));
+    assert!(appends[1].concat().contains("Name: Sora"));
+    assert_eq!(
+        std::fs::read_to_string(persona::path(&rig.config.home)).expect("persona file"),
+        persona::render("Sora", "short and warm", "Owner 111 likes short replies").unwrap()
+    );
+    assert_eq!(
+        rig.store().onboarding().expect("read onboarding"),
+        Some(OnboardingRow {
+            state: OnboardingState::Done,
+            after_row: 0
+        })
+    );
 }
