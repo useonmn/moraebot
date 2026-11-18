@@ -3,19 +3,51 @@ name: Release
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  # Builds (without publishing) when a PR changes how releases are made.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: macos-15
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          # Linux builds run in an Ubuntu 22.04 container so the binary needs only glibc 2.35.
+          - runner: ubuntu-24.04
+            container: ubuntu:22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            container: ubuntu:22.04
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
     steps:
+      - name: Build tools (Linux container)
+        if: runner.os == 'Linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq libssl-dev pkg-config
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: glibc floor
+        if: runner.os == 'Linux'
+        run: ldd --version | head -n 1 | grep -q ' 2\.35$'
+
       - name: Tag matches the Cargo.toml version
+        if: github.event_name == 'push'
         run: |
           v="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="moraebot") | .version')"
           test "v$v" = "$GITHUB_REF_NAME"
@@ -24,18 +56,44 @@ jobs:
         run: cargo build --release --locked --bin moraebot
 
       - name: Smoke test
-        run: test "$(target/release/moraebot --version)" = "moraebot ${GITHUB_REF_NAME#v}"
+        run: |
+          v="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="moraebot") | .version')"
+          test "$(target/release/moraebot --version)" = "moraebot $v"
 
       - name: Package
         run: |
-          tar -czf moraebot-aarch64-apple-darwin.tar.gz -C target/release moraebot
-          test "$(tar -tzf moraebot-aarch64-apple-darwin.tar.gz)" = moraebot
-          shasum -a 256 moraebot-aarch64-apple-darwin.tar.gz > SHA256SUMS.txt
+          asset="moraebot-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" -C target/release moraebot
+          test "$(tar -tzf "$asset")" = moraebot
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moraebot-${{ matrix.target }}
+          path: moraebot-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: moraebot-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          test "$(ls moraebot-*.tar.gz | wc -l)" -eq 3
+          sha256sum moraebot-*.tar.gz > SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq 3
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            moraebot-aarch64-apple-darwin.tar.gz SHA256SUMS.txt install.sh \
+            moraebot-*.tar.gz SHA256SUMS.txt install.sh \
             --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
