@@ -16,8 +16,10 @@ use moraebot::lane::{
     self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_CLOSED, E_LANE_INTERRUPTED, E_LANE_LIMIT,
     E_LANE_STOPPING, E_LANE_UNKNOWN,
 };
+use moraebot::lane::{E_LANE_IDLE, E_LANE_STOPPED};
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, REPORT_FOOTER};
 use moraebot::lead;
+use moraebot::lead::LaneResult;
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
 use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REMOVE, E_LANE_REPO};
@@ -1836,4 +1838,125 @@ async fn lane_report_refuses_empty_text() {
     assert_eq!(r.len(), 1, "{r:?}");
     assert_refused(&r[0], E_LANE_ARGS);
     assert!(news.is_empty(), "{news:?}");
+}
+
+/// Waits until no lane child, check or git command is running.
+async fn await_no_running_pids(omp: &OmpManager) {
+    bounded(omp.lanes().running_pids().wait_for(|p| p.is_empty()))
+        .await
+        .expect("pid channel open");
+}
+
+#[tokio::test]
+async fn lane_stop_ends_a_running_turn() {
+    let h = Harness::new();
+    let omp = h.report_manager(&[report_call("qa step 1")], true);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_reports(&omp, 1).await;
+    let lane_pid = h.lane_pid(0);
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let first = omp.lanes().stop(1, "qa stuck");
+    bounded(notified).await;
+    await_no_running_pids(&omp).await;
+    let again = omp.lanes().stop(1, "qa");
+    let alive = process_exists(lane_pid);
+    let row = queued_row(&h, 1);
+    let lane = h.lane(1);
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(first, Ok(true));
+    assert_eq!(again, Err(E_LANE_IDLE));
+    assert!(!alive);
+    assert_eq!(row.message_id, "1:1");
+    assert_eq!(
+        row.text,
+        lead::lane_result(KEY, 1, &LaneResult::Stopped { reason: "qa stuck" })
+    );
+    assert_eq!(lane.state, LaneState::Failed);
+    assert_eq!(lane.error.as_deref(), Some(E_LANE_STOPPED));
+    assert!(!lane.closed);
+    assert_eq!(lane.prompts, 1);
+}
+
+#[tokio::test]
+async fn lane_message_resumes_a_stopped_lane() {
+    let h = Harness::new();
+    let m1 = h.report_manager(&[report_call("qa step 1")], true);
+    bounded(m1.prompt(KEY, 1, "run-tools go")).await;
+    await_lane_reports(&m1, 1).await;
+    let wake = m1.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let stopped = m1.lanes().stop(1, "qa stuck");
+    bounded(notified).await;
+    bounded(m1.shutdown_all()).await;
+
+    let m2 = h.manager(
+        "ok",
+        &[json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}})],
+    );
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    let results = h.tool_results();
+    let accepted: Value =
+        serde_json::from_str(&results.last().expect("lane_message result").1).expect("json");
+    let row = queued_row(&h, 2);
+    let tag = result_tag(&h, 2);
+    let lane = h.lane(1);
+    let starts = h.lane_starts();
+    let lease = h
+        .frames_after_start(1, "get_session_lease")
+        .into_iter()
+        .next()
+        .expect("lease checked before reopening");
+    bounded(m2.shutdown_all()).await;
+
+    assert_eq!(stopped, Ok(true));
+    assert_eq!(accepted, json!({"lane_id": 1, "accepted": true}));
+    assert_eq!(row.message_id, "1:2");
+    assert_eq!(tag.failed, None);
+    assert!(row.text.split_once('\n').unwrap().1.starts_with("echo: t2"));
+    assert_eq!(lane.state, LaneState::Idle);
+    assert_eq!(lane.error, None);
+    assert_eq!(lane.prompts, 2);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        lease["sessionIds"],
+        json!([lane.omp_session_id.clone().expect("session")])
+    );
+}
+
+#[tokio::test]
+async fn lane_stop_kills_a_running_check() {
+    let h = Harness::new();
+    let omp = h.done_manager(&check_done_line(), 1);
+    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let mut pids = omp.lanes().running_pids();
+    let running = bounded(pids.wait_for(|p| p.len() == 2))
+        .await
+        .expect("pid channel open")
+        .clone();
+    let lane_pid = h.lane_pid(0);
+    let check_pid = *running.iter().find(|p| **p != lane_pid).unwrap();
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let first = omp.lanes().stop(1, "qa");
+    bounded(notified).await;
+    await_no_running_pids(&omp).await;
+    let check_alive = process_exists(check_pid);
+    let lane_alive = process_exists(lane_pid);
+    let tag = result_tag(&h, 1);
+    let lane = h.lane(1);
+    bounded(omp.shutdown_all()).await;
+
+    assert_eq!(first, Ok(true));
+    assert!(!check_alive);
+    assert!(!lane_alive);
+    assert_eq!(tag.failed.as_deref(), Some(E_LANE_STOPPED));
+    assert_eq!(lane.state, LaneState::Failed);
 }

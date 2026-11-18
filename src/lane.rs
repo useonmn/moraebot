@@ -42,6 +42,12 @@
 //! `news_text` and kept as the job's newest report in its `Activity`. `news` lists the reports
 //! not yet posted for their lane; the dispatcher posts them while the lane's conversation is
 //! quiet and calls `news_posted`. Reports live in memory only.
+//!
+//! The lead stops a running job through `stop`: the job is marked stopped, its child's process
+//! group and the checks it started are killed the way `shutdown_all` kills them, and from then
+//! on the job starts no child and no check. The worker then stores a `failed
+//! code=E_LANE_STOPPED` result and the lane is `failed`, open for `lane_message`. A job that
+//! ended on its own before the kill keeps its own result.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -104,12 +110,17 @@ pub const E_LANE_STOPPING: &str = "E_LANE_STOPPING";
 pub const E_LANE_CLOSED: &str = "E_LANE_CLOSED";
 /// The lead stopped the lane's running turn with `lane_stop`.
 pub const E_LANE_STOPPED: &str = "E_LANE_STOPPED";
+/// The lane has no running turn to stop.
+pub const E_LANE_IDLE: &str = "E_LANE_IDLE";
 
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;
 
 /// A lane progress note is cut to this many characters.
 pub const REPORT_CHARS: usize = 200;
+
+/// A `lane_stop` reason is cut to this many characters.
+pub const STOP_REASON_CHARS: usize = 200;
 
 /// Appended to every lane prompt: ask for progress notes.
 pub const REPORT_FOOTER: &str = "\n[moraebot] At each big step (a milestone reached, a blocker hit), call lane_report with one short line for the owner. moraebot posts the newest line later, only while the conversation is quiet. Keep paths, keys and personal data out of it.";
@@ -137,6 +148,8 @@ struct LaneChild {
     conversation_key: String,
     /// Counted by the child's event callback, read by `watch_tick`.
     activity: Arc<Mutex<Activity>>,
+    /// Set once by `stop`: the cleaned reason. A stopped job starts no child or check.
+    stop: Option<String>,
 }
 
 /// What a running job's omp agent events showed. The event callback only counts;
@@ -288,6 +301,8 @@ enum LaneOutcome {
     Plain(Outcome),
     Done { text: String, receipt: String },
     Unmet { text: String, receipt: String },
+    /// The lead stopped the job and the kill ended it.
+    Stopped { reason: String },
 }
 
 pub struct LaneManager {
@@ -539,6 +554,53 @@ impl LaneManager {
     /// From now on `lane_start` and `lane_message` refuse with `E_LANE_STOPPING`.
     pub fn stop_accepting(&self) {
         lock(&self.inner).stopping = true;
+    }
+
+    /// Stops lane `id`'s running job for the lead: marks it stopped with the cleaned `reason`
+    /// (one line, at most `STOP_REASON_CHARS` characters), kills its child's process group and
+    /// every check it started, and returns at once: `true`, or `false` when the job was already
+    /// stopped (nothing is killed again). The worker writes the result. Refuses with the code
+    /// `E_LANE_ARGS`, `E_LANE_STOPPING`, `E_LANE_UNKNOWN`, `E_LANE_CLOSED` or `E_LANE_IDLE`.
+    pub fn stop(&self, id: i64, reason: &str) -> Result<bool, &'static str> {
+        let reason: String = reason
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(STOP_REASON_CHARS)
+            .collect();
+        if reason.is_empty() {
+            return Err(E_LANE_ARGS);
+        }
+        let mut guard = lock(&self.inner);
+        let set = &mut *guard;
+        if set.stopping {
+            return Err(E_LANE_STOPPING);
+        }
+        if let Some(child) = set.children.get_mut(&id) {
+            if child.stop.is_some() {
+                return Ok(false);
+            }
+            child.stop = Some(reason);
+            if let Some(group) = &child.kill {
+                group.kill();
+            }
+            let seq = child.seq;
+            for (pid, owner) in &set.checks {
+                if *owner == (id, seq) {
+                    omp::kill_group(*pid);
+                }
+            }
+            tracing::info!(lane = id, seq, "lane stop requested");
+            return Ok(true);
+        }
+        // Still under `inner` (lock order inner -> store): no job can start meanwhile.
+        match lock(&self.store).lane(id) {
+            Ok(None) => Err(E_LANE_UNKNOWN),
+            Ok(Some(lane)) if lane.closed => Err(E_LANE_CLOSED),
+            Ok(Some(_)) => Err(E_LANE_IDLE),
+            Err(e) => Err(e.code()),
+        }
     }
 
     /// Stops accepting, then kills every lane child (including one still starting), then
@@ -900,6 +962,7 @@ impl LaneManager {
                         seq,
                         conversation_key: key.clone(),
                         activity,
+                        stop: None,
                     },
                 );
                 tracing::info!(lane = id, seq, "lane started");
@@ -948,10 +1011,14 @@ impl LaneManager {
     }
 
     /// Registers `pid` (a check or git command) as running for job `(id, seq)`; `false`
-    /// when moraebot is stopping, the call was cancelled or the job is no longer current.
+    /// when moraebot is stopping, the call was cancelled, the job is no longer current or the
+    /// job was stopped.
     fn track(&self, pid: u32, (id, seq): (i64, i64), cancelled: bool) -> bool {
         let mut set = lock(&self.inner);
-        let current = set.children.get(&id).is_some_and(|child| child.seq == seq);
+        let current = set
+            .children
+            .get(&id)
+            .is_some_and(|child| child.seq == seq && child.stop.is_none());
         if set.stopping || cancelled || !current {
             return false;
         }
@@ -1358,6 +1425,9 @@ impl LaneManager {
                 let Some(child) = set.children.get_mut(&job.id) else {
                     return false;
                 };
+                if child.stop.is_some() {
+                    return false;
+                }
                 if let Some(spawned) = group.pid() {
                     *pid = Some(spawned);
                     self.pids.send_modify(|pids| pids.push(spawned));
@@ -1419,6 +1489,7 @@ impl LaneManager {
     /// kill ended the prompt (then the lane stays `running` for `recover_on_start`). A
     /// prompt that ended on its own is written even while stopping. Returns whether a
     /// row was written.
+    /// A stopped job that the kill ended gets the `E_LANE_STOPPED` result.
     fn write_result(
         &self,
         set: &LaneSet,
@@ -1427,11 +1498,11 @@ impl LaneManager {
         conversation_key: &str,
         outcome: Result<LaneOutcome, Outcome>,
     ) -> bool {
-        let killed = set.stopping
-            && matches!(
-                &outcome,
-                Err(_) | Ok(LaneOutcome::Plain(Outcome::NeedsCheck { .. }))
-            );
+        let cut = matches!(
+            &outcome,
+            Err(_) | Ok(LaneOutcome::Plain(Outcome::NeedsCheck { .. }))
+        );
+        let killed = set.stopping && cut;
         if killed {
             tracing::info!(
                 lane = id,
@@ -1440,7 +1511,15 @@ impl LaneManager {
             );
             return false;
         }
-        let outcome = outcome.unwrap_or_else(LaneOutcome::Plain);
+        let stopped = set
+            .children
+            .get(&id)
+            .filter(|child| child.seq == seq && cut)
+            .and_then(|child| child.stop.clone());
+        let outcome = match stopped {
+            Some(reason) => LaneOutcome::Stopped { reason },
+            None => outcome.unwrap_or_else(LaneOutcome::Plain),
+        };
         let (result, state, code) = match &outcome {
             LaneOutcome::Plain(plain) => {
                 let (result, state) = match plain {
@@ -1460,6 +1539,11 @@ impl LaneManager {
                 LaneResult::Unmet { text, receipt },
                 LaneState::Failed,
                 Some(done::E_DONE_UNMET),
+            ),
+            LaneOutcome::Stopped { reason } => (
+                LaneResult::Stopped { reason },
+                LaneState::Failed,
+                Some(E_LANE_STOPPED),
             ),
         };
         let text = lead::lane_result(conversation_key, id, &result);
@@ -1690,6 +1774,7 @@ mod tests {
                 seq: 1,
                 conversation_key: "discord:th:111".into(),
                 activity,
+                stop: None,
             },
         );
         let wake = manager.wake();
@@ -1813,6 +1898,7 @@ mod tests {
                 seq: 1,
                 conversation_key: key.into(),
                 activity: Arc::clone(&activity),
+                stop: None,
             },
         );
         activity
@@ -1935,5 +2021,225 @@ mod tests {
         assert!(matches!(first_seen, Ok(Ok(()))));
         assert!(matches!(second_seen, Ok(Ok(()))));
         assert_eq!(second.duration_since(first), WATCH_TICK);
+    }
+
+    #[test]
+    fn stop_marks_a_running_job_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let started = lock(&m.store)
+            .start_lane(
+                "call-1",
+                "discord:th:111",
+                "t1",
+                Some("file ."),
+                None,
+                MAX_RUNNING_LANES,
+            )
+            .expect("start lane");
+        qa_child(&m, 1, "discord:th:111");
+        qa_child(&m, 2, "discord:th:222");
+        let first = m.stop(1, "qa  stuck\n now");
+        let tracked = m.track(4242, (1, 1), false);
+        let second = m.stop(1, "other");
+        let long = m.stop(2, &"x".repeat(300));
+        let reason1 = lock(&m.inner).children[&1].stop.clone();
+        let reason2_chars = lock(&m.inner).children[&2]
+            .stop
+            .as_ref()
+            .map(|r| r.chars().count());
+        let checks_empty = lock(&m.inner).checks.is_empty();
+        qa_drop_child(&m, 1);
+        qa_drop_child(&m, 2);
+
+        assert!(matches!(started, LaneStart::New(1)));
+        assert_eq!(first, Ok(true));
+        assert!(!tracked);
+        assert_eq!(second, Ok(false));
+        assert_eq!(long, Ok(true));
+        assert_eq!(reason1.as_deref(), Some("qa stuck now"));
+        assert_eq!(reason2_chars, Some(STOP_REASON_CHARS));
+        assert!(checks_empty);
+    }
+
+    #[test]
+    fn stop_refuses_unknown_idle_closed_and_stopping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let (started1, finished1, started2, finished2, closed2) = {
+            let mut store = lock(&m.store);
+            let started1 = store
+                .start_lane(
+                    "call-1",
+                    "discord:th:111",
+                    "t1",
+                    Some("file ."),
+                    None,
+                    MAX_RUNNING_LANES,
+                )
+                .expect("start lane 1");
+            let finished1 = store
+                .finish_lane(1, 1, "r", LaneState::Idle, None)
+                .expect("finish lane 1");
+            let started2 = store
+                .start_lane(
+                    "call-2",
+                    "discord:th:222",
+                    "t2",
+                    Some("file ."),
+                    None,
+                    MAX_RUNNING_LANES,
+                )
+                .expect("start lane 2");
+            let finished2 = store
+                .finish_lane(2, 1, "r", LaneState::Idle, None)
+                .expect("finish lane 2");
+            let closed2 = store.close_lane(2, "qa").expect("close lane 2");
+            (started1, finished1, started2, finished2, closed2)
+        };
+        let got = [
+            m.stop(1, "  \n "),
+            m.stop(99, "qa"),
+            m.stop(1, "qa"),
+            m.stop(2, "qa"),
+        ];
+        m.stop_accepting();
+        let late = m.stop(1, "qa");
+
+        assert!(matches!(started1, LaneStart::New(1)));
+        assert!(finished1);
+        assert!(matches!(started2, LaneStart::New(2)));
+        assert!(finished2);
+        assert!(matches!(closed2, LaneClose::Closed { .. }));
+        assert_eq!(
+            got,
+            [
+                Err(E_LANE_ARGS),
+                Err(E_LANE_UNKNOWN),
+                Err(E_LANE_IDLE),
+                Err(E_LANE_CLOSED)
+            ]
+        );
+        assert_eq!(late, Err(E_LANE_STOPPING));
+    }
+
+    #[test]
+    fn stop_kills_the_running_checks_of_the_job() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        qa_child(&m, 1, "discord:th:111");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        lock(&m.inner).checks.insert(pid, (1, 1));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait());
+        });
+        let stopped = m.stop(1, "qa");
+        let got = rx.recv_timeout(Duration::from_secs(30));
+        if got.is_err() {
+            // Cleanup before any assertion: a failing run leaves no `sleep` behind.
+            omp::kill_group(pid);
+            let _ = rx.recv_timeout(Duration::from_secs(30));
+        }
+        lock(&m.inner).checks.remove(&pid);
+        qa_drop_child(&m, 1);
+
+        assert_eq!(stopped, Ok(true));
+        assert!(matches!(got, Ok(Ok(status)) if !status.success()));
+    }
+
+    #[test]
+    fn write_result_reports_a_stopped_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = qa_manager(dir.path());
+        let started: Vec<LaneStart> = (1..=3)
+            .map(|n| {
+                lock(&m.store)
+                    .start_lane(
+                        &format!("call-{n}"),
+                        "discord:th:111",
+                        &format!("t{n}"),
+                        Some("file ."),
+                        None,
+                        MAX_RUNNING_LANES,
+                    )
+                    .expect("start lane")
+            })
+            .collect();
+        for n in 1..=3 {
+            qa_child(&m, n, "discord:th:111");
+        }
+        for n in 1..=2 {
+            lock(&m.inner).children.get_mut(&n).unwrap().stop = Some("qa".into());
+        }
+        let lost = || {
+            Ok(LaneOutcome::Plain(Outcome::NeedsCheck {
+                code: omp::E_CHILD_LOST,
+                detail: "qa".into(),
+            }))
+        };
+        let written = {
+            let set = lock(&m.inner);
+            [
+                m.write_result(&set, 1, 1, "discord:th:111", lost()),
+                m.write_result(
+                    &set,
+                    2,
+                    1,
+                    "discord:th:111",
+                    Ok(LaneOutcome::Plain(Outcome::Reply("qa done".into()))),
+                ),
+                m.write_result(&set, 3, 1, "discord:th:111", lost()),
+            ]
+        };
+        let (rows, lanes): (Vec<String>, Vec<(LaneState, Option<String>)>) = {
+            let store = lock(&m.store);
+            (1..=3)
+                .map(|n| {
+                    let row = store.get(n).expect("get").expect("row").text;
+                    let lane = store.lane(n).expect("lane").expect("lane row");
+                    (row, (lane.state, lane.error))
+                })
+                .unzip()
+        };
+        for n in 1..=3 {
+            qa_drop_child(&m, n);
+        }
+
+        assert!(
+            started
+                .iter()
+                .zip(1..)
+                .all(|(s, n)| matches!(s, LaneStart::New(id) if *id == n))
+        );
+        assert_eq!(written, [true, true, true]);
+        assert_eq!(
+            rows[0],
+            lead::lane_result("discord:th:111", 1, &LaneResult::Stopped { reason: "qa" })
+        );
+        assert_eq!(
+            lanes[0],
+            (LaneState::Failed, Some(E_LANE_STOPPED.to_owned()))
+        );
+        assert_eq!(
+            rows[1],
+            lead::lane_result("discord:th:111", 2, &LaneResult::Text("qa done"))
+        );
+        assert_eq!(lanes[1], (LaneState::Idle, None));
+        assert_eq!(
+            rows[2],
+            lead::lane_result("discord:th:111", 3, &LaneResult::Failed(omp::E_CHILD_LOST))
+        );
+        assert_eq!(
+            lanes[2],
+            (LaneState::NeedsCheck, Some(omp::E_CHILD_LOST.to_owned()))
+        );
     }
 }
