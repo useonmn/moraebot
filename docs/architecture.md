@@ -305,7 +305,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 | `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
 | `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다 |
 
-거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 lead와 같은 작업 폴더에서 돌고, 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 모르는 id는 `E_LANE_UNKNOWN`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
 
 **결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
 
@@ -391,6 +391,40 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 
 **0.2.0에서 올라올 때.** `~/.moraebot/memory/` 폴더, `~/.moraebot/omp/config-overlay.yml`, 데이터베이스의 기억 표는 지우지도 옮기지도 않고 쓰지 않습니다. 필요 없으면 손으로 지웁니다.
 
+### 3.11 레인 작업 폴더 (lanes L1)
+
+**언제 쓰나.** `lane_start`는 선택 인자 `repo`(git 저장소 경로)를 받습니다. 없거나 `null`이면 lane은 지금처럼 lead와 같은 작업 폴더에서 일합니다. 있으면 그 저장소의 lane 전용 git worktree에서 일합니다. `repo`는 절대 경로, `~/`로 시작하는 경로(`HOME` 기준), 작업 폴더 기준 상대 경로 중 하나이고, 풀어서 `canonicalize`한 경로를 `lanes.repo` 열에 저장하고 `lane_status`에도 보여 줍니다. 문자열이 아니거나 비면 `E_LANE_ARGS`, 있는 폴더가 아니면 `E_LANE_REPO`로 거절하고, 거절된 호출은 lane을 저장하지도 자식을 띄우지도 않습니다. 도구 처리기는 git을 부르지 않습니다.
+
+**폴더와 브랜치.** 폴더는 `<작업 폴더>/.moraebot-lanes/lane-<id>`, 브랜치는 `moraebot/lane-<id>`이고 시작점은 그 순간 저장소의 `HEAD`입니다. 작업 폴더 안에 두는 까닭은 첨부 파일의 `.moraebot-inbox/`와 같습니다. 홈 안에 두면 lead의 `send_file`이 그 파일을 보낼 수 없습니다.
+
+**만드는 순서.** lane 워커가 omp 자식을 띄우기 전에 `worktree::ensure`를 부릅니다. git은 셸 없이 argv 그대로, 완료 확인과 같은 환경(`omp::check_env`)에 `GIT_TERMINAL_PROMPT=0`을 더해 돕니다. 출력은 `<홈>/lanes/<id>/git/stdout`, `stderr` 파일로 가고, 명령 하나에 `GIT_TIMEOUT`(120초)이 지나면 그룹째 죽입니다.
+
+1. `git --version`이 0으로 끝나는지 봅니다. 개발 도구가 없는 macOS의 `git` 안내 프로그램처럼 실행은 되지만 실패하는 경우도 여기서 걸립니다.
+2. `git -C <repo> rev-parse --show-toplevel --git-common-dir`로 저장소의 맨 위 폴더와 공통 git 폴더를 얻습니다.
+3. 폴더가 이미 있으면 새로 만들지 않고 아래의 재사용 확인만 합니다.
+4. 없으면 부모 폴더를 만들고 `git -C <맨 위> worktree add -b moraebot/lane-<id> <폴더> HEAD`를 돌립니다.
+5. 새 폴더를 재사용 확인과 같은 방법으로 확인하고, 그 worktree 자신의 git 폴더(`--git-dir`)에 빈 표시 파일 `moraebot-ready`를 씁니다.
+
+그다음 lane의 omp는 `--cwd <폴더>`로 뜨고, 완료 확인(3.8)도 그 폴더에서 돕니다. lead의 `--cwd`는 늘 작업 폴더입니다.
+
+**코드.** 실패하면 omp 자식을 띄우지 않고 lead에게 `[moraebot conversation=<key> lane=<id> failed code=<CODE>]`가 가며, lane 상태는 `failed`입니다.
+
+| 코드 | 경우 |
+|---|---|
+| `E_LANE_GIT` | git을 띄울 수 없음, `git --version`이 0이 아님, git 명령이 `GIT_TIMEOUT`을 넘김 |
+| `E_LANE_REPO` | `repo`에서 `rev-parse`가 실패함(git 저장소가 아님) |
+| `E_LANE_WORKTREE` | 부모 폴더를 만들 수 없음, `worktree add` 실패, 있던 폴더나 새 폴더가 재사용 확인을 통과하지 못함 |
+
+로그에는 lane id, 순번, 코드만 남기고 경로, 브랜치 이름, git 출력은 남기지 않습니다.
+
+**재사용.** `lane_message`로 일을 더 주면 같은 폴더와 같은 브랜치를 씁니다. 폴더가 있으면 읽기만 하는 `git -C <폴더> rev-parse --show-toplevel --git-dir --git-common-dir --abbrev-ref HEAD`를 돌려, 맨 위 폴더가 그 폴더이고, 브랜치가 `moraebot/lane-<id>`이고, 공통 git 폴더가 `repo`의 것과 같고, `moraebot-ready` 표시 파일이 있을 때만 다시 씁니다. 그냥 폴더, 반쯤 만들어진 worktree(표시 파일 없음), 다른 저장소의 worktree는 쓰지도 지우지도 않고 `E_LANE_WORKTREE`로 실패합니다.
+
+**끄기.** 워커가 돌리는 git 명령은 완료 확인처럼 `LaneSet.checks`에 pid -> `(lane id, 순번)`으로 적힙니다. `shutdown_all`은 lane 자식을 먼저 죽이고, 그다음 git 명령의 그룹을 죽이고 거둘 때까지 기다립니다. 이렇게 끊긴 턴은 결과 줄을 쓰지 않고, 다음 시작 때 `needs_check` / `E_LANE_INTERRUPTED`가 됩니다(3.7). 꺼지는 중이면 git을 시작하지 않고 `E_LANE_STOPPING`으로 끝납니다.
+
+**아직 하지 않는 것.** lane 폴더와 브랜치는 지우지 않습니다. `git worktree prune`도, `.git/info/exclude` 변경도 없습니다. 작업 폴더 자체가 git 저장소면 `.moraebot-lanes/`가 그 저장소에서 "추적 안 됨"으로 보입니다. moraebot이 git 폴더 안에 쓰는 파일은 `moraebot-ready` 하나뿐이고, git이 그 worktree를 지울 때 함께 지워집니다.
+
+**dori와 다른 점.** dori에서는 lane(AI)이 직접 worktree를 만들고, dori는 브랜치 이름으로 그 폴더를 찾아 검사하고 닫을 때 지웁니다. moraebot lane은 명령줄 도구가 없는 백그라운드 프로그램이라 moraebot 코드가 만듭니다. 그래서 이름과 위치가 늘 같습니다. lane 이름을 딴 브랜치, 저장소가 없으면 공유 폴더라는 점은 dori와 같고, 지우기는 moraebot에 "lane 닫기"가 생긴 뒤에 넣습니다.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -472,6 +506,11 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 
    자세한 설계는 이 단계에 들어갈 때 합니다.
 5. **light (v0.3.0).** 0.2.0의 기억 장치를 걷어내고 첫 만남과 `persona.md` 하나만 남깁니다(3.9절). omp 기억은 주인 설정을 따릅니다(3.10절). 기억 코드는 `memory-full` 브랜치에 그대로 두어 나중에 다시 합칠 수 있습니다.
+6. **lane 기능.** 한 번에 하나씩, 앞 것이 동작한 뒤에 다음으로 갑니다.
+   - **L1 레인 작업 폴더.** `repo`를 받은 lane은 자기 git worktree에서 일합니다(3.11절).
+   - **L2 올리지 않은 작업 검사.** `lane_done` 때 lane 폴더에 커밋하지 않은 변경이나 원격에 올리지 않은 커밋이 있으면 거절합니다. L1 폴더가 있어야 합니다.
+   - **L3 레인 감시.** 멈추거나 헛도는 lane을 시간 제한 전에 lead에게 한 번 알립니다. lane을 끄지는 않습니다.
+   - **L4 진행 소식.** lane이 일하는 동안 짧은 진행 소식을 메신저로 보냅니다. L3의 주기 점검을 씁니다.
 
 ## 6. 열린 질문
 
