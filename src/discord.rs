@@ -439,12 +439,27 @@ fn rest_client(timeout: Option<Duration>) -> reqwest012::Client {
     .expect("the TLS backend initializes")
 }
 
+/// Ends `call` with a `code` error once it runs past `limit`. The adapter's REST client has
+/// no total limit (uploads need longer), so every other call it makes goes through this.
+async fn within<T>(
+    limit: Duration,
+    code: &'static str,
+    call: impl Future<Output = Result<T, AdapterError>>,
+) -> Result<T, AdapterError> {
+    tokio::time::timeout(limit, call).await.unwrap_or_else(|_| {
+        Err(AdapterError {
+            code,
+            message: format!("no answer within {limit:?}"),
+        })
+    })
+}
+
 pub struct DiscordAdapter {
     token: Arc<Token>,
-    /// Every API call except uploads; each gives up after [`API_TIMEOUT`].
+    /// The one REST client, so sends and uploads share serenity's rate limiter. It has a
+    /// connect timeout but no total limit: the core bounds uploads by
+    /// `files::UPLOAD_TIMEOUT`, and every other call is bounded by [`API_TIMEOUT`] here.
     http: Arc<Http>,
-    /// Uploads only: no total limit here, the core bounds them by `files::UPLOAD_TIMEOUT`.
-    upload_http: Http,
     /// Downloads only; uploads go through `http`.
     file_client: reqwest::Client,
     scope: Scope,
@@ -457,12 +472,10 @@ impl DiscordAdapter {
     /// Reads the token file once; the token goes only to serenity.
     pub fn new(token_file: &Path, scope: Scope) -> Result<Self, AdapterError> {
         let token = read_token(token_file)?;
-        let http = Arc::new(rest_http(&token.0, Some(API_TIMEOUT)));
-        let upload_http = rest_http(&token.0, None);
+        let http = Arc::new(rest_http(&token.0, None));
         Ok(Self {
             token: Arc::new(token),
             http,
-            upload_http,
             file_client: files::file_client(),
             scope,
             runtime: Arc::new(Mutex::new(Runtime::default())),
@@ -577,13 +590,16 @@ impl MessengerAdapter for DiscordAdapter {
         let channel_id = ChannelId::new(parse_id(channel)?);
         let mut last_id = String::new();
         for chunk in reply_chunks(text) {
-            let message = channel_id
-                .say(&self.http, chunk)
-                .await
-                .map_err(|err| AdapterError {
-                    code: E_ADAPTER_SEND,
-                    message: err.to_string(),
-                })?;
+            let message = within(API_TIMEOUT, E_ADAPTER_SEND, async {
+                channel_id
+                    .say(&self.http, chunk)
+                    .await
+                    .map_err(|err| AdapterError {
+                        code: E_ADAPTER_SEND,
+                        message: err.to_string(),
+                    })
+            })
+            .await?;
             last_id = message.id.get().to_string();
         }
         Ok(SendResult {
@@ -599,17 +615,20 @@ impl MessengerAdapter for DiscordAdapter {
     ) -> Result<String, AdapterError> {
         let channel_id = ChannelId::new(parse_id(channel_id)?);
         let message_id = MessageId::new(parse_id(from_message_id)?);
-        let thread = channel_id
-            .create_thread_from_message(
-                &self.http,
-                message_id,
-                CreateThread::new(thread_name(name)),
-            )
-            .await
-            .map_err(|err| AdapterError {
-                code: E_ADAPTER_THREAD,
-                message: err.to_string(),
-            })?;
+        let thread = within(API_TIMEOUT, E_ADAPTER_THREAD, async {
+            channel_id
+                .create_thread_from_message(
+                    &self.http,
+                    message_id,
+                    CreateThread::new(thread_name(name)),
+                )
+                .await
+                .map_err(|err| AdapterError {
+                    code: E_ADAPTER_THREAD,
+                    message: err.to_string(),
+                })
+        })
+        .await?;
         Ok(thread.id.get().to_string())
     }
 
@@ -625,7 +644,7 @@ impl MessengerAdapter for DiscordAdapter {
             code: E_ADAPTER_DM,
             message: err.message,
         })?;
-        open_dm_channel(&self.http, id).await
+        within(API_TIMEOUT, E_ADAPTER_DM, open_dm_channel(&self.http, id)).await
     }
 
     async fn fetch_attachment(
@@ -644,7 +663,7 @@ impl MessengerAdapter for DiscordAdapter {
         path: &Path,
         name: &str,
     ) -> Result<SendResult, AdapterError> {
-        let message_id = upload_file(&self.upload_http, parse_id(target)?, path, name).await?;
+        let message_id = upload_file(&self.http, parse_id(target)?, path, name).await?;
         Ok(SendResult { message_id })
     }
 
@@ -655,7 +674,12 @@ impl MessengerAdapter for DiscordAdapter {
             code: E_ADAPTER_EDIT,
             message: err.to_string(),
         })?;
-        edit_text(&self.http, channel_id, message_id, text).await
+        within(
+            API_TIMEOUT,
+            E_ADAPTER_EDIT,
+            edit_text(&self.http, channel_id, message_id, text),
+        )
+        .await
     }
 
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
@@ -961,6 +985,22 @@ mod tests {
             .expect("the request ended on its own")
             .expect_err("the server never answers");
         assert!(err.is_timeout(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn within_ends_a_call_that_never_answers_with_its_code() {
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            within::<()>(
+                Duration::from_millis(50),
+                E_ADAPTER_SEND,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("the call ended on its own")
+        .expect_err("the call never answers");
+        assert_eq!(err.code, E_ADAPTER_SEND);
     }
 
     fn loopback_http(base: &str) -> Http {
