@@ -173,6 +173,7 @@ impl Rig {
                     channel_id: SLACK_CHANNEL.into(),
                     bot_token_file: home.join("secrets").join("slack-bot.token"),
                     app_token_file: home.join("secrets").join("slack-app.token"),
+                    access: Default::default(),
                 }),
             ),
             Platform::Discord => (
@@ -180,6 +181,7 @@ impl Rig {
                     owner_id: DISCORD_OWNER.parse().unwrap(),
                     channel_id: DISCORD_CHANNEL.parse().unwrap(),
                     token_file: home.join("secrets").join("discord.token"),
+                    access: Default::default(),
                 }),
                 None,
             ),

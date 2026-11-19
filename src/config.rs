@@ -28,6 +28,11 @@ pub const E_CONFIG_READ: &str = "E_CONFIG_READ";
 pub const E_CONFIG_PARSE: &str = "E_CONFIG_PARSE";
 pub const E_CONFIG_VALUE: &str = "E_CONFIG_VALUE";
 pub const E_IO: &str = "E_IO";
+/// Advisory only: someone besides the owner is listed and may talk to moraebot.
+pub const W_ALLOWLIST: &str = "W_ALLOWLIST";
+
+/// The window that `max_bot_replies` counts replies in, per thread.
+pub const BOT_REPLY_WINDOW_MINUTES: u64 = 10;
 
 const DEFAULT_WORK_DIR: &str = "~/moraebot-work";
 
@@ -115,16 +120,76 @@ impl Env {
     }
 }
 
-/// Only `owner_only` exists in slice 1.
+/// `owner_only` (the default) or `allowlist`, which turns on the `allow` lists in the
+/// messenger sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
     OwnerOnly,
+    Allowlist,
 }
 
 impl AccessMode {
     pub fn as_str(self) -> &'static str {
         match self {
             AccessMode::OwnerOnly => "owner_only",
+            AccessMode::Allowlist => "allowlist",
+        }
+    }
+}
+
+/// Whether a listed sender is a person or a bot account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderKind {
+    User,
+    Bot,
+}
+
+impl SenderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SenderKind::User => "user",
+            SenderKind::Bot => "bot",
+        }
+    }
+}
+
+/// What a listed sender may do. Only `chat` exists in this version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Chat,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Chat => "chat",
+        }
+    }
+}
+
+/// One `[[<messenger>.allow]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowEntry<Id> {
+    pub id: Id,
+    pub kind: SenderKind,
+    pub role: Role,
+}
+
+/// The allowlist settings of one messenger section. Empty unless
+/// `access_mode = "allowlist"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access<Id> {
+    pub allow: Vec<AllowEntry<Id>>,
+    /// Replies to bot messages allowed per thread in any [`BOT_REPLY_WINDOW_MINUTES`]
+    /// window. Absent means no limit.
+    pub max_bot_replies: Option<u32>,
+}
+
+impl<Id> Default for Access<Id> {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            max_bot_replies: None,
         }
     }
 }
@@ -150,6 +215,7 @@ pub struct DiscordConfig {
     pub owner_id: u64,
     pub channel_id: u64,
     pub token_file: PathBuf,
+    pub access: Access<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +224,7 @@ pub struct SlackConfig {
     pub channel_id: String,
     pub bot_token_file: PathBuf,
     pub app_token_file: PathBuf,
+    pub access: Access<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -231,6 +298,10 @@ struct DiscordSection {
     channel_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bot_replies: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<AllowSection<u64>>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -244,6 +315,33 @@ struct SlackSection {
     bot_token_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     app_token_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bot_replies: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<AllowSection<String>>>,
+}
+
+/// On-disk `[[<messenger>.allow]]` entry. `kind` and `role` stay text so a bad value
+/// gets an `E_CONFIG_VALUE` that names the entry.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AllowSection<Id> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+}
+
+impl<Id: Clone> AllowSection<Id> {
+    fn from_entry(entry: &AllowEntry<Id>) -> Self {
+        Self {
+            id: Some(entry.id.clone()),
+            kind: Some(entry.kind.as_str().to_string()),
+            role: Some(entry.role.as_str().to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -284,12 +382,12 @@ impl Config {
 
         let access_mode = match file.access_mode.as_deref() {
             None | Some("owner_only") => AccessMode::OwnerOnly,
+            Some("allowlist") => AccessMode::Allowlist,
             Some(other) => {
                 return Err(ConfigError::new(
                     E_ACCESS_MODE,
                     format!(
-                        "access_mode '{other}' is not available yet; other modes arrive in stage 2, \
-                         only 'owner_only' is supported"
+                        "access_mode '{other}' is not available; use 'owner_only' or 'allowlist'"
                     ),
                 ));
             }
@@ -304,8 +402,14 @@ impl Config {
                 ));
             }
         };
-        let discord = discord_config(file.discord, file.owner_id, file.token_file, env)?;
-        let slack = slack_config(file.slack, env)?;
+        let discord = discord_config(
+            file.discord,
+            file.owner_id,
+            file.token_file,
+            access_mode,
+            env,
+        )?;
+        let slack = slack_config(file.slack, access_mode, env)?;
         let missing = match messenger {
             Platform::Discord => discord.is_none().then_some("[discord]"),
             Platform::Slack => slack.is_none().then_some("[slack]"),
@@ -380,12 +484,16 @@ impl Config {
                 owner_id: Some(d.owner_id),
                 channel_id: Some(d.channel_id),
                 token_file: Some(d.token_file.clone()),
+                max_bot_replies: d.access.max_bot_replies,
+                allow: allow_sections(&d.access),
             }),
             slack: self.slack.as_ref().map(|s| SlackSection {
                 owner_id: Some(s.owner_id.clone()),
                 channel_id: Some(s.channel_id.clone()),
                 bot_token_file: Some(s.bot_token_file.clone()),
                 app_token_file: Some(s.app_token_file.clone()),
+                max_bot_replies: s.access.max_bot_replies,
+                allow: allow_sections(&s.access),
             }),
             omp: has_omp_limits.then_some(OmpSection {
                 turn_timeout_minutes: self.omp.turn_timeout_minutes,
@@ -432,6 +540,28 @@ impl Config {
                 advisory: false,
             },
         ];
+        if self.access_mode == AccessMode::Allowlist {
+            match active {
+                Platform::Discord => {
+                    if let Some(discord) = &self.discord {
+                        checks.extend(access_checks(
+                            "discord.allow",
+                            "discord.max_bot_replies",
+                            &discord.access,
+                        ));
+                    }
+                }
+                Platform::Slack => {
+                    if let Some(slack) = &self.slack {
+                        checks.extend(access_checks(
+                            "slack.allow",
+                            "slack.max_bot_replies",
+                            &slack.access,
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(discord) = &self.discord {
             checks.push(Check {
                 name: "discord token_file",
@@ -608,12 +738,145 @@ fn check_token_file(path: &Path) -> Result<String, ConfigError> {
     Ok(format!("{} (mode {mode:03o})", path.display()))
 }
 
+/// One `WARN` line per listed sender, so the owner sees who else can talk to moraebot,
+/// and one line for the bot reply limit.
+fn access_checks<Id: fmt::Display>(
+    allow_name: &'static str,
+    limit_name: &'static str,
+    access: &Access<Id>,
+) -> Vec<Check> {
+    let mut checks: Vec<Check> = access
+        .allow
+        .iter()
+        .map(|entry| Check {
+            name: allow_name,
+            result: Err(ConfigError::new(
+                W_ALLOWLIST,
+                format!(
+                    "{} (kind {}, role {}) may talk to moraebot",
+                    entry.id,
+                    entry.kind.as_str(),
+                    entry.role.as_str()
+                ),
+            )),
+            advisory: true,
+        })
+        .collect();
+    if checks.is_empty() {
+        checks.push(Check {
+            name: allow_name,
+            result: Ok("empty, only the owner can talk to moraebot".to_string()),
+            advisory: true,
+        });
+    }
+    checks.push(Check {
+        name: limit_name,
+        result: Ok(match access.max_bot_replies {
+            Some(limit) => {
+                format!("{limit} replies to bots per thread per {BOT_REPLY_WINDOW_MINUTES} minutes")
+            }
+            None => "no limit".to_string(),
+        }),
+        advisory: true,
+    });
+    checks
+}
+
+fn allow_sections<Id: Clone>(access: &Access<Id>) -> Option<Vec<AllowSection<Id>>> {
+    (!access.allow.is_empty()).then(|| access.allow.iter().map(AllowSection::from_entry).collect())
+}
+
+/// Validates one section's `allow` list and `max_bot_replies`. Both need
+/// `access_mode = "allowlist"`, so an `owner_only` config never looks wider than it is.
+fn access_config<Id: PartialEq + fmt::Display>(
+    section: &str,
+    mode: AccessMode,
+    owner_id: &Id,
+    allow: Option<Vec<AllowSection<Id>>>,
+    max_bot_replies: Option<u32>,
+    check_id: impl Fn(&str, &Id, SenderKind) -> Result<(), ConfigError>,
+) -> Result<Access<Id>, ConfigError> {
+    if mode == AccessMode::OwnerOnly && (allow.is_some() || max_bot_replies.is_some()) {
+        return Err(ConfigError::new(
+            E_CONFIG_VALUE,
+            format!(
+                "{section}.allow and {section}.max_bot_replies need access_mode = \"allowlist\""
+            ),
+        ));
+    }
+    if max_bot_replies == Some(0) {
+        return Err(ConfigError::new(
+            E_CONFIG_VALUE,
+            format!("{section}.max_bot_replies must be greater than zero (omit it for no limit)"),
+        ));
+    }
+    let mut entries: Vec<AllowEntry<Id>> = Vec::new();
+    for (index, raw) in allow.unwrap_or_default().into_iter().enumerate() {
+        let name = format!("{section}.allow[{index}]");
+        let id = raw
+            .id
+            .ok_or_else(|| ConfigError::new(E_CONFIG_VALUE, format!("{name}.id is required")))?;
+        let kind = match raw.kind.as_deref() {
+            Some("user") => SenderKind::User,
+            Some("bot") => SenderKind::Bot,
+            Some(other) => {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!("{name}.kind '{other}' is not valid; use 'user' or 'bot'"),
+                ));
+            }
+            None => {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!("{name}.kind is required: 'user' or 'bot'"),
+                ));
+            }
+        };
+        check_id(&format!("{name}.id"), &id, kind)?;
+        if &id == owner_id {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("{name}.id {id} is the owner; the owner is never listed in allow"),
+            ));
+        }
+        if entries.iter().any(|entry| entry.id == id) {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("{name}.id {id} is listed more than once"),
+            ));
+        }
+        let role = match raw.role.as_deref() {
+            None | Some("chat") => Role::Chat,
+            Some("work") => {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!(
+                        "{name}.role 'work' does not exist yet; listed senders can only chat, and only the owner gives work"
+                    ),
+                ));
+            }
+            Some(other) => {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!("{name}.role '{other}' is not available; only 'chat' exists"),
+                ));
+            }
+        };
+        entries.push(AllowEntry { id, kind, role });
+    }
+    Ok(Access {
+        allow: entries,
+        max_bot_replies,
+    })
+}
+
 /// Merges the `[discord]` section with the slice-1 top-level keys. A key given in both
 /// places is ambiguous. `None` means no Discord settings at all.
 fn discord_config(
     section: Option<DiscordSection>,
     legacy_owner: Option<u64>,
     legacy_token: Option<PathBuf>,
+    mode: AccessMode,
     env: &Env,
 ) -> Result<Option<DiscordConfig>, ConfigError> {
     if section.is_none() && legacy_owner.is_none() && legacy_token.is_none() {
@@ -641,15 +904,33 @@ fn discord_config(
     let token_file = legacy_token
         .or(section.token_file)
         .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "token_file is required"))?;
+    let access = access_config(
+        "discord",
+        mode,
+        &owner_id,
+        section.allow,
+        section.max_bot_replies,
+        |name, id, _kind| {
+            if *id == 0 {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!("{name} must be a non-zero user id"),
+                ));
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(DiscordConfig {
         owner_id,
         channel_id,
         token_file: env.expand_tilde(&token_file)?,
+        access,
     }))
 }
 
 fn slack_config(
     section: Option<SlackSection>,
+    mode: AccessMode,
     env: &Env,
 ) -> Result<Option<SlackConfig>, ConfigError> {
     let Some(section) = section else {
@@ -669,11 +950,25 @@ fn slack_config(
         .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "slack.app_token_file is required"))?;
     check_slack_id("slack.owner_id", &owner_id, &['U', 'W'])?;
     check_slack_id("slack.channel_id", &channel_id, &['C', 'G'])?;
+    let access = access_config(
+        "slack",
+        mode,
+        &owner_id,
+        section.allow,
+        section.max_bot_replies,
+        // A Slack bot is matched by its user id or by the `bot_id` (`B...`) the adapter
+        // sees on bot messages, some of which carry no user id at all.
+        |name, id, kind| match kind {
+            SenderKind::User => check_slack_id(name, id, &['U', 'W']),
+            SenderKind::Bot => check_slack_id(name, id, &['U', 'W', 'B']),
+        },
+    )?;
     Ok(Some(SlackConfig {
         owner_id,
         channel_id,
         bot_token_file: env.expand_tilde(&bot_token_file)?,
         app_token_file: env.expand_tilde(&app_token_file)?,
+        access,
     }))
 }
 
@@ -795,6 +1090,7 @@ mod tests {
             channel_id: "C222".to_string(),
             bot_token_file: fx.token.clone(),
             app_token_file: fx.token.clone(),
+            access: Default::default(),
         });
         assert_eq!(cfg.channel_id(), "C222");
     }
@@ -867,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn access_mode_open_is_a_stage_2_error() {
+    fn access_mode_open_is_rejected() {
         let fx = Fixture::new();
         let text = format!("access_mode = \"open\"\n{}", fx.valid_toml());
         assert_eq!(code(fx.load(&text)), E_ACCESS_MODE);
@@ -881,6 +1177,187 @@ mod tests {
             fx.load(&text).expect("loads").access_mode,
             AccessMode::OwnerOnly
         );
+    }
+
+    fn allowlist_toml(fx: &Fixture, extra: &str) -> String {
+        format!("access_mode = \"allowlist\"\n{}{extra}", fx.valid_toml())
+    }
+
+    const DISCORD_ALLOW: &str = "max_bot_replies = 30\n\
+         [[discord.allow]]\nid = 333\nkind = \"user\"\nrole = \"chat\"\n\
+         [[discord.allow]]\nid = 444\nkind = \"bot\"\n";
+
+    #[test]
+    fn owner_only_configs_load_with_an_empty_allowlist() {
+        let fx = Fixture::new();
+        let discord = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(discord.access_mode, AccessMode::OwnerOnly);
+        assert_eq!(discord.discord.expect("discord").access, Access::default());
+        let slack = fx.load(&slack_toml(&fx)).expect("loads");
+        assert_eq!(slack.slack.expect("slack").access, Access::default());
+    }
+
+    #[test]
+    fn discord_allowlist_is_parsed() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&allowlist_toml(&fx, DISCORD_ALLOW)).expect("loads");
+        assert_eq!(cfg.access_mode, AccessMode::Allowlist);
+        let access = cfg.discord.expect("discord").access;
+        assert_eq!(
+            access.allow,
+            vec![
+                AllowEntry {
+                    id: 333,
+                    kind: SenderKind::User,
+                    role: Role::Chat
+                },
+                AllowEntry {
+                    id: 444,
+                    kind: SenderKind::Bot,
+                    role: Role::Chat
+                },
+            ]
+        );
+        assert_eq!(access.max_bot_replies, Some(30));
+    }
+
+    #[test]
+    fn max_bot_replies_absent_means_no_limit() {
+        let fx = Fixture::new();
+        let text = allowlist_toml(&fx, &DISCORD_ALLOW.replace("max_bot_replies = 30\n", ""));
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.discord.expect("discord").access.max_bot_replies, None);
+        let zero = allowlist_toml(&fx, &DISCORD_ALLOW.replace("= 30", "= 0"));
+        assert_eq!(code(fx.load(&zero)), E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn slack_allowlist_is_parsed() {
+        let fx = Fixture::new();
+        let text = format!(
+            "access_mode = \"allowlist\"\n{}[[slack.allow]]\nid = \"U0BOT\"\nkind = \"bot\"\nrole = \"chat\"\n",
+            slack_toml(&fx)
+        );
+        let access = fx.load(&text).expect("loads").slack.expect("slack").access;
+        assert_eq!(
+            access.allow,
+            vec![AllowEntry {
+                id: "U0BOT".to_string(),
+                kind: SenderKind::Bot,
+                role: Role::Chat
+            }]
+        );
+        assert_eq!(access.max_bot_replies, None);
+        for bad in ["C0BOT", "u0bot", ""] {
+            let text = text.replace("U0BOT", bad);
+            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "id {bad:?}");
+        }
+    }
+
+    #[test]
+    fn slack_bot_entries_accept_a_bot_id() {
+        let fx = Fixture::new();
+        let text = format!(
+            "access_mode = \"allowlist\"\n{}[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
+            slack_toml(&fx)
+        );
+        let access = fx.load(&text).expect("loads").slack.expect("slack").access;
+        assert_eq!(access.allow[0].id, "B0BOT");
+        assert_eq!(access.allow[0].kind, SenderKind::Bot);
+        let user = text.replace("\"bot\"", "\"user\"");
+        assert_eq!(code(fx.load(&user)), E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn invalid_allow_entries_are_config_value_errors() {
+        let fx = Fixture::new();
+        let cases = [
+            (
+                "unknown kind",
+                DISCORD_ALLOW.replace("\"user\"", "\"admin\""),
+            ),
+            ("work role", DISCORD_ALLOW.replace("\"chat\"", "\"work\"")),
+            (
+                "unknown role",
+                DISCORD_ALLOW.replace("\"chat\"", "\"owner\""),
+            ),
+            (
+                "missing kind",
+                DISCORD_ALLOW.replace("kind = \"user\"\n", ""),
+            ),
+            ("missing id", DISCORD_ALLOW.replace("id = 333\n", "")),
+            ("zero id", DISCORD_ALLOW.replace("id = 333", "id = 0")),
+            (
+                "duplicate id",
+                DISCORD_ALLOW.replace("id = 444", "id = 333"),
+            ),
+            (
+                "owner listed",
+                DISCORD_ALLOW.replace("id = 444", "id = 111"),
+            ),
+        ];
+        for (case, extra) in cases {
+            assert_eq!(
+                code(fx.load(&allowlist_toml(&fx, &extra))),
+                E_CONFIG_VALUE,
+                "{case}"
+            );
+        }
+        let message = |role: &str| {
+            let extra = DISCORD_ALLOW.replace("\"chat\"", role);
+            fx.load(&allowlist_toml(&fx, &extra))
+                .expect_err("rejected")
+                .message
+        };
+        assert_ne!(message("\"work\""), message("\"owner\""));
+        let unknown_key = allowlist_toml(&fx, &format!("{DISCORD_ALLOW}surprise = 1\n"));
+        assert_eq!(code(fx.load(&unknown_key)), E_CONFIG_PARSE);
+    }
+
+    #[test]
+    fn allowlist_keys_need_allowlist_mode() {
+        let fx = Fixture::new();
+        let allow = format!("{}{DISCORD_ALLOW}", fx.valid_toml());
+        assert_eq!(code(fx.load(&allow)), E_CONFIG_VALUE);
+        let limit = format!("{}max_bot_replies = 5\n", fx.valid_toml());
+        assert_eq!(code(fx.load(&limit)), E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn to_toml_keeps_the_allowlist() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&allowlist_toml(&fx, DISCORD_ALLOW)).expect("loads");
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.access_mode, AccessMode::Allowlist);
+        assert_eq!(
+            again.discord.expect("discord").access,
+            cfg.discord.expect("discord").access
+        );
+    }
+
+    #[test]
+    fn check_config_warns_with_each_allowed_id_and_role() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&allowlist_toml(&fx, DISCORD_ALLOW)).expect("loads");
+        cfg.validate().expect("warnings never fail validation");
+        let mut out = Vec::new();
+        assert!(report_checks(&cfg.checks(), &mut out).expect("report"));
+        let report = String::from_utf8(out).expect("utf-8");
+        let warns: Vec<_> = report
+            .lines()
+            .filter(|line| line.starts_with("WARN discord.allow:"))
+            .collect();
+        assert_eq!(warns.len(), 2, "{report}");
+        assert!(warns[0].contains(W_ALLOWLIST) && warns[0].contains("333"));
+        assert!(warns[0].contains("user") && warns[0].contains("chat"));
+        assert!(warns[1].contains("444") && warns[1].contains("bot"));
+        assert!(report.contains("OK   discord.max_bot_replies: 30 "));
+
+        let owner_only = fx.load(&fx.valid_toml()).expect("loads");
+        let names: Vec<_> = owner_only.checks().iter().map(|c| c.name).collect();
+        assert!(!names.contains(&"discord.allow"));
     }
 
     #[test]

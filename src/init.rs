@@ -128,6 +128,7 @@ pub fn build_config(answers: &Answers, env: &Env) -> Result<Config, ConfigError>
         owner_id,
         channel_id,
         token_file: env.default_home()?.join("secrets").join(TOKEN_FILE_NAME),
+        access: Default::default(),
     };
     assemble(
         env,
@@ -363,6 +364,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             owner_id: parse_id(&owner_id).expect("validated by ask_id"),
             channel_id: parse_id(&channel_id).expect("validated by ask_id"),
             token_file,
+            access: existing.map(|d| d.access.clone()).unwrap_or_default(),
         };
         Ok((section, vec![token]))
     }
@@ -407,6 +409,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             channel_id,
             bot_token_file,
             app_token_file,
+            access: existing.map(|s| s.access.clone()).unwrap_or_default(),
         };
         Ok((section, vec![bot, app]))
     }
@@ -1083,6 +1086,53 @@ mod tests {
             (slack.owner_id.as_str(), slack.channel_id.as_str()),
             ("U222", "C222")
         );
+    }
+
+    #[test]
+    fn setup_keeps_the_allowlist() {
+        let cases = [
+            (
+                Platform::Discord,
+                "1\n111\n222\nTOKEN_SENTINEL_9f3a\n".to_string(),
+                "\n\n\n",
+                "max_bot_replies = 5\n[[discord.allow]]\nid = 333\nkind = \"bot\"\n",
+            ),
+            (
+                Platform::Slack,
+                format!("2\nU111\nC222\n{BOT}\n{APP}\n"),
+                "\n\n\n\n",
+                "max_bot_replies = 5\n[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
+            ),
+        ];
+        for (platform, init, setup, allow) in cases {
+            let fx = Fixture::new();
+            let init = format!("{init}{}\n\n", fx.omp.display());
+            assert!(fx.run(&init).0.is_ok(), "{platform:?} init");
+            let text = fs::read_to_string(fx.config_path()).expect("config");
+            let text = text.replace(
+                "access_mode = \"owner_only\"",
+                "access_mode = \"allowlist\"",
+            );
+            fs::write(fx.config_path(), format!("{text}{allow}")).expect("allowlist config");
+            let before = Config::load(&fx.config_path(), &fx.env).expect("loads");
+            assert_eq!(before.access_mode, AccessMode::Allowlist, "{platform:?}");
+            let (result, _) = fx.setup(platform, setup);
+            assert!(result.is_ok(), "{platform:?} setup");
+            let after = Config::load(&fx.config_path(), &fx.env).expect("reloads");
+            assert_eq!(after.access_mode, AccessMode::Allowlist, "{platform:?}");
+            match platform {
+                Platform::Discord => {
+                    let access = &after.discord.as_ref().expect("discord").access;
+                    assert_eq!(access, &before.discord.as_ref().expect("discord").access);
+                    assert_eq!(access.allow.len(), 1);
+                }
+                Platform::Slack => {
+                    let access = &after.slack.as_ref().expect("slack").access;
+                    assert_eq!(access, &before.slack.as_ref().expect("slack").access);
+                    assert_eq!(access.allow.len(), 1);
+                }
+            }
+        }
     }
 
     impl Fixture {

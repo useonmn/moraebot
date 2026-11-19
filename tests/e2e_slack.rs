@@ -171,6 +171,7 @@ impl Rig {
                 channel_id: CHANNEL.into(),
                 bot_token_file: home.join("secrets").join("slack-bot.token"),
                 app_token_file: home.join("secrets").join("slack-app.token"),
+                access: Default::default(),
             }),
             omp: OmpConfig::default(),
         };

@@ -9,7 +9,7 @@ This is slice 3. It adds files: you can attach files to a message, and omp can s
 - Discord or Slack, one at a time. Other messengers come later.
 - Apple Silicon macOS. It runs as a per-user LaunchAgent.
 - Linux x86_64 or aarch64 with glibc 2.35 or newer and OpenSSL 3. It runs as a systemd user service.
-- One owner. Only you can talk to the bot (`access_mode = "owner_only"`).
+- One owner. Only you can talk to the bot (`access_mode = "owner_only"`, the default). An allowlist for other people and bots is on the way; see [Access](#access).
 - One task at a time. Messages wait in a queue and run in order.
 
 ## Read this first: yolo mode
@@ -18,7 +18,7 @@ This is slice 3. It adds files: you can attach files to a message, and omp can s
 >
 > moraebot runs omp without asking for approval. Anyone who can talk to the bot can run commands on this Mac, with your user's permissions.
 >
-> - Keep `access_mode = "owner_only"`. It's the default and the only mode for now.
+> - Keep `access_mode = "owner_only"` unless you need the allowlist. It's the default.
 > - Use a private channel that only you can see.
 > - Turn on two-factor login for your Discord or Slack account. That account is now a key to your Mac.
 > - The work folder is not a sandbox. omp can read and change files outside it.
@@ -158,7 +158,7 @@ messenger = "discord"
 work_dir = "~/moraebot-work"
 # Absolute path to omp.
 omp_path = "<PATH_TO_OMP>"
-# Only owner_only exists for now.
+# "owner_only" (default) or "allowlist". See Access below.
 access_mode = "owner_only"
 
 [discord]
@@ -186,6 +186,42 @@ token_file = "~/.moraebot/secrets/discord.token"
 ```
 
 Configs written by slice 1 (top-level `owner_id` and `token_file`, no `messenger` line) still load as Discord. You don't need to rewrite them.
+
+### Access
+
+There are two access modes:
+
+- `owner_only` (the default): only `owner_id` can talk to the bot. Every config without an `access_mode` line works this way, exactly as before.
+- `allowlist`: the owner, plus the people and bots you list under the active messenger.
+
+```toml
+access_mode = "allowlist"
+
+[slack]
+owner_id = "<YOUR_SLACK_MEMBER_ID>"
+# ...channel_id and token files as above...
+# Optional. At most this many replies to bot messages per thread in any 10 minutes.
+# Leave it out for no limit.
+max_bot_replies = 30
+
+[[slack.allow]]
+id = "<THEIR_MEMBER_ID>"   # Discord: a number, as for owner_id
+kind = "user"              # "user" or "bot"
+role = "chat"              # only "chat" exists; it's also the default
+```
+
+Rules, checked when the config loads:
+
+- `allow` and `max_bot_replies` need `access_mode = "allowlist"`. With `owner_only` they are an error, so a list never looks active when it isn't.
+- Each entry needs an `id` in the messenger's format (Slack `U...` or `W...`, and for a bot also its `B...` bot id; Discord a non-zero number) and a `kind`. An unknown `kind` or `role`, a duplicate id, or the owner's own id is an error.
+- `max_bot_replies` must be greater than zero.
+- Older moraebot versions reject a config with these keys.
+
+`moraebot check-config` prints a `WARN` line for every listed id with its kind and role, so you can see who else can reach the bot.
+
+The `chat` role is for conversation only. A chat sender gets answers from a separate omp with no tools, never from the lead that works on your machine, and can't stop or close lanes. Chat senders may attach files. Bots in the list should not talk to each other forever: `max_bot_replies` is the hard limit, and the lead is also told to wind down endless bot-to-bot exchanges.
+
+> **Status:** this release reads and checks the allowlist but doesn't act on it yet. Only the owner can talk to the bot until the following releases add the chat role and the bot reply limit.
 
 Set `MORAEBOT_HOME` if you want moraebot's home somewhere other than `~/.moraebot`.
 

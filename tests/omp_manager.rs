@@ -44,6 +44,7 @@ impl Harness {
                 owner_id: 111,
                 channel_id: 222,
                 token_file: home.join("secrets").join("discord.token"),
+                access: Default::default(),
             }),
             slack: None,
             omp,
