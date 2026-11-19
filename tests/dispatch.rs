@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -188,23 +189,11 @@ impl Harness {
             .collect()
     }
 
-    /// Every prompt frame, its `message` turned into the body: the frame must start with a
-    /// moraebot tag line, which is dropped.
+    /// Every prompt frame, its `message` turned into the body (see [`prompt_frame`]).
     fn prompts(&self) -> Vec<Value> {
         self.log_lines()
             .iter()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|f| f["type"] == "prompt")
-            .map(|mut frame| {
-                let message = frame["message"].as_str().expect("prompt message");
-                assert!(
-                    lead::parse_tag(message).is_some(),
-                    "prompt starts with a moraebot tag"
-                );
-                let body = message.split_once('\n').map_or("", |(_, body)| body);
-                frame["message"] = Value::String(body.to_owned());
-                frame
-            })
+            .filter_map(|l| prompt_frame(l))
             .collect()
     }
 
@@ -1855,6 +1844,90 @@ impl Harness {
     }
 }
 
+/// The prompt frame on a fake-omp log line, its `message` turned into the body: the frame
+/// must start with a moraebot tag line, which is dropped.
+fn prompt_frame(line: &str) -> Option<Value> {
+    let mut frame = serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(|f| f["type"] == "prompt")?;
+    let message = frame["message"].as_str().expect("prompt message");
+    assert!(
+        lead::parse_tag(message).is_some(),
+        "prompt starts with a moraebot tag"
+    );
+    let body = message.split_once('\n').map_or("", |(_, body)| body);
+    frame["message"] = Value::String(body.to_owned());
+    Some(frame)
+}
+
+/// Streams the lines fake-omp appends to `FAKE_OMP_LOG`. The log is a FIFO that the tap
+/// holds open for reading and writing, so a test waits for a line instead of polling.
+struct LogTap {
+    path: PathBuf,
+    lines: mpsc::UnboundedReceiver<String>,
+}
+
+impl LogTap {
+    /// Makes `path` a FIFO; create it before the first fake-omp child starts.
+    fn create(path: &Path) -> Self {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open fifo");
+        let (tx, lines) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(fifo).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            path: path.to_owned(),
+            lines,
+        }
+    }
+
+    async fn next_line(&mut self) -> String {
+        bounded(self.lines.recv()).await.expect("log tap open")
+    }
+
+    /// Waits for the next prompt frame (see [`prompt_frame`]).
+    async fn next_prompt(&mut self) -> Value {
+        loop {
+            if let Some(frame) = prompt_frame(&self.next_line().await) {
+                return frame;
+            }
+        }
+    }
+
+    /// The prompt frames not read yet. Call it once no fake-omp child is left: the end
+    /// marker written here reaches the tap after every line written before it.
+    async fn rest_prompts(&mut self) -> Vec<Value> {
+        const END: &str = "TAP_END";
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|mut fifo| fifo.write_all(format!("{END}\n").as_bytes()))
+            .expect("write the end marker");
+        let mut prompts = Vec::new();
+        loop {
+            let line = self.next_line().await;
+            if line == END {
+                return prompts;
+            }
+            prompts.extend(prompt_frame(&line));
+        }
+    }
+}
+
 fn behavior(frame: &Value) -> &str {
     frame["streamingBehavior"].as_str().unwrap_or_default()
 }
@@ -2207,16 +2280,23 @@ async fn group_needs_check_marks_every_member() {
 async fn second_same_conversation_message_waits_for_next_turn() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open_steer(dir.path(), "hold");
+    let mut tap = LogTap::create(&dir.path().join("fake-omp.log"));
     let a = queued(
         h.handle(in_thread("1300000000000000960", THREAD_A, "A"))
             .await,
     );
     let step = h.spawn_step();
     h.wait_turn(&h.row(a).conversation_key).await;
+    assert_eq!(tap.next_prompt().await["message"], "A");
     let b = steered(
         h.handle(in_thread("1300000000000000961", THREAD_A, "B"))
             .await,
     );
+    // `try_steer` only queues B's frame for the lead's worker thread: wait until fake-omp
+    // read it, or the shutdown below may kill the child before the frame is written.
+    let b_frame = tap.next_prompt().await;
+    assert_eq!(b_frame["message"], "B");
+    assert_eq!(behavior(&b_frame), "steer");
     let c = queued(
         h.handle(in_thread("1300000000000000962", THREAD_A, "C"))
             .await,
@@ -2238,7 +2318,9 @@ async fn second_same_conversation_message_waits_for_next_turn() {
         h.sends(),
         [(THREAD_A.to_owned(), notice_text(N_INTERRUPTED).to_owned())]
     );
-    assert_eq!(h.prompts().len(), 2, "A and B's steer only");
+    // The shutdown reaped the child, so the tap holds every frame it read.
+    let rest = tap.rest_prompts().await;
+    assert!(rest.is_empty(), "A and B's steer only: {rest:?}");
     h.close().await;
 }
 
