@@ -15,6 +15,11 @@
 //! newer message of the same conversation can be steered into it (`try_steer`).
 //! Message text reaches omp only as a JSON line on the child's stdin, never as an
 //! argument or through a shell.
+//!
+//! While a lead turn runs, its omp agent events are counted in a `LeadWatch`; on each lane
+//! watchdog tick `lead_stalled` reports a turn with no event for `omp.stall_after_minutes`
+//! once per stretch, and the dispatcher posts one notice in its conversation. moraebot never
+//! stops a turn for it.
 
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
@@ -23,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omp_rpc::{
     Client, ClientOptions, Error as RpcError, Event, GetSessionLeaseCommand, HostTool,
@@ -62,6 +67,9 @@ pub const E_COST_CAP: &str = "E_COST_CAP";
 pub const E_TURN_TIMEOUT: &str = "E_TURN_TIMEOUT";
 /// The child went away (or its transport broke) during the turn.
 pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
+/// Warn log code: a running lead or lane turn showed no progress for `omp.stall_after_minutes`.
+/// Only a notice follows; the turn keeps running.
+pub const W_TURN_STALLED: &str = "W_TURN_STALLED";
 
 /// How the pinned `omp_rpc` client reports a `prompt_result` it could not decode. omp's
 /// typed `error.code` accepts only `cost_cap`, so a turn that ended with any other error
@@ -574,6 +582,64 @@ fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, e
     }
 }
 
+/// Progress of the running lead turn, for the stall notice. The lead's event callback only
+/// counts agent events (any of them is progress); `stalled`, called with each watchdog tick's
+/// time, keeps the times, like a lane's `Activity`.
+#[derive(Default)]
+struct LeadWatch {
+    /// The running turn's conversation; `None` between turns.
+    key: Option<String>,
+    events: u64,
+    /// The event count as of the last check that saw it change, and when.
+    seen: Option<(u64, Instant)>,
+    /// The current stretch without progress was already reported.
+    reported: bool,
+}
+
+impl LeadWatch {
+    fn begin(&mut self, key: &str) {
+        self.key = Some(key.to_owned());
+        self.seen = None;
+        self.reported = false;
+    }
+
+    fn end(&mut self) {
+        self.key = None;
+        self.seen = None;
+    }
+
+    fn note(&mut self, event: &Event) {
+        if matches!(
+            event,
+            Event::Notification(RpcNotification::RpcAgentEvent(_))
+        ) {
+            self.events += 1;
+        }
+    }
+
+    /// The running turn's conversation when it showed no agent event for `after`, once per
+    /// stretch: new progress starts a new one. The first check of a turn only starts the clock.
+    fn stalled(&mut self, now: Instant, after: Duration) -> Option<String> {
+        self.key.as_ref()?;
+        let events = self.events;
+        let Some((seen, since)) = self.seen.as_mut() else {
+            self.seen = Some((events, now));
+            return None;
+        };
+        if *seen != events {
+            *seen = events;
+            *since = now;
+            self.reported = false;
+            return None;
+        }
+        if self.reported || now.saturating_duration_since(*since) < after {
+            return None;
+        }
+        self.reported = true;
+        self.key.clone()
+    }
+}
+
 /// The lead child and the thread that owns its client.
 struct Live {
     requests: mpsc::Sender<PromptRequest>,
@@ -621,6 +687,9 @@ pub struct OmpManager {
     config: Config,
     store: Arc<Mutex<Store>>,
     turn_timeout: Duration,
+    /// How long a lead turn may show no progress before `lead_stalled` reports it.
+    stall_after: Duration,
+    lead_watch: Arc<Mutex<LeadWatch>>,
     extra_env: Vec<(OsString, OsString)>,
     hints: String,
     host_tools: Vec<HostTool>,
@@ -655,9 +724,11 @@ impl OmpManager {
             turn_timeout,
         ));
         Self {
+            stall_after: config.omp.stall_after(),
             config,
             store,
             turn_timeout,
+            lead_watch: Default::default(),
             extra_env: Vec::new(),
             hints: String::new(),
             host_tools: Vec::new(),
@@ -751,6 +822,29 @@ impl OmpManager {
         &self.lanes
     }
 
+    /// How long a running turn may show no progress before its stall notice.
+    pub fn stall_after(&self) -> Duration {
+        self.stall_after
+    }
+
+    /// One stall check of the running lead turn at watchdog tick time `now`: its conversation
+    /// key when the lead sent no agent event for [`Self::stall_after`], once per stretch (new
+    /// progress, or a new turn, starts a new one). Logs [`W_TURN_STALLED`]. The turn is never
+    /// stopped. Off when the turn limit is `stall_after` or less: the limit ends the turn first.
+    pub fn lead_stalled(&self, now: Instant) -> Option<String> {
+        if self.turn_timeout <= self.stall_after {
+            return None;
+        }
+        let key = lock(&self.lead_watch).stalled(now, self.stall_after)?;
+        tracing::warn!(
+            code = W_TURN_STALLED,
+            conversation = %key,
+            minutes = self.stall_after.as_secs() / 60,
+            "lead turn looks stalled"
+        );
+        Some(key)
+    }
+
     /// The chat role's runtime: tool-less children, never the lead.
     pub fn chat(&self) -> Arc<ChatManager> {
         Arc::clone(&self.chat)
@@ -800,6 +894,7 @@ impl OmpManager {
             conversation_key: key.to_owned(),
             sender,
         });
+        lock(&self.lead_watch).begin(key);
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text: text.to_owned(),
@@ -880,6 +975,7 @@ impl OmpManager {
             current.settled = settled;
         }
         *lock(&self.turn) = None;
+        lock(&self.lead_watch).end();
         self.running.send_replace(None);
         GroupReport {
             main: report(key, main, files),
@@ -985,6 +1081,7 @@ impl OmpManager {
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
+        let lead_watch = Arc::clone(&self.lead_watch);
         let worker = std::thread::Builder::new()
             .name("omp-lead".to_owned())
             .spawn(move || {
@@ -998,7 +1095,11 @@ impl OmpManager {
                         *lock(&lead_kill) = Some(group);
                         true
                     },
-                    move |event| note_agent_start(&gate, &running, event),
+                    move |event| {
+                        // Counted first: whoever sees the turn start also sees its progress.
+                        lock(&lead_watch).note(event);
+                        note_agent_start(&gate, &running, event);
+                    },
                 );
                 match opened {
                     Err(outcome) => {
@@ -1133,7 +1234,146 @@ fn log_event(name: &str, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omp_rpc::{PromptError, PromptResultEvent};
+    use crate::config::DEFAULT_STALL_AFTER as AFTER;
+    use omp_rpc::{AgentStartEvent, PromptError, PromptResultEvent};
+
+    const TICK: Duration = Duration::from_secs(30);
+
+    fn agent_event() -> Event {
+        Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(
+            AgentStartEvent {
+                resumed_tool_call_ids: None,
+            },
+        )))
+    }
+
+    #[test]
+    fn lead_watch_reports_a_quiet_turn_once_per_stretch() {
+        let base = Instant::now();
+        let mut w = LeadWatch::default();
+        assert_eq!(
+            w.stalled(base + 2 * AFTER, AFTER),
+            None,
+            "no turn, no stall"
+        );
+        w.begin("discord:th:1");
+        w.note(&agent_event());
+        assert_eq!(
+            w.stalled(base, AFTER),
+            None,
+            "the first check starts the clock"
+        );
+        assert_eq!(w.stalled(base + AFTER - TICK, AFTER), None);
+        assert_eq!(
+            w.stalled(base + AFTER, AFTER).as_deref(),
+            Some("discord:th:1")
+        );
+        assert_eq!(
+            w.stalled(base + 2 * AFTER, AFTER),
+            None,
+            "one notice per stretch"
+        );
+        assert_eq!(w.stalled(base + 9 * AFTER, AFTER), None);
+    }
+
+    #[test]
+    fn lead_watch_progress_starts_a_new_stretch() {
+        let base = Instant::now();
+        let mut w = LeadWatch::default();
+        w.begin("discord:th:1");
+        assert_eq!(w.stalled(base, AFTER), None);
+        // Progress just before the limit moves the clock.
+        w.note(&agent_event());
+        assert_eq!(w.stalled(base + AFTER - TICK, AFTER), None);
+        assert_eq!(w.stalled(base + AFTER, AFTER), None);
+        assert!(w.stalled(base + 2 * AFTER - TICK, AFTER).is_some());
+        // Progress after a notice re-arms it for the next stall.
+        w.note(&agent_event());
+        assert_eq!(w.stalled(base + 2 * AFTER, AFTER), None);
+        assert_eq!(w.stalled(base + 3 * AFTER - TICK, AFTER), None);
+        assert!(w.stalled(base + 3 * AFTER, AFTER).is_some());
+        // Frames that are not agent events are not progress.
+        w.note(&Event::Undecodable {
+            raw: serde_json::json!({}),
+            error: "qa".into(),
+        });
+        assert_eq!(w.stalled(base + 4 * AFTER, AFTER), None);
+    }
+
+    fn manager_with(turn_timeout_minutes: Option<u64>) -> (tempfile::TempDir, OmpManager) {
+        use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&work_dir).expect("work dir");
+        let config = Config {
+            messenger: Platform::Discord,
+            work_dir,
+            omp_path: PathBuf::from("/qa/omp"),
+            home: home.clone(),
+            access_mode: AccessMode::OwnerOnly,
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("discord.token"),
+                access: Default::default(),
+            }),
+            slack: None,
+            omp: OmpConfig {
+                turn_timeout_minutes,
+                ..OmpConfig::default()
+            },
+        };
+        let store = Store::open(&home.join("inbox.sqlite")).expect("store");
+        let manager = OmpManager::new(config, Arc::new(Mutex::new(store)));
+        (dir, manager)
+    }
+
+    #[test]
+    fn turns_have_no_time_limit_when_left_out() {
+        let (_dir, manager) = manager_with(None);
+        assert_eq!(manager.turn_timeout, UNLIMITED);
+        assert_eq!(manager.lanes().turn_timeout, UNLIMITED);
+        assert_eq!(manager.chat().turn_timeout, UNLIMITED);
+        assert_eq!(manager.stall_after(), AFTER);
+    }
+
+    #[test]
+    fn configured_turn_limit_caps_lead_lanes_and_chat() {
+        let (_dir, manager) = manager_with(Some(5));
+        let five = Duration::from_secs(5 * 60);
+        assert_eq!(manager.turn_timeout, five);
+        assert_eq!(manager.lanes().turn_timeout, five);
+        assert_eq!(manager.chat().turn_timeout, five);
+        // A limit at or below the stall time ends the turn first: no stall check.
+        lock(&manager.lead_watch).begin("discord:th:1");
+        let base = Instant::now();
+        assert_eq!(manager.lead_stalled(base), None);
+        assert_eq!(manager.lead_stalled(base + 2 * AFTER), None);
+    }
+
+    #[test]
+    fn lead_watch_starts_over_for_each_turn() {
+        let base = Instant::now();
+        let mut w = LeadWatch::default();
+        w.begin("discord:th:1");
+        assert_eq!(w.stalled(base, AFTER), None);
+        assert!(w.stalled(base + AFTER, AFTER).is_some());
+        w.end();
+        assert_eq!(
+            w.stalled(base + 2 * AFTER, AFTER),
+            None,
+            "idle between turns"
+        );
+        w.begin("discord:th:2");
+        assert_eq!(w.stalled(base + 2 * AFTER, AFTER), None);
+        assert_eq!(
+            w.stalled(base + 3 * AFTER, AFTER).as_deref(),
+            Some("discord:th:2")
+        );
+    }
 
     fn turn(
         status: Option<PromptStatus>,

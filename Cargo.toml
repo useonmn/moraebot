@@ -21,6 +21,8 @@ path = "tests/bin/fake_omp.rs"
 
 [dependencies]
 serenity = "0.12.5"
+# serenity's own reqwest version: its REST client is built here with timeouts (see discord.rs).
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 toml = "1.2"
 serde = { version = "1", features = ["derive"] }

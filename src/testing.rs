@@ -886,6 +886,22 @@ impl SlackTransport for FakeSlackTransport {
     }
 }
 
+/// Starts a loopback HTTP server that accepts every connection and never answers; returns
+/// its `http://` base URL. The server lives as long as the runtime.
+pub async fn silent_http_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("http://{addr}/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

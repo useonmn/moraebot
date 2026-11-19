@@ -20,13 +20,13 @@ use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
-use crate::omp::OmpManager;
+use crate::omp::{OmpManager, lock};
 use crate::onboarding;
 use crate::store::{Store, StoreError};
 
 /// File name of the inbox database inside the home folder.
 pub const STORE_FILE: &str = "inbox.sqlite";
-/// The dispatcher task panicked or was cancelled.
+/// The dispatcher task, or one of its background tasks, panicked, ended or was cancelled.
 pub const E_GATEWAY_TASK: &str = "E_GATEWAY_TASK";
 /// The process could not listen for termination signals.
 pub const E_GATEWAY_SIGNAL: &str = "E_GATEWAY_SIGNAL";
@@ -46,6 +46,8 @@ pub enum GatewayError {
     Config(#[from] ConfigError),
     #[error("{E_GATEWAY_TASK}: dispatcher task failed: {0}")]
     Task(JoinError),
+    #[error("{E_GATEWAY_TASK}: the {0} task stopped")]
+    TaskEnded(&'static str),
     #[error("{E_GATEWAY_SIGNAL}: cannot listen for signals: {0}")]
     Signal(std::io::Error),
     #[error("{E_SHUTDOWN_TIMEOUT}: the gateway did not stop in time")]
@@ -58,7 +60,7 @@ impl GatewayError {
             Self::Store(err) => err.code(),
             Self::Adapter(err) => err.code,
             Self::Config(err) => err.code,
-            Self::Task(_) => E_GATEWAY_TASK,
+            Self::Task(_) | Self::TaskEnded(_) => E_GATEWAY_TASK,
             Self::Signal(_) => E_GATEWAY_SIGNAL,
             Self::ShutdownTimeout => E_SHUTDOWN_TIMEOUT,
         }
@@ -147,10 +149,7 @@ impl Gateway {
         };
         // A turn that was cut off is still `processing` and a stopped lane `running`:
         // make them `needs_check`.
-        store
-            .lock()
-            .expect("store mutex poisoned")
-            .recover_on_start()?;
+        lock(&store).recover_on_start()?;
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())

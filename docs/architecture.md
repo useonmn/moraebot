@@ -546,7 +546,7 @@ moraebot은 `git fetch`도 `git push`도 하지 않습니다. 컴퓨터에 있�
 | `N_LANE_RETRYING` | 20분 동안 조용하고, 마지막 이벤트가 `AutoRetryStart`(모델 서비스 실패 뒤 재시도) |
 | `N_LANE_SPINNING` | 이벤트는 오는데 20분 동안 새 도구 호출이 없음 |
 
-**주기와 기준.** 30초마다(`WATCH_TICK`) 돌고 있는 lane을 하나씩 보고, 기준은 20분(`STALL_AFTER`)입니다. 둘 다 상수이고 설정 항목은 없습니다. 숫자는 dori에서 왔습니다. dori의 `watch`도 30초마다 돌고, 멈춤(hung)과 오래됨(stale) 기준이 둘 다 20분이며, dori도 lane을 죽이지 않습니다. 첫 점검은 시계를 시작하기만 하고, 그 뒤 점검에서 숫자가 바뀌었으면 그때 시각을 적습니다.
+**주기와 기준.** 30초마다(`WATCH_TICK`) 돌고 있는 lane을 하나씩 보고, 기준은 `omp.stall_after_minutes`(`OmpConfig::stall_after`, 빠지면 20분 `DEFAULT_STALL_AFTER`, 0은 거부)입니다. 주기는 상수입니다. 숫자는 dori에서 왔습니다. dori의 `watch`도 30초마다 돌고, 멈춤(hung)과 오래됨(stale) 기준이 둘 다 20분이며, dori도 lane을 죽이지 않습니다. 첫 점검은 시계를 시작하기만 하고, 그 뒤 점검에서 숫자가 바뀌었으면 그때 시각을 적습니다.
 
 **멈춤 한 번에 알림 한 번.** 알린 뒤에는 새 도구 호출이 생겨 그 멈춤이 끝날 때까지 다시 알리지 않습니다. 같은 lane이 다시 20분 멈추면 새 멈춤으로 보고 다시 한 번 알립니다. 알림은 나중에 지우지 않으므로 lead는 "멈춘 것 같다" 다음에 결과를 차례로 읽습니다.
 
@@ -558,9 +558,11 @@ moraebot은 `git fetch`도 `git push`도 하지 않습니다. 컴퓨터에 있�
 The lane is still running and moraebot does not stop it; its result comes later as its own input.
 ```
 
-`lead::parse_tag`가 `stalled`와 `reason=`을 읽고, lead의 기본 역할 글이 이 태그와 세 코드를 설명합니다. 도구 인자, 경로, lane이 쓴 글, lane의 일 내용은 넣지 않습니다. 비밀이 들어 있을 수 있기 때문입니다. 알림을 쓰면 로그에 `lane looks stalled` 한 줄(lane id, 순번, 코드, 멈춤 번호)을 남깁니다.
+`lead::parse_tag`가 `stalled`와 `reason=`을 읽고, lead의 기본 역할 글이 이 태그와 세 코드를 설명합니다. 도구 인자, 경로, lane이 쓴 글, lane의 일 내용은 넣지 않습니다. 비밀이 들어 있을 수 있기 때문입니다. 알림을 쓰면 로그에 warn 수준 `lane looks stalled` 한 줄(`code=W_TURN_STALLED`, lane id, 순번, 코드, 멈춤 번호)을 남깁니다.
 
-**꺼지는 때.** turn 시간 제한이 20분 이하이면 시간 제한이 먼저 끝내므로 감시하지 않습니다. 게이트웨이가 꺼지는 중일 때, 그리고 돌고 있는 자식이 없는 lane(쉬는 lane, 끝난 lane, 닫힌 lane)도 보지 않습니다. 감시는 lane을 멈추거나 재촉하거나 상태를 바꾸지 않습니다. 멈추기는 lead가 `lane_stop`으로 합니다(3.16절).
+**lead turn 감시.** 같은 tick에서 dispatcher가 `OmpManager::lead_stalled`로 돌고 있는 lead turn도 봅니다. lead 자식의 이벤트 콜백이 agent 이벤트(글 조각, 도구 호출 시작과 끝 등 무엇이든)를 `LeadWatch`에 세고, tick 시각으로 lane과 같은 방식(첫 점검은 시계만 시작, 숫자가 바뀌면 그 시각 기록)으로 판단합니다. 기준 시간 동안 이벤트가 없으면 그 turn의 대화에 `N_TURN_STALLED` 알림("No progress for 20 minutes. The task may be stuck. It keeps running and nothing was stopped.")을 한 번 보내고 로그에 warn `lead turn looks stalled`(`code=W_TURN_STALLED`)를 남깁니다. 새 이벤트가 오거나 새 turn이 시작되면 다시 알릴 수 있습니다. turn은 죽이거나 다시 켜거나 끊지 않습니다.
+
+**꺼지는 때.** turn 시간 제한(`omp.turn_timeout_minutes`, 빠지면 제한 없음)이 기준 시간 이하이면 시간 제한이 먼저 끝내므로 감시하지 않습니다. 게이트웨이가 꺼지는 중일 때, 그리고 돌고 있는 자식이 없는 lane(쉬는 lane, 끝난 lane, 닫힌 lane)도 보지 않습니다. 감시는 lane을 멈추거나 재촉하거나 상태를 바꾸지 않습니다. 멈추기는 lead가 `lane_stop`으로 합니다(3.16절).
 
 **dori와 다른 점.** dori는 터미널 화면과 파일 변경으로 진행을 보고, 15분 조용하면 lane에 재촉 글을 넣습니다. moraebot은 omp의 이벤트 흐름을 읽고 새 도구 호출을 진행으로 세며, L3에서는 재촉하지 않고 lead에게 알리기만 합니다.
 

@@ -22,6 +22,12 @@ pub const E_ADAPTER_DM: &str = "E_ADAPTER_DM";
 /// A message could not be edited (gone, not allowed, network, rate limit, unknown id, or this messenger cannot edit); the caller may post a new one.
 pub const E_ADAPTER_EDIT: &str = "E_ADAPTER_EDIT";
 
+/// A messenger API request (not a file transfer) gives up after this long, so a server that
+/// never answers cannot hold a send or the dispatcher forever.
+pub const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// A messenger API connection attempt gives up after this long.
+pub const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEvent {
     pub message_id: String,

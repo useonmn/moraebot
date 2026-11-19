@@ -13,6 +13,7 @@ use moraebot::adapter::{
     InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
 use moraebot::chat;
+use moraebot::config::DEFAULT_STALL_AFTER;
 use moraebot::config::{
     AccessMode, AllowEntry, Config, DiscordConfig, OmpConfig, Platform, Role, SenderKind,
 };
@@ -21,7 +22,7 @@ use moraebot::dispatch::{
     N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_ONBOARDING_HELLO,
     N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text, reply_messages,
 };
-use moraebot::dispatch::{NEWS_AFTER, news_line};
+use moraebot::dispatch::{NEWS_AFTER, news_line, stalled_text};
 use moraebot::files::{self, OutFile, SavedFile};
 use moraebot::gateway::Gateway;
 use moraebot::hints;
@@ -2741,6 +2742,64 @@ async fn same_conversation_message_is_steered_into_running_turn() {
     assert_eq!(behavior(&prompts[1]), "steer");
     assert_eq!(prompts[1]["message"], "B");
     assert!(!h.step().await, "nothing left to run");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn stalled_lead_turn_gets_one_notice_and_keeps_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // `steer`: the lead starts the turn, then sends nothing until a steer arrives.
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000960", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+
+    let t0 = Instant::now();
+    assert!(
+        !h.dispatcher.post_stall_notice(t0).await,
+        "the first tick starts the clock"
+    );
+    assert!(
+        !h.dispatcher
+            .post_stall_notice(t0 + DEFAULT_STALL_AFTER - WATCH_TICK)
+            .await
+    );
+    assert!(
+        h.dispatcher
+            .post_stall_notice(t0 + DEFAULT_STALL_AFTER)
+            .await
+    );
+    assert!(
+        !h.dispatcher
+            .post_stall_notice(t0 + 3 * DEFAULT_STALL_AFTER)
+            .await,
+        "one notice per stall"
+    );
+    let notice = (THREAD_A.to_owned(), stalled_text(20));
+    assert_eq!(h.sends(), std::slice::from_ref(&notice));
+    assert!(!step.is_finished(), "the stalled turn is still running");
+
+    // Nothing was killed: the lead answers once the steer arrives and the turn completes.
+    steered(
+        h.handle(in_thread("1300000000000000961", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    assert_eq!(
+        h.sends(),
+        [notice, (THREAD_A.to_owned(), "echo: A + B".to_owned())]
+    );
+    assert_eq!(h.row(a).state, State::Done);
+    assert_eq!(h.starts(), 1, "the lead child was never restarted");
+    assert!(
+        !h.dispatcher
+            .post_stall_notice(t0 + 5 * DEFAULT_STALL_AFTER)
+            .await,
+        "no turn, no notice"
+    );
     h.close().await;
 }
 
