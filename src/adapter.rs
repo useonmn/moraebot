@@ -136,9 +136,10 @@ pub trait MessengerAdapter: Send + Sync {
         })
     }
 
-    /// Downloads `attachment` into `dest` with no size limit and returns the bytes written.
-    /// Calls `progress.record(n)` after every chunk written so the core's stall watchdog
-    /// sees the download moving. Must not follow redirects. Messengers without file
+    /// Downloads `attachment` into `dest` and returns the bytes written. Calls
+    /// `progress.check_limit(total)` before and `progress.record(n)` after every chunk
+    /// written, so a download over the core's limit stops (leaving no file) and the
+    /// stall watchdog sees it moving. Must not follow redirects. Messengers without file
     /// support keep this default.
     async fn fetch_attachment(
         &self,

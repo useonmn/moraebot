@@ -18,8 +18,9 @@
 //!
 //! Attachments from a chat sender are delivered with the prompt only: images as prompt
 //! images, small text files inline, anything else by name. A file over its kind's limit
-//! ([`MAX_IMAGE_BYTES`], [`MAX_INLINE_TEXT_BYTES`]) by its declared size is not fetched,
-//! and one over it on disk is not read: it is named only. The rest are fetched into
+//! ([`MAX_IMAGE_BYTES`], [`MAX_INLINE_TEXT_BYTES`]) by its declared size is not fetched
+//! and is named only; a download that streams past the limit anyway is stopped and
+//! deleted, and the sender gets the file notice. The rest are fetched into
 //! `<home>/chat/<conversation>/files/` and removed after the turn; nothing goes into the
 //! owner's work folder.
 //!
@@ -298,6 +299,16 @@ impl ChatManager {
         true
     }
 
+    /// Forgets `message_id` again, so a redelivery of a message that was never run (its
+    /// thread could not be opened) is run then.
+    pub fn forget_delivery(&self, message_id: &str) {
+        let mut recent = lock(&self.recent);
+        let (order, seen) = &mut *recent;
+        if seen.remove(message_id) {
+            order.retain(|id| id != message_id);
+        }
+    }
+
     /// Conversations with a chat turn running or waiting.
     pub fn open_conversations(&self) -> usize {
         lock(&self.conversations).len()
@@ -333,7 +344,7 @@ impl ChatManager {
             turn
         };
         let cwd = chat_turn_cwd(&self.config, turn);
-        let outcome = match self.prepare(key, &cwd) {
+        let outcome = match self.prepare(turn, key, &cwd) {
             Ok((command, previous_session)) => {
                 let (message, images) = chat_prompt(text, files);
                 self.spawn_turn(turn, key, command, previous_session, message, images)
@@ -358,16 +369,26 @@ impl ChatManager {
     }
 
     /// The child command and the conversation's previous session id. The turn's working
-    /// folder `cwd` is made empty and the overlay is written again before every start.
+    /// folder `cwd` is made empty and the overlay is written again before every start,
+    /// through a per-turn temp file renamed over it, so a child starting meanwhile never
+    /// reads a partial overlay.
     fn prepare(
         &self,
+        turn: u64,
         key: &str,
         cwd: &Path,
     ) -> Result<(std::process::Command, Option<String>), Outcome> {
         let spawn_failed = |e: std::io::Error| failed(E_OMP_SPAWN, e);
         remove_files(cwd);
         private_dir(cwd).map_err(spawn_failed)?;
-        std::fs::write(chat_overlay_path(&self.config), CHAT_OVERLAY).map_err(spawn_failed)?;
+        let overlay = chat_overlay_path(&self.config);
+        let temp = overlay.with_extension(format!("yml.{turn}"));
+        std::fs::write(&temp, CHAT_OVERLAY)
+            .and_then(|()| std::fs::rename(&temp, &overlay))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp);
+                spawn_failed(e)
+            })?;
         private_dir(&chat_session_dir(&self.config, key)).map_err(spawn_failed)?;
         let previous = lock(&self.store)
             .session_id(&chat_session_name(key))

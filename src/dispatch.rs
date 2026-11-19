@@ -511,6 +511,7 @@ impl Dispatcher {
                 .await
         {
             tracing::warn!(message_id = %event.message_id, code = err.code, "chat thread not opened");
+            chat.forget_delivery(&event.message_id);
             self.notify(&event.channel_id, N_THREAD_FAILED).await;
             return Handled::Notice(N_THREAD_FAILED);
         }
@@ -1329,7 +1330,8 @@ impl ChatTurn {
 
     /// Saves every attachment within its [`chat::size_limit`] (by declared size) under
     /// `dir` (0700 levels) under the stall watchdog, reads it back and removes `dir`.
-    /// Larger ones are not fetched and only named.
+    /// Larger ones are not fetched and only named; a download that streams past the
+    /// limit anyway stops with `E_FILE_TOO_LARGE`.
     async fn fetch(&self, dir: &std::path::Path) -> Result<Vec<ChatFile>, AdapterError> {
         if self.event.attachments.is_empty() {
             return Ok(Vec::new());
@@ -1338,12 +1340,13 @@ impl ChatTurn {
         let mut saved = Vec::with_capacity(self.event.attachments.len());
         for (index, attachment) in self.event.attachments.iter().enumerate() {
             let name = files::sanitize_name(&attachment.name, index + 1);
-            if attachment.size > chat::size_limit(attachment.mime.as_deref()) {
+            let limit = chat::size_limit(attachment.mime.as_deref());
+            if attachment.size > limit {
                 saved.push((name, attachment.mime.clone(), attachment.size, None));
                 continue;
             }
             let path = dir.join(&name);
-            let progress = files::Progress::new();
+            let progress = files::Progress::with_limit(limit);
             files::with_stall_timeout(
                 self.adapter.fetch_attachment(attachment, &path, &progress),
                 &progress,

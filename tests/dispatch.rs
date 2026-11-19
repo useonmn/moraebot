@@ -151,23 +151,20 @@ impl Harness {
         mode: &str,
         extra_env: Vec<(&'static str, String)>,
     ) -> Self {
-        let mut config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
-        config.access_mode = AccessMode::Allowlist;
-        let discord = config.discord.as_mut().expect("discord section");
-        discord.access.allow = vec![
-            AllowEntry {
-                id: FRIEND.parse().unwrap(),
-                kind: SenderKind::User,
-                role: Role::Chat,
-            },
-            AllowEntry {
-                id: PEER_BOT.parse().unwrap(),
-                kind: SenderKind::Bot,
-                role: Role::Chat,
-            },
-        ];
-        discord.access.max_bot_replies = max_bot_replies;
+        let config = allowlist_config(root, max_bot_replies);
         Self::with_config(root, config, mode, false, extra_env)
+    }
+
+    /// Like [`Self::open_allowlist`], but every `create_thread` call is recorded and then
+    /// fails.
+    fn open_allowlist_failing_threads(root: &Path) -> Self {
+        Self::with_config(
+            root,
+            allowlist_config(root, None),
+            "tools",
+            true,
+            Vec::new(),
+        )
     }
 
     fn with_config(
@@ -347,6 +344,28 @@ impl Harness {
             other => panic!("expected New, got {other:?}"),
         }
     }
+}
+
+/// `access_mode = "allowlist"` with [`FRIEND`] (user) and [`PEER_BOT`] (bot) listed as
+/// chat, and `max_bot_replies`.
+fn allowlist_config(root: &Path, max_bot_replies: Option<u32>) -> Config {
+    let mut config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    config.access_mode = AccessMode::Allowlist;
+    let discord = config.discord.as_mut().expect("discord section");
+    discord.access.allow = vec![
+        AllowEntry {
+            id: FRIEND.parse().unwrap(),
+            kind: SenderKind::User,
+            role: Role::Chat,
+        },
+        AllowEntry {
+            id: PEER_BOT.parse().unwrap(),
+            kind: SenderKind::Bot,
+            role: Role::Chat,
+        },
+    ];
+    discord.access.max_bot_replies = max_bot_replies;
+    config
 }
 
 /// A [`FakeAdapter`] whose `create_thread` is recorded and then fails.
@@ -1123,6 +1142,56 @@ async fn oversized_chat_attachment_is_named_not_fetched() {
         "- 1-big.txt (text/plain, {size} bytes): too large to show"
     )));
     assert_eq!(h.sends().len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_attachment_streaming_past_its_limit_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let served = chat::MAX_INLINE_TEXT_BYTES + 1;
+    h.adapter
+        .set_attachment_bytes("ref-lie", vec![b'a'; served]);
+    let thread = "1300000000000000115";
+    let chat = with_files(
+        event("1300000000000000116", FRIEND, Some(thread), "small file"),
+        vec![attachment("lie.txt", "ref-lie", 5)],
+    );
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+    let fetched = fetches(&h);
+    assert_eq!(
+        fetched.len(),
+        1,
+        "the declared size passed, so it was fetched"
+    );
+    assert!(!fetched[0].exists(), "nothing over the limit stays on disk");
+    assert_eq!(h.starts(), 0, "no chat turn runs on a refused file");
+    assert_eq!(
+        h.sends(),
+        vec![(
+            thread.to_owned(),
+            notice_text(N_FILE_NOT_RECEIVED).to_owned()
+        )]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_message_whose_thread_failed_is_answered_on_redelivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist_failing_threads(dir.path());
+    let post = event("1300000000000000117", FRIEND, None, "hello");
+    assert_eq!(
+        h.handle(post.clone()).await,
+        Handled::Notice(N_THREAD_FAILED)
+    );
+    assert_eq!(
+        h.handle(post).await,
+        Handled::Notice(N_THREAD_FAILED),
+        "the redelivery is tried again, not dropped as a duplicate"
+    );
+    assert_eq!(h.threads_created(), 2);
     h.close().await;
 }
 

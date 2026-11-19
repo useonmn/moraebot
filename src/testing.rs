@@ -329,6 +329,11 @@ impl MessengerAdapter for FakeAdapter {
             let mut file = create_private_file(dest)?;
             let mut total = 0u64;
             while let Some(chunk) = chunks.recv().await {
+                if let Err(err) = progress.check_limit(total + chunk.len() as u64) {
+                    drop(file);
+                    let _ = std::fs::remove_file(dest);
+                    return Err(err);
+                }
                 file.write_all(&chunk).map_err(|e| write_failure(&e))?;
                 progress.record(chunk.len() as u64);
                 total += chunk.len() as u64;
@@ -356,6 +361,7 @@ impl MessengerAdapter for FakeAdapter {
             });
         }
         let bytes = bytes.unwrap_or_default();
+        progress.check_limit(bytes.len() as u64)?;
         create_private_file(dest)?
             .write_all(&bytes)
             .map_err(|e| write_failure(&e))?;

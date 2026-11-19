@@ -44,11 +44,14 @@ pub const E_FILE_INCOMPLETE: &str = "E_FILE_INCOMPLETE";
 pub const E_FILE_DENIED: &str = "E_FILE_DENIED";
 /// An upload call ran past `UPLOAD_TIMEOUT`.
 pub const E_FILE_UPLOAD_TIMEOUT: &str = "E_FILE_UPLOAD_TIMEOUT";
+/// A download streamed more bytes than its [`Progress`] limit allows.
+pub const E_FILE_TOO_LARGE: &str = "E_FILE_TOO_LARGE";
 
 /// Bytes received so far and when the last chunk arrived, for the stall watchdog.
 pub struct Progress {
     bytes: AtomicU64,
     last: Mutex<tokio::time::Instant>,
+    limit: Option<u64>,
 }
 
 impl Progress {
@@ -56,6 +59,28 @@ impl Progress {
         Self {
             bytes: AtomicU64::new(0),
             last: Mutex::new(tokio::time::Instant::now()),
+            limit: None,
+        }
+    }
+
+    /// Like [`Self::new`], but the download must stop before it writes more than `limit`
+    /// bytes (see [`Self::check_limit`]).
+    pub fn with_limit(limit: u64) -> Self {
+        Self {
+            limit: Some(limit),
+            ..Self::new()
+        }
+    }
+
+    /// `E_FILE_TOO_LARGE` when `total` bytes would pass the limit. Adapters call this with
+    /// the running total before writing each chunk.
+    pub fn check_limit(&self, total: u64) -> Result<(), AdapterError> {
+        match self.limit {
+            Some(limit) if total > limit => Err(error(
+                E_FILE_TOO_LARGE,
+                "download is larger than its size limit",
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -210,8 +235,9 @@ pub fn write_error(err: &io::Error) -> AdapterError {
 }
 
 /// Streams `url` into `dest` through `<dest>.part` (0600, created new), recording every
-/// written chunk in `progress`, and renames it to `dest` on success. No size limit and no
-/// timer: the caller wraps this in `with_stall_timeout`. The client must not follow
+/// written chunk in `progress`, and renames it to `dest` on success. Fails with
+/// `E_FILE_TOO_LARGE` (the `.part` file removed) before writing past `progress`'s limit.
+/// No timer: the caller wraps this in `with_stall_timeout`. The client must not follow
 /// redirects; a 3xx is `E_FILE_FETCH` anyway.
 pub async fn fetch_to_file(
     client: &reqwest::Client,
@@ -264,6 +290,7 @@ pub async fn fetch_to_file(
     let streamed = async {
         let mut total = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(|_| fetch_failed())? {
+            progress.check_limit(total + chunk.len() as u64)?;
             file.write_all(&chunk).await.map_err(|e| write_error(&e))?;
             progress.record(chunk.len() as u64);
             total += chunk.len() as u64;
@@ -476,7 +503,15 @@ mod tests {
         dest: &Path,
         reject_html: bool,
     ) -> (Result<u64, AdapterError>, Progress) {
-        let progress = Progress::new();
+        fetch_with(base, dest, reject_html, Progress::new()).await
+    }
+
+    async fn fetch_with(
+        base: &str,
+        dest: &Path,
+        reject_html: bool,
+        progress: Progress,
+    ) -> (Result<u64, AdapterError>, Progress) {
         let r = tokio::time::timeout(
             WAIT,
             fetch_to_file(
@@ -643,6 +678,39 @@ mod tests {
         assert_eq!(r.unwrap(), 18);
         assert_eq!(progress.bytes(), 18);
         assert_eq!(std::fs::read(&dest).unwrap(), b"first-second-third");
+        tokio::time::timeout(WAIT, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_over_the_limit_stops_and_removes_the_part_file() {
+        let (listener, base) = listen().await;
+        let server = serve_once(
+            listener,
+            vec![
+                CHUNKED_HEAD.to_vec(),
+                chunk(b"first-"),
+                chunk(b"second-"),
+                chunk(b"third"),
+                b"0\r\n\r\n".to_vec(),
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("0-over.bin");
+        let (r, progress) = fetch_with(&base, &dest, false, Progress::with_limit(10)).await;
+        assert_eq!(r.unwrap_err().code, E_FILE_TOO_LARGE);
+        assert!(progress.bytes() <= 10, "nothing past the limit was written");
+        assert!(!dest.exists());
+        assert!(!part_of(&dest).exists());
+        tokio::time::timeout(WAIT, server).await.unwrap().unwrap();
+
+        let (listener, base) = listen().await;
+        let server = serve_once(
+            listener,
+            vec![b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nabc".to_vec()],
+        );
+        let exact = dir.path().join("0-exact.bin");
+        let (r, _) = fetch_with(&base, &exact, false, Progress::with_limit(3)).await;
+        assert_eq!(r.unwrap(), 3, "a file of exactly the limit is saved");
         tokio::time::timeout(WAIT, server).await.unwrap().unwrap();
     }
 

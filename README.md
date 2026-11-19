@@ -201,7 +201,7 @@ access_mode = "allowlist"
 owner_id = "<YOUR_SLACK_MEMBER_ID>"
 # ...channel_id and token files as above...
 # Optional. At most this many replies to bot messages per thread in any 10 minutes.
-# Leave it out for no limit.
+# Leave it out for no limit (check-config warns when bots are listed without it).
 max_bot_replies = 30
 
 [[slack.allow]]
