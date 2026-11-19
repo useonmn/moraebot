@@ -74,8 +74,8 @@ pub struct Scope {
     pub owner_id: String,
     pub channel_id: String,
     pub bot_user_id: String,
-    /// User ids of the `allow` list: their DMs are accepted, and so are their messages
-    /// that carry a `bot_id`. The core access check decides the rest.
+    /// Ids of the `allow` list: their DMs are accepted, and so are bot messages whose
+    /// `bot_id` (`B...`) or user id is listed. The core access check decides the rest.
     pub allowed: Vec<String>,
 }
 
@@ -165,15 +165,21 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     {
         return None;
     }
-    let user = event.get("user")?.as_str()?;
-    if user == scope.bot_user_id {
+    let user = event.get("user").and_then(Value::as_str);
+    if user == Some(scope.bot_user_id.as_str()) {
         return None;
     }
-    let listed = scope.allowed.iter().any(|id| id == user);
+    let is_listed = |id: &&str| scope.allowed.iter().any(|allowed| allowed == id);
     let is_bot = event.get("bot_id").is_some();
-    if is_bot && !listed {
-        return None;
-    }
+    // A bot message is known by its listed `bot_id` first (some carry no user id), then
+    // by a listed user id; an unlisted bot is dropped here.
+    let (user, listed) = if is_bot {
+        let bot_id = event.get("bot_id").and_then(Value::as_str);
+        (bot_id.filter(is_listed).or(user.filter(is_listed))?, true)
+    } else {
+        let user = user?;
+        (user, is_listed(&user))
+    };
     let channel = event.get("channel")?.as_str()?;
     let ts = event.get("ts")?.as_str()?;
     let is_dm = event.get("channel_type").and_then(Value::as_str) == Some("im");
@@ -1200,7 +1206,12 @@ mod tests {
             owner_id: "U111".into(),
             channel_id: "C222".into(),
             bot_user_id: "UBOT".into(),
-            allowed: vec!["UPEER".into(), "UFRIEND".into(), "UBOT".into()],
+            allowed: vec![
+                "UPEER".into(),
+                "UFRIEND".into(),
+                "UBOT".into(),
+                "BPEER".into(),
+            ],
         }
     }
 
@@ -1330,6 +1341,18 @@ mod tests {
         let mut unlisted = msg("U999", "C222", "1.2");
         unlisted["bot_id"] = json!("B3");
         assert!(map_event(&payload(unlisted), &scope()).is_none());
+    }
+
+    #[test]
+    fn listed_bot_id_passes_with_its_bot_id() {
+        let mut m = msg("U777", "C222", "1.1");
+        m["bot_id"] = json!("BPEER");
+        let event = map_event(&payload(m.clone()), &scope()).expect("listed bot id passes");
+        assert_eq!(event.author_id, "BPEER");
+        assert!(event.author_is_bot);
+        m.as_object_mut().unwrap().remove("user");
+        let event = map_event(&payload(m), &scope()).expect("no user id needed");
+        assert_eq!(event.author_id, "BPEER");
     }
 
     #[test]
