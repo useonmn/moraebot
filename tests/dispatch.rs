@@ -826,6 +826,9 @@ async fn chat_message_never_reaches_the_lead_or_its_tools() {
         "run-tools lane_stop lane_close",
     );
     assert_eq!(h.handle(chat).await, Handled::Chat);
+    // The two chats are different conversations and run in parallel: wait for the first
+    // reply so the send order below is fixed.
+    h.chats_done().await;
     let mut dm = event("1300000000000000052", FRIEND, None, "run-tools again");
     dm.is_dm = true;
     dm.channel_id = "dm-666".into();
