@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod adapter;
+pub mod chat;
 pub mod config;
 pub mod discord;
 pub mod dispatch;

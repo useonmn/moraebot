@@ -6,7 +6,8 @@
 //! lead's appended system prompt changed, the idle child is closed and started again on
 //! the same session. Its session folder is `<home>/lead/session` and its
 //! omp session id is stored under `lead::LEAD_SESSION`. Lane children are owned by
-//! `lane.rs` and built with the same plumbing (`child_command`, `open_child`).
+//! `lane.rs` and chat children by `chat.rs`, built with the same plumbing
+//! (`child_command`, `open_child`).
 //!
 //! The official `omp_rpc::Client` is blocking, so the lead's client is owned by a
 //! dedicated OS thread that serves each prompt on its own short-lived thread over a
@@ -33,6 +34,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{Notify, oneshot, watch};
 
 use crate::access::Sender;
+use crate::chat::ChatManager;
 use crate::config::Config;
 use crate::files;
 use crate::lane::LaneManager;
@@ -628,6 +630,7 @@ pub struct OmpManager {
     running: Arc<watch::Sender<Option<String>>>,
     turn: Arc<Mutex<Option<TurnContext>>>,
     lanes: Arc<LaneManager>,
+    chat: Arc<ChatManager>,
 }
 
 impl OmpManager {
@@ -646,6 +649,11 @@ impl OmpManager {
             Arc::clone(&turn),
             turn_timeout,
         ));
+        let chat = Arc::new(ChatManager::new(
+            config.clone(),
+            Arc::clone(&store),
+            turn_timeout,
+        ));
         Self {
             config,
             store,
@@ -659,12 +667,17 @@ impl OmpManager {
             running: Arc::new(watch::channel(None).0),
             turn,
             lanes,
+            chat,
         }
     }
 
-    /// Overrides the turn time limit of the lead and every lane (tests use a short one).
+    /// Overrides the turn time limit of the lead, every lane and every chat turn (tests
+    /// use a short one).
     pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
         self.turn_timeout = timeout;
+        Arc::get_mut(&mut self.chat)
+            .expect("chat manager not shared yet")
+            .turn_timeout = timeout;
         // The lane manager is first shared when the lead child starts.
         Arc::get_mut(&mut self.lanes)
             .expect("lane manager not shared yet")
@@ -680,8 +693,8 @@ impl OmpManager {
         self
     }
 
-    /// Extra variables for the lead and every lane child, subject to the same filter as
-    /// the inherited ones.
+    /// Extra variables for the lead, every lane child and every chat child, subject to the
+    /// same filter as the inherited ones.
     pub fn with_extra_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<OsString>,
@@ -694,6 +707,10 @@ impl OmpManager {
         // The lane manager is first shared when the lead child starts.
         Arc::get_mut(&mut self.lanes)
             .expect("lane manager not shared yet")
+            .extra_env
+            .extend(vars.iter().cloned());
+        Arc::get_mut(&mut self.chat)
+            .expect("chat manager not shared yet")
             .extra_env
             .extend(vars.iter().cloned());
         self.extra_env.extend(vars);
@@ -732,6 +749,11 @@ impl OmpManager {
 
     pub fn lanes(&self) -> &LaneManager {
         &self.lanes
+    }
+
+    /// The chat role's runtime: tool-less children, never the lead.
+    pub fn chat(&self) -> Arc<ChatManager> {
+        Arc::clone(&self.chat)
     }
 
     pub async fn child_pid(&self) -> Option<u32> {
@@ -905,10 +927,12 @@ impl OmpManager {
 
     /// Stops the lead child even in the middle of a turn, without waiting for the turn:
     /// the kill makes a running `prompt` report `NeedsCheck(E_CHILD_LOST)` and release
-    /// the child, and whatever is left is aborted. Lanes stop accepting first and every
-    /// lane child is killed too. Rows and lanes are left for the caller to mark.
+    /// the child, and whatever is left is aborted. Lanes and chat turns stop accepting
+    /// first and every lane and chat child is killed too. Rows and lanes are left for the
+    /// caller to mark.
     pub async fn shutdown_all(&self) {
         self.lanes.stop_accepting();
+        self.chat.shutdown_all();
         self.kill_lead();
         self.lanes.shutdown_all().await;
         if let Some(live) = self.live.lock().await.take() {

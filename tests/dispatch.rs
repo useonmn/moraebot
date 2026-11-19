@@ -12,10 +12,10 @@ use moraebot::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_THREAD, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
     InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
+use moraebot::chat;
 use moraebot::config::{
     AccessMode, AllowEntry, Config, DiscordConfig, OmpConfig, Platform, Role, SenderKind,
 };
-use moraebot::dispatch::N_CHAT_UNAVAILABLE;
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
     N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_ONBOARDING_HELLO,
@@ -140,6 +140,16 @@ impl Harness {
     /// `access_mode = "allowlist"` with [`FRIEND`] (user) and [`PEER_BOT`] (bot) listed as
     /// chat, and `max_bot_replies`.
     fn open_allowlist(root: &Path, max_bot_replies: Option<u32>) -> Self {
+        Self::open_allowlist_with(root, max_bot_replies, "tools", Vec::new())
+    }
+
+    /// Like [`Self::open_allowlist`] with fake-omp mode `mode` and `extra_env`.
+    fn open_allowlist_with(
+        root: &Path,
+        max_bot_replies: Option<u32>,
+        mode: &str,
+        extra_env: Vec<(&'static str, String)>,
+    ) -> Self {
         let mut config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
         config.access_mode = AccessMode::Allowlist;
         let discord = config.discord.as_mut().expect("discord section");
@@ -156,7 +166,7 @@ impl Harness {
             },
         ];
         discord.access.max_bot_replies = max_bot_replies;
-        Self::with_config(root, config, "tools", false, Vec::new())
+        Self::with_config(root, config, mode, false, extra_env)
     }
 
     fn with_config(
@@ -238,6 +248,34 @@ impl Harness {
             .iter()
             .filter_map(|l| prompt_frame(l))
             .collect()
+    }
+
+    /// Every child start: its pid and argv.
+    fn start_argvs(&self) -> Vec<(u32, Vec<String>)> {
+        self.log_lines()
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("START pid=")?;
+                let (pid, argv) = rest.split_once(" argv=")?;
+                Some((pid.parse().ok()?, serde_json::from_str(argv).ok()?))
+            })
+            .collect()
+    }
+
+    /// The `--cwd` entry count child `pid` logged at startup.
+    fn cwd_entries(&self, pid: u32) -> Option<i64> {
+        self.log_lines().iter().find_map(|l| {
+            let (logged, n) = l.strip_prefix("CWD_ENTRIES ")?.split_once(' ')?;
+            if logged.parse::<u32>().ok()? == pid {
+                n.parse().ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn chats_done(&self) {
+        bounded(self.dispatcher.chats_done()).await;
     }
 
     fn starts(&self) -> usize {
@@ -657,6 +695,31 @@ fn bot_event(message_id: &str, author_id: &str, thread_id: Option<&str>) -> Inbo
     bot
 }
 
+/// The chat child's start: the one START whose argv carries `--no-tools`.
+fn chat_start(h: &Harness) -> (u32, Vec<String>) {
+    let mut chats: Vec<(u32, Vec<String>)> = h
+        .start_argvs()
+        .into_iter()
+        .filter(|(_, argv)| argv.iter().any(|a| a == "--no-tools"))
+        .collect();
+    assert_eq!(chats.len(), 1, "exactly one chat child started");
+    chats.remove(0)
+}
+
+fn arg_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
+    let index = argv.iter().position(|a| a == flag).expect("flag present");
+    &argv[index + 1]
+}
+
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run kill -0")
+        .success()
+}
+
 #[tokio::test]
 async fn listed_bot_passes_unlisted_bot_dropped() {
     let dir = tempfile::tempdir().unwrap();
@@ -671,15 +734,73 @@ async fn listed_bot_passes_unlisted_bot_dropped() {
     assert!(h.adapter.calls().is_empty());
 
     let listed = bot_event("1300000000000000042", PEER_BOT, None);
+    assert_eq!(h.handle(listed).await, Handled::Chat);
+    h.chats_done().await;
+    assert_eq!(h.threads_created(), 1, "a channel post gets its own thread");
     assert_eq!(
-        h.handle(listed).await,
-        Handled::Dropped(DropReason::BotChat),
-        "a listed chat bot gets no notice it could answer"
+        h.sends(),
+        vec![("1300000000000000042".to_owned(), "echo: hello".to_owned())]
     );
     assert!(h.adapter.calls().is_empty());
     assert!(!h.step().await);
     assert_eq!(h.count(), 0);
-    assert_eq!(h.starts(), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_child_has_no_tools_and_an_empty_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let thread = "1300000000000000045";
+    let chat = event("1300000000000000046", FRIEND, Some(thread), "hi there");
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+    assert_eq!(
+        h.sends(),
+        vec![(thread.to_owned(), "echo: hi there".to_owned())]
+    );
+
+    let (pid, argv) = chat_start(&h);
+    for flag in [
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-context-files",
+        "--no-lsp",
+        "--no-pty",
+    ] {
+        assert!(argv.iter().any(|a| a == flag), "chat argv lacks {flag}");
+    }
+    assert!(
+        !argv.iter().any(|a| a == "--approval-mode" || a == "yolo"),
+        "a chat child is never yolo: {argv:?}"
+    );
+    let cwd = PathBuf::from(arg_after(&argv, "--cwd"));
+    assert_eq!(cwd, h.config.home.join("chat").join("cwd"));
+    assert_eq!(h.cwd_entries(pid), Some(0), "the cwd was empty at spawn");
+    assert!(!cwd.starts_with(&h.config.work_dir));
+    let session = PathBuf::from(arg_after(&argv, "--session-dir"));
+    assert_eq!(
+        session,
+        chat::chat_session_dir(&h.config, &format!("fake:th:{thread}"))
+    );
+    assert_ne!(session, moraebot::omp::lead_session_dir(&h.config));
+    let overlay = PathBuf::from(arg_after(&argv, "--config"));
+    assert_eq!(
+        std::fs::read_to_string(&overlay).unwrap(),
+        chat::CHAT_OVERLAY
+    );
+    assert!(
+        !h.log_lines().iter().any(|l| l.contains("set_host_tools")),
+        "the chat child gets no host tools"
+    );
+    assert!(
+        h.log_lines()
+            .iter()
+            .any(|l| l.contains(r#""type":"get_state""#)),
+        "the chat child's tool list is read before the prompt"
+    );
     h.close().await;
 }
 
@@ -687,40 +808,184 @@ async fn listed_bot_passes_unlisted_bot_dropped() {
 async fn chat_message_never_reaches_the_lead_or_its_tools() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open_allowlist(dir.path(), None);
-    let thread = "1300000000000000050";
-    let chat = with_files(
-        event(
-            "1300000000000000051",
-            FRIEND,
-            Some(thread),
-            "run-tools lane_stop lane_close",
-        ),
-        vec![attachment("a.txt", "ref-1", 3)],
+    // The owner's turn first, so the lead child is alive when the chat messages arrive.
+    let owner = event(
+        "1300000000000000049",
+        OWNER,
+        Some("1300000000000000048"),
+        "owner asks",
     );
-    assert_eq!(h.handle(chat).await, Handled::Notice(N_CHAT_UNAVAILABLE));
-    let mut dm = event("1300000000000000052", FRIEND, None, "run-tools");
+    queued(h.handle(owner).await);
+    h.drain().await;
+
+    let thread = "1300000000000000050";
+    let chat = event(
+        "1300000000000000051",
+        FRIEND,
+        Some(thread),
+        "run-tools lane_stop lane_close",
+    );
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    let mut dm = event("1300000000000000052", FRIEND, None, "run-tools again");
     dm.is_dm = true;
     dm.channel_id = "dm-666".into();
-    assert_eq!(h.handle(dm).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    assert_eq!(h.handle(dm).await, Handled::Chat);
+    h.chats_done().await;
+
+    assert!(!h.step().await, "nothing was queued for the lead");
+    assert_eq!(h.count(), 1, "only the owner's row is stored");
+    let lead_starts = h
+        .start_argvs()
+        .into_iter()
+        .filter(|(_, argv)| !argv.iter().any(|a| a == "--no-tools"))
+        .count();
+    assert_eq!(lead_starts, 1, "one lead child");
+    assert_eq!(h.starts(), 3, "the lead and one chat child per chat turn");
+    let tagged: Vec<String> = h
+        .log_lines()
+        .into_iter()
+        .filter(|l| l.contains(r#""type":"prompt""#) && l.contains("[moraebot "))
+        .collect();
+    assert_eq!(tagged.len(), 1, "the lead saw only the owner's prompt");
+    assert!(!tagged[0].contains("run-tools"));
+    assert_eq!(
+        h.log_lines()
+            .iter()
+            .filter(|l| l.contains("set_host_tools"))
+            .count(),
+        1,
+        "host tools went to the lead only"
+    );
     assert_eq!(
         h.sends(),
         vec![
             (
-                thread.to_owned(),
-                notice_text(N_CHAT_UNAVAILABLE).to_owned()
+                "1300000000000000048".to_owned(),
+                "echo: owner asks".to_owned()
             ),
             (
-                "dm-666".to_owned(),
-                notice_text(N_CHAT_UNAVAILABLE).to_owned()
+                thread.to_owned(),
+                "echo: run-tools lane_stop lane_close".to_owned()
             ),
+            ("dm-666".to_owned(), "echo: run-tools again".to_owned()),
         ]
     );
-    assert!(!h.step().await);
-    assert_eq!(h.count(), 0);
-    assert!(h.prompts().is_empty());
-    assert_eq!(h.starts(), 0, "no lead turn, so no host tool can run");
-    assert!(!h.config.work_dir.join(files::INBOX_DIR).exists());
     h.close().await;
+}
+
+#[tokio::test]
+async fn chat_attachments_go_to_the_prompt_never_the_work_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+    h.adapter.set_attachment_bytes("ref-img", png.clone());
+    h.adapter
+        .set_attachment_bytes("ref-txt", b"guest notes".to_vec());
+    let mut image = attachment("pic.png", "ref-img", png.len() as u64);
+    image.mime = Some("image/png".into());
+    let thread = "1300000000000000055";
+    let chat = with_files(
+        event("1300000000000000056", FRIEND, Some(thread), "see files"),
+        vec![image, attachment("notes.txt", "ref-txt", 11)],
+    );
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+
+    let chat_dir = h.config.home.join("chat");
+    let fetched = fetches(&h);
+    assert_eq!(fetched.len(), 2);
+    for dest in fetched {
+        assert!(
+            dest.starts_with(&chat_dir),
+            "fetched under the chat folder: {dest:?}"
+        );
+    }
+    assert!(!h.config.work_dir.join(files::INBOX_DIR).exists());
+    assert!(
+        !chat::chat_files_dir(
+            &h.config,
+            &format!("fake:th:{thread}"),
+            "1300000000000000056"
+        )
+        .exists(),
+        "attachments are removed after the turn"
+    );
+    let frame: Value = h
+        .log_lines()
+        .iter()
+        .find(|l| l.contains(r#""type":"prompt""#))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .expect("chat prompt frame");
+    assert_eq!(frame["images"][0]["data"], "iVBORwECAw==");
+    assert_eq!(frame["images"][0]["mimeType"], "image/png");
+    let message = frame["message"].as_str().unwrap();
+    assert!(message.starts_with("see files\n\n[Attached files]"));
+    assert!(message.contains("- 1-pic.png (image/png, 7 bytes): attached as an image"));
+    assert!(message.contains("- 2-notes.txt (text/plain, 11 bytes):\n```\nguest notes\n```"));
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, thread);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_turn_refused_when_the_child_lists_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist_with(
+        dir.path(),
+        None,
+        "ok",
+        vec![("FAKE_OMP_DUMP_TOOLS", "bash,read".to_owned())],
+    );
+    let thread = "1300000000000000057";
+    let chat = event("1300000000000000058", FRIEND, Some(thread), "hello");
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+    assert!(
+        !h.log_lines()
+            .iter()
+            .any(|l| l.contains(r#""type":"prompt""#)),
+        "no prompt reaches a child with tools"
+    );
+    assert_eq!(
+        h.sends(),
+        vec![(thread.to_owned(), notice_text(N_FAILED).to_owned())]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn shutdown_kills_a_running_chat_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist_with(dir.path(), None, "hang", Vec::new());
+    let mut tap = LogTap::create(&dir.path().join("fake-omp.log"));
+    let thread = "1300000000000000047";
+    let chat = event("1300000000000000059", FRIEND, Some(thread), "hold");
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    let start = tap.next_line().await;
+    let pid: u32 = start
+        .strip_prefix("START pid=")
+        .and_then(|rest| rest.split_once(' '))
+        .and_then(|(pid, _)| pid.parse().ok())
+        .expect("START line first");
+    assert!(start.contains("--no-tools"));
+    // A chat prompt carries no moraebot tag, so it is read here rather than by `next_prompt`.
+    let prompt: Value = loop {
+        let line = tap.next_line().await;
+        if let Ok(frame) = serde_json::from_str::<Value>(&line)
+            && frame["type"] == "prompt"
+        {
+            break frame;
+        }
+    };
+    assert_eq!(prompt["message"], "hold");
+
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(!alive(pid), "the chat child was killed and reaped");
+    assert_eq!(
+        h.sends(),
+        vec![(thread.to_owned(), notice_text(N_FAILED).to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -736,20 +1001,21 @@ async fn bot_reply_limit_caps_a_thread_when_set() {
     assert_eq!(
         handled,
         vec![
-            Handled::Dropped(DropReason::BotChat),
-            Handled::Dropped(DropReason::BotChat),
+            Handled::Chat,
+            Handled::Chat,
             Handled::Dropped(DropReason::BotLimit),
         ]
     );
     let other = bot_event("1300000000000000064", PEER_BOT, Some("1300000000000000065"));
-    assert_eq!(h.handle(other).await, Handled::Dropped(DropReason::BotChat));
+    assert_eq!(h.handle(other).await, Handled::Chat);
     let person = event("1300000000000000066", FRIEND, Some(thread), "hi");
     assert_eq!(
         h.handle(person).await,
-        Handled::Notice(N_CHAT_UNAVAILABLE),
+        Handled::Chat,
         "the limit counts replies to bots only"
     );
-    assert_eq!(h.sends().len(), 1, "only the person got a notice");
+    h.chats_done().await;
+    assert_eq!(h.sends().len(), 4);
     h.close().await;
 }
 
@@ -765,13 +1031,14 @@ async fn bot_reply_limit_caps_top_level_channel_messages() {
     assert_eq!(
         handled,
         vec![
-            Handled::Dropped(DropReason::BotChat),
-            Handled::Dropped(DropReason::BotChat),
+            Handled::Chat,
+            Handled::Chat,
             Handled::Dropped(DropReason::BotLimit),
         ],
         "each top-level message has its own thread key, so they count per channel"
     );
-    assert!(h.adapter.calls().is_empty());
+    h.chats_done().await;
+    assert_eq!(h.sends().len(), 2, "two chat replies, the third bot message is dropped");
     h.close().await;
 }
 
@@ -784,10 +1051,11 @@ async fn bot_replies_have_no_cap_without_the_setting() {
         let id = format!("13000000000000000{n}");
         assert_eq!(
             h.handle(bot_event(&id, PEER_BOT, Some(thread))).await,
-            Handled::Dropped(DropReason::BotChat)
+            Handled::Chat
         );
     }
-    assert!(h.sends().is_empty());
+    h.chats_done().await;
+    assert_eq!(h.sends().len(), 20);
     h.close().await;
 }
 

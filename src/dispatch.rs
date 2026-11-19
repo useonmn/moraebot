@@ -3,12 +3,18 @@
 //! Order of an inbound message: drop authors that are neither the owner nor listed in the
 //! active messenger's `allow` list (nothing stored); drop a listed bot's message once its
 //! conversation reached `max_bot_replies` in the window (no limit when unset; bot
-//! messages posted directly in the channel count per channel); drop a listed bot's `chat`
-//! message without a notice; answer a listed `chat` person with one fixed notice
-//! ([`N_CHAT_UNAVAILABLE`]; never stored, no file fetched, never forwarded to the lead); answer `/` messages and empty messages without attachments with one fixed notice (never
-//! stored, never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing
-//! stored, nothing fetched), pick the conversation key, store the row FIRST (a duplicate
-//! stops here), and only then open a thread for a message posted directly in the channel.
+//! messages posted directly in the channel count per channel); answer `/`
+//! messages and empty messages without attachments with one fixed notice (never stored,
+//! never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing stored,
+//! nothing fetched); hand a listed `chat` sender's message to the chat runtime
+//! ([`crate::chat`]: never stored, never steered, never seen by the lead or its tools);
+//! pick the conversation key, store the row FIRST (a duplicate stops here), and only then
+//! open a thread for a message posted directly in the channel.
+//!
+//! A chat message posted directly in the channel gets its own thread first (no thread: one
+//! [`N_THREAD_FAILED`] notice). Its turn then runs on its own task: its attachments are
+//! fetched into the chat folder under the home (never the work folder), handed to the chat
+//! child with the prompt and removed; the reply, or one notice, goes to its conversation.
 //!
 //! Attachments are forwarded: they are fetched only after the row is stored and its thread
 //! opened, outside the admission lock, into `<work_dir>/.moraebot-inbox/<key>/<row>/`, each
@@ -67,11 +73,12 @@ use crate::adapter::{
     AdapterError, ConversationKey, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent,
     MessengerAdapter, split_reply,
 };
+use crate::chat::{self, ChatFile, ChatManager};
 use crate::config::Config;
 use crate::files::{self, OutFile, SavedFile};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
-use crate::omp::{E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
+use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
@@ -100,8 +107,6 @@ pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
 pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
 /// The one greeting after an onboarding request.
 pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
-/// A listed `chat` sender's message: chat replies are not available yet; not stored.
-pub const N_CHAT_UNAVAILABLE: &str = "N_CHAT_UNAVAILABLE";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -148,10 +153,6 @@ pub fn notice_text(code: &str) -> &'static str {
             "Hi! I'm your moraebot agent, and this is our first chat. When you reply, I'll ask \
              what to call me, how I should talk to you, and a little about you. Reply skip if \
              you'd rather not."
-        }
-        N_CHAT_UNAVAILABLE => {
-            "This account is allowed to chat with moraebot, but chat replies are not available \
-             in this version yet, so the message was not run."
         }
         _ => "Something went wrong.",
     }
@@ -285,6 +286,9 @@ pub enum Handled {
     /// Stored and sent into the running lead turn of its conversation; answered in that
     /// turn's reply.
     Steered(i64),
+    /// A listed chat sender's message, handed to the chat runtime on its own task; nothing
+    /// stored.
+    Chat,
 }
 
 /// How often a conversation saw an owner message, a delivered reply or posted news, and
@@ -301,6 +305,8 @@ pub struct Dispatcher {
     access: Policy,
     /// Replies to listed bots per conversation, capped by `max_bot_replies`.
     bot_replies: Mutex<BotReplies>,
+    /// Running chat turns; joined by [`Self::chats_done`] and at shutdown.
+    chats: Mutex<tokio::task::JoinSet<()>>,
     adapter: Arc<dyn MessengerAdapter>,
     store: Arc<Mutex<Store>>,
     omp: OmpManager,
@@ -332,6 +338,7 @@ impl Dispatcher {
             owner_id: config.owner_id(),
             access: Policy::from_config(config),
             bot_replies: Mutex::new(BotReplies::from_config(config)),
+            chats: Mutex::default(),
             adapter,
             store,
             omp,
@@ -467,6 +474,51 @@ impl Dispatcher {
     /// Stops the lead child, even in the middle of a turn, and every lane child.
     pub async fn shutdown(&self) {
         self.omp.shutdown_all().await;
+        let chats = std::mem::take(&mut *self.chats.lock().expect("chat task lock"));
+        if tokio::time::timeout(ABORT_JOIN_BOUND, chats.join_all())
+            .await
+            .is_err()
+        {
+            tracing::error!("a chat turn did not stop in time");
+        }
+    }
+
+    /// Waits until every chat turn started so far has sent its reply or notice.
+    pub async fn chats_done(&self) {
+        let chats = std::mem::take(&mut *self.chats.lock().expect("chat task lock"));
+        chats.join_all().await;
+    }
+
+    /// Runs a listed chat sender's message on its own task (see the module docs). A
+    /// channel post first gets its own thread, so its conversation continues there.
+    async fn start_chat(
+        &self,
+        event: InboundEvent,
+        key: ConversationKey,
+        new_thread: bool,
+    ) -> Handled {
+        if new_thread
+            && let Err(err) = self
+                .adapter
+                .create_thread(&event.channel_id, &event.message_id, &event.text)
+                .await
+        {
+            tracing::warn!(message_id = %event.message_id, code = err.code, "chat thread not opened");
+            self.notify(&event.channel_id, N_THREAD_FAILED).await;
+            return Handled::Notice(N_THREAD_FAILED);
+        }
+        let Some(target) = reply_target(key.as_str()).map(str::to_owned) else {
+            return Handled::Notice(N_FAILED);
+        };
+        let turn = ChatTurn {
+            adapter: Arc::clone(&self.adapter),
+            chat: self.omp.chat(),
+            key: key.as_str().to_owned(),
+            target,
+            event,
+        };
+        self.chats.lock().expect("chat task lock").spawn(turn.run());
+        Handled::Chat
     }
 
     /// `Some(conversation key)` while a lead turn that accepts a steer runs.
@@ -560,27 +612,6 @@ impl Dispatcher {
         }
 
         let here = event.thread_id.as_deref().unwrap_or(&event.channel_id);
-        if let Sender::Listed(role) = sender {
-            if event.author_is_bot {
-                tracing::info!(
-                    message_id = %event.message_id,
-                    author_id = %event.author_id,
-                    role = role.as_str(),
-                    code = DropReason::BotChat.code(),
-                    "listed bot's chat message dropped"
-                );
-                return Ok(Handled::Dropped(DropReason::BotChat));
-            }
-            tracing::info!(
-                message_id = %event.message_id,
-                author_id = %event.author_id,
-                role = role.as_str(),
-                code = N_CHAT_UNAVAILABLE,
-                "chat message not run"
-            );
-            self.notify(here, N_CHAT_UNAVAILABLE).await;
-            return Ok(Handled::Notice(N_CHAT_UNAVAILABLE));
-        }
         let text = event.text.trim();
         if text.starts_with('/') || (text.is_empty() && event.attachments.is_empty()) {
             tracing::info!(message_id = %event.message_id, code = N_UNSUPPORTED_INPUT, "input not forwarded");
@@ -596,6 +627,16 @@ impl Dispatcher {
             );
             self.notify(here, N_FILE_NOT_RECEIVED).await;
             return Ok(Handled::FilesRejected(N_FILE_NOT_RECEIVED));
+        }
+        if let Sender::Listed(role) = sender {
+            tracing::info!(
+                message_id = %event.message_id,
+                author_id = %event.author_id,
+                role = role.as_str(),
+                conversation = key.as_str(),
+                "chat message handed to the chat runtime"
+            );
+            return Ok(self.start_chat(event, key, new_thread).await);
         }
 
         let attachments_json =
@@ -1201,12 +1242,96 @@ impl Dispatcher {
 
     /// Sends a fixed notice; returns whether the messenger accepted it.
     async fn notify(&self, channel: &str, code: &'static str) -> bool {
-        match self.adapter.send(channel, notice_text(code)).await {
-            Ok(_) => true,
-            Err(err) => {
-                tracing::warn!(notice = code, code = err.code, "notice send failed");
-                false
-            }
+        send_notice(self.adapter.as_ref(), channel, code).await
+    }
+}
+
+/// Sends a fixed notice; returns whether the messenger accepted it.
+async fn send_notice(adapter: &dyn MessengerAdapter, channel: &str, code: &'static str) -> bool {
+    match adapter.send(channel, notice_text(code)).await {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(notice = code, code = err.code, "notice send failed");
+            false
         }
+    }
+}
+
+/// One chat sender's message, answered by the chat runtime on its own task.
+struct ChatTurn {
+    adapter: Arc<dyn MessengerAdapter>,
+    chat: Arc<ChatManager>,
+    key: String,
+    target: String,
+    event: InboundEvent,
+}
+
+impl ChatTurn {
+    /// Fetches the attachments (one failed file: one notice, no turn), runs the chat turn
+    /// and posts its reply, or one notice when it did not reply.
+    async fn run(self) {
+        let dir = self.chat.files_dir(&self.key, &self.event.message_id);
+        let files = match self.fetch(&dir).await {
+            Ok(files) => files,
+            Err(err) => {
+                chat::remove_files(&dir);
+                tracing::warn!(conversation = %self.key, code = err.code, "chat attachments not received");
+                send_notice(self.adapter.as_ref(), &self.target, file_notice(err.code)).await;
+                return;
+            }
+        };
+        let typing = match self.adapter.start_typing(&self.target).await {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::warn!(code = err.code, "typing indicator failed");
+                None
+            }
+        };
+        let outcome = self.chat.reply(&self.key, &self.event.text, &files).await;
+        drop(typing);
+        let notice = match outcome {
+            Outcome::Reply(text) => {
+                for chunk in reply_messages(&text, self.adapter.message_limit()) {
+                    if let Err(err) = self.adapter.send(&self.target, &chunk).await {
+                        tracing::warn!(conversation = %self.key, code = err.code, "chat reply not sent");
+                        return;
+                    }
+                }
+                tracing::info!(conversation = %self.key, "chat reply sent");
+                return;
+            }
+            Outcome::NoAgent => N_NO_AGENT,
+            Outcome::Failed { code, .. } | Outcome::NeedsCheck { code, .. } => {
+                tracing::warn!(conversation = %self.key, code, "chat turn failed");
+                if code == E_COST_CAP {
+                    N_COST_CAP
+                } else {
+                    N_FAILED
+                }
+            }
+        };
+        send_notice(self.adapter.as_ref(), &self.target, notice).await;
+    }
+
+    /// Saves every attachment under `dir` (0700 levels) under the stall watchdog, reads it
+    /// back and removes `dir`.
+    async fn fetch(&self, dir: &std::path::Path) -> Result<Vec<ChatFile>, AdapterError> {
+        if self.event.attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        files::create_private_dir_all(dir)?;
+        let mut saved = Vec::with_capacity(self.event.attachments.len());
+        for (index, attachment) in self.event.attachments.iter().enumerate() {
+            let name = files::sanitize_name(&attachment.name, index + 1);
+            let path = dir.join(&name);
+            let progress = files::Progress::new();
+            files::with_stall_timeout(
+                self.adapter.fetch_attachment(attachment, &path, &progress),
+                &progress,
+            )
+            .await?;
+            saved.push((name, attachment.mime.clone(), path));
+        }
+        Ok(chat::take_files(dir, saved))
     }
 }
