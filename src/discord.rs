@@ -56,10 +56,13 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A gateway session that lasted at least this long resets the reconnect backoff.
 const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     pub owner_id: u64,
     pub channel_id: u64,
+    /// User ids of the `allow` list: their DMs are accepted. The core access check decides
+    /// the rest.
+    pub allowed: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +78,9 @@ pub struct RawMessage<'a> {
     pub author_id: u64,
     pub author_is_bot: bool,
     pub from_self: bool,
+    /// Posted through a webhook: anyone with its URL can post under any name, so these
+    /// are always dropped.
+    pub webhook: bool,
     /// A regular message or an inline reply; system messages are false.
     pub is_regular: bool,
     pub channel_id: u64,
@@ -93,15 +99,18 @@ pub struct AttachmentMeta {
     pub url: AttachmentRef,
 }
 
-/// Turns a message into a core event, or `None` when it is outside the listening scope.
+/// Turns a message into a core event, or `None` when it is outside the listening scope:
+/// own, system and webhook messages, DMs from anyone but the owner and listed ids, other
+/// channels.
 /// Empty text is kept as an empty `text`: with attachments it is a files-only message, without
 /// them the core answers it with its fixed notice.
 pub fn map_message(raw: &RawMessage<'_>, scope: &Scope) -> Option<InboundEvent> {
-    if raw.from_self || !raw.is_regular {
+    if raw.from_self || raw.webhook || !raw.is_regular {
         return None;
     }
+    let dm_allowed = raw.author_id == scope.owner_id || scope.allowed.contains(&raw.author_id);
     let (channel_id, thread_id, is_dm) = match raw.location {
-        Location::Dm if raw.author_id == scope.owner_id => (raw.channel_id, None, true),
+        Location::Dm if dm_allowed => (raw.channel_id, None, true),
         Location::Dm => return None,
         Location::GuildChannel if raw.channel_id == scope.channel_id => {
             (raw.channel_id, None, false)
@@ -378,6 +387,7 @@ impl EventHandler for Handler {
             author_id: msg.author.id.get(),
             author_is_bot: msg.author.bot,
             from_self,
+            webhook: msg.webhook_id.is_some(),
             is_regular: matches!(msg.kind, MessageType::Regular | MessageType::InlineReply),
             channel_id: msg.channel_id.get(),
             location,
@@ -446,6 +456,7 @@ impl DiscordAdapter {
             Scope {
                 owner_id: discord.owner_id,
                 channel_id: discord.channel_id,
+                allowed: discord.access.allow.iter().map(|e| e.id).collect(),
             },
         )
     }
@@ -523,7 +534,7 @@ impl MessengerAdapter for DiscordAdapter {
         runtime.started = true;
         let (tx, rx) = mpsc::channel(INBOUND_BUFFER);
         let handler = Arc::new(Handler {
-            scope: self.scope,
+            scope: self.scope.clone(),
             tx,
             reconnects: self.reconnects.clone(),
             locations: Mutex::new(HashMap::new()),
@@ -652,11 +663,14 @@ mod tests {
     const OTHER: u64 = 333;
     const CHANNEL: u64 = 222;
     const THREAD: u64 = 444;
+    const FRIEND: u64 = 666;
+    const PEER_BOT: u64 = 777;
 
     fn scope() -> Scope {
         Scope {
             owner_id: OWNER,
             channel_id: CHANNEL,
+            allowed: vec![FRIEND, PEER_BOT],
         }
     }
 
@@ -666,6 +680,7 @@ mod tests {
             author_id,
             author_is_bot: false,
             from_self: false,
+            webhook: false,
             is_regular: true,
             channel_id,
             location,
@@ -1187,6 +1202,32 @@ mod tests {
         assert_eq!(
             map_message(&raw(Location::Dm, 555, OTHER, "dm"), &scope()),
             None
+        );
+    }
+
+    #[test]
+    fn listed_dm_is_accepted() {
+        let event = map_message(&raw(Location::Dm, 556, FRIEND, "dm"), &scope()).expect("event");
+        assert!(event.is_dm);
+        assert_eq!(event.author_id, FRIEND.to_string());
+    }
+
+    #[test]
+    fn listed_bot_passes_and_webhooks_are_dropped() {
+        let mut bot = raw(Location::GuildChannel, CHANNEL, PEER_BOT, "hi");
+        bot.author_is_bot = true;
+        let event = map_message(&bot, &scope()).expect("listed bot passes");
+        assert!(event.author_is_bot);
+        assert_eq!(event.author_id, PEER_BOT.to_string());
+        let mut hook = bot.clone();
+        hook.webhook = true;
+        assert_eq!(map_message(&hook, &scope()), None);
+        let mut own = bot;
+        own.from_self = true;
+        assert_eq!(
+            map_message(&own, &scope()),
+            None,
+            "own messages drop even if listed"
         );
     }
 

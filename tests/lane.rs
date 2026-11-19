@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::access::{E_ACCESS_NOT_OWNER, Sender};
+use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, Role};
 use moraebot::done::{self, E_DONE_SYNTAX, E_DONE_UNMET};
 use moraebot::lane::{
     self, E_LANE_ARGS, E_LANE_BUSY, E_LANE_CLOSED, E_LANE_INTERRUPTED, E_LANE_LIMIT,
@@ -274,7 +275,7 @@ async fn prompt_until_lane_result(omp: &OmpManager, message: i64, input: &str) {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(omp.prompt(KEY, message, input)).await;
+    bounded(omp.prompt(KEY, message, Sender::Owner, input)).await;
     bounded(notified).await;
 }
 
@@ -340,7 +341,7 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
     tokio::pin!(notified);
     notified.as_mut().enable();
 
-    let report = bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let report = bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     assert_eq!(
         report.main.outcome,
         Outcome::Reply("echo: run-tools go".into())
@@ -383,7 +384,7 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
 async fn lane_start_does_not_wait_for_the_lane() {
     let h = Harness::new();
     let omp = h.manager("hang", &[lane_start("t1")]);
-    let report = bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let report = bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     assert_eq!(
         report.main.outcome,
         Outcome::Reply("echo: run-tools go".into())
@@ -405,7 +406,7 @@ async fn fourth_running_lane_is_refused() {
     let h = Harness::new();
     let calls: Vec<Value> = ["t1", "t2", "t3", "t4"].map(lane_start).to_vec();
     let omp = h.manager("hang", &calls);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 4, "{results:?}");
     for (n, result) in results[..3].iter().enumerate() {
@@ -427,7 +428,7 @@ async fn lane_message_refused_while_running() {
             json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(!results[0].0, "{results:?}");
@@ -445,7 +446,7 @@ async fn lane_message_resumes_idle_lane_session() {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(m1.prompt(KEY, 1, "run-tools go")).await;
+    bounded(m1.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     bounded(notified).await;
     assert_eq!(h.lane(1).state, LaneState::Idle);
     assert_eq!(queued_row(&h, 1).message_id, "1:1");
@@ -460,7 +461,7 @@ async fn lane_message_resumes_idle_lane_session() {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(m2.prompt(KEY, 2, "run-tools again")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools again")).await;
     let results = h.tool_results();
     let last = results.last().expect("lane_message result");
     assert!(!last.0, "{results:?}");
@@ -518,7 +519,7 @@ async fn lane_status_lists_lanes_and_rejects_unknown() {
             status(json!({"lane_id": 99})),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 5, "{results:?}");
     let all: Value = serde_json::from_str(&results[2].1).expect("status json");
@@ -551,7 +552,7 @@ async fn lane_args_are_validated() {
             call(lane::LANE_STATUS_TOOL, json!({"lane_id": "a"})),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 5, "{results:?}");
     for result in &results {
@@ -566,7 +567,7 @@ async fn lane_start_after_shutdown_starts_no_child() {
     let h = Harness::new();
     let omp = h.manager("ok", &[lane_start("t1")]);
     bounded(omp.shutdown_all()).await;
-    let report = bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    let report = bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     assert_eq!(
         report.main.outcome,
         Outcome::Reply("echo: run-tools go".into())
@@ -583,7 +584,7 @@ async fn lane_start_after_shutdown_starts_no_child() {
 async fn shutdown_while_lane_child_starts_kills_it() {
     let h = Harness::new();
     let omp = h.manager("hold_open", &[lane_start("t1")]);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_running_pids(&omp).await;
 
     tokio::time::timeout(
@@ -609,7 +610,7 @@ async fn lane_result_written_when_stop_did_not_kill_it() {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_running_pids(&omp).await;
     omp.lanes().stop_accepting();
     bounded(notified).await;
@@ -626,7 +627,7 @@ async fn lane_failure_comes_back_as_failed_tag() {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     bounded(notified).await;
     let row = queued_row(&h, 1);
     let tag = lead::parse_tag(&row.text).expect("tagged result");
@@ -645,7 +646,7 @@ async fn duplicate_tool_call_starts_one_lane() {
         "id": "dup"
     });
     let omp = h.manager("hang", &[dup.clone(), dup]);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(!results[0].0 && !results[1].0, "{results:?}");
@@ -668,7 +669,7 @@ async fn lane_start_requires_a_checkable_done_line() {
             start(json!({"task": "t1", "done": "published p@1"})),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     assert_eq!(results.len(), 3, "{results:?}");
     assert_refused(&results[0], E_LANE_ARGS);
@@ -934,7 +935,7 @@ async fn check_timeout_refuses_the_claim() {
 async fn shutdown_during_a_check_kills_it_and_writes_no_result() {
     let h = Harness::new();
     let omp = h.done_manager(&check_done_line(), 1);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let mut pids = omp.lanes().running_pids();
     let running = bounded(pids.wait_for(|p| p.len() == 2))
         .await
@@ -995,7 +996,7 @@ async fn lane_status_lists_done_line() {
             json!({"tool": lane::LANE_STATUS_TOOL, "arguments": {}}),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     let status = results
         .iter()
@@ -1179,7 +1180,7 @@ async fn two_lanes_get_separate_worktrees() {
             ],
         )
         .with_extra_env(GIT_ENV);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     wait_finished_lanes(&h, &omp, 2).await;
     let mut cwds = lane_cwds(&h);
     cwds.sort();
@@ -1227,7 +1228,7 @@ async fn lane_start_refuses_a_bad_repo() {
             ],
         )
         .with_extra_env(GIT_ENV);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let r = h.tool_results();
     assert_eq!(r.len(), 3, "{r:?}");
     assert_refused(&r[0], E_LANE_REPO);
@@ -1314,7 +1315,7 @@ async fn lane_status_lists_repo() {
             ],
         )
         .with_extra_env(GIT_ENV);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let results = h.tool_results();
     let status = results
         .iter()
@@ -1459,7 +1460,7 @@ async fn lane_close_closes_an_idle_lane_without_repo() {
             json!({"tool": lane::LANE_STATUS_TOOL, "arguments": {"lane_id": 1}}),
         ],
     );
-    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
     bounded(m2.shutdown_all()).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 3, "{r:?}");
@@ -1492,7 +1493,7 @@ async fn lane_close_refuses_running_unknown_and_bad_args() {
             lane_close(1, "x"),
         ],
     );
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     bounded(omp.shutdown_all()).await;
     let r = h.tool_results();
     assert_eq!(r.len(), 7, "{r:?}");
@@ -1501,6 +1502,24 @@ async fn lane_close_refuses_running_unknown_and_bad_args() {
     }
     assert_refused(&r[5], E_LANE_UNKNOWN);
     assert_refused(&r[6], E_LANE_BUSY);
+    assert!(!h.lane(1).closed);
+}
+
+#[tokio::test]
+async fn lane_stop_and_close_refuse_a_non_owner_turn() {
+    let h = Harness::new();
+    let stop = json!({"tool": lane::LANE_STOP_TOOL, "arguments": {"lane_id": 1, "reason": "x"}});
+    let owner = h.manager("hang", &[lane_start("t1")]);
+    bounded(owner.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+    let chat = h.manager("hang", &[stop, lane_close(1, "x")]);
+    bounded(chat.prompt(KEY, 2, Sender::Listed(Role::Chat), "run-tools go")).await;
+    bounded(chat.shutdown_all()).await;
+    bounded(owner.shutdown_all()).await;
+    let r = h.tool_results();
+    assert_eq!(r.len(), 3, "{r:?}");
+    assert!(!r[0].0, "the owner's lane_start runs: {:?}", r[0]);
+    assert_refused(&r[1], E_ACCESS_NOT_OWNER);
+    assert_refused(&r[2], E_ACCESS_NOT_OWNER);
     assert!(!h.lane(1).closed);
 }
 
@@ -1514,7 +1533,7 @@ async fn lane_close_after_shutdown_is_refused() {
     let n = h.tool_results().len();
     let m2 = h.manager("ok", &[lane_close(1, "x")]);
     bounded(m2.shutdown_all()).await;
-    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 1, "{r:?}");
     assert_refused(&r[0], E_LANE_STOPPING);
@@ -1536,7 +1555,7 @@ async fn lane_close_removes_a_clean_pushed_worktree_and_keeps_the_branch() {
     let m2 = h
         .manager("ok", &[lane_close(1, "finished")])
         .with_extra_env(GIT_ENV);
-    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
     bounded(m2.shutdown_all()).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 1, "{r:?}");
@@ -1571,7 +1590,7 @@ async fn lane_close_keeps_unpushed_work_and_retries_after_a_push() {
     let m2 = h
         .manager("ok", &[lane_close(1, "first")])
         .with_extra_env(GIT_ENV);
-    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
     bounded(m2.shutdown_all()).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 1, "{r:?}");
@@ -1587,7 +1606,7 @@ async fn lane_close_keeps_unpushed_work_and_retries_after_a_push() {
     let m3 = h
         .manager("ok", &[lane_close(1, "again")])
         .with_extra_env(GIT_ENV);
-    bounded(m3.prompt(KEY, 3, "run-tools go")).await;
+    bounded(m3.prompt(KEY, 3, Sender::Owner, "run-tools go")).await;
     bounded(m3.shutdown_all()).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 1, "{r:?}");
@@ -1611,7 +1630,7 @@ async fn lane_close_keeps_a_worktree_with_untracked_files() {
     let m2 = h
         .manager("ok", &[lane_close(1, "finished")])
         .with_extra_env(GIT_ENV);
-    bounded(m2.prompt(KEY, 2, "run-tools go")).await;
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
     bounded(m2.shutdown_all()).await;
     let r = h.tool_results()[n..].to_vec();
     assert_eq!(r.len(), 1, "{r:?}");
@@ -1625,7 +1644,7 @@ async fn lane_close_keeps_a_worktree_with_untracked_files() {
 async fn watchdog_reports_a_quiet_lane_once() {
     let h = Harness::new();
     let omp = h.manager("hang", &[lane_start("t1")]);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_events(&omp, 1).await;
     let wake = omp.lane_wake();
     let notified = wake.notified();
@@ -1667,7 +1686,7 @@ async fn watchdog_reports_a_quiet_lane_once() {
 async fn watchdog_counts_repeated_tool_calls_as_one() {
     let h = Harness::new();
     let omp = h.manager("spin", &[lane_start("t1")]);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     // agent_start and four tool_execution_start frames.
     await_lane_events(&omp, 5).await;
     let t0 = Instant::now();
@@ -1695,7 +1714,7 @@ async fn watchdog_is_off_when_the_turn_timeout_is_shorter() {
     let omp = h
         .manager("hang", &[lane_start("t1")])
         .with_turn_timeout(lane::STALL_AFTER);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_events(&omp, 1).await;
     let t0 = Instant::now();
     let lanes = omp.lanes();
@@ -1714,7 +1733,7 @@ async fn watchdog_is_off_when_the_turn_timeout_is_shorter() {
 async fn watchdog_stops_with_the_gateway() {
     let h = Harness::new();
     let omp = h.manager("hang", &[lane_start("t1")]);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_events(&omp, 1).await;
     let t0 = Instant::now();
     let first = omp.lanes().watch_tick(t0);
@@ -1775,7 +1794,7 @@ async fn await_lane_reports(omp: &OmpManager, n: u64) {
 async fn lane_report_is_news_while_the_lane_runs() {
     let h = Harness::new();
     let omp = h.report_manager(&[report_call("qa step 1")], true);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_reports(&omp, 1).await;
     let news = omp.lanes().news();
     let state = h.lane(1).state;
@@ -1852,7 +1871,7 @@ async fn await_no_running_pids(omp: &OmpManager) {
 async fn lane_stop_ends_a_running_turn() {
     let h = Harness::new();
     let omp = h.report_manager(&[report_call("qa step 1")], true);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_reports(&omp, 1).await;
     let lane_pid = h.lane_pid(0);
     let wake = omp.lane_wake();
@@ -1886,7 +1905,7 @@ async fn lane_stop_ends_a_running_turn() {
 async fn lane_message_resumes_a_stopped_lane() {
     let h = Harness::new();
     let m1 = h.report_manager(&[report_call("qa step 1")], true);
-    bounded(m1.prompt(KEY, 1, "run-tools go")).await;
+    bounded(m1.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_reports(&m1, 1).await;
     let wake = m1.lane_wake();
     let notified = wake.notified();
@@ -1934,7 +1953,7 @@ async fn lane_message_resumes_a_stopped_lane() {
 async fn lane_stop_kills_a_running_check() {
     let h = Harness::new();
     let omp = h.done_manager(&check_done_line(), 1);
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     let mut pids = omp.lanes().running_pids();
     let running = bounded(pids.wait_for(|p| p.len() == 2))
         .await
@@ -1985,7 +2004,7 @@ async fn lane_stop_tool_stops_a_lane_through_the_lead() {
     let notified = wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    bounded(omp.prompt(KEY, 1, "run-tools go")).await;
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     bounded(notified).await;
     await_no_running_pids(&omp).await;
     let r = h.tool_results();

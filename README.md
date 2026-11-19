@@ -221,7 +221,7 @@ Rules, checked when the config loads:
 
 The `chat` role is for conversation only. A chat sender gets answers from a separate omp with no tools, never from the lead that works on your machine, and can't stop or close lanes. Chat senders may attach files. Bots in the list should not talk to each other forever: `max_bot_replies` is the hard limit, and the lead is also told to wind down endless bot-to-bot exchanges.
 
-> **Status:** this release reads and checks the allowlist but doesn't act on it yet. Only the owner can talk to the bot until the following releases add the chat role and the bot reply limit.
+> **Status:** this release acts on the allowlist. Listed people and bots get through, `max_bot_replies` is enforced, and `lane_stop`, `lane_close` and the first-meeting setup stay owner-only. Chat replies aren't here yet: a chat person gets a fixed notice that chat isn't available, a listed chat bot's message is dropped without a notice (so two bots can't trade notices), and the message is not stored or run. Bot messages posted directly in the channel count toward `max_bot_replies` per channel, since each one would start its own thread. The next release adds the separate chat omp.
 
 Set `MORAEBOT_HOME` if you want moraebot's home somewhere other than `~/.moraebot`.
 

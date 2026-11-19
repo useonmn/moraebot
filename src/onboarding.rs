@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use omp_rpc::{HostTool, HostToolError, ToolLoadMode};
 use serde_json::{Map, Value};
 
+use crate::access::Sender;
 use crate::omp::{self, TurnContext};
 use crate::persona;
 use crate::store::{OnboardingState, Store, StoreError};
@@ -175,7 +176,9 @@ fn end_onboarding(
         .ok_or_else(|| refusal(E_ONBOARDING_ARGS, "outcome must be done or skipped"))?;
 
     let not_owner = || refusal(E_ONBOARDING_ORIGIN, "not answering an owner message");
-    let turn = turn.ok_or_else(not_owner)?;
+    let turn = turn
+        .filter(|turn| turn.sender == Sender::Owner)
+        .ok_or_else(not_owner)?;
     let store = omp::lock(store);
     let row = store.get(turn.row_id).map_err(store_refusal)?;
     if !row.is_some_and(|row| row.origin == "owner") {
@@ -266,6 +269,7 @@ mod tests {
         let turn = TurnContext {
             row_id: 1,
             conversation_key: "p:th:111".into(),
+            sender: Sender::Owner,
         };
         (dir, home, Mutex::new(store), turn)
     }
@@ -333,11 +337,19 @@ mod tests {
 
     #[test]
     fn finish_needs_an_owner_turn() {
-        let (_dir, home, store, _turn) = fixture();
+        let (_dir, home, store, turn) = fixture();
         start(&store);
         let done = args("done", "Sora", "", "");
         assert_eq!(
             code(finish(&store, &home, None, &done)),
+            E_ONBOARDING_ORIGIN
+        );
+        let chat_turn = TurnContext {
+            sender: Sender::Listed(crate::config::Role::Chat),
+            ..turn
+        };
+        assert_eq!(
+            code(finish(&store, &home, Some(&chat_turn), &done)),
             E_ONBOARDING_ORIGIN
         );
         {
@@ -350,6 +362,7 @@ mod tests {
         let lane_turn = TurnContext {
             row_id: 2,
             conversation_key: "p:th:111".into(),
+            sender: Sender::Owner,
         };
         assert_eq!(
             code(finish(&store, &home, Some(&lane_turn), &done)),

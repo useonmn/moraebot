@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::access::Sender;
+use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, Role};
 use moraebot::files;
 use moraebot::lead;
 use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
@@ -151,7 +152,10 @@ async fn argv_is_exact_and_env_drops_only_discord_names() {
         ("MORAEBOT_DISCORD_PROBE", "x"),
         ("PROVIDER_PROBE_API_KEY", "y"),
     ]);
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert_eq!(outcome, Outcome::Reply("echo: hi".into()));
 
     let lines = h.log_lines();
@@ -203,7 +207,7 @@ async fn max_cost_adds_flag_only_when_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -222,7 +226,7 @@ async fn flag_present_when_hints_set() {
         max_cost_usd: Some(2.5),
     });
     let manager = h.manager("ok").with_hints("probe hints".into());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -238,7 +242,7 @@ async fn flag_present_when_hints_set() {
 async fn no_flag_when_hints_empty() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints(String::new());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -281,7 +285,7 @@ async fn lead_appends_persona_after_hints() {
         "Owner 111 likes short replies",
     );
     let manager = h.manager("ok").with_hints("H".into());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let loaded = persona::load(&h.config.home).unwrap();
     let expected = format!(
         "--append-system-prompt={}",
@@ -302,9 +306,15 @@ async fn persona_change_restarts_the_lead_before_the_next_turn() {
     let h = Harness::new();
     save_sora(&h);
     let m = h.manager("ok");
-    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     save_persona(&h, "Kai", "", "");
-    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let r2 = bounded(m.prompt(KEY_B, 2, Sender::Owner, "again"))
+        .await
+        .main
+        .outcome;
     let pids = h.start_pids();
     let first_alive = pids.first().map(|p| alive(*p));
     let leases = h.frames("get_session_lease");
@@ -347,10 +357,10 @@ async fn unchanged_persona_keeps_the_lead() {
     let h = Harness::new();
     save_sora(&h);
     let m = h.manager("ok");
-    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     save_sora(&h);
-    bounded(m.prompt(KEY_B, 2, "again")).await;
-    bounded(m.prompt(KEY_A, 3, "more")).await;
+    bounded(m.prompt(KEY_B, 2, Sender::Owner, "again")).await;
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "more")).await;
     let pids = h.start_pids();
     bounded(m.shutdown_all()).await;
 
@@ -366,9 +376,9 @@ async fn removed_persona_restarts_without_it() {
         persona::append("H", persona::load(&h.config.home).unwrap().as_deref())
     );
     let m = h.manager("ok").with_hints("H".into());
-    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     std::fs::remove_file(persona::path(&h.config.home)).unwrap();
-    bounded(m.prompt(KEY_B, 2, "again")).await;
+    bounded(m.prompt(KEY_B, 2, Sender::Owner, "again")).await;
     let appends = appends(&h);
     bounded(m.shutdown_all()).await;
 
@@ -383,15 +393,15 @@ async fn refused_persona_change_restarts_without_it() {
     let h = Harness::new();
     save_sora(&h);
     let m = h.manager("ok").with_hints("H".into());
-    bounded(m.prompt(KEY_A, 1, "hi")).await;
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let secret = ["gl", "pat-"].concat() + &"c".repeat(20);
     std::fs::write(
         persona::path(&h.config.home),
         format!("Name: X\nOwner: {secret}"),
     )
     .unwrap();
-    bounded(m.prompt(KEY_B, 2, "again")).await;
-    bounded(m.prompt(KEY_A, 3, "more")).await;
+    bounded(m.prompt(KEY_B, 2, Sender::Owner, "again")).await;
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "more")).await;
     let appends = appends(&h);
     let code = persona::load(&h.config.home).unwrap_err().code;
     bounded(m.shutdown_all()).await;
@@ -408,10 +418,22 @@ async fn onboarding_finish_applies_from_the_next_turn() {
     h.store.lock().unwrap().start_onboarding().unwrap();
     let r1 = owner_row(&h, "m-on-1", "run-tools");
     let m = onboarding_manager(&h, &[finish_done_call()]);
-    bounded(m.prompt(KEY_A, r1, &lead::owner_input(KEY_A, r1, "run-tools"))).await;
+    bounded(m.prompt(
+        KEY_A,
+        r1,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r1, "run-tools"),
+    ))
+    .await;
     let after_first = h.start_pids().len();
     let r2 = owner_row(&h, "m-on-2", "again");
-    bounded(m.prompt(KEY_A, r2, &lead::owner_input(KEY_A, r2, "again"))).await;
+    bounded(m.prompt(
+        KEY_A,
+        r2,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r2, "again"),
+    ))
+    .await;
     let pids = h.start_pids();
     let appends = appends(&h);
     let tools = h.frames("set_host_tools");
@@ -439,11 +461,20 @@ async fn unsettled_session_defers_the_restart_until_settled() {
     h.config.omp_path = unsettled_once_wrapper(h.dir.path());
     save_sora(&h);
     let m = h.manager("ok");
-    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     save_persona(&h, "Kai", "", "");
-    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let r2 = bounded(m.prompt(KEY_B, 2, Sender::Owner, "again"))
+        .await
+        .main
+        .outcome;
     let after_second = h.start_pids().len();
-    let r3 = bounded(m.prompt(KEY_A, 3, "more")).await.main.outcome;
+    let r3 = bounded(m.prompt(KEY_A, 3, Sender::Owner, "more"))
+        .await
+        .main
+        .outcome;
     let pids = h.start_pids();
     let appends = appends(&h);
     bounded(m.shutdown_all()).await;
@@ -467,15 +498,24 @@ async fn failed_restart_reports_the_start_failure_then_starts_again() {
     h.config.omp_path = refusing_wrapper(h.dir.path(), &marker);
     save_sora(&h);
     let m = h.manager("ok");
-    let r1 = bounded(m.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     std::fs::write(&marker, "").unwrap();
     save_persona(&h, "Kai", "", "");
-    let r2 = bounded(m.prompt(KEY_B, 2, "again")).await.main.outcome;
+    let r2 = bounded(m.prompt(KEY_B, 2, Sender::Owner, "again"))
+        .await
+        .main
+        .outcome;
     let after_fail = h.start_pids();
     let first_alive = after_fail.first().map(|p| alive(*p));
     let child_after_fail = m.child_pid().await;
     std::fs::remove_file(&marker).unwrap();
-    let r3 = bounded(m.prompt(KEY_A, 3, "more")).await.main.outcome;
+    let r3 = bounded(m.prompt(KEY_A, 3, Sender::Owner, "more"))
+        .await
+        .main
+        .outcome;
     let pids = h.start_pids();
     let appends = appends(&h);
     bounded(m.shutdown_all()).await;
@@ -502,7 +542,7 @@ async fn refused_persona_is_left_out() {
     )
     .unwrap();
     let manager = h.manager("ok").with_hints("H".into());
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(
         appends(&h),
         vec![vec!["--append-system-prompt=H".to_owned()]]
@@ -519,7 +559,7 @@ async fn injection_payload_arrives_byte_for_byte_with_hints_set() {
     let h = Harness::new();
     let manager = h.manager("ok").with_hints("probe hints".into());
     let payload = "$(touch /tmp/moraebot-pwned-7f3a); touch /tmp/moraebot-pwned-7f3a-b";
-    let outcome = bounded(manager.prompt(KEY_A, 1, payload))
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, payload))
         .await
         .main
         .outcome;
@@ -537,7 +577,10 @@ async fn multibyte_text_round_trips() {
     let h = Harness::new();
     let manager = h.manager("ok");
     let text = "안녕하세요, 모래봇 🌊";
-    let outcome = bounded(manager.prompt(KEY_A, 1, text)).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, text))
+        .await
+        .main
+        .outcome;
     assert_eq!(outcome, Outcome::Reply(format!("echo: {text}")));
     manager.shutdown_all().await;
 }
@@ -547,7 +590,7 @@ async fn injection_payload_arrives_byte_for_byte_and_never_runs() {
     let h = Harness::new();
     let manager = h.manager("ok");
     let payload = "$(touch /tmp/moraebot-pwned-7f3a); touch /tmp/moraebot-pwned-7f3a-b";
-    let outcome = bounded(manager.prompt(KEY_A, 1, payload))
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, payload))
         .await
         .main
         .outcome;
@@ -575,7 +618,10 @@ async fn not_invoked_is_no_agent() {
     let h = Harness::new();
     let manager = h.manager("not_invoked");
     assert_eq!(
-        bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome,
+        bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+            .await
+            .main
+            .outcome,
         Outcome::NoAgent
     );
     manager.shutdown_all().await;
@@ -585,7 +631,10 @@ async fn not_invoked_is_no_agent() {
 async fn error_status_is_failed() {
     let h = Harness::new();
     let manager = h.manager("error");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }));
     assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
     manager.shutdown_all().await;
@@ -642,7 +691,10 @@ async fn coded_non_cost_cap_error_is_prompt_error() {
     let mut h = Harness::new();
     h.config.omp_path = coded_error_wrapper(h.dir.path());
     let manager = h.manager("error");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_PROMPT_ERROR));
     assert!(
@@ -657,7 +709,10 @@ async fn coded_non_cost_cap_error_is_prompt_error() {
 async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
     let h = Harness::new();
     let manager = h.manager("hang").with_turn_timeout(Duration::from_secs(1));
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }));
     assert_eq!(outcome.code(), Some(omp::E_TURN_TIMEOUT));
     let pids = h.start_pids();
@@ -671,7 +726,10 @@ async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
 async fn open_session_failure_is_failed_without_prompt() {
     let h = Harness::new();
     let manager = h.manager("open_session_fail");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::Failed { .. }));
     assert_eq!(outcome.code(), Some(omp::E_OPEN_SESSION));
     assert!(h.frames("prompt").is_empty());
@@ -684,7 +742,10 @@ async fn held_lease_is_needs_check_without_prompt() {
     let h = Harness::new();
     h.set_session("fake-session-1");
     let manager = h.manager("lease_held");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }));
     assert_eq!(outcome.code(), Some(omp::E_SESSION_BUSY));
     let leases = h.frames("get_session_lease");
@@ -704,7 +765,10 @@ async fn reopen_checks_free_lease_then_prompts() {
     h.set_session("fake-session-1");
     let manager = h.manager("ok");
     assert_eq!(
-        bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome,
+        bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+            .await
+            .main
+            .outcome,
         Outcome::Reply("echo: hi".into())
     );
     assert_eq!(h.frames("get_session_lease").len(), 1);
@@ -716,7 +780,7 @@ async fn reopen_checks_free_lease_then_prompts() {
 async fn fresh_conversation_skips_lease_check() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert!(h.frames("get_session_lease").is_empty());
     assert_eq!(h.frames("open_session").len(), 1);
     manager.shutdown_all().await;
@@ -727,10 +791,10 @@ async fn one_lead_child_serves_every_conversation() {
     let h = Harness::new();
     let manager = h.manager("ok");
 
-    let first = bounded(manager.prompt("discord:th:111", 1, "one")).await;
+    let first = bounded(manager.prompt("discord:th:111", 1, Sender::Owner, "one")).await;
     assert_eq!(first.main.outcome, Outcome::Reply("echo: one".into()));
     let pid = manager.child_pid().await.expect("live lead child");
-    let second = bounded(manager.prompt("discord:dm:222", 2, "two")).await;
+    let second = bounded(manager.prompt("discord:dm:222", 2, Sender::Owner, "two")).await;
     assert_eq!(second.main.outcome, Outcome::Reply("echo: two".into()));
     assert_eq!(
         manager.child_pid().await,
@@ -755,7 +819,7 @@ async fn one_lead_child_serves_every_conversation() {
 async fn lead_session_id_is_stored_and_lease_checked() {
     let h = Harness::new();
     let first = h.manager("ok");
-    bounded(first.prompt(KEY_A, 1, "hi")).await;
+    bounded(first.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(
         h.store
             .lock()
@@ -769,7 +833,10 @@ async fn lead_session_id_is_stored_and_lease_checked() {
 
     let second = h.manager("ok");
     assert_eq!(
-        bounded(second.prompt(KEY_B, 2, "again")).await.main.outcome,
+        bounded(second.prompt(KEY_B, 2, Sender::Owner, "again"))
+            .await
+            .main
+            .outcome,
         Outcome::Reply("echo: again".into())
     );
     second.shutdown_all().await;
@@ -794,7 +861,10 @@ async fn lead_session_id_is_stored_and_lease_checked() {
     assert_eq!(opening[1]["type"], "open_session");
 
     let third = h.manager("lease_held");
-    let outcome = bounded(third.prompt(KEY_A, 3, "busy")).await.main.outcome;
+    let outcome = bounded(third.prompt(KEY_A, 3, Sender::Owner, "busy"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_SESSION_BUSY));
 }
@@ -803,7 +873,7 @@ async fn lead_session_id_is_stored_and_lease_checked() {
 async fn killed_child_is_lost_then_respawned() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "first")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "first")).await;
     let pid = manager.child_pid().await.expect("live child");
     let killed = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
@@ -811,7 +881,7 @@ async fn killed_child_is_lost_then_respawned() {
         .expect("run kill");
     assert!(killed.success());
 
-    let outcome = bounded(manager.prompt(KEY_A, 2, "second"))
+    let outcome = bounded(manager.prompt(KEY_A, 2, Sender::Owner, "second"))
         .await
         .main
         .outcome;
@@ -820,7 +890,7 @@ async fn killed_child_is_lost_then_respawned() {
     assert_eq!(manager.child_pid().await, None);
     assert!(!alive(pid));
 
-    let outcome = bounded(manager.prompt(KEY_A, 3, "third"))
+    let outcome = bounded(manager.prompt(KEY_A, 3, Sender::Owner, "third"))
         .await
         .main
         .outcome;
@@ -833,7 +903,10 @@ async fn killed_child_is_lost_then_respawned() {
 async fn exit1_is_lost() {
     let h = Harness::new();
     let manager = h.manager("exit1");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert!(matches!(outcome, Outcome::NeedsCheck { .. }), "{outcome:?}");
     assert_eq!(outcome.code(), Some(omp::E_CHILD_LOST));
     assert_eq!(manager.child_pid().await, None);
@@ -848,7 +921,10 @@ async fn missing_omp_binary_is_spawn_failure() {
     let mut h = Harness::new();
     h.config.omp_path = h.dir.path().join("no-such-omp");
     let manager = h.manager("ok");
-    let outcome = bounded(manager.prompt(KEY_A, 1, "hi")).await.main.outcome;
+    let outcome = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
+        .await
+        .main
+        .outcome;
     assert_eq!(outcome.code(), Some(omp::E_OMP_SPAWN));
 }
 
@@ -889,7 +965,7 @@ async fn send_file_tool_records_inside_path() {
     let h = Harness::new();
     let file = h.work_file("s3-report.txt");
     let manager = h.send_file_manager(&[file.to_string_lossy().into_owned()]);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(report.main.outcome, Outcome::Reply("echo: hi".into()));
     assert_eq!(report.main.files, [file]);
     let results = h.tool_results();
@@ -919,7 +995,7 @@ async fn send_file_tool_accepts_relative_path() {
         "out/s3-rel-report.txt".to_owned(),
         "../s3-outside.txt".to_owned(),
     ]);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(report.main.outcome, Outcome::Reply("echo: hi".into()));
     assert_eq!(report.main.files, [file]);
     let results = h.tool_results();
@@ -937,7 +1013,7 @@ async fn send_file_tool_rejects_outside_path() {
     let outside = other.path().join("s3-elsewhere.txt");
     std::fs::write(&outside, b"elsewhere").expect("outside file");
     let manager = h.send_file_manager(&[outside.to_string_lossy().into_owned()]);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(report.main.outcome, Outcome::Reply("echo: hi".into()));
     assert!(report.main.files.is_empty());
     let results = h.tool_results();
@@ -958,7 +1034,7 @@ async fn send_file_tool_rejects_home() {
     h.config.home = h.config.work_dir.join("mb-home");
     let secret = h.work_file("mb-home/secrets/s3-token.txt");
     let manager = h.send_file_manager(&[secret.to_string_lossy().into_owned()]);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(report.main.outcome, Outcome::Reply("echo: hi".into()));
     assert!(report.main.files.is_empty());
     let results = h.tool_results();
@@ -979,7 +1055,7 @@ async fn send_file_tool_caps_files_per_turn() {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let manager = h.send_file_manager(&lines);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert_eq!(report.main.outcome, Outcome::Reply("echo: hi".into()));
     assert_eq!(report.main.files, paths[..files::MAX_FILES]);
     let results = h.tool_results();
@@ -1000,9 +1076,9 @@ async fn send_file_bucket_is_per_turn() {
         a.to_string_lossy().into_owned(),
         b.to_string_lossy().into_owned(),
     ]);
-    let first = bounded(manager.prompt(KEY_A, 1, "one")).await;
+    let first = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "one")).await;
     assert_eq!(first.main.files, [a.clone(), b.clone()]);
-    let second = bounded(manager.prompt(KEY_A, 2, "two")).await;
+    let second = bounded(manager.prompt(KEY_A, 2, Sender::Owner, "two")).await;
     assert_eq!(second.main.outcome, Outcome::Reply("echo: two".into()));
     assert_eq!(
         second.main.files,
@@ -1036,7 +1112,7 @@ async fn files_dropped_when_turn_fails() {
     let manager = h
         .send_file_manager(&[file.to_string_lossy().into_owned()])
         .with_turn_timeout(Duration::from_secs(5));
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert!(
         matches!(report.main.outcome, Outcome::NeedsCheck { .. }),
         "{report:?}"
@@ -1055,7 +1131,7 @@ async fn files_dropped_when_turn_fails() {
 async fn send_file_tool_never_runs_shell_payload() {
     let h = Harness::new();
     let manager = h.send_file_manager(&["$(touch /tmp/moraebot-pwned-3c1d)".to_owned()]);
-    let report = bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    let report = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     assert!(report.main.files.is_empty());
     let results = h.tool_results();
     assert_eq!(results.len(), 1);
@@ -1069,7 +1145,7 @@ async fn send_file_tool_never_runs_shell_payload() {
 async fn argv_unchanged_by_host_tools() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let start = h
         .log_lines()
         .into_iter()
@@ -1129,7 +1205,7 @@ fn spawn_prompt(
     text: &'static str,
 ) -> tokio::task::JoinHandle<GroupReport> {
     let manager = Arc::clone(manager);
-    tokio::spawn(async move { manager.prompt(key, row_id, text).await })
+    tokio::spawn(async move { manager.prompt(key, row_id, Sender::Owner, text).await })
 }
 
 /// Waits until the lead reported `agent_start` for a turn of `key`.
@@ -1154,7 +1230,7 @@ fn codes(report: &GroupReport) -> (Option<&'static str>, Option<(i64, Option<&'s
 async fn main_prompt_uses_follow_up() {
     let h = Harness::new();
     let manager = h.manager("ok");
-    bounded(manager.prompt(KEY_A, 1, "hi")).await;
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let prompts = h.frames("prompt");
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0]["streamingBehavior"], "followUp");
@@ -1167,7 +1243,7 @@ async fn steer_merged_gives_both_rows_one_text() {
     let manager = h.steer_manager("merged");
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
     let report = bounded(turn).await.expect("prompt task");
     assert_eq!(report.main.outcome, Outcome::Reply("echo: m1 + m2".into()));
     assert_eq!(
@@ -1186,7 +1262,7 @@ async fn steer_separate_gives_each_row_its_text() {
     let manager = h.steer_manager("separate");
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
     let report = bounded(turn).await.expect("prompt task");
     assert_eq!(report.main.outcome, Outcome::Reply("echo: m1".into()));
     assert_eq!(report.steered, Some((2, Outcome::Reply("echo: m2".into()))));
@@ -1202,23 +1278,51 @@ async fn steer_refused_for_other_conversation_or_closed_turn() {
     turn_running(&manager, KEY_STEER).await;
 
     let mut called = false;
-    assert!(!manager.try_steer("discord:th:999", 2, "other", |_| {
-        called = true;
-        true
-    }));
+    assert!(
+        !manager.try_steer("discord:th:999", 2, Sender::Owner, "other", |_| {
+            called = true;
+            true
+        })
+    );
     assert!(!called, "another conversation never reaches the claim");
 
-    assert!(manager.try_steer(KEY_STEER, 3, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 3, Sender::Owner, "m2", |_| true));
     let report = bounded(turn).await.expect("prompt task");
     assert_eq!(report.steered.map(|(id, _)| id), Some(3));
 
-    assert!(!manager.try_steer(KEY_STEER, 4, "late", |_| {
-        called = true;
-        true
-    }));
+    assert!(
+        !manager.try_steer(KEY_STEER, 4, Sender::Owner, "late", |_| {
+            called = true;
+            true
+        })
+    );
     assert!(!called, "a closed turn never reaches the claim");
     assert_eq!(*manager.running_turn().borrow(), None);
     assert_eq!(h.steer_frames().len(), 1);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn steer_refused_from_another_sender() {
+    let h = Harness::new();
+    let manager = h.steer_manager("merged");
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+
+    let mut called = false;
+    let chat = Sender::Listed(Role::Chat);
+    assert!(!manager.try_steer(KEY_STEER, 2, chat, "chat", |_| {
+        called = true;
+        true
+    }));
+    assert!(!called, "a non-owner message never joins the owner's turn");
+
+    assert!(manager.try_steer(KEY_STEER, 3, Sender::Owner, "m2", |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(report.steered.map(|(id, _)| id), Some(3));
+    let steers = h.steer_frames();
+    assert_eq!(steers.len(), 1);
+    assert_eq!(steers[0]["message"], "m2");
     manager.shutdown_all().await;
 }
 
@@ -1247,7 +1351,7 @@ async fn turn_context_is_set_during_the_turn() {
     });
     let manager = base.with_host_tools(vec![probe]);
 
-    let report = bounded(manager.prompt(KEY_STEER, 7, "run-tools ctx")).await;
+    let report = bounded(manager.prompt(KEY_STEER, 7, Sender::Owner, "run-tools ctx")).await;
     assert_eq!(
         report.main.outcome,
         Outcome::Reply("echo: run-tools ctx".into())
@@ -1310,7 +1414,13 @@ async fn onboarding_finish_through_the_lead() {
     let r = owner_row(&h, "m-on-1", "run-tools");
     assert_eq!(r, 3);
     let m = onboarding_manager(&h, &[finish_done_call()]);
-    bounded(m.prompt(KEY_A, r, &lead::owner_input(KEY_A, r, "run-tools"))).await;
+    bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, "run-tools"),
+    ))
+    .await;
 
     let tools = h.frames("set_host_tools");
     assert_eq!(tools.len(), 1);
@@ -1349,7 +1459,13 @@ async fn onboarding_finish_refusal_reaches_the_lead() {
     let h = Harness::new();
     let r = owner_row(&h, "m-on-1", "run-tools");
     let m = onboarding_manager(&h, &[finish_done_call()]);
-    bounded(m.prompt(KEY_A, r, &lead::owner_input(KEY_A, r, "run-tools"))).await;
+    bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, "run-tools"),
+    ))
+    .await;
 
     let results = h.tool_results();
     assert_eq!(results.len(), 1, "{results:?}");
@@ -1378,14 +1494,14 @@ async fn steer_claim_race_runs_row_once() {
     turn_running(&manager, KEY_STEER).await;
 
     let mut called = None;
-    let steered_r = manager.try_steer(KEY_STEER, r, "mR", |main| {
+    let steered_r = manager.try_steer(KEY_STEER, r, Sender::Owner, "mR", |main| {
         called = Some(main);
         h.store.lock().unwrap().steer_into(r, main).unwrap()
     });
     assert!(!steered_r);
     assert_eq!(called, Some(a), "the claim got the open turn's main row");
 
-    let steered_s = manager.try_steer(KEY_STEER, s, "mS", |main| {
+    let steered_s = manager.try_steer(KEY_STEER, s, Sender::Owner, "mS", |main| {
         h.store.lock().unwrap().steer_into(s, main).unwrap()
     });
     assert!(steered_s);
@@ -1408,7 +1524,7 @@ async fn shutdown_all_does_not_wait_for_the_running_turn() {
     let manager = h.steer_manager("hold");
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
 
     bounded(manager.shutdown_all()).await;
     let report = bounded(turn).await.expect("prompt task");
@@ -1433,7 +1549,7 @@ async fn shutdown_all_after_a_cancelled_turn_joins_the_lead_promptly() {
     let manager = h.steer_manager("hold");
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
     turn.abort();
     assert!(bounded(turn).await.expect_err("aborted").is_cancelled());
 
@@ -1450,10 +1566,10 @@ async fn second_steer_in_one_turn_is_refused() {
     let manager = h.steer_manager("hold");
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
 
     let mut called = false;
-    assert!(!manager.try_steer(KEY_STEER, 3, "m3", |_| {
+    assert!(!manager.try_steer(KEY_STEER, 3, Sender::Owner, "m3", |_| {
         called = true;
         true
     }));
@@ -1481,7 +1597,7 @@ async fn turn_timeout_with_steer_kills_lead_before_waiting() {
     );
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
-    assert!(manager.try_steer(KEY_STEER, 2, "m2", |_| true));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
 
     let report = bounded(turn).await.expect("prompt task");
     assert_eq!(

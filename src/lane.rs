@@ -64,6 +64,7 @@ use omp_rpc::{
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
+use crate::access::{E_ACCESS_NOT_OWNER, Sender};
 use crate::config::Config;
 use crate::done::{self, DoneLine};
 use crate::lead::{self, LaneResult, Stalled};
@@ -1085,13 +1086,28 @@ impl LaneManager {
         true
     }
 
+    /// Refuses a management tool unless the running lead turn is the owner's.
+    fn owner_turn(&self, action: &str) -> Result<(), HostToolError> {
+        let owner = lock(&self.turn)
+            .as_ref()
+            .is_some_and(|turn| turn.sender == Sender::Owner);
+        if owner {
+            return Ok(());
+        }
+        Err(refused(
+            E_ACCESS_NOT_OWNER,
+            &format!("only the owner may {action}"),
+        ))
+    }
+
     /// Closes a lane that is not running, then removes its worktree when nothing would be
-    /// lost. No git command runs while `inner` is held.
+    /// lost. Owner turns only. No git command runs while `inner` is held.
     fn lane_close(
         &self,
         arguments: &Map<String, Value>,
         ctx: &HostToolContext,
     ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        self.owner_turn("close a lane")?;
         let id = arguments
             .get("lane_id")
             .and_then(Value::as_i64)
@@ -1180,11 +1196,13 @@ impl LaneManager {
         Ok(result.to_string().into())
     }
 
-    /// Handles one `lane_stop` call: checks the arguments and calls `stop`; never waits.
+    /// Handles one `lane_stop` call: checks the turn's sender and the arguments and calls
+    /// `stop`; never waits.
     fn lane_stop(
         &self,
         arguments: &Map<String, Value>,
     ) -> Result<omp_rpc::HostToolOutput, HostToolError> {
+        self.owner_turn("stop a lane")?;
         let id = arguments
             .get("lane_id")
             .and_then(Value::as_i64)
