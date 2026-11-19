@@ -179,11 +179,8 @@ token_file = "~/.moraebot/secrets/discord.token"
 # app_token_file = "~/.moraebot/secrets/slack-app.token"
 
 [omp]
-# Optional. Left out, a lead turn may run 60 minutes and lanes and chat turns
-# have no limit. A lead turn that runs longer is stopped and its omp process
-# ended; your next message starts a fresh one. When set, it limits lead, lane
-# and chat turns alike.
-# turn_timeout_minutes = 60
+# Optional. No time limit when left out.
+# turn_timeout_minutes = 30
 # Optional. No cost limit when left out.
 # max_cost_usd = 5.0
 ```

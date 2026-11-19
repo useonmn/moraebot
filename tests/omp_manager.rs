@@ -723,28 +723,6 @@ async fn hang_with_turn_timeout_is_needs_check_and_child_is_reaped() {
 }
 
 #[tokio::test]
-async fn next_turn_after_a_timed_out_turn_runs_on_a_fresh_child() {
-    let h = Harness::new();
-    let manager = h
-        .manager("hang_on_text")
-        .with_turn_timeout(Duration::from_secs(1));
-    let stuck = bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hang"))
-        .await
-        .main
-        .outcome;
-    assert_eq!(stuck.code(), Some(omp::E_TURN_TIMEOUT));
-    let next = bounded(manager.prompt(KEY_A, 2, Sender::Owner, "again"))
-        .await
-        .main
-        .outcome;
-    assert_eq!(next, Outcome::Reply("echo: again".into()));
-    let pids = h.start_pids();
-    assert_eq!(pids.len(), 2, "the next turn started a new child");
-    assert!(!alive(pids[0]), "the timed-out child is gone");
-    manager.shutdown_all().await;
-}
-
-#[tokio::test]
 async fn open_session_failure_is_failed_without_prompt() {
     let h = Harness::new();
     let manager = h.manager("open_session_fail");

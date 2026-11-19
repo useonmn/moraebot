@@ -520,8 +520,6 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
     send(out, &json!({"type": "agent_start"}));
     match mode {
         "hang" => {}
-        // Hangs on a prompt whose body is `hang` only; any other prompt is echoed.
-        "hang_on_text" if prompt_message(frame) == "hang" => {}
         "spin" => spin(out),
         "exit1" => std::process::exit(1),
         "error" => {

@@ -634,24 +634,25 @@ pub struct OmpManager {
 }
 
 impl OmpManager {
-    /// The turn limits come from `omp.turn_timeout_minutes`. Left out, the lead gets
-    /// [`DEFAULT_TURN_TIMEOUT_MINUTES`] and lanes and chat turns get no limit.
-    ///
-    /// [`DEFAULT_TURN_TIMEOUT_MINUTES`]: crate::config::DEFAULT_TURN_TIMEOUT_MINUTES
+    /// The turn limit comes from `omp.turn_timeout_minutes`; absent means no limit.
     pub fn new(config: Config, store: Arc<Mutex<Store>>) -> Self {
-        let turn_timeout = config.omp.lead_turn_timeout();
-        let worker_timeout = config.omp.turn_limit().unwrap_or(UNLIMITED);
+        let turn_timeout = config
+            .omp
+            .turn_timeout_minutes
+            .map_or(UNLIMITED, |minutes| {
+                Duration::from_secs(minutes.saturating_mul(60))
+            });
         let turn: Arc<Mutex<Option<TurnContext>>> = Default::default();
         let lanes = Arc::new(LaneManager::new(
             config.clone(),
             Arc::clone(&store),
             Arc::clone(&turn),
-            worker_timeout,
+            turn_timeout,
         ));
         let chat = Arc::new(ChatManager::new(
             config.clone(),
             Arc::clone(&store),
-            worker_timeout,
+            turn_timeout,
         ));
         Self {
             config,
@@ -1152,54 +1153,6 @@ mod tests {
                 error,
             }),
         }
-    }
-
-    fn manager_with(turn_timeout_minutes: Option<u64>) -> (tempfile::TempDir, OmpManager) {
-        use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().join("home");
-        let work_dir = dir.path().join("work");
-        std::fs::create_dir_all(&home).expect("home dir");
-        std::fs::create_dir_all(&work_dir).expect("work dir");
-        let config = Config {
-            messenger: Platform::Discord,
-            work_dir,
-            omp_path: PathBuf::from("/qa/omp"),
-            home: home.clone(),
-            access_mode: AccessMode::OwnerOnly,
-            discord: Some(DiscordConfig {
-                owner_id: 111,
-                channel_id: 222,
-                token_file: home.join("discord.token"),
-                access: Default::default(),
-            }),
-            slack: None,
-            omp: OmpConfig {
-                turn_timeout_minutes,
-                max_cost_usd: None,
-            },
-        };
-        let store = Store::open(&home.join("inbox.sqlite")).expect("store");
-        let manager = OmpManager::new(config, Arc::new(Mutex::new(store)));
-        (dir, manager)
-    }
-
-    #[test]
-    fn default_turn_limit_caps_the_lead_only() {
-        let (_dir, manager) = manager_with(None);
-        assert_eq!(manager.turn_timeout, Duration::from_secs(60 * 60));
-        assert_eq!(manager.lanes().turn_timeout, UNLIMITED);
-        assert_eq!(manager.chat().turn_timeout, UNLIMITED);
-    }
-
-    #[test]
-    fn configured_turn_limit_caps_lead_lanes_and_chat() {
-        let (_dir, manager) = manager_with(Some(5));
-        let five = Duration::from_secs(5 * 60);
-        assert_eq!(manager.turn_timeout, five);
-        assert_eq!(manager.lanes().turn_timeout, five);
-        assert_eq!(manager.chat().turn_timeout, five);
     }
 
     fn prompt_error(code: Option<&str>) -> PromptError {
