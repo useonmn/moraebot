@@ -230,24 +230,29 @@ pub struct SlackConfig {
     pub access: Access<String>,
 }
 
-/// The turn time limit when `omp.turn_timeout_minutes` is left out.
+/// The lead's turn time limit when `omp.turn_timeout_minutes` is left out.
 pub const DEFAULT_TURN_TIMEOUT_MINUTES: u64 = 60;
 
 #[derive(Debug, Clone, Default)]
 pub struct OmpConfig {
-    /// Absent means [`DEFAULT_TURN_TIMEOUT_MINUTES`].
+    /// Absent means [`DEFAULT_TURN_TIMEOUT_MINUTES`] for the lead and no limit for lanes and
+    /// chat turns.
     pub turn_timeout_minutes: Option<u64>,
     /// Absent means no cost limit.
     pub max_cost_usd: Option<f64>,
 }
 
 impl OmpConfig {
-    /// The turn time limit of the lead, every lane and every chat turn.
-    pub fn turn_timeout(&self) -> Duration {
-        let minutes = self
-            .turn_timeout_minutes
-            .unwrap_or(DEFAULT_TURN_TIMEOUT_MINUTES);
-        Duration::from_secs(minutes.saturating_mul(60))
+    /// The configured turn time limit; `None` when left out. Lanes and chat turns use it.
+    pub fn turn_limit(&self) -> Option<Duration> {
+        self.turn_timeout_minutes
+            .map(|minutes| Duration::from_secs(minutes.saturating_mul(60)))
+    }
+
+    /// The lead's turn time limit: the configured one, else [`DEFAULT_TURN_TIMEOUT_MINUTES`].
+    pub fn lead_turn_timeout(&self) -> Duration {
+        self.turn_limit()
+            .unwrap_or(Duration::from_secs(DEFAULT_TURN_TIMEOUT_MINUTES * 60))
     }
 }
 
@@ -450,7 +455,7 @@ impl Config {
         if omp.turn_timeout_minutes == Some(0) {
             return Err(ConfigError::new(
                 E_CONFIG_VALUE,
-                "omp.turn_timeout_minutes must be greater than zero (omit it for the 60-minute default)",
+                "omp.turn_timeout_minutes must be greater than zero (omit it for the defaults)",
             ));
         }
         if let Some(cost) = omp.max_cost_usd
@@ -1466,7 +1471,8 @@ mod tests {
         assert_eq!(cfg.work_dir, fx.dir.path().join("moraebot-work"));
         assert_eq!(cfg.home, fx.dir.path().join(".moraebot"));
         assert_eq!(cfg.omp.turn_timeout_minutes, None);
-        assert_eq!(cfg.omp.turn_timeout(), Duration::from_secs(60 * 60));
+        assert_eq!(cfg.omp.lead_turn_timeout(), Duration::from_secs(60 * 60));
+        assert_eq!(cfg.omp.turn_limit(), None);
         assert_eq!(cfg.omp.max_cost_usd, None);
     }
 
@@ -1501,7 +1507,8 @@ mod tests {
         );
         let cfg = fx.load(&text).expect("loads");
         assert_eq!(cfg.omp.turn_timeout_minutes, Some(30));
-        assert_eq!(cfg.omp.turn_timeout(), Duration::from_secs(30 * 60));
+        assert_eq!(cfg.omp.lead_turn_timeout(), Duration::from_secs(30 * 60));
+        assert_eq!(cfg.omp.turn_limit(), Some(Duration::from_secs(30 * 60)));
         assert_eq!(cfg.omp.max_cost_usd, Some(2.5));
     }
 
