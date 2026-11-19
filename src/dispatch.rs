@@ -62,6 +62,11 @@
 //! reply or delivered news for [`NEWS_AFTER`]; the lead is not involved. Each lane has one
 //! news message: the first note is posted, later notes edit it, and a failed edit posts a
 //! new one. A note the messenger did not accept is tried again on the next tick.
+//!
+//! Stalled lead turn: after every lane watchdog tick, a lead turn that sent no omp agent event
+//! for `omp.stall_after_minutes` gets one [`N_TURN_STALLED`] notice in its conversation
+//! ([`OmpManager::lead_stalled`]); after new progress a later stall gets a new one. The turn
+//! keeps running: nothing is killed, restarted or interrupted.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -112,6 +117,8 @@ pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
 pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
 /// The one greeting after an onboarding request.
 pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
+/// The running lead turn showed no progress for `omp.stall_after_minutes`; it keeps running.
+pub const N_TURN_STALLED: &str = "N_TURN_STALLED";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -161,6 +168,14 @@ pub fn notice_text(code: &str) -> &'static str {
         }
         _ => "Something went wrong.",
     }
+}
+
+/// The [`N_TURN_STALLED`] notice text for a stall of `minutes`.
+pub fn stalled_text(minutes: u64) -> String {
+    format!(
+        "No progress for {minutes} minutes. The task may be stuck. It keeps running and nothing \
+         was stopped."
+    )
 }
 
 /// The messages to post for a reply: at most [`MAX_REPLY_MESSAGES`] chunks of at most
@@ -1263,6 +1278,31 @@ impl Dispatcher {
             let now = *ticks.borrow_and_update();
             if let Some(now) = now {
                 self.post_news(self.lanes().news(), now).await;
+                self.post_stall_notice(now).await;
+            }
+        }
+    }
+
+    /// One lead stall check at tick time `now`: when [`OmpManager::lead_stalled`] reports the
+    /// running turn, its conversation gets one [`N_TURN_STALLED`] notice. Returns whether the
+    /// messenger accepted one. The turn is left running.
+    pub async fn post_stall_notice(&self, now: Instant) -> bool {
+        let Some(key) = self.omp.lead_stalled(now) else {
+            return false;
+        };
+        let Some(target) = reply_target(&key) else {
+            return false;
+        };
+        let text = stalled_text(self.omp.stall_after().as_secs() / 60);
+        match self.adapter.send(target, &text).await {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!(
+                    notice = N_TURN_STALLED,
+                    code = err.code,
+                    "notice send failed"
+                );
+                false
             }
         }
     }

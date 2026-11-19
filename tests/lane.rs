@@ -1654,9 +1654,9 @@ async fn watchdog_reports_a_quiet_lane_once() {
     let lanes = omp.lanes();
     let ticks = [
         lanes.watch_tick(t0),
-        lanes.watch_tick(t0 + lane::STALL_AFTER - Duration::from_secs(1)),
-        lanes.watch_tick(t0 + lane::STALL_AFTER),
-        lanes.watch_tick(t0 + 2 * lane::STALL_AFTER),
+        lanes.watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER - Duration::from_secs(1)),
+        lanes.watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER),
+        lanes.watch_tick(t0 + 2 * moraebot::config::DEFAULT_STALL_AFTER),
     ];
     let woke = tokio::time::timeout(BOUND, notified).await.is_ok();
     let state = h.lane(1).state;
@@ -1693,7 +1693,7 @@ async fn watchdog_counts_repeated_tool_calls_as_one() {
     let lanes = omp.lanes();
     let ticks = [
         lanes.watch_tick(t0),
-        lanes.watch_tick(t0 + lane::STALL_AFTER),
+        lanes.watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER),
     ];
     bounded(omp.shutdown_all()).await;
 
@@ -1713,15 +1713,15 @@ async fn watchdog_is_off_when_the_turn_timeout_is_shorter() {
     let h = Harness::new();
     let omp = h
         .manager("hang", &[lane_start("t1")])
-        .with_turn_timeout(lane::STALL_AFTER);
+        .with_turn_timeout(moraebot::config::DEFAULT_STALL_AFTER);
     bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
     await_lane_events(&omp, 1).await;
     let t0 = Instant::now();
     let lanes = omp.lanes();
     let ticks = [
         lanes.watch_tick(t0),
-        lanes.watch_tick(t0 + lane::STALL_AFTER),
-        lanes.watch_tick(t0 + 2 * lane::STALL_AFTER),
+        lanes.watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER),
+        lanes.watch_tick(t0 + 2 * moraebot::config::DEFAULT_STALL_AFTER),
     ];
     bounded(omp.shutdown_all()).await;
 
@@ -1738,7 +1738,9 @@ async fn watchdog_stops_with_the_gateway() {
     let t0 = Instant::now();
     let first = omp.lanes().watch_tick(t0);
     omp.lanes().stop_accepting();
-    let second = omp.lanes().watch_tick(t0 + lane::STALL_AFTER);
+    let second = omp
+        .lanes()
+        .watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER);
     bounded(omp.shutdown_all()).await;
 
     assert_eq!(first, 0);
@@ -1755,7 +1757,7 @@ async fn watchdog_ignores_finished_lanes() {
     let lanes = omp.lanes();
     let ticks = [
         lanes.watch_tick(t0),
-        lanes.watch_tick(t0 + lane::STALL_AFTER),
+        lanes.watch_tick(t0 + moraebot::config::DEFAULT_STALL_AFTER),
     ];
     bounded(omp.shutdown_all()).await;
 

@@ -205,6 +205,7 @@ async fn max_cost_adds_flag_only_when_set() {
     let h = Harness::with_omp(OmpConfig {
         turn_timeout_minutes: None,
         max_cost_usd: Some(2.5),
+        stall_after_minutes: None,
     });
     let manager = h.manager("ok");
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
@@ -224,6 +225,7 @@ async fn flag_present_when_hints_set() {
     let h = Harness::with_omp(OmpConfig {
         turn_timeout_minutes: None,
         max_cost_usd: Some(2.5),
+        stall_after_minutes: None,
     });
     let manager = h.manager("ok").with_hints("probe hints".into());
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;

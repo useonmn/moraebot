@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -229,12 +230,29 @@ pub struct SlackConfig {
     pub access: Access<String>,
 }
 
+/// How long a running turn may show no progress before the stall notice, when
+/// `omp.stall_after_minutes` is left out.
+pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(20 * 60);
+
 #[derive(Debug, Clone, Default)]
 pub struct OmpConfig {
     /// Absent means no turn time limit.
     pub turn_timeout_minutes: Option<u64>,
     /// Absent means no cost limit.
     pub max_cost_usd: Option<f64>,
+    /// Absent means [`DEFAULT_STALL_AFTER`].
+    pub stall_after_minutes: Option<u64>,
+}
+
+impl OmpConfig {
+    /// How long a running lead or lane turn may show no progress before moraebot sends one
+    /// stall notice. It never stops the turn.
+    pub fn stall_after(&self) -> Duration {
+        self.stall_after_minutes
+            .map_or(DEFAULT_STALL_AFTER, |minutes| {
+                Duration::from_secs(minutes.saturating_mul(60))
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -353,6 +371,8 @@ struct OmpSection {
     turn_timeout_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall_after_minutes: Option<u64>,
 }
 
 /// One line of `check-config` output.
@@ -432,11 +452,18 @@ impl Config {
         let omp = file.omp.unwrap_or(OmpSection {
             turn_timeout_minutes: None,
             max_cost_usd: None,
+            stall_after_minutes: None,
         });
         if omp.turn_timeout_minutes == Some(0) {
             return Err(ConfigError::new(
                 E_CONFIG_VALUE,
                 "omp.turn_timeout_minutes must be greater than zero (omit it for no limit)",
+            ));
+        }
+        if omp.stall_after_minutes == Some(0) {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "omp.stall_after_minutes must be greater than zero (omit it for 20 minutes)",
             ));
         }
         if let Some(cost) = omp.max_cost_usd
@@ -466,14 +493,16 @@ impl Config {
             omp: OmpConfig {
                 turn_timeout_minutes: omp.turn_timeout_minutes,
                 max_cost_usd: omp.max_cost_usd,
+                stall_after_minutes: omp.stall_after_minutes,
             },
         })
     }
 
     /// Serializes to `config.toml` text, including the resolved `home`.
     pub fn to_toml(&self) -> Result<String, ConfigError> {
-        let has_omp_limits =
-            self.omp.turn_timeout_minutes.is_some() || self.omp.max_cost_usd.is_some();
+        let has_omp_limits = self.omp.turn_timeout_minutes.is_some()
+            || self.omp.max_cost_usd.is_some()
+            || self.omp.stall_after_minutes.is_some();
         let file = ConfigFile {
             messenger: Some(self.messenger.as_str().to_string()),
             owner_id: None,
@@ -500,6 +529,7 @@ impl Config {
             omp: has_omp_limits.then_some(OmpSection {
                 turn_timeout_minutes: self.omp.turn_timeout_minutes,
                 max_cost_usd: self.omp.max_cost_usd,
+                stall_after_minutes: self.omp.stall_after_minutes,
             }),
         };
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
@@ -1453,6 +1483,8 @@ mod tests {
         assert_eq!(cfg.home, fx.dir.path().join(".moraebot"));
         assert_eq!(cfg.omp.turn_timeout_minutes, None);
         assert_eq!(cfg.omp.max_cost_usd, None);
+        assert_eq!(cfg.omp.stall_after_minutes, None);
+        assert_eq!(cfg.omp.stall_after(), Duration::from_secs(20 * 60));
     }
 
     #[test]
@@ -1481,12 +1513,14 @@ mod tests {
     fn optional_limits_are_parsed() {
         let fx = Fixture::new();
         let text = format!(
-            "{}[omp]\nturn_timeout_minutes = 30\nmax_cost_usd = 2.5\n",
+            "{}[omp]\nturn_timeout_minutes = 30\nmax_cost_usd = 2.5\nstall_after_minutes = 7\n",
             fx.valid_toml()
         );
         let cfg = fx.load(&text).expect("loads");
         assert_eq!(cfg.omp.turn_timeout_minutes, Some(30));
         assert_eq!(cfg.omp.max_cost_usd, Some(2.5));
+        assert_eq!(cfg.omp.stall_after_minutes, Some(7));
+        assert_eq!(cfg.omp.stall_after(), Duration::from_secs(7 * 60));
     }
 
     #[test]
@@ -1496,6 +1530,8 @@ mod tests {
         assert_eq!(code(fx.load(&timeout)), E_CONFIG_VALUE);
         let cost = format!("{}[omp]\nmax_cost_usd = 0.0\n", fx.valid_toml());
         assert_eq!(code(fx.load(&cost)), E_CONFIG_VALUE);
+        let stall = format!("{}[omp]\nstall_after_minutes = 0\n", fx.valid_toml());
+        assert_eq!(code(fx.load(&stall)), E_CONFIG_VALUE);
     }
 
     #[test]
@@ -1510,7 +1546,10 @@ mod tests {
     #[test]
     fn to_toml_round_trips() {
         let fx = Fixture::new();
-        let text = format!("{}[omp]\nturn_timeout_minutes = 5\n", fx.valid_toml());
+        let text = format!(
+            "{}[omp]\nturn_timeout_minutes = 5\nstall_after_minutes = 9\n",
+            fx.valid_toml()
+        );
         let cfg = fx.load(&text).expect("loads");
         let again = fx
             .load(&cfg.to_toml().expect("serializes"))
@@ -1520,6 +1559,7 @@ mod tests {
         assert_eq!(again.work_dir, cfg.work_dir);
         assert_eq!(again.omp_path, cfg.omp_path);
         assert_eq!(again.omp.turn_timeout_minutes, Some(5));
+        assert_eq!(again.omp.stall_after_minutes, Some(9));
     }
 
     fn slack_toml(fx: &Fixture) -> String {

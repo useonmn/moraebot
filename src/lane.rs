@@ -35,8 +35,8 @@
 //!
 //! While a job runs, its omp agent events are counted in an `Activity` (a new tool call, by
 //! name and args, is progress); `watch_tick` reports a job with no event, or no progress, for
-//! `STALL_AFTER` to the lead once per episode as a lane inbox row. moraebot never stops a
-//! lane for it.
+//! `omp.stall_after_minutes` (`stall_after`) to the lead once per episode as a lane inbox row.
+//! moraebot never stops a lane for it.
 //!
 //! Every lane job also gets `lane_report`: the lane leaves a one-line progress note, cleaned by
 //! `news_text` and kept as the job's newest report in its `Activity`. `news` lists the reports
@@ -78,8 +78,6 @@ use crate::worktree::{self, Cleanup, WorktreeError};
 
 /// Most lanes that may run a turn at the same time.
 pub const MAX_RUNNING_LANES: usize = 3;
-/// A running job with no omp agent event, or no new tool call, for this long is reported to the lead.
-pub const STALL_AFTER: Duration = Duration::from_secs(20 * 60);
 /// How often the watchdog looks at running lanes.
 pub const WATCH_TICK: Duration = Duration::from_secs(30);
 /// Inbox `platform` of rows that carry a lane's result to the lead.
@@ -212,9 +210,9 @@ impl Activity {
         true
     }
 
-    /// Updates the times from the counters and returns the stall to report, once per
-    /// episode; the first call only starts the clock.
-    fn stall(&mut self, now: Instant) -> Option<Stall> {
+    /// Updates the times from the counters and returns the stall to report (no event, or no
+    /// new tool call, for `after`), once per episode; the first call only starts the clock.
+    fn stall(&mut self, now: Instant, after: Duration) -> Option<Stall> {
         let Some(seen) = self.seen.as_mut() else {
             self.seen = Some(Seen {
                 events: self.events,
@@ -238,13 +236,13 @@ impl Activity {
         }
         let quiet = now.saturating_duration_since(seen.event_at);
         let idle = now.saturating_duration_since(seen.progress_at);
-        let reason = if quiet >= STALL_AFTER {
+        let reason = if quiet >= after {
             if self.retrying {
                 lead::N_LANE_RETRYING
             } else {
                 lead::N_LANE_QUIET
             }
-        } else if idle >= STALL_AFTER {
+        } else if idle >= after {
             lead::N_LANE_SPINNING
         } else {
             return None;
@@ -324,6 +322,9 @@ pub struct LaneManager {
     wake: Arc<Notify>,
     turn: Arc<Mutex<Option<TurnContext>>>,
     pub(crate) turn_timeout: Duration,
+    /// A running job with no omp agent event, or no new tool call, for this long is reported
+    /// to the lead (`omp.stall_after_minutes`).
+    pub(crate) stall_after: Duration,
     /// Kill deadline of one Done check command.
     pub(crate) check_timeout: Duration,
     inner: Mutex<LaneSet>,
@@ -402,6 +403,7 @@ impl LaneManager {
         turn_timeout: Duration,
     ) -> Self {
         Self {
+            stall_after: config.omp.stall_after(),
             config,
             store,
             wake: Arc::default(),
@@ -507,9 +509,9 @@ impl LaneManager {
 
     /// One watchdog tick at `now`: queues a notice for each running job that looks stalled
     /// and wakes the dispatcher; returns the number of notices written. Off when the turn
-    /// limit is `STALL_AFTER` or less and while stopping.
+    /// limit is `stall_after` or less and while stopping.
     pub fn watch_tick(&self, now: Instant) -> usize {
-        if self.turn_timeout <= STALL_AFTER {
+        if self.turn_timeout <= self.stall_after {
             return 0;
         }
         let mut written = 0;
@@ -521,7 +523,7 @@ impl LaneManager {
             for (id, child) in &set.children {
                 let (stall, text) = {
                     let mut activity = lock(&child.activity);
-                    let Some(stall) = activity.stall(now) else {
+                    let Some(stall) = activity.stall(now, self.stall_after) else {
                         continue;
                     };
                     let text = lead::lane_stalled(
@@ -541,7 +543,8 @@ impl LaneManager {
                 match lock(&self.store).stall_notice(*id, child.seq, stall.episode, &text) {
                     Ok(true) => {
                         written += 1;
-                        tracing::info!(
+                        tracing::warn!(
+                            code = omp::W_TURN_STALLED,
                             lane = id,
                             seq = child.seq,
                             reason = stall.reason,
@@ -1667,6 +1670,7 @@ impl LaneManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_STALL_AFTER as STALL_AFTER;
     use omp_rpc::{
         AgentStartEvent, AutoRetryEndEvent, AutoRetryStartEvent, ToolExecutionStartEvent,
     };
@@ -1716,20 +1720,25 @@ mod tests {
         let base = Instant::now();
         let mut a = Activity::default();
         a.note(&agent_start());
-        assert!(a.stall(base).is_none());
+        assert!(a.stall(base, STALL_AFTER).is_none());
         assert!(
-            a.stall(base + STALL_AFTER - Duration::from_secs(1))
+            a.stall(base + STALL_AFTER - Duration::from_secs(1), STALL_AFTER)
                 .is_none()
         );
-        let first = a.stall(base + STALL_AFTER).expect("first episode");
+        let first = a
+            .stall(base + STALL_AFTER, STALL_AFTER)
+            .expect("first episode");
         assert_eq!(first.reason, lead::N_LANE_QUIET);
         assert_eq!(first.episode, 1);
         assert_eq!(first.quiet, STALL_AFTER);
-        assert!(a.stall(base + 2 * STALL_AFTER).is_none());
+        assert!(a.stall(base + 2 * STALL_AFTER, STALL_AFTER).is_none());
         a.note(&tool_start("bash", json!({"command": "ls"})));
-        assert!(a.stall(base + 2 * STALL_AFTER + TICK).is_none());
+        assert!(
+            a.stall(base + 2 * STALL_AFTER + TICK, STALL_AFTER)
+                .is_none()
+        );
         let second = a
-            .stall(base + 3 * STALL_AFTER + TICK)
+            .stall(base + 3 * STALL_AFTER + TICK, STALL_AFTER)
             .expect("second episode");
         assert_eq!(second.episode, 2);
         assert_eq!(second.reason, lead::N_LANE_QUIET);
@@ -1740,10 +1749,10 @@ mod tests {
         let base = Instant::now();
         let mut a = Activity::default();
         a.note(&tool_start("bash", json!({"command": "ls"})));
-        assert!(a.stall(base).is_none());
+        assert!(a.stall(base, STALL_AFTER).is_none());
         for k in 1..=40u32 {
             a.note(&tool_start("bash", json!({"command": "ls"})));
-            let r = a.stall(base + k * TICK);
+            let r = a.stall(base + k * TICK, STALL_AFTER);
             if k < 40 {
                 assert!(r.is_none(), "no stall at tick {k}");
             } else {
@@ -1762,7 +1771,7 @@ mod tests {
         let base = Instant::now();
         let mut a = Activity::default();
         a.note(&tool_start("bash", json!({"command": "ls"})));
-        assert!(a.stall(base).is_none());
+        assert!(a.stall(base, STALL_AFTER).is_none());
         for k in 1..=40u32 {
             let args = if k == 20 {
                 json!({"command": "pwd"})
@@ -1770,12 +1779,15 @@ mod tests {
                 json!({"command": "ls"})
             };
             a.note(&tool_start("bash", args));
-            assert!(a.stall(base + k * TICK).is_none(), "no stall at tick {k}");
+            assert!(
+                a.stall(base + k * TICK, STALL_AFTER).is_none(),
+                "no stall at tick {k}"
+            );
         }
         let mut first = None;
         for k in 41..=60u32 {
             a.note(&tool_start("bash", json!({"command": "ls"})));
-            if let Some(stall) = a.stall(base + k * TICK) {
+            if let Some(stall) = a.stall(base + k * TICK, STALL_AFTER) {
                 first = Some((k, stall.reason));
                 break;
             }
@@ -1790,16 +1802,16 @@ mod tests {
         let mut open = Activity::default();
         open.note(&agent_start());
         open.note(&retry_start());
-        assert!(open.stall(base).is_none());
-        let stall = open.stall(base + STALL_AFTER).expect("stall");
+        assert!(open.stall(base, STALL_AFTER).is_none());
+        let stall = open.stall(base + STALL_AFTER, STALL_AFTER).expect("stall");
         assert_eq!(stall.reason, lead::N_LANE_RETRYING);
 
         let mut ended = Activity::default();
         ended.note(&agent_start());
         ended.note(&retry_start());
         ended.note(&retry_end());
-        assert!(ended.stall(base).is_none());
-        let stall = ended.stall(base + STALL_AFTER).expect("stall");
+        assert!(ended.stall(base, STALL_AFTER).is_none());
+        let stall = ended.stall(base + STALL_AFTER, STALL_AFTER).expect("stall");
         assert_eq!(stall.reason, lead::N_LANE_QUIET);
     }
 

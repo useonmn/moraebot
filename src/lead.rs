@@ -7,9 +7,9 @@ use crate::lane::E_LANE_STOPPED;
 pub const GUIDANCE_NAME: &str = "lead";
 /// `sessions.name` of the lead session.
 pub const LEAD_SESSION: &str = "lead";
-/// Stalled-lane reason: no omp agent event for `lane::STALL_AFTER`.
+/// Stalled-lane reason: no omp agent event for `omp.stall_after_minutes`.
 pub const N_LANE_QUIET: &str = "N_LANE_QUIET";
-/// Stalled-lane reason: events but no new tool call for `lane::STALL_AFTER`.
+/// Stalled-lane reason: events but no new tool call for `omp.stall_after_minutes`.
 pub const N_LANE_SPINNING: &str = "N_LANE_SPINNING";
 /// Stalled-lane reason: quiet after the provider began a retry.
 pub const N_LANE_RETRYING: &str = "N_LANE_RETRYING";
