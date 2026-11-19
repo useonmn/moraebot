@@ -671,14 +671,12 @@ async fn listed_bot_passes_unlisted_bot_dropped() {
     assert!(h.adapter.calls().is_empty());
 
     let listed = bot_event("1300000000000000042", PEER_BOT, None);
-    assert_eq!(h.handle(listed).await, Handled::Notice(N_CHAT_UNAVAILABLE));
     assert_eq!(
-        h.sends(),
-        vec![(
-            CHANNEL.to_owned(),
-            notice_text(N_CHAT_UNAVAILABLE).to_owned()
-        )]
+        h.handle(listed).await,
+        Handled::Dropped(DropReason::BotChat),
+        "a listed chat bot gets no notice it could answer"
     );
+    assert!(h.adapter.calls().is_empty());
     assert!(!h.step().await);
     assert_eq!(h.count(), 0);
     assert_eq!(h.starts(), 0);
@@ -738,20 +736,42 @@ async fn bot_reply_limit_caps_a_thread_when_set() {
     assert_eq!(
         handled,
         vec![
-            Handled::Notice(N_CHAT_UNAVAILABLE),
-            Handled::Notice(N_CHAT_UNAVAILABLE),
+            Handled::Dropped(DropReason::BotChat),
+            Handled::Dropped(DropReason::BotChat),
             Handled::Dropped(DropReason::BotLimit),
         ]
     );
     let other = bot_event("1300000000000000064", PEER_BOT, Some("1300000000000000065"));
-    assert_eq!(h.handle(other).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    assert_eq!(h.handle(other).await, Handled::Dropped(DropReason::BotChat));
     let person = event("1300000000000000066", FRIEND, Some(thread), "hi");
     assert_eq!(
         h.handle(person).await,
         Handled::Notice(N_CHAT_UNAVAILABLE),
         "the limit counts replies to bots only"
     );
-    assert_eq!(h.sends().len(), 4);
+    assert_eq!(h.sends().len(), 1, "only the person got a notice");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn bot_reply_limit_caps_top_level_channel_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), Some(2));
+    let mut handled = Vec::new();
+    for n in 91..=93 {
+        let id = format!("13000000000000000{n}");
+        handled.push(h.handle(bot_event(&id, PEER_BOT, None)).await);
+    }
+    assert_eq!(
+        handled,
+        vec![
+            Handled::Dropped(DropReason::BotChat),
+            Handled::Dropped(DropReason::BotChat),
+            Handled::Dropped(DropReason::BotLimit),
+        ],
+        "each top-level message has its own thread key, so they count per channel"
+    );
+    assert!(h.adapter.calls().is_empty());
     h.close().await;
 }
 
@@ -764,10 +784,10 @@ async fn bot_replies_have_no_cap_without_the_setting() {
         let id = format!("13000000000000000{n}");
         assert_eq!(
             h.handle(bot_event(&id, PEER_BOT, Some(thread))).await,
-            Handled::Notice(N_CHAT_UNAVAILABLE)
+            Handled::Dropped(DropReason::BotChat)
         );
     }
-    assert_eq!(h.sends().len(), 20);
+    assert!(h.sends().is_empty());
     h.close().await;
 }
 

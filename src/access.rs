@@ -11,12 +11,16 @@ pub const E_ACCESS_BOT: &str = "E_ACCESS_BOT";
 pub const E_ACCESS_NOT_OWNER: &str = "E_ACCESS_NOT_OWNER";
 /// A listed bot reached `max_bot_replies` in its thread; the message gets no answer.
 pub const E_ACCESS_BOT_LIMIT: &str = "E_ACCESS_BOT_LIMIT";
+/// A listed bot's `chat` message: dropped without a notice until chat replies exist, so
+/// a peer bot never gets a notice it could answer.
+pub const E_ACCESS_BOT_CHAT: &str = "E_ACCESS_BOT_CHAT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     Bot,
     NotOwner,
     BotLimit,
+    BotChat,
 }
 
 impl DropReason {
@@ -25,6 +29,7 @@ impl DropReason {
             DropReason::Bot => E_ACCESS_BOT,
             DropReason::NotOwner => E_ACCESS_NOT_OWNER,
             DropReason::BotLimit => E_ACCESS_BOT_LIMIT,
+            DropReason::BotChat => E_ACCESS_BOT_CHAT,
         }
     }
 }

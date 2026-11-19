@@ -2,9 +2,10 @@
 //!
 //! Order of an inbound message: drop authors that are neither the owner nor listed in the
 //! active messenger's `allow` list (nothing stored); drop a listed bot's message once its
-//! conversation reached `max_bot_replies` in the window (no limit when unset); answer a
-//! listed `chat` sender with one fixed notice ([`N_CHAT_UNAVAILABLE`]; never stored, no
-//! file fetched, never forwarded to the lead); answer `/` messages and empty messages without attachments with one fixed notice (never
+//! conversation reached `max_bot_replies` in the window (no limit when unset; bot
+//! messages posted directly in the channel count per channel); drop a listed bot's `chat`
+//! message without a notice; answer a listed `chat` person with one fixed notice
+//! ([`N_CHAT_UNAVAILABLE`]; never stored, no file fetched, never forwarded to the lead); answer `/` messages and empty messages without attachments with one fixed notice (never
 //! stored, never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing
 //! stored, nothing fetched), pick the conversation key, store the row FIRST (a duplicate
 //! stops here), and only then open a thread for a message posted directly in the channel.
@@ -534,17 +535,24 @@ impl Dispatcher {
             (Some(thread), false) => (ConversationKey::thread(platform, thread), false),
             (None, false) => (ConversationKey::thread(platform, &event.message_id), true),
         };
+        // A message posted directly in the channel opens its own thread, so its key is new
+        // every time: bot messages there count under the channel instead.
+        let bot_key = if new_thread {
+            format!("{platform}:ch:{}", event.channel_id)
+        } else {
+            key.as_str().to_owned()
+        };
         if event.author_is_bot
             && !self
                 .bot_replies
                 .lock()
                 .expect("bot reply mutex poisoned")
-                .take(key.as_str(), Instant::now())
+                .take(&bot_key, Instant::now())
         {
             tracing::info!(
                 message_id = %event.message_id,
                 author_id = %event.author_id,
-                conversation = key.as_str(),
+                conversation = bot_key.as_str(),
                 code = DropReason::BotLimit.code(),
                 "bot reply limit reached, message dropped"
             );
@@ -553,6 +561,16 @@ impl Dispatcher {
 
         let here = event.thread_id.as_deref().unwrap_or(&event.channel_id);
         if let Sender::Listed(role) = sender {
+            if event.author_is_bot {
+                tracing::info!(
+                    message_id = %event.message_id,
+                    author_id = %event.author_id,
+                    role = role.as_str(),
+                    code = DropReason::BotChat.code(),
+                    "listed bot's chat message dropped"
+                );
+                return Ok(Handled::Dropped(DropReason::BotChat));
+            }
             tracing::info!(
                 message_id = %event.message_id,
                 author_id = %event.author_id,
