@@ -85,8 +85,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const KILL_BIN: &str = "/bin/kill";
 /// How long shutdown waits for a killed child's worker thread to finish.
 pub const ABORT_JOIN_BOUND: Duration = Duration::from_secs(10);
-/// "No limit": `prompt_and_wait` needs a deadline, so use one that never matters.
-const UNLIMITED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Result of one prompt. The caller maps it to the inbox state and at most one notice.
 #[derive(Debug, Clone, PartialEq)]
@@ -634,14 +632,11 @@ pub struct OmpManager {
 }
 
 impl OmpManager {
-    /// The turn limit comes from `omp.turn_timeout_minutes`; absent means no limit.
+    /// The turn limit comes from `omp.turn_timeout_minutes` (see [`OmpConfig::turn_timeout`]).
+    ///
+    /// [`OmpConfig::turn_timeout`]: crate::config::OmpConfig::turn_timeout
     pub fn new(config: Config, store: Arc<Mutex<Store>>) -> Self {
-        let turn_timeout = config
-            .omp
-            .turn_timeout_minutes
-            .map_or(UNLIMITED, |minutes| {
-                Duration::from_secs(minutes.saturating_mul(60))
-            });
+        let turn_timeout = config.omp.turn_timeout();
         let turn: Arc<Mutex<Option<TurnContext>>> = Default::default();
         let lanes = Arc::new(LaneManager::new(
             config.clone(),
