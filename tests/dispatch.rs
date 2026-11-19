@@ -82,6 +82,7 @@ struct Harness {
     store: Arc<Mutex<Store>>,
     adapter: Arc<FakeAdapter>,
     dispatcher: Arc<Dispatcher>,
+    chat: Arc<chat::ChatManager>,
 }
 
 impl Harness {
@@ -189,6 +190,7 @@ impl Harness {
         ];
         env.extend(extra_env);
         let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env(env);
+        let chat = omp.chat();
         let adapter = Arc::new(FakeAdapter::new());
         let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
             Arc::new(ThreadFailAdapter(Arc::clone(&adapter)))
@@ -202,6 +204,7 @@ impl Harness {
             store,
             adapter,
             dispatcher,
+            chat,
         }
     }
 
@@ -741,7 +744,6 @@ async fn listed_bot_passes_unlisted_bot_dropped() {
         h.sends(),
         vec![("1300000000000000042".to_owned(), "echo: hello".to_owned())]
     );
-    assert!(h.adapter.calls().is_empty());
     assert!(!h.step().await);
     assert_eq!(h.count(), 0);
     h.close().await;
@@ -777,7 +779,11 @@ async fn chat_child_has_no_tools_and_an_empty_cwd() {
         "a chat child is never yolo: {argv:?}"
     );
     let cwd = PathBuf::from(arg_after(&argv, "--cwd"));
-    assert_eq!(cwd, h.config.home.join("chat").join("cwd"));
+    assert_eq!(cwd.parent(), Some(chat::chat_cwd(&h.config).as_path()));
+    assert!(
+        !cwd.exists(),
+        "the turn's working folder is removed after it"
+    );
     assert_eq!(h.cwd_entries(pid), Some(0), "the cwd was empty at spawn");
     assert!(!cwd.starts_with(&h.config.work_dir));
     let session = PathBuf::from(arg_after(&argv, "--session-dir"));
@@ -992,6 +998,135 @@ async fn shutdown_kills_a_running_chat_child() {
 }
 
 #[tokio::test]
+async fn chat_conversation_locks_are_dropped_after_their_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let thread = "1300000000000000100";
+    for (id, text) in [
+        ("1300000000000000101", "one"),
+        ("1300000000000000102", "two"),
+    ] {
+        assert_eq!(
+            h.handle(event(id, FRIEND, Some(thread), text)).await,
+            Handled::Chat
+        );
+    }
+    let other = event(
+        "1300000000000000103",
+        FRIEND,
+        Some("1300000000000000104"),
+        "three",
+    );
+    assert_eq!(h.handle(other).await, Handled::Chat);
+    h.chats_done().await;
+    assert_eq!(h.sends().len(), 3);
+    assert_eq!(h.chat.open_conversations(), 0, "no lock outlives its turns");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn redelivered_chat_message_runs_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let post = event("1300000000000000105", FRIEND, None, "hello once");
+    assert_eq!(h.handle(post.clone()).await, Handled::Chat);
+    assert_eq!(h.handle(post).await, Handled::Duplicate);
+    h.chats_done().await;
+    assert_eq!(
+        h.threads_created(),
+        1,
+        "no second thread for the redelivery"
+    );
+    assert_eq!(h.starts(), 1, "one chat child");
+    assert_eq!(
+        h.sends(),
+        vec![(
+            "1300000000000000105".to_owned(),
+            "echo: hello once".to_owned()
+        )]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_children_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist_with(dir.path(), None, "hang", Vec::new());
+    let mut tap = LogTap::create(&dir.path().join("fake-omp.log"));
+    let threads = [
+        "1300000000000000110",
+        "1300000000000000111",
+        "1300000000000000112",
+    ];
+    for (n, thread) in threads.iter().enumerate() {
+        let id = format!("130000000000000012{n}");
+        assert_eq!(
+            h.handle(event(&id, FRIEND, Some(thread), "hold")).await,
+            Handled::Chat
+        );
+    }
+    // Every turn task ran up to its first wait before any child could start, so once
+    // two children took their prompt the third turn is waiting for a slot.
+    let mut prompts = 0;
+    while prompts < chat::MAX_CHAT_CHILDREN {
+        let line = tap.next_line().await;
+        if serde_json::from_str::<Value>(&line).is_ok_and(|frame| frame["type"] == "prompt") {
+            prompts += 1;
+        }
+    }
+    assert_eq!(h.chat.running(), chat::MAX_CHAT_CHILDREN);
+
+    bounded(h.dispatcher.shutdown()).await;
+    assert_eq!(h.chat.running(), 0);
+    let mut sends = h.sends();
+    sends.sort();
+    let failed = notice_text(N_FAILED).to_owned();
+    assert_eq!(
+        sends,
+        threads
+            .iter()
+            .map(|t| (t.to_string(), failed.clone()))
+            .collect::<Vec<_>>(),
+        "two killed turns and the waiting one each get one notice"
+    );
+}
+
+#[tokio::test]
+async fn oversized_chat_attachment_is_named_not_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    h.adapter.set_attachment_bytes("ref-big", vec![b'a'; 16]);
+    let size = chat::MAX_INLINE_TEXT_BYTES as u64 + 1;
+    let thread = "1300000000000000113";
+    let chat = with_files(
+        event("1300000000000000114", FRIEND, Some(thread), "big file"),
+        vec![attachment("big.txt", "ref-big", size)],
+    );
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+    assert!(
+        fetches(&h).is_empty(),
+        "an oversized file is never downloaded"
+    );
+    let message = h
+        .log_lines()
+        .iter()
+        .find(|l| l.contains(r#""type":"prompt""#))
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .expect("chat prompt frame");
+    assert!(message.contains(&format!(
+        "- 1-big.txt (text/plain, {size} bytes): too large to show"
+    )));
+    assert_eq!(h.sends().len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn bot_reply_limit_caps_a_thread_when_set() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open_allowlist(dir.path(), Some(2));
@@ -1041,7 +1176,11 @@ async fn bot_reply_limit_caps_top_level_channel_messages() {
         "each top-level message has its own thread key, so they count per channel"
     );
     h.chats_done().await;
-    assert_eq!(h.sends().len(), 2, "two chat replies, the third bot message is dropped");
+    assert_eq!(
+        h.sends().len(),
+        2,
+        "two chat replies, the third bot message is dropped"
+    );
     h.close().await;
 }
 

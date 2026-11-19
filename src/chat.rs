@@ -4,9 +4,12 @@
 //! One child per chat turn, closed (and reaped) when the turn ends, so no chat child is
 //! left idle. Each conversation has its own omp session under
 //! `<home>/chat/<conversation>/session`, never the lead's; turns of one conversation run
-//! one at a time, different conversations in parallel. The child starts with every omp
-//! switch that removes a way to act ([`chat_args`]): no built-in tools, no extensions,
-//! skills, rules or context files, no LSP or PTY, in the empty folder `<home>/chat/cwd`,
+//! one at a time, different conversations in parallel, at most [`MAX_CHAT_CHILDREN`]
+//! children at once (later turns wait for a slot). A redelivered chat message (same
+//! message id among the last [`RECENT_CHAT_MESSAGES`]) is not run again. The child
+//! starts with every omp switch that removes a way to act ([`chat_args`]): no built-in
+//! tools, no extensions, skills, rules or context files, no LSP or PTY, in its own empty
+//! folder `<home>/chat/cwd/<turn>` (made fresh for the turn and removed after it),
 //! with the overlay `<home>/chat/omp-chat.yml` ([`CHAT_OVERLAY`]) that turns off every
 //! config discovery source (so no MCP server, plugin, hook or skill), memory, lesson
 //! capture and the advisor, and with no host tools (no `set_host_tools`). Before the
@@ -14,18 +17,21 @@
 //! ([`E_CHAT_TOOLS`]).
 //!
 //! Attachments from a chat sender are delivered with the prompt only: images as prompt
-//! images, small text files inline, anything else by name. They are fetched into
+//! images, small text files inline, anything else by name. A file over its kind's limit
+//! ([`MAX_IMAGE_BYTES`], [`MAX_INLINE_TEXT_BYTES`]) by its declared size is not fetched,
+//! and one over it on disk is not read: it is named only. The rest are fetched into
 //! `<home>/chat/<conversation>/files/` and removed after the turn; nothing goes into the
 //! owner's work folder.
 //!
 //! `shutdown_all` stops new chat turns and kills every chat child, like lanes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use omp_rpc::{GetStateCommand, ImageContent, LitImage, PromptCommand};
 use serde_json::Map;
 
@@ -38,8 +44,6 @@ use crate::store::Store;
 
 /// The chat child listed tools of its own; the turn was not run.
 pub const E_CHAT_TOOLS: &str = "E_CHAT_TOOLS";
-/// The chat working folder is not empty; the turn was not run.
-pub const E_CHAT_CWD: &str = "E_CHAT_CWD";
 /// The gateway is stopping; no chat turn starts.
 pub const E_CHAT_STOPPING: &str = "E_CHAT_STOPPING";
 
@@ -47,12 +51,16 @@ pub const E_CHAT_STOPPING: &str = "E_CHAT_STOPPING";
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// A text attachment larger than this is named, not inlined.
 pub const MAX_INLINE_TEXT_BYTES: usize = 64 * 1024;
+/// Chat children running at once; later turns wait for a slot.
+pub const MAX_CHAT_CHILDREN: usize = 2;
+/// Chat message ids remembered to drop a redelivered message.
+pub const RECENT_CHAT_MESSAGES: usize = 1024;
 
 /// The settings overlay of every chat child (`--config`). It beats the user's global
 /// omp config for this process only. `disabledProviders` lists every omp config
 /// discovery source, so no MCP server, plugin, hook, skill or command is loaded: with
 /// `--no-tools` alone omp lists a user-level MCP server's tools as top-level tools. The
-/// list replaces the user's own `disabledProviders` for this child.
+/// list replaces the user's own `disabledProviders` for this child (README, access).
 pub const CHAT_OVERLAY: &str = "\
 # Written by moraebot for chat children. Edits are overwritten.
 disabledProviders:
@@ -98,9 +106,14 @@ pub fn chat_root(config: &Config) -> PathBuf {
     config.home.join("chat")
 }
 
-/// The empty working folder of every chat child: `<home>/chat/cwd`.
+/// `<home>/chat/cwd`: holds one empty working folder per running chat turn.
 pub fn chat_cwd(config: &Config) -> PathBuf {
     chat_root(config).join("cwd")
+}
+
+/// `<home>/chat/cwd/<turn>`: the working folder of one chat turn, made empty for it.
+pub fn chat_turn_cwd(config: &Config, turn: u64) -> PathBuf {
+    chat_cwd(config).join(turn.to_string())
 }
 
 /// `<home>/chat/omp-chat.yml`.
@@ -129,14 +142,14 @@ pub fn chat_session_name(key: &str) -> String {
 
 /// Exact omp argv (without the program) for a chat child. Unlike the lead (`omp_args`)
 /// there is no `--approval-mode yolo`, and every switch that adds a way to act is off.
-pub fn chat_args(config: &Config, key: &str) -> Vec<OsString> {
+pub fn chat_args(config: &Config, key: &str, cwd: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
         .collect();
     args.push(chat_session_dir(config, key).into());
     args.push("--cwd".into());
-    args.push(chat_cwd(config).into());
+    args.push(cwd.into());
     args.push("--config".into());
     args.push(chat_overlay_path(config).into());
     for flag in [
@@ -164,7 +177,19 @@ pub fn chat_args(config: &Config, key: &str) -> Vec<OsString> {
 pub struct ChatFile {
     pub name: String,
     pub mime: Option<String>,
-    pub bytes: Vec<u8>,
+    pub size: u64,
+    /// `None`: over [`size_limit`], so never fetched or read; it is named only.
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// The largest attachment of this mime type that is read into the prompt.
+pub fn size_limit(mime: Option<&str>) -> u64 {
+    let limit = if mime.is_some_and(|m| m.starts_with("image/")) {
+        MAX_IMAGE_BYTES
+    } else {
+        MAX_INLINE_TEXT_BYTES
+    };
+    limit as u64
 }
 
 /// The prompt of a chat turn: the text with a block naming every file (small text files
@@ -178,15 +203,18 @@ pub fn chat_prompt(text: &str, files: &[ChatFile]) -> (String, Vec<ImageContent>
     let mut images = Vec::new();
     for file in files {
         let mime = file.mime.as_deref().unwrap_or("application/octet-stream");
-        let size = file.bytes.len();
-        let head = format!("\n- {} ({mime}, {size} bytes)", file.name);
+        let head = format!("\n- {} ({mime}, {} bytes)", file.name, file.size);
         message.push_str(&head);
+        let Some(bytes) = file.bytes.as_deref() else {
+            message.push_str(": too large to show");
+            continue;
+        };
         if mime.starts_with("image/") {
-            if size <= MAX_IMAGE_BYTES {
+            if bytes.len() <= MAX_IMAGE_BYTES {
                 message.push_str(": attached as an image");
                 images.push(ImageContent {
                     r#type: Some(LitImage),
-                    data: Some(base64(&file.bytes)),
+                    data: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
                     mime_type: Some(mime.to_owned()),
                     detail: None,
                     url: None,
@@ -198,8 +226,8 @@ pub fn chat_prompt(text: &str, files: &[ChatFile]) -> (String, Vec<ImageContent>
             }
             continue;
         }
-        match std::str::from_utf8(&file.bytes) {
-            Ok(body) if size <= MAX_INLINE_TEXT_BYTES => {
+        match std::str::from_utf8(bytes) {
+            Ok(body) if bytes.len() <= MAX_INLINE_TEXT_BYTES => {
                 message.push_str(":\n```\n");
                 message.push_str(body);
                 if !body.ends_with('\n') {
@@ -212,28 +240,6 @@ pub fn chat_prompt(text: &str, files: &[ChatFile]) -> (String, Vec<ImageContent>
         }
     }
     (message, images)
-}
-
-/// Standard base64 with padding.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-            if i <= chunk.len() {
-                out.push(char::from(ALPHABET[(n >> shift) as usize & 63]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// Running chat children by turn number; `stopping` refuses new ones.
@@ -250,12 +256,19 @@ pub struct ChatManager {
     pub(crate) extra_env: Vec<(OsString, OsString)>,
     pub(crate) turn_timeout: Duration,
     set: Arc<Mutex<ChatSet>>,
-    /// One lock per conversation: its turns run one at a time.
+    /// One lock per conversation: its turns run one at a time. An entry lives only while
+    /// a turn of its conversation runs or waits.
     conversations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// [`MAX_CHAT_CHILDREN`] permits; closed by [`Self::shutdown_all`].
+    slots: tokio::sync::Semaphore,
+    /// The last [`RECENT_CHAT_MESSAGES`] chat message ids, oldest first.
+    recent: Mutex<(VecDeque<String>, HashSet<String>)>,
 }
 
 impl ChatManager {
     pub(crate) fn new(config: Config, store: Arc<Mutex<Store>>, turn_timeout: Duration) -> Self {
+        // Turn numbers restart with the process: drop working folders a crash left behind.
+        remove_files(&chat_cwd(&config));
         Self {
             config,
             store,
@@ -263,18 +276,48 @@ impl ChatManager {
             turn_timeout,
             set: Arc::default(),
             conversations: Mutex::default(),
+            slots: tokio::sync::Semaphore::new(MAX_CHAT_CHILDREN),
+            recent: Mutex::default(),
         }
     }
 
+    /// False when `message_id` was seen among the last [`RECENT_CHAT_MESSAGES`] chat
+    /// messages (a redelivery); records it otherwise.
+    pub fn first_delivery(&self, message_id: &str) -> bool {
+        let mut recent = lock(&self.recent);
+        let (order, seen) = &mut *recent;
+        if !seen.insert(message_id.to_owned()) {
+            return false;
+        }
+        order.push_back(message_id.to_owned());
+        if order.len() > RECENT_CHAT_MESSAGES
+            && let Some(oldest) = order.pop_front()
+        {
+            seen.remove(&oldest);
+        }
+        true
+    }
+
+    /// Conversations with a chat turn running or waiting.
+    pub fn open_conversations(&self) -> usize {
+        lock(&self.conversations).len()
+    }
+
     /// Runs one chat turn for conversation `key` in a fresh tool-less child and closes
-    /// it. Turns of the same conversation wait for each other.
+    /// it. Turns of the same conversation wait for each other, and every turn waits for
+    /// one of the [`MAX_CHAT_CHILDREN`] slots.
     pub async fn reply(&self, key: &str, text: &str, files: &[ChatFile]) -> Outcome {
         let conversation = Arc::clone(lock(&self.conversations).entry(key.to_owned()).or_default());
-        let _turn = conversation.lock().await;
-        let outcome = self.run(key, text, files).await;
-        drop(_turn);
-        lock(&self.conversations)
-            .retain(|_, lock| Arc::strong_count(lock) > 1 || !Arc::ptr_eq(lock, &conversation));
+        let turn = conversation.lock().await;
+        let outcome = match self.slots.acquire().await {
+            Ok(_slot) => self.run(key, text, files).await,
+            Err(_) => failed(E_CHAT_STOPPING, "the gateway is stopping"),
+        };
+        drop(turn);
+        drop(conversation);
+        // Clones are taken under this map lock, so an entry held only by the map has no
+        // turn running or waiting.
+        lock(&self.conversations).retain(|_, lock| Arc::strong_count(lock) > 1);
         outcome
     }
 
@@ -289,7 +332,8 @@ impl ChatManager {
             set.children.insert(turn, None);
             turn
         };
-        let outcome = match self.prepare(key) {
+        let cwd = chat_turn_cwd(&self.config, turn);
+        let outcome = match self.prepare(key, &cwd) {
             Ok((command, previous_session)) => {
                 let (message, images) = chat_prompt(text, files);
                 self.spawn_turn(turn, key, command, previous_session, message, images)
@@ -301,25 +345,28 @@ impl ChatManager {
         if let Some(Some(mut group)) = lock(&self.set).children.remove(&turn) {
             group.disarm();
         }
+        if let Ok(entries) = std::fs::read_dir(&cwd)
+            && entries.count() > 0
+        {
+            tracing::warn!(
+                cwd = %cwd.display(),
+                "chat child wrote into its working folder; removed with the turn"
+            );
+        }
+        remove_files(&cwd);
         outcome
     }
 
-    /// The child command and the conversation's previous session id. The working folder
-    /// must be empty and the overlay is written again before every start.
-    fn prepare(&self, key: &str) -> Result<(std::process::Command, Option<String>), Outcome> {
+    /// The child command and the conversation's previous session id. The turn's working
+    /// folder `cwd` is made empty and the overlay is written again before every start.
+    fn prepare(
+        &self,
+        key: &str,
+        cwd: &Path,
+    ) -> Result<(std::process::Command, Option<String>), Outcome> {
         let spawn_failed = |e: std::io::Error| failed(E_OMP_SPAWN, e);
-        let cwd = chat_cwd(&self.config);
-        private_dir(&cwd).map_err(spawn_failed)?;
-        if std::fs::read_dir(&cwd)
-            .map_err(spawn_failed)?
-            .next()
-            .is_some()
-        {
-            return Err(failed(
-                E_CHAT_CWD,
-                format!("{} is not empty", cwd.display()),
-            ));
-        }
+        remove_files(cwd);
+        private_dir(cwd).map_err(spawn_failed)?;
         std::fs::write(chat_overlay_path(&self.config), CHAT_OVERLAY).map_err(spawn_failed)?;
         private_dir(&chat_session_dir(&self.config, key)).map_err(spawn_failed)?;
         let previous = lock(&self.store)
@@ -327,7 +374,7 @@ impl ChatManager {
             .map_err(|e| failed(e.code(), e))?;
         let command = child_command(
             &self.config,
-            chat_args(&self.config, key),
+            chat_args(&self.config, key, cwd),
             &stderr_log_path(&self.config, &chat_session_name(key)),
             &self.extra_env,
         )
@@ -415,6 +462,7 @@ impl ChatManager {
     /// Refuses new chat turns and kills every running chat child; each turn's worker
     /// then sees its child gone and returns.
     pub fn shutdown_all(&self) {
+        self.slots.close();
         let mut set = lock(&self.set);
         set.stopping = true;
         for group in set.children.values().flatten() {
@@ -440,15 +488,42 @@ fn failed(code: &'static str, detail: impl ToString) -> Outcome {
     }
 }
 
-/// Reads the saved attachments of a chat message, then removes their folder.
-pub fn take_files(dir: &Path, saved: Vec<(String, Option<String>, PathBuf)>) -> Vec<ChatFile> {
+/// One attachment of a chat message: its name, mime type, declared size, and where it
+/// was saved (`None`: over its [`size_limit`], not fetched).
+pub type SavedFile = (String, Option<String>, u64, Option<PathBuf>);
+
+/// Reads the saved attachments of a chat message, then removes their folder. A file over
+/// its [`size_limit`] on disk is not read.
+pub fn take_files(dir: &Path, saved: Vec<SavedFile>) -> Vec<ChatFile> {
     let files = saved
         .into_iter()
-        .filter_map(|(name, mime, path)| match std::fs::read(&path) {
-            Ok(bytes) => Some(ChatFile { name, mime, bytes }),
-            Err(e) => {
-                tracing::warn!(error = %e, "chat attachment not readable");
-                None
+        .filter_map(|(name, mime, size, path)| {
+            let Some(path) = path else {
+                return Some(ChatFile {
+                    name,
+                    mime,
+                    size,
+                    bytes: None,
+                });
+            };
+            let read = std::fs::metadata(&path).and_then(|meta| {
+                if meta.len() > size_limit(mime.as_deref()) {
+                    Ok((meta.len(), None))
+                } else {
+                    std::fs::read(&path).map(|bytes| (bytes.len() as u64, Some(bytes)))
+                }
+            });
+            match read {
+                Ok((size, bytes)) => Some(ChatFile {
+                    name,
+                    mime,
+                    size,
+                    bytes,
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "chat attachment not readable");
+                    None
+                }
             }
         })
         .collect();
@@ -469,26 +544,12 @@ pub fn remove_files(dir: &Path) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn base64_matches_known_vectors() {
-        for (raw, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(raw.as_bytes()), encoded);
-        }
-    }
-
     fn file(name: &str, mime: Option<&str>, bytes: &[u8]) -> ChatFile {
         ChatFile {
             name: name.into(),
             mime: mime.map(str::to_owned),
-            bytes: bytes.to_vec(),
+            size: bytes.len() as u64,
+            bytes: Some(bytes.to_vec()),
         }
     }
 
@@ -529,5 +590,45 @@ mod tests {
         );
         assert!(images.is_empty());
         assert_eq!(message.matches("too large to show").count(), 2);
+    }
+
+    #[test]
+    fn unread_files_are_named_with_their_size() {
+        let skipped = ChatFile {
+            name: "big.txt".into(),
+            mime: Some("text/plain".into()),
+            size: 9_000_000,
+            bytes: None,
+        };
+        let (message, images) = chat_prompt("x", &[skipped]);
+        assert!(images.is_empty());
+        assert!(message.contains("- big.txt (text/plain, 9000000 bytes): too large to show"));
+    }
+
+    #[test]
+    fn take_files_does_not_read_a_file_over_its_limit_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let files_dir = dir.path().join("files");
+        std::fs::create_dir(&files_dir).unwrap();
+        let small = files_dir.join("small.txt");
+        let big = files_dir.join("big.txt");
+        std::fs::write(&small, b"hi").unwrap();
+        std::fs::write(&big, vec![b'a'; MAX_INLINE_TEXT_BYTES + 1]).unwrap();
+        let text = Some("text/plain".to_owned());
+        let files = take_files(
+            &files_dir,
+            vec![
+                ("small.txt".into(), text.clone(), 2, Some(small)),
+                // Declared small, larger on disk: the disk size wins.
+                ("big.txt".into(), text.clone(), 3, Some(big)),
+                ("skipped.txt".into(), text, 9_000_000, None),
+            ],
+        );
+        assert_eq!(files[0].bytes.as_deref(), Some(&b"hi"[..]));
+        assert_eq!(files[1].bytes, None);
+        assert_eq!(files[1].size, MAX_INLINE_TEXT_BYTES as u64 + 1);
+        assert_eq!(files[2].bytes, None);
+        assert_eq!(files[2].size, 9_000_000);
+        assert!(!files_dir.exists(), "the folder is removed");
     }
 }

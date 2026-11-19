@@ -11,10 +11,12 @@
 //! pick the conversation key, store the row FIRST (a duplicate stops here), and only then
 //! open a thread for a message posted directly in the channel.
 //!
-//! A chat message posted directly in the channel gets its own thread first (no thread: one
-//! [`N_THREAD_FAILED`] notice). Its turn then runs on its own task: its attachments are
-//! fetched into the chat folder under the home (never the work folder), handed to the chat
-//! child with the prompt and removed; the reply, or one notice, goes to its conversation.
+//! A chat message seen before (a redelivery, see [`ChatManager::first_delivery`]) stops
+//! there. A chat message posted directly in the channel gets its own thread first (no
+//! thread: one [`N_THREAD_FAILED`] notice). Its turn then runs on its own task: its
+//! attachments within their size limit are fetched into the chat folder under the home
+//! (never the work folder), handed to the chat child with the prompt and removed; the
+//! reply, or one notice, goes to its conversation.
 //!
 //! Attachments are forwarded: they are fetched only after the row is stored and its thread
 //! opened, outside the admission lock, into `<work_dir>/.moraebot-inbox/<key>/<row>/`, each
@@ -497,6 +499,11 @@ impl Dispatcher {
         key: ConversationKey,
         new_thread: bool,
     ) -> Handled {
+        let chat = self.omp.chat();
+        if !chat.first_delivery(&event.message_id) {
+            tracing::info!(message_id = %event.message_id, "chat message redelivered, not run again");
+            return Handled::Duplicate;
+        }
         if new_thread
             && let Err(err) = self
                 .adapter
@@ -512,12 +519,19 @@ impl Dispatcher {
         };
         let turn = ChatTurn {
             adapter: Arc::clone(&self.adapter),
-            chat: self.omp.chat(),
+            chat,
             key: key.as_str().to_owned(),
             target,
             event,
         };
-        self.chats.lock().expect("chat task lock").spawn(turn.run());
+        let mut chats = self.chats.lock().expect("chat task lock");
+        // Reap finished turns so the set holds running ones only.
+        while let Some(done) = chats.try_join_next() {
+            if let Err(e) = done {
+                tracing::error!(error = %e, "a chat turn panicked");
+            }
+        }
+        chats.spawn(turn.run());
         Handled::Chat
     }
 
@@ -1313,8 +1327,9 @@ impl ChatTurn {
         send_notice(self.adapter.as_ref(), &self.target, notice).await;
     }
 
-    /// Saves every attachment under `dir` (0700 levels) under the stall watchdog, reads it
-    /// back and removes `dir`.
+    /// Saves every attachment within its [`chat::size_limit`] (by declared size) under
+    /// `dir` (0700 levels) under the stall watchdog, reads it back and removes `dir`.
+    /// Larger ones are not fetched and only named.
     async fn fetch(&self, dir: &std::path::Path) -> Result<Vec<ChatFile>, AdapterError> {
         if self.event.attachments.is_empty() {
             return Ok(Vec::new());
@@ -1323,6 +1338,10 @@ impl ChatTurn {
         let mut saved = Vec::with_capacity(self.event.attachments.len());
         for (index, attachment) in self.event.attachments.iter().enumerate() {
             let name = files::sanitize_name(&attachment.name, index + 1);
+            if attachment.size > chat::size_limit(attachment.mime.as_deref()) {
+                saved.push((name, attachment.mime.clone(), attachment.size, None));
+                continue;
+            }
             let path = dir.join(&name);
             let progress = files::Progress::new();
             files::with_stall_timeout(
@@ -1330,7 +1349,7 @@ impl ChatTurn {
                 &progress,
             )
             .await?;
-            saved.push((name, attachment.mime.clone(), path));
+            saved.push((name, attachment.mime.clone(), attachment.size, Some(path)));
         }
         Ok(chat::take_files(dir, saved))
     }

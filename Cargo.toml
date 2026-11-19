@@ -43,6 +43,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "n
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "native-tls"] }
 # Stream/Sink helpers for the Socket Mode WebSocket.
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# Standard base64 for chat image attachments.
+base64 = "0.22"
 # Official omp RPC client, pinned to the oh-my-pi v18.20.2 commit.
 # Do not replace with the crates.io crate named "omp-rpc": it is unrelated.
 omp-rpc = { git = "https://github.com/can1357/oh-my-pi", rev = "7c49c11aa5bbaf3f418406583096168ad5b8c6dc" }
