@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -83,7 +83,7 @@ use crate::files::{self, OutFile, SavedFile};
 use crate::gateway::{E_GATEWAY_TASK, GatewayError};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
-use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
+use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug, lock};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
@@ -359,7 +359,7 @@ impl Dispatcher {
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.store)
     }
 
     /// Startup recovery: interrupted rows become `needs_check` (never re-prompted) and the
@@ -499,7 +499,7 @@ impl Dispatcher {
     /// Stops the lead child, even in the middle of a turn, and every lane child.
     pub async fn shutdown(&self) {
         self.omp.shutdown_all().await;
-        let chats = std::mem::take(&mut *self.chats.lock().unwrap_or_else(PoisonError::into_inner));
+        let chats = std::mem::take(&mut *lock(&self.chats));
         if tokio::time::timeout(ABORT_JOIN_BOUND, chats.join_all())
             .await
             .is_err()
@@ -510,7 +510,7 @@ impl Dispatcher {
 
     /// Waits until every chat turn started so far has sent its reply or notice.
     pub async fn chats_done(&self) {
-        let chats = std::mem::take(&mut *self.chats.lock().unwrap_or_else(PoisonError::into_inner));
+        let chats = std::mem::take(&mut *lock(&self.chats));
         chats.join_all().await;
     }
 
@@ -548,7 +548,7 @@ impl Dispatcher {
             target,
             event,
         };
-        let mut chats = self.chats.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut chats = lock(&self.chats);
         // Reap finished turns so the set holds running ones only.
         while let Some(done) = chats.try_join_next() {
             if let Err(e) = done {
@@ -632,13 +632,7 @@ impl Dispatcher {
         } else {
             key.as_str().to_owned()
         };
-        if event.author_is_bot
-            && !self
-                .bot_replies
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take(&bot_key, Instant::now())
-        {
+        if event.author_is_bot && !lock(&self.bot_replies).take(&bot_key, Instant::now()) {
             tracing::info!(
                 message_id = %event.message_id,
                 author_id = %event.author_id,
@@ -974,7 +968,7 @@ impl Dispatcher {
     /// Re-sends replies whose earlier send failed (call after a reconnect).
     /// Returns how many were delivered.
     pub async fn resend_pending(&self) -> Result<usize, StoreError> {
-        let ids = std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        let ids = std::mem::take(&mut *lock(&self.pending));
         let mut delivered = 0;
         for id in ids {
             let Some(row) = self.store().get(id)? else {
@@ -1080,7 +1074,7 @@ impl Dispatcher {
 
     /// Remembers a `reply_pending` row for the next reconnect resend.
     fn remember_pending(&self, id: i64) {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = lock(&self.pending);
         if !pending.contains(&id) {
             pending.push(id);
         }
@@ -1174,21 +1168,13 @@ impl Dispatcher {
 
     /// Counts one owner message, delivered reply or posted news in `key`; no clock is read.
     fn talked(&self, key: &str) {
-        self.talk
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key.to_owned())
-            .or_default()
-            .said += 1;
+        lock(&self.talk).entry(key.to_owned()).or_default().said += 1;
     }
 
     /// Conversations whose talk is tracked for lane news; quiet ones are dropped at each news
     /// step.
     pub fn talk_len(&self) -> usize {
-        self.talk
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        lock(&self.talk).len()
     }
 
     /// The lane manager, for lane news.
@@ -1202,7 +1188,7 @@ impl Dispatcher {
     /// notes the messenger accepted.
     pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
         let due: Vec<LaneNews> = {
-            let mut talk = self.talk.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut talk = lock(&self.talk);
             for t in talk.values_mut() {
                 if t.seen.is_none_or(|(count, _)| count != t.said) {
                     t.seen = Some((t.said, now));

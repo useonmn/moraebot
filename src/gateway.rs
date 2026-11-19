@@ -20,7 +20,7 @@ use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
-use crate::omp::OmpManager;
+use crate::omp::{OmpManager, lock};
 use crate::onboarding;
 use crate::store::{Store, StoreError};
 
@@ -149,10 +149,7 @@ impl Gateway {
         };
         // A turn that was cut off is still `processing` and a stopped lane `running`:
         // make them `needs_check`.
-        store
-            .lock()
-            .expect("store mutex poisoned")
-            .recover_on_start()?;
+        lock(&store).recover_on_start()?;
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())
