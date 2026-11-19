@@ -794,7 +794,7 @@ fn access_config<Id: PartialEq + fmt::Display>(
     owner_id: &Id,
     allow: Option<Vec<AllowSection<Id>>>,
     max_bot_replies: Option<u32>,
-    check_id: impl Fn(&str, &Id) -> Result<(), ConfigError>,
+    check_id: impl Fn(&str, &Id, SenderKind) -> Result<(), ConfigError>,
 ) -> Result<Access<Id>, ConfigError> {
     if mode == AccessMode::OwnerOnly && (allow.is_some() || max_bot_replies.is_some()) {
         return Err(ConfigError::new(
@@ -816,19 +816,6 @@ fn access_config<Id: PartialEq + fmt::Display>(
         let id = raw
             .id
             .ok_or_else(|| ConfigError::new(E_CONFIG_VALUE, format!("{name}.id is required")))?;
-        check_id(&format!("{name}.id"), &id)?;
-        if &id == owner_id {
-            return Err(ConfigError::new(
-                E_CONFIG_VALUE,
-                format!("{name}.id {id} is the owner; the owner is never listed in allow"),
-            ));
-        }
-        if entries.iter().any(|entry| entry.id == id) {
-            return Err(ConfigError::new(
-                E_CONFIG_VALUE,
-                format!("{name}.id {id} is listed more than once"),
-            ));
-        }
         let kind = match raw.kind.as_deref() {
             Some("user") => SenderKind::User,
             Some("bot") => SenderKind::Bot,
@@ -845,8 +832,29 @@ fn access_config<Id: PartialEq + fmt::Display>(
                 ));
             }
         };
+        check_id(&format!("{name}.id"), &id, kind)?;
+        if &id == owner_id {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("{name}.id {id} is the owner; the owner is never listed in allow"),
+            ));
+        }
+        if entries.iter().any(|entry| entry.id == id) {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("{name}.id {id} is listed more than once"),
+            ));
+        }
         let role = match raw.role.as_deref() {
             None | Some("chat") => Role::Chat,
+            Some("work") => {
+                return Err(ConfigError::new(
+                    E_CONFIG_VALUE,
+                    format!(
+                        "{name}.role 'work' does not exist yet; listed senders can only chat, and only the owner gives work"
+                    ),
+                ));
+            }
             Some(other) => {
                 return Err(ConfigError::new(
                     E_CONFIG_VALUE,
@@ -902,7 +910,7 @@ fn discord_config(
         &owner_id,
         section.allow,
         section.max_bot_replies,
-        |name, id| {
+        |name, id, _kind| {
             if *id == 0 {
                 return Err(ConfigError::new(
                     E_CONFIG_VALUE,
@@ -948,7 +956,12 @@ fn slack_config(
         &owner_id,
         section.allow,
         section.max_bot_replies,
-        |name, id| check_slack_id(name, id, &['U', 'W']),
+        // A Slack bot is matched by its user id or by the `bot_id` (`B...`) the adapter
+        // sees on bot messages, some of which carry no user id at all.
+        |name, id, kind| match kind {
+            SenderKind::User => check_slack_id(name, id, &['U', 'W']),
+            SenderKind::Bot => check_slack_id(name, id, &['U', 'W', 'B']),
+        },
     )?;
     Ok(Some(SlackConfig {
         owner_id,
@@ -1235,10 +1248,24 @@ mod tests {
             }]
         );
         assert_eq!(access.max_bot_replies, None);
-        for bad in ["B0BOT", "u0bot", ""] {
+        for bad in ["C0BOT", "u0bot", ""] {
             let text = text.replace("U0BOT", bad);
             assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "id {bad:?}");
         }
+    }
+
+    #[test]
+    fn slack_bot_entries_accept_a_bot_id() {
+        let fx = Fixture::new();
+        let text = format!(
+            "access_mode = \"allowlist\"\n{}[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
+            slack_toml(&fx)
+        );
+        let access = fx.load(&text).expect("loads").slack.expect("slack").access;
+        assert_eq!(access.allow[0].id, "B0BOT");
+        assert_eq!(access.allow[0].kind, SenderKind::Bot);
+        let user = text.replace("\"bot\"", "\"user\"");
+        assert_eq!(code(fx.load(&user)), E_CONFIG_VALUE);
     }
 
     #[test]
@@ -1276,6 +1303,13 @@ mod tests {
                 "{case}"
             );
         }
+        let message = |role: &str| {
+            let extra = DISCORD_ALLOW.replace("\"chat\"", role);
+            fx.load(&allowlist_toml(&fx, &extra))
+                .expect_err("rejected")
+                .message
+        };
+        assert_ne!(message("\"work\""), message("\"owner\""));
         let unknown_key = allowlist_toml(&fx, &format!("{DISCORD_ALLOW}surprise = 1\n"));
         assert_eq!(code(fx.load(&unknown_key)), E_CONFIG_PARSE);
     }

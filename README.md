@@ -213,7 +213,7 @@ role = "chat"              # only "chat" exists; it's also the default
 Rules, checked when the config loads:
 
 - `allow` and `max_bot_replies` need `access_mode = "allowlist"`. With `owner_only` they are an error, so a list never looks active when it isn't.
-- Each entry needs an `id` in the messenger's format (Slack `U...` or `W...`, Discord a non-zero number) and a `kind`. An unknown `kind` or `role`, a duplicate id, or the owner's own id is an error.
+- Each entry needs an `id` in the messenger's format (Slack `U...` or `W...`, and for a bot also its `B...` bot id; Discord a non-zero number) and a `kind`. An unknown `kind` or `role`, a duplicate id, or the owner's own id is an error.
 - `max_bot_replies` must be greater than zero.
 - Older moraebot versions reject a config with these keys.
 
