@@ -64,11 +64,13 @@
 //! new one. A note the messenger did not accept is tried again on the next tick.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::{self, JoinSet};
 
 use crate::access::{BotReplies, Decision, DropReason, E_ACCESS_NOT_OWNER, Policy, Sender};
 use crate::adapter::{
@@ -78,6 +80,7 @@ use crate::adapter::{
 use crate::chat::{self, ChatFile, ChatManager};
 use crate::config::Config;
 use crate::files::{self, OutFile, SavedFile};
+use crate::gateway::{E_GATEWAY_TASK, GatewayError};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
 use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug};
@@ -356,7 +359,7 @@ impl Dispatcher {
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().expect("store mutex poisoned")
+        self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Startup recovery: interrupted rows become `needs_check` (never re-prompted) and the
@@ -440,43 +443,63 @@ impl Dispatcher {
     }
 
     /// Runs startup, then serves inbound events and the worker until `inbound` closes.
+    /// The worker, the lane watchdog and the lane news never end on their own: when one does
+    /// (or panics), the dispatcher shuts down with [`GatewayError::TaskEnded`], so the
+    /// process exits non-zero and its service manager restarts it.
     pub async fn run(
         self: Arc<Self>,
-        mut inbound: mpsc::Receiver<InboundEvent>,
-    ) -> Result<(), StoreError> {
+        inbound: mpsc::Receiver<InboundEvent>,
+    ) -> Result<(), GatewayError> {
         let reconnects = self.adapter.reconnects();
         self.startup().await?;
-        let worker = tokio::spawn({
+        let mut tasks = Supervised::default();
+        tasks.spawn("worker", {
             let this = Arc::clone(&self);
             async move { this.work_loop(reconnects).await }
         });
-        let watchdog = tokio::spawn({
+        tasks.spawn("lane watchdog", {
             let this = Arc::clone(&self);
             async move { this.omp.lanes().watch().await }
         });
-        let news = tokio::spawn({
+        tasks.spawn("lane news", {
             let this = Arc::clone(&self);
             async move { this.news_loop().await }
         });
-        while let Some(event) = inbound.recv().await {
-            if let Err(err) = self.handle_event(event).await {
-                tracing::error!(code = err.code(), error = %err, "inbound event not handled");
+        self.serve(inbound, tasks).await
+    }
+
+    /// Serves inbound events until `inbound` closes or one of `tasks` ends, then stops the
+    /// tasks and shuts down.
+    async fn serve(
+        &self,
+        mut inbound: mpsc::Receiver<InboundEvent>,
+        mut tasks: Supervised,
+    ) -> Result<(), GatewayError> {
+        let ended = loop {
+            tokio::select! {
+                event = inbound.recv() => match event {
+                    Some(event) => {
+                        if let Err(err) = self.handle_event(event).await {
+                            tracing::error!(code = err.code(), error = %err, "inbound event not handled");
+                        }
+                    }
+                    None => break None,
+                },
+                name = tasks.ended() => break Some(name),
             }
-        }
-        worker.abort();
-        watchdog.abort();
-        news.abort();
-        let _ = worker.await;
-        let _ = watchdog.await;
-        let _ = news.await;
+        };
+        tasks.set.shutdown().await;
         self.shutdown().await;
-        Ok(())
+        match ended {
+            Some(name) => Err(GatewayError::TaskEnded(name)),
+            None => Ok(()),
+        }
     }
 
     /// Stops the lead child, even in the middle of a turn, and every lane child.
     pub async fn shutdown(&self) {
         self.omp.shutdown_all().await;
-        let chats = std::mem::take(&mut *self.chats.lock().expect("chat task lock"));
+        let chats = std::mem::take(&mut *self.chats.lock().unwrap_or_else(PoisonError::into_inner));
         if tokio::time::timeout(ABORT_JOIN_BOUND, chats.join_all())
             .await
             .is_err()
@@ -487,7 +510,7 @@ impl Dispatcher {
 
     /// Waits until every chat turn started so far has sent its reply or notice.
     pub async fn chats_done(&self) {
-        let chats = std::mem::take(&mut *self.chats.lock().expect("chat task lock"));
+        let chats = std::mem::take(&mut *self.chats.lock().unwrap_or_else(PoisonError::into_inner));
         chats.join_all().await;
     }
 
@@ -525,7 +548,7 @@ impl Dispatcher {
             target,
             event,
         };
-        let mut chats = self.chats.lock().expect("chat task lock");
+        let mut chats = self.chats.lock().unwrap_or_else(PoisonError::into_inner);
         // Reap finished turns so the set holds running ones only.
         while let Some(done) = chats.try_join_next() {
             if let Err(e) = done {
@@ -613,7 +636,7 @@ impl Dispatcher {
             && !self
                 .bot_replies
                 .lock()
-                .expect("bot reply mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .take(&bot_key, Instant::now())
         {
             tracing::info!(
@@ -951,7 +974,7 @@ impl Dispatcher {
     /// Re-sends replies whose earlier send failed (call after a reconnect).
     /// Returns how many were delivered.
     pub async fn resend_pending(&self) -> Result<usize, StoreError> {
-        let ids = std::mem::take(&mut *self.pending.lock().expect("pending lock"));
+        let ids = std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
         let mut delivered = 0;
         for id in ids {
             let Some(row) = self.store().get(id)? else {
@@ -1057,7 +1080,7 @@ impl Dispatcher {
 
     /// Remembers a `reply_pending` row for the next reconnect resend.
     fn remember_pending(&self, id: i64) {
-        let mut pending = self.pending.lock().expect("pending lock");
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         if !pending.contains(&id) {
             pending.push(id);
         }
@@ -1153,7 +1176,7 @@ impl Dispatcher {
     fn talked(&self, key: &str) {
         self.talk
             .lock()
-            .expect("talk lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(key.to_owned())
             .or_default()
             .said += 1;
@@ -1162,7 +1185,10 @@ impl Dispatcher {
     /// Conversations whose talk is tracked for lane news; quiet ones are dropped at each news
     /// step.
     pub fn talk_len(&self) -> usize {
-        self.talk.lock().expect("talk lock").len()
+        self.talk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// The lane manager, for lane news.
@@ -1176,7 +1202,7 @@ impl Dispatcher {
     /// notes the messenger accepted.
     pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
         let due: Vec<LaneNews> = {
-            let mut talk = self.talk.lock().expect("talk lock");
+            let mut talk = self.talk.lock().unwrap_or_else(PoisonError::into_inner);
             for t in talk.values_mut() {
                 if t.seen.is_none_or(|(count, _)| count != t.said) {
                     t.seen = Some((t.said, now));
@@ -1258,6 +1284,40 @@ impl Dispatcher {
     /// Sends a fixed notice; returns whether the messenger accepted it.
     async fn notify(&self, channel: &str, code: &'static str) -> bool {
         send_notice(self.adapter.as_ref(), channel, code).await
+    }
+}
+
+/// The background tasks of [`Dispatcher::run`], each with a name for the log.
+#[derive(Default)]
+struct Supervised {
+    set: JoinSet<()>,
+    names: HashMap<task::Id, &'static str>,
+}
+
+impl Supervised {
+    fn spawn(&mut self, name: &'static str, task: impl Future<Output = ()> + Send + 'static) {
+        let id = self.set.spawn(task).id();
+        self.names.insert(id, name);
+    }
+
+    /// Waits until a task returns or panics, logs it at error level and returns its name.
+    /// Never resolves while the set is empty.
+    async fn ended(&mut self) -> &'static str {
+        let Some(joined) = self.set.join_next_with_id().await else {
+            return std::future::pending().await;
+        };
+        let (id, panic) = match joined {
+            Ok((id, ())) => (id, None),
+            Err(err) => (err.id(), Some(err)),
+        };
+        let name = self.names.get(&id).copied().unwrap_or("unknown");
+        match panic {
+            None => tracing::error!(code = E_GATEWAY_TASK, task = name, "background task ended"),
+            Some(err) => {
+                tracing::error!(code = E_GATEWAY_TASK, task = name, error = %err, "background task failed");
+            }
+        }
+        name
     }
 }
 
@@ -1355,5 +1415,82 @@ impl ChatTurn {
             saved.push((name, attachment.mime.clone(), attachment.size, Some(path)));
         }
         Ok(chat::take_files(dir, saved))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Env;
+    use crate::testing::FakeAdapter;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn dispatcher(dir: &tempfile::TempDir) -> Dispatcher {
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let env = Env {
+            home_dir: Some(dir.path().to_path_buf()),
+            moraebot_home: None,
+            path: None,
+        };
+        let text = format!(
+            "owner_id = 111\ntoken_file = \"{}\"\nomp_path = \"{}\"\nhome = \"{}\"\nwork_dir = \"{}\"\n[discord]\nchannel_id = 222\n",
+            dir.path().join("token").display(),
+            dir.path().join("omp").display(),
+            home.display(),
+            dir.path().join("work").display(),
+        );
+        let config = Config::from_toml(&text, &env).expect("loads");
+        let store = Arc::new(Mutex::new(
+            Store::open(&home.join("inbox.sqlite")).expect("store"),
+        ));
+        let omp = OmpManager::new(config.clone(), Arc::clone(&store));
+        Dispatcher::new(&config, Arc::new(FakeAdapter::new()), store, omp)
+    }
+
+    #[tokio::test]
+    async fn a_supervised_task_that_returns_stops_the_dispatcher_with_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dispatcher = dispatcher(&dir);
+        // The sender stays open, so only the ended task can stop `serve`.
+        let (_events, inbound) = mpsc::channel(1);
+        let mut tasks = Supervised::default();
+        tasks.spawn("forever", std::future::pending());
+        tasks.spawn("short", async {});
+        let result = tokio::time::timeout(BOUND, dispatcher.serve(inbound, tasks))
+            .await
+            .expect("serve stopped");
+        assert!(
+            matches!(result, Err(GatewayError::TaskEnded("short"))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_task_is_reported_by_name() {
+        let mut tasks = Supervised::default();
+        tasks.spawn("forever", std::future::pending());
+        tasks.spawn("boom", async {
+            panic!("supervised task panics on purpose")
+        });
+        let name = tokio::time::timeout(BOUND, tasks.ended())
+            .await
+            .expect("a task ended");
+        assert_eq!(name, "boom");
+    }
+
+    #[tokio::test]
+    async fn a_closed_inbound_stops_the_dispatcher_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dispatcher = dispatcher(&dir);
+        let (events, inbound) = mpsc::channel(1);
+        drop(events);
+        let mut tasks = Supervised::default();
+        tasks.spawn("forever", std::future::pending());
+        let result = tokio::time::timeout(BOUND, dispatcher.serve(inbound, tasks))
+            .await
+            .expect("serve stopped");
+        assert!(result.is_ok(), "{result:?}");
     }
 }
