@@ -900,6 +900,15 @@ mod tests {
         .unwrap()
     }
 
+    /// A `http://127.0.0.1:PORT` base whose port is closed: bound to get a free
+    /// port, then released, so the OS refuses the connect on every platform.
+    fn closed_port_base() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
     /// Serves exactly `statuses.len()` connections in order on 127.0.0.1: sends each
     /// request's first line on the channel and answers with the next status.
     fn http_server(statuses: &[u16]) -> (String, mpsc::Receiver<String>) {
@@ -1311,7 +1320,7 @@ mod tests {
         let d = dirs();
         let checks = run_all(
             &d,
-            vec![Signal::Url("http://127.0.0.1:0/health".to_owned())],
+            vec![Signal::Url(format!("{}/health", closed_port_base()))],
             CHECK_TIMEOUT,
         );
         assert_eq!(checks[0].code, Some(E_CHECK_HTTP));
@@ -1491,7 +1500,7 @@ mod tests {
         let (code, _) = check_merged(
             &pull("acme", "app", 111),
             &[],
-            "http://127.0.0.1:0",
+            &closed_port_base(),
             CHECK_TIMEOUT,
         );
         assert_eq!(code, Some(E_CHECK_HTTP));
