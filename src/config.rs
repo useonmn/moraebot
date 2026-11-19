@@ -30,6 +30,8 @@ pub const E_CONFIG_VALUE: &str = "E_CONFIG_VALUE";
 pub const E_IO: &str = "E_IO";
 /// Advisory only: someone besides the owner is listed and may talk to moraebot.
 pub const W_ALLOWLIST: &str = "W_ALLOWLIST";
+/// Advisory only: bots are listed and `max_bot_replies` is unset, so bot chats have no cap.
+pub const W_BOT_REPLIES: &str = "W_BOT_REPLIES";
 
 /// The window that `max_bot_replies` counts replies in, per thread.
 pub const BOT_REPLY_WINDOW_MINUTES: u64 = 10;
@@ -739,7 +741,7 @@ fn check_token_file(path: &Path) -> Result<String, ConfigError> {
 }
 
 /// One `WARN` line per listed sender, so the owner sees who else can talk to moraebot,
-/// and one line for the bot reply limit.
+/// and one line for the bot reply limit (a `WARN` when bots are listed without one).
 fn access_checks<Id: fmt::Display>(
     allow_name: &'static str,
     limit_name: &'static str,
@@ -769,14 +771,25 @@ fn access_checks<Id: fmt::Display>(
             advisory: true,
         });
     }
+    let lists_bots = access
+        .allow
+        .iter()
+        .any(|entry| entry.kind == SenderKind::Bot);
     checks.push(Check {
         name: limit_name,
-        result: Ok(match access.max_bot_replies {
-            Some(limit) => {
-                format!("{limit} replies to bots per thread per {BOT_REPLY_WINDOW_MINUTES} minutes")
-            }
-            None => "no limit".to_string(),
-        }),
+        result: match access.max_bot_replies {
+            Some(limit) => Ok(format!(
+                "{limit} replies to bots per thread per {BOT_REPLY_WINDOW_MINUTES} minutes"
+            )),
+            None if lists_bots => Err(ConfigError::new(
+                W_BOT_REPLIES,
+                format!(
+                    "not set, so listed bots get chat replies with no limit and each reply is a \
+                     paid model turn; set {limit_name} to cap them"
+                ),
+            )),
+            None => Ok("no limit".to_string()),
+        },
         advisory: true,
     });
     checks
@@ -1334,6 +1347,35 @@ mod tests {
         assert_eq!(
             again.discord.expect("discord").access,
             cfg.discord.expect("discord").access
+        );
+    }
+
+    #[test]
+    fn check_config_warns_when_bots_are_listed_without_a_reply_limit() {
+        let fx = Fixture::new();
+        let text = allowlist_toml(&fx, &DISCORD_ALLOW.replace("max_bot_replies = 30\n", ""));
+        let cfg = fx.load(&text).expect("loads");
+        cfg.validate().expect("warnings never fail validation");
+        let mut out = Vec::new();
+        assert!(report_checks(&cfg.checks(), &mut out).expect("report"));
+        let report = String::from_utf8(out).expect("utf-8");
+        assert!(
+            report.lines().any(
+                |l| l.starts_with("WARN discord.max_bot_replies:") && l.contains(W_BOT_REPLIES)
+            ),
+            "{report}"
+        );
+
+        let users_only = DISCORD_ALLOW
+            .replace("max_bot_replies = 30\n", "")
+            .replace("[[discord.allow]]\nid = 444\nkind = \"bot\"\n", "");
+        let cfg = fx.load(&allowlist_toml(&fx, &users_only)).expect("loads");
+        let mut out = Vec::new();
+        report_checks(&cfg.checks(), &mut out).expect("report");
+        let report = String::from_utf8(out).expect("utf-8");
+        assert!(
+            report.contains("OK   discord.max_bot_replies: no limit"),
+            "{report}"
         );
     }
 

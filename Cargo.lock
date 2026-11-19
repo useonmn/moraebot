@@ -1007,6 +1007,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
  "libc",
  "omp-rpc",

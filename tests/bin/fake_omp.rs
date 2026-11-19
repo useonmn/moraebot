@@ -6,7 +6,12 @@
 //! lead and its lanes run different scripts from one environment. When
 //! FAKE_OMP_LOG is set, the process appends a trace line at startup
 //! (`START pid=<pid> argv=<json>`), a line with the environment variable NAMES
-//! only (`ENV <names>`), and then every received stdin line.
+//! only (`ENV <names>`), a line with the number of entries in the `--cwd`
+//! folder at startup (`CWD_ENTRIES <pid> <n>`; `-1` when it cannot be read or
+//! there is no `--cwd`), and then every received stdin line.
+//!
+//! `get_state` answers a full session state whose `dumpTools` lists one tool
+//! per comma-separated name in FAKE_OMP_DUMP_TOOLS (unset or empty: none).
 //!
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
@@ -112,14 +117,21 @@ fn main() {
     let mode = select_mode(lane);
     let log = std::env::var_os("FAKE_OMP_LOG").map(std::path::PathBuf::from);
     if let Some(path) = &log {
-        let argv = serde_json::to_string(&argv).expect("argv is serializable");
+        let json = serde_json::to_string(&argv).expect("argv is serializable");
         log_line(
             path,
-            &format!("START pid={} argv={argv}", std::process::id()),
+            &format!("START pid={} argv={json}", std::process::id()),
         );
         let mut names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
         names.sort();
         log_line(path, &format!("ENV {}", names.join(" ")));
+        let entries = arg_value(&argv, "--cwd")
+            .and_then(|cwd| std::fs::read_dir(cwd).ok())
+            .map_or(-1, |dir| dir.count() as i64);
+        log_line(
+            path,
+            &format!("CWD_ENTRIES {} {entries}", std::process::id()),
+        );
     }
 
     let stdout = io::stdout();
@@ -164,16 +176,52 @@ fn main() {
     }
 }
 
-/// Whether the `--session-dir` argument contains `/lanes/` (a lane child).
-fn is_lane(argv: &[String]) -> bool {
-    let session_dir = argv.iter().enumerate().find_map(|(index, arg)| {
-        if arg == "--session-dir" {
+/// The value of `flag` given as `<flag> <value>` or `<flag>=<value>`.
+fn arg_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+    argv.iter().enumerate().find_map(|(index, arg)| {
+        if arg == flag {
             argv.get(index + 1).map(String::as_str)
         } else {
-            arg.strip_prefix("--session-dir=")
+            arg.strip_prefix(flag)
+                .and_then(|rest| rest.strip_prefix('='))
         }
-    });
-    session_dir.is_some_and(|dir| dir.contains("/lanes/"))
+    })
+}
+
+/// Whether the `--session-dir` argument contains `/lanes/` (a lane child).
+fn is_lane(argv: &[String]) -> bool {
+    arg_value(argv, "--session-dir").is_some_and(|dir| dir.contains("/lanes/"))
+}
+
+/// A full `get_state` answer; `dumpTools` from FAKE_OMP_DUMP_TOOLS.
+fn session_state() -> Value {
+    let tools: Vec<Value> = std::env::var("FAKE_OMP_DUMP_TOOLS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(|name| json!({"name": name, "description": "fake tool"}))
+        .collect();
+    json!({
+        "sessionId": SESSION_ID,
+        "isStreaming": false,
+        "isCompacting": false,
+        "steeringMode": "all",
+        "followUpMode": "all",
+        "interruptMode": "immediate",
+        "autoCompactionEnabled": false,
+        "fastModeEnabled": false,
+        "fastModeActive": false,
+        "slowModeSupported": false,
+        "slowModeEnabled": false,
+        "messageCount": 0,
+        "queuedMessageCount": 0,
+        "hasPendingAsyncWork": false,
+        "isSettled": true,
+        "queuedMessages": {"steering": [], "followUp": []},
+        "todoPhases": [],
+        "systemPrompt": [],
+        "dumpTools": tools,
+    })
 }
 
 /// FAKE_OMP_LANE_MODE for a lane child, FAKE_OMP_MODE otherwise.
@@ -215,7 +263,7 @@ impl Fake {
                     "sessionFile": "fake-session.jsonl",
                 }),
             ),
-            "get_state" => respond_ok(out, &id, command, json!({"sessionId": SESSION_ID})),
+            "get_state" => respond_ok(out, &id, command, session_state()),
             "get_session_lease" => {
                 let requested = frame
                     .get("sessionIds")

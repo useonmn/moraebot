@@ -201,7 +201,7 @@ access_mode = "allowlist"
 owner_id = "<YOUR_SLACK_MEMBER_ID>"
 # ...channel_id and token files as above...
 # Optional. At most this many replies to bot messages per thread in any 10 minutes.
-# Leave it out for no limit.
+# Leave it out for no limit (check-config warns when bots are listed without it).
 max_bot_replies = 30
 
 [[slack.allow]]
@@ -221,7 +221,7 @@ Rules, checked when the config loads:
 
 The `chat` role is for conversation only. A chat sender gets answers from a separate omp with no tools, never from the lead that works on your machine, and can't stop or close lanes. Chat senders may attach files. Bots in the list should not talk to each other forever: `max_bot_replies` is the hard limit, and the lead is also told to wind down endless bot-to-bot exchanges.
 
-> **Status:** this release acts on the allowlist. Listed people and bots get through, `max_bot_replies` is enforced, and `lane_stop`, `lane_close` and the first-meeting setup stay owner-only. Chat replies aren't here yet: a chat person gets a fixed notice that chat isn't available, a listed chat bot's message is dropped without a notice (so two bots can't trade notices), and the message is not stored or run. Bot messages posted directly in the channel count toward `max_bot_replies` per channel, since each one would start its own thread. The next release adds the separate chat omp.
+How a chat sender is answered: each chat message starts its own omp with every tool switched off (`--no-tools --no-extensions --no-skills --no-rules --no-context-files --no-lsp --no-pty`), in its own empty folder (`<home>/chat/cwd/<turn>`, removed after the turn), with an overlay config that turns off every omp config source (so no MCP server, plugin, hook or skill is loaded), memory and the advisor, and with none of moraebot's tools. That overlay's `disabledProviders` list replaces your own omp `disabledProviders` for chat children only. At most two chat omps run at once; later chat messages wait for a slot. A chat message delivered twice by the messenger is answered once. Before it answers, moraebot asks it for its tool list and refuses the turn if anything is there. Each conversation keeps its own omp session under `<home>/chat/`, apart from the lead's. A chat message posted straight in the channel gets its own thread. Bot messages posted directly in the channel count toward `max_bot_replies` per channel, since each one would start its own thread. Chat messages are never stored in the inbox and never reach the lead. Attached files go into the prompt only (images up to 5 MB as images, text files up to 64 KiB inline, anything else or larger by name; a file over its limit is not downloaded), are kept under `<home>/chat/` only while the turn runs, and never land in your work folder. The chat omp is closed after each answer, and stopped with everything else at shutdown.
 
 Set `MORAEBOT_HOME` if you want moraebot's home somewhere other than `~/.moraebot`.
 
