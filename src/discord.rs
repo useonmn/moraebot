@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serenity::all::EditMessage;
 use serenity::all::{
-    Channel, ChannelId, ChannelType, Client, Context, CreateAttachment, CreateMessage,
-    CreateThread, EventHandler, GatewayIntents, Http, Message, MessageId, MessageType, Ready,
-    ResumedEvent, ShardManager, UserId,
+    Channel, ChannelId, ChannelType, ClientBuilder, Context, CreateAttachment, CreateMessage,
+    CreateThread, EventHandler, GatewayIntents, Http, HttpBuilder, Message, MessageId, MessageType,
+    Ready, ResumedEvent, ShardManager, UserId,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -25,9 +25,10 @@ use tokio::task::JoinHandle;
 use crate::adapter::E_ADAPTER_EDIT;
 
 use crate::adapter::{
-    AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START, E_ADAPTER_THREAD,
-    E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
-    SendResult, TypingHandle, next_backoff, split_reply,
+    API_CONNECT_TIMEOUT, API_TIMEOUT, AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND,
+    E_ADAPTER_START, E_ADAPTER_THREAD, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
+    InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle, next_backoff,
+    split_reply,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
 use crate::files::{self, Progress};
@@ -419,9 +420,31 @@ struct Runtime {
     task: Option<JoinHandle<()>>,
 }
 
+/// serenity's REST client with a connect timeout and, when given, a total limit per request.
+/// serenity's default client has neither, so one unanswered call could hang forever.
+fn rest_http(token: &str, timeout: Option<Duration>) -> Http {
+    HttpBuilder::new(token).client(rest_client(timeout)).build()
+}
+
+/// Built like serenity's default client (rustls), plus the timeouts.
+fn rest_client(timeout: Option<Duration>) -> reqwest012::Client {
+    let builder = reqwest012::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(API_CONNECT_TIMEOUT);
+    match timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    }
+    .build()
+    .expect("the TLS backend initializes")
+}
+
 pub struct DiscordAdapter {
     token: Arc<Token>,
+    /// Every API call except uploads; each gives up after [`API_TIMEOUT`].
     http: Arc<Http>,
+    /// Uploads only: no total limit here, the core bounds them by `files::UPLOAD_TIMEOUT`.
+    upload_http: Http,
     /// Downloads only; uploads go through `http`.
     file_client: reqwest::Client,
     scope: Scope,
@@ -434,10 +457,12 @@ impl DiscordAdapter {
     /// Reads the token file once; the token goes only to serenity.
     pub fn new(token_file: &Path, scope: Scope) -> Result<Self, AdapterError> {
         let token = read_token(token_file)?;
-        let http = Arc::new(Http::new(&token.0));
+        let http = Arc::new(rest_http(&token.0, Some(API_TIMEOUT)));
+        let upload_http = rest_http(&token.0, None);
         Ok(Self {
             token: Arc::new(token),
             http,
+            upload_http,
             file_client: files::file_client(),
             scope,
             runtime: Arc::new(Mutex::new(Runtime::default())),
@@ -472,7 +497,7 @@ async fn gateway_loop(
 ) {
     let mut delay = BACKOFF_START;
     loop {
-        match Client::builder(&token.0, intents())
+        match ClientBuilder::new_with_http(rest_http(&token.0, Some(API_TIMEOUT)), intents())
             .event_handler_arc(handler.clone())
             .await
         {
@@ -619,7 +644,7 @@ impl MessengerAdapter for DiscordAdapter {
         path: &Path,
         name: &str,
     ) -> Result<SendResult, AdapterError> {
-        let message_id = upload_file(&self.http, parse_id(target)?, path, name).await?;
+        let message_id = upload_file(&self.upload_http, parse_id(target)?, path, name).await?;
         Ok(SendResult { message_id })
     }
 
@@ -925,6 +950,17 @@ mod tests {
             }
         });
         (base, rx)
+    }
+
+    #[tokio::test]
+    async fn rest_client_gives_up_on_a_server_that_never_answers() {
+        let url = crate::testing::silent_http_server().await;
+        let client = rest_client(Some(Duration::from_millis(300)));
+        let err = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
+            .await
+            .expect("the request ended on its own")
+            .expect_err("the server never answers");
+        assert!(err.is_timeout(), "{err}");
     }
 
     fn loopback_http(base: &str) -> Http {

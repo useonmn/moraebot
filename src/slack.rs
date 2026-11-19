@@ -24,9 +24,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::adapter::E_ADAPTER_EDIT;
 use crate::adapter::{
-    AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_START,
-    E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter, SendResult,
-    TypingHandle, next_backoff,
+    API_CONNECT_TIMEOUT, API_TIMEOUT, AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_SEND,
+    E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
+    SendResult, TypingHandle, next_backoff,
 };
 use crate::config::{Config, E_MESSENGER_MISSING};
 use crate::files::{self, E_FILE_REMOTE, Progress};
@@ -496,6 +496,16 @@ enum ApiBody<'a> {
     Form(&'a [(&'a str, String)]),
 }
 
+/// The Web API client: a request gives up after `timeout`, a connection attempt after
+/// `connect_timeout`.
+fn api_client(timeout: Duration, connect_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .expect("the TLS backend initializes")
+}
+
 /// The real transport: HTTPS Web API calls and an outbound WebSocket.
 pub struct HttpTransport {
     client: reqwest::Client,
@@ -525,7 +535,7 @@ impl HttpTransport {
 
     fn from_secrets(bot_token: Secret, app_token: Secret) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: api_client(API_TIMEOUT, API_CONNECT_TIMEOUT),
             file_client: files::file_client(),
             bot_token,
             app_token,
@@ -1222,6 +1232,17 @@ mod tests {
     fn msg(user: &str, channel: &str, ts: &str) -> Value {
         json!({ "type": "message", "user": user, "channel": channel, "ts": ts, "text": "hi",
                 "channel_type": "channel" })
+    }
+
+    #[tokio::test]
+    async fn api_client_gives_up_on_a_server_that_never_answers() {
+        let url = crate::testing::silent_http_server().await;
+        let client = api_client(Duration::from_millis(300), API_CONNECT_TIMEOUT);
+        let err = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
+            .await
+            .expect("the request ended on its own")
+            .expect_err("the server never answers");
+        assert!(err.is_timeout(), "{err}");
     }
 
     #[test]
