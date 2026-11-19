@@ -74,6 +74,9 @@ pub struct Scope {
     pub owner_id: String,
     pub channel_id: String,
     pub bot_user_id: String,
+    /// User ids of the `allow` list: their DMs are accepted, and so are their messages
+    /// that carry a `bot_id`. The core access check decides the rest.
+    pub allowed: Vec<String>,
 }
 
 fn protocol_error(message: impl Into<String>) -> AdapterError {
@@ -145,8 +148,9 @@ fn map_file(entry: &Value) -> InboundAttachment {
 }
 
 /// Maps an `events_api` payload to an inbound event, or `None` when the message must be
-/// dropped: wrong type, bot or own messages, edits and subtypes other than `file_share`
-/// and `thread_broadcast`, other users in a DM, other channels. Every field is optional on
+/// dropped: wrong type, own messages, bot messages unless their `user` is listed (a bot
+/// message without `user` is dropped), edits and subtypes other than `file_share` and
+/// `thread_broadcast`, users other than the owner and listed ids in a DM, other channels. Every field is optional on
 /// the wire; a missing one drops the event (an odd `files[]` entry never does).
 pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     if payload.get("type")?.as_str()? != "event_callback" {
@@ -161,18 +165,20 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     {
         return None;
     }
-    if event.get("bot_id").is_some() {
-        return None;
-    }
     let user = event.get("user")?.as_str()?;
     if user == scope.bot_user_id {
+        return None;
+    }
+    let listed = scope.allowed.iter().any(|id| id == user);
+    let is_bot = event.get("bot_id").is_some();
+    if is_bot && !listed {
         return None;
     }
     let channel = event.get("channel")?.as_str()?;
     let ts = event.get("ts")?.as_str()?;
     let is_dm = event.get("channel_type").and_then(Value::as_str) == Some("im");
     let thread_id = if is_dm {
-        if user != scope.owner_id {
+        if user != scope.owner_id && !listed {
             return None;
         }
         None
@@ -203,7 +209,7 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     Some(InboundEvent {
         message_id: format!("{channel}:{ts}"),
         author_id: user.to_string(),
-        author_is_bot: false,
+        author_is_bot: is_bot,
         channel_id: channel.to_string(),
         thread_id,
         is_dm,
@@ -948,6 +954,7 @@ pub struct SlackAdapter {
     transport: Arc<dyn SlackTransport>,
     owner_id: String,
     channel_id: String,
+    allowed: Vec<String>,
     reconnects: watch::Sender<u64>,
     stop: watch::Sender<bool>,
     runtime: Mutex<Runtime>,
@@ -964,7 +971,14 @@ impl SlackAdapter {
             Arc::new(transport),
             slack.owner_id.clone(),
             slack.channel_id.clone(),
-        ))
+        )
+        .with_allowed(slack.access.allow.iter().map(|e| e.id.clone()).collect()))
+    }
+
+    /// The listed user ids that pass the adapter's filter besides the owner.
+    pub fn with_allowed(mut self, allowed: Vec<String>) -> Self {
+        self.allowed = allowed;
+        self
     }
 
     pub fn with_transport(
@@ -976,6 +990,7 @@ impl SlackAdapter {
             transport,
             owner_id,
             channel_id,
+            allowed: Vec::new(),
             reconnects: watch::channel(0).0,
             stop: watch::channel(false).0,
             runtime: Mutex::new(Runtime::default()),
@@ -1038,6 +1053,7 @@ impl MessengerAdapter for SlackAdapter {
                 owner_id: self.owner_id.clone(),
                 channel_id: self.channel_id.clone(),
                 bot_user_id,
+                allowed: self.allowed.clone(),
             },
             tx,
             reconnects: self.reconnects.clone(),
@@ -1184,6 +1200,7 @@ mod tests {
             owner_id: "U111".into(),
             channel_id: "C222".into(),
             bot_user_id: "UBOT".into(),
+            allowed: vec!["UPEER".into(), "UFRIEND".into(), "UBOT".into()],
         }
     }
 
@@ -1300,6 +1317,43 @@ mod tests {
     fn bot_id_dropped() {
         let mut m = msg("U111", "C222", "1.1");
         m["bot_id"] = json!("B1");
+        assert!(map_event(&payload(m), &scope()).is_none());
+    }
+
+    #[test]
+    fn listed_bot_passes_as_a_bot() {
+        let mut m = msg("UPEER", "C222", "1.1");
+        m["bot_id"] = json!("B2");
+        let event = map_event(&payload(m), &scope()).expect("listed bot passes");
+        assert_eq!(event.author_id, "UPEER");
+        assert!(event.author_is_bot);
+        let mut unlisted = msg("U999", "C222", "1.2");
+        unlisted["bot_id"] = json!("B3");
+        assert!(map_event(&payload(unlisted), &scope()).is_none());
+    }
+
+    #[test]
+    fn bot_message_without_user_dropped() {
+        let mut m = msg("UPEER", "C222", "1.1");
+        m["bot_id"] = json!("B2");
+        m.as_object_mut().unwrap().remove("user");
+        assert!(map_event(&payload(m), &scope()).is_none());
+    }
+
+    #[test]
+    fn listed_user_dm_accepted() {
+        let mut m = msg("UFRIEND", "D444", "3.3");
+        m["channel_type"] = json!("im");
+        let event = map_event(&payload(m), &scope()).expect("listed DM passes");
+        assert!(event.is_dm);
+        assert_eq!(event.author_id, "UFRIEND");
+        assert!(!event.author_is_bot);
+    }
+
+    #[test]
+    fn own_messages_dropped_even_when_listed() {
+        let mut m = msg("UBOT", "C222", "1.1");
+        m["bot_id"] = json!("BOWN");
         assert!(map_event(&payload(m), &scope()).is_none());
     }
 

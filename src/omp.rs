@@ -32,6 +32,7 @@ use omp_rpc::{
 use serde_json::{Map, Value};
 use tokio::sync::{Notify, oneshot, watch};
 
+use crate::access::Sender;
 use crate::config::Config;
 use crate::files;
 use crate::lane::LaneManager;
@@ -148,12 +149,14 @@ pub struct GroupReport {
     pub steered: Option<(i64, Outcome)>,
 }
 
-/// The lead turn that is running: its main row and conversation. Host-tool handlers
-/// read it through [`OmpManager::turn_context`].
+/// The lead turn that is running: its main row, conversation and the sender of the main
+/// row. Host-tool handlers read it through [`OmpManager::turn_context`]; management tools
+/// refuse a turn whose sender is not the owner.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnContext {
     pub row_id: i64,
     pub conversation_key: String,
+    pub sender: Sender,
 }
 
 /// The `send_file` host tool. The handler (on the client's own thread) only checks the
@@ -533,6 +536,7 @@ struct Steer {
 struct OpenTurn {
     key: String,
     main_row_id: i64,
+    sender: Sender,
     /// The lead reported `agent_start` for this turn.
     started: bool,
     requests: mpsc::Sender<PromptRequest>,
@@ -736,12 +740,12 @@ impl OmpManager {
         lock(&self.lead_kill).as_ref().and_then(|group| group.0)
     }
 
-    /// Sends `text` (row `row_id` of conversation `key`) to the lead and waits for the
-    /// turn, including a message steered into it, then reports the group with the files
-    /// queued by `send_file` during it. One lead turn runs at a time. The child is closed
+    /// Sends `text` (row `row_id` of conversation `key`, sent by `sender`) to the lead and
+    /// waits for the turn, including a message steered into it, then reports the group
+    /// with the files queued by `send_file` during it. One lead turn runs at a time. The child is closed
     /// when an outcome is `NeedsCheck` (timeout or lost child), or before a turn when the
     /// lead's appended system prompt changed and the last turn's session settled.
-    pub async fn prompt(&self, key: &str, row_id: i64, text: &str) -> GroupReport {
+    pub async fn prompt(&self, key: &str, row_id: i64, sender: Sender, text: &str) -> GroupReport {
         let mut live = self.live.lock().await;
         // Between turns: the live mutex is held, so no turn or steer is open here.
         let (append, refused) = self.lead_append();
@@ -772,6 +776,7 @@ impl OmpManager {
         *lock(&self.turn) = Some(TurnContext {
             row_id,
             conversation_key: key.to_owned(),
+            sender,
         });
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
@@ -786,6 +791,7 @@ impl OmpManager {
             *gate = Some(OpenTurn {
                 key: key.to_owned(),
                 main_row_id: row_id,
+                sender,
                 started: false,
                 requests: current.requests.clone(),
                 steer: None,
@@ -859,14 +865,16 @@ impl OmpManager {
         }
     }
 
-    /// Sends `text` (row `row_id`) into the running lead turn as a steer. Only when that
-    /// turn is for `key`, the lead reported `agent_start` for it and it holds no steer
-    /// yet; then `claim` gets the turn's main row id and must claim the row in the store
+    /// Sends `text` (row `row_id`, sent by `sender`) into the running lead turn as a
+    /// steer. Only when that turn is for `key` and has the same sender (a message never
+    /// runs inside another sender's turn), the lead reported `agent_start` for it and it
+    /// holds no steer yet; then `claim` gets the turn's main row id and must claim the row in the store
     /// (false: nothing is sent). Returns whether the row was steered.
     pub fn try_steer(
         &self,
         key: &str,
         row_id: i64,
+        sender: Sender,
         text: &str,
         claim: impl FnOnce(i64) -> bool,
     ) -> bool {
@@ -874,7 +882,7 @@ impl OmpManager {
         let Some(turn) = gate.as_mut() else {
             return false;
         };
-        if turn.key != key || !turn.started || turn.steer.is_some() {
+        if turn.key != key || turn.sender != sender || !turn.started || turn.steer.is_some() {
             return false;
         }
         if !claim(turn.main_row_id) {

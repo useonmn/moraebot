@@ -1,7 +1,10 @@
-//! Core dispatcher: inbound event -> owner check -> store -> one global worker -> omp -> reply.
+//! Core dispatcher: inbound event -> access check -> store -> one global worker -> omp -> reply.
 //!
-//! Order of an inbound message: drop non-owner and bot authors (nothing stored), answer
-//! `/` messages and empty messages without attachments with one fixed notice (never
+//! Order of an inbound message: drop authors that are neither the owner nor listed in the
+//! active messenger's `allow` list (nothing stored); drop a listed bot's message once its
+//! conversation reached `max_bot_replies` in the window (no limit when unset); answer a
+//! listed `chat` sender with one fixed notice ([`N_CHAT_UNAVAILABLE`]; never stored, no
+//! file fetched, never forwarded to the lead); answer `/` messages and empty messages without attachments with one fixed notice (never
 //! stored, never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing
 //! stored, nothing fetched), pick the conversation key, store the row FIRST (a duplicate
 //! stops here), and only then open a thread for a message posted directly in the channel.
@@ -23,7 +26,7 @@
 //! and skips the owner check. Every reply goes to `reply_target(row.conversation_key)`.
 //!
 //! A message of the conversation whose lead turn is running is steered into that turn
-//! once its files are saved, when the store accepts the claim ([`Store::steer_into`]);
+//! once its files are saved, only when it comes from the same sender as the turn, when the store accepts the claim ([`Store::steer_into`]);
 //! otherwise it is queued. A turn and its steered row form one group: one reply on the
 //! main row, or one outcome for both (`needs_check` wins over `failed`).
 //!
@@ -58,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::access::{self, Decision, DropReason, E_ACCESS_NOT_OWNER};
+use crate::access::{BotReplies, Decision, DropReason, E_ACCESS_NOT_OWNER, Policy, Sender};
 use crate::adapter::{
     AdapterError, ConversationKey, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent,
     MessengerAdapter, split_reply,
@@ -96,6 +99,8 @@ pub const N_FILE_NOT_SENT: &str = "N_FILE_NOT_SENT";
 pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
 /// The one greeting after an onboarding request.
 pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
+/// A listed `chat` sender's message: chat replies are not available yet; not stored.
+pub const N_CHAT_UNAVAILABLE: &str = "N_CHAT_UNAVAILABLE";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -142,6 +147,10 @@ pub fn notice_text(code: &str) -> &'static str {
             "Hi! I'm your moraebot agent, and this is our first chat. When you reply, I'll ask \
              what to call me, how I should talk to you, and a little about you. Reply skip if \
              you'd rather not."
+        }
+        N_CHAT_UNAVAILABLE => {
+            "This account is allowed to chat with moraebot, but chat replies are not available \
+             in this version yet, so the message was not run."
         }
         _ => "Something went wrong.",
     }
@@ -287,6 +296,10 @@ struct Talk {
 
 pub struct Dispatcher {
     owner_id: String,
+    /// Who may talk to moraebot, from the active messenger's config.
+    access: Policy,
+    /// Replies to listed bots per conversation, capped by `max_bot_replies`.
+    bot_replies: Mutex<BotReplies>,
     adapter: Arc<dyn MessengerAdapter>,
     store: Arc<Mutex<Store>>,
     omp: OmpManager,
@@ -316,6 +329,8 @@ impl Dispatcher {
     ) -> Self {
         Self {
             owner_id: config.owner_id(),
+            access: Policy::from_config(config),
+            bot_replies: Mutex::new(BotReplies::from_config(config)),
             adapter,
             store,
             omp,
@@ -497,20 +512,57 @@ impl Dispatcher {
         }
     }
 
-    /// Owner check, input filter, file count, conversation key, store-first admission,
-    /// thread creation, then the attachment downloads outside the admission lock.
+    /// Access check, bot reply limit, chat notice, input filter, file count, store-first
+    /// admission, thread creation, then the attachment downloads outside the admission lock.
     pub async fn handle_event(&self, event: InboundEvent) -> Result<Handled, StoreError> {
-        if let Decision::Drop(reason) = access::allow(&event, &self.owner_id) {
+        let sender = match self.access.allow(&event) {
+            Decision::Allow(sender) => sender,
+            Decision::Drop(reason) => {
+                tracing::info!(
+                    message_id = %event.message_id,
+                    author_id = %event.author_id,
+                    code = reason.code(),
+                    "inbound message dropped"
+                );
+                return Ok(Handled::Dropped(reason));
+            }
+        };
+
+        let platform = self.adapter.platform();
+        let (key, new_thread) = match (&event.thread_id, event.is_dm) {
+            (_, true) => (ConversationKey::dm(platform, &event.channel_id), false),
+            (Some(thread), false) => (ConversationKey::thread(platform, thread), false),
+            (None, false) => (ConversationKey::thread(platform, &event.message_id), true),
+        };
+        if event.author_is_bot
+            && !self
+                .bot_replies
+                .lock()
+                .expect("bot reply mutex poisoned")
+                .take(key.as_str(), Instant::now())
+        {
             tracing::info!(
                 message_id = %event.message_id,
                 author_id = %event.author_id,
-                code = reason.code(),
-                "inbound message dropped"
+                conversation = key.as_str(),
+                code = DropReason::BotLimit.code(),
+                "bot reply limit reached, message dropped"
             );
-            return Ok(Handled::Dropped(reason));
+            return Ok(Handled::Dropped(DropReason::BotLimit));
         }
 
         let here = event.thread_id.as_deref().unwrap_or(&event.channel_id);
+        if let Sender::Listed(role) = sender {
+            tracing::info!(
+                message_id = %event.message_id,
+                author_id = %event.author_id,
+                role = role.as_str(),
+                code = N_CHAT_UNAVAILABLE,
+                "chat message not run"
+            );
+            self.notify(here, N_CHAT_UNAVAILABLE).await;
+            return Ok(Handled::Notice(N_CHAT_UNAVAILABLE));
+        }
         let text = event.text.trim();
         if text.starts_with('/') || (text.is_empty() && event.attachments.is_empty()) {
             tracing::info!(message_id = %event.message_id, code = N_UNSUPPORTED_INPUT, "input not forwarded");
@@ -527,13 +579,6 @@ impl Dispatcher {
             self.notify(here, N_FILE_NOT_RECEIVED).await;
             return Ok(Handled::FilesRejected(N_FILE_NOT_RECEIVED));
         }
-
-        let platform = self.adapter.platform();
-        let (key, new_thread) = match (&event.thread_id, event.is_dm) {
-            (_, true) => (ConversationKey::dm(platform, &event.channel_id), false),
-            (Some(thread), false) => (ConversationKey::thread(platform, thread), false),
-            (None, false) => (ConversationKey::thread(platform, &event.message_id), true),
-        };
 
         let attachments_json =
             (!event.attachments.is_empty()).then(|| declared_json(&event.attachments));
@@ -606,7 +651,7 @@ impl Dispatcher {
             &files::prompt_with_files(&event.text, &saved),
         );
         let mut claim_error = None;
-        let steered = self.omp.try_steer(key.as_str(), id, &body, |main| {
+        let steered = self.omp.try_steer(key.as_str(), id, sender, &body, |main| {
             self.store().steer_into(id, main).unwrap_or_else(|err| {
                 claim_error = Some(err);
                 false
@@ -736,7 +781,9 @@ impl Dispatcher {
                 None
             }
         };
-        let group = self.omp.prompt(key, row.id, &prompt).await;
+        // Only owner rows are stored and run. A lane-result row acts for the owner who
+        // started the lane.
+        let group = self.omp.prompt(key, row.id, Sender::Owner, &prompt).await;
         drop(typing);
         self.settle_group(row.id, target, group).await?;
         Ok(true)

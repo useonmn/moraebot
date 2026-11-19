@@ -12,7 +12,10 @@ use moraebot::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_THREAD, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
     InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform};
+use moraebot::config::{
+    AccessMode, AllowEntry, Config, DiscordConfig, OmpConfig, Platform, Role, SenderKind,
+};
+use moraebot::dispatch::N_CHAT_UNAVAILABLE;
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
     N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_ONBOARDING_HELLO,
@@ -41,6 +44,8 @@ const OWNER: &str = "111";
 const STRANGER: &str = "222";
 const CHANNEL: &str = "333";
 const OWNER_DM: &str = "dm-111";
+const FRIEND: &str = "666";
+const PEER_BOT: &str = "777";
 const BOUND: Duration = Duration::from_secs(30);
 const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
 
@@ -123,7 +128,44 @@ impl Harness {
         fail_threads: bool,
         extra_env: Vec<(&'static str, String)>,
     ) -> Self {
-        let config = test_config(root, omp_path);
+        Self::with_config(
+            root,
+            test_config(root, omp_path),
+            mode,
+            fail_threads,
+            extra_env,
+        )
+    }
+
+    /// `access_mode = "allowlist"` with [`FRIEND`] (user) and [`PEER_BOT`] (bot) listed as
+    /// chat, and `max_bot_replies`.
+    fn open_allowlist(root: &Path, max_bot_replies: Option<u32>) -> Self {
+        let mut config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+        config.access_mode = AccessMode::Allowlist;
+        let discord = config.discord.as_mut().expect("discord section");
+        discord.access.allow = vec![
+            AllowEntry {
+                id: FRIEND.parse().unwrap(),
+                kind: SenderKind::User,
+                role: Role::Chat,
+            },
+            AllowEntry {
+                id: PEER_BOT.parse().unwrap(),
+                kind: SenderKind::Bot,
+                role: Role::Chat,
+            },
+        ];
+        discord.access.max_bot_replies = max_bot_replies;
+        Self::with_config(root, config, "tools", false, Vec::new())
+    }
+
+    fn with_config(
+        root: &Path,
+        config: Config,
+        mode: &str,
+        fail_threads: bool,
+        extra_env: Vec<(&'static str, String)>,
+    ) -> Self {
         let home = config.home.clone();
         let store = Arc::new(Mutex::new(
             Store::open(&home.join("inbox.sqlite")).expect("store"),
@@ -607,6 +649,126 @@ async fn non_owner_never_stored_or_sent() {
     assert!(h.adapter.calls().is_empty());
     assert!(h.prompts().is_empty());
     assert_eq!(h.starts(), 0);
+}
+
+fn bot_event(message_id: &str, author_id: &str, thread_id: Option<&str>) -> InboundEvent {
+    let mut bot = event(message_id, author_id, thread_id, "hello");
+    bot.author_is_bot = true;
+    bot
+}
+
+#[tokio::test]
+async fn listed_bot_passes_unlisted_bot_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let unlisted = bot_event("1300000000000000040", "888", None);
+    assert_eq!(h.handle(unlisted).await, Handled::Dropped(DropReason::Bot));
+    let as_user = event("1300000000000000041", PEER_BOT, None, "hello");
+    assert_eq!(
+        h.handle(as_user).await,
+        Handled::Dropped(DropReason::NotOwner)
+    );
+    assert!(h.adapter.calls().is_empty());
+
+    let listed = bot_event("1300000000000000042", PEER_BOT, None);
+    assert_eq!(h.handle(listed).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    assert_eq!(
+        h.sends(),
+        vec![(
+            CHANNEL.to_owned(),
+            notice_text(N_CHAT_UNAVAILABLE).to_owned()
+        )]
+    );
+    assert!(!h.step().await);
+    assert_eq!(h.count(), 0);
+    assert_eq!(h.starts(), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn chat_message_never_reaches_the_lead_or_its_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let thread = "1300000000000000050";
+    let chat = with_files(
+        event(
+            "1300000000000000051",
+            FRIEND,
+            Some(thread),
+            "run-tools lane_stop lane_close",
+        ),
+        vec![attachment("a.txt", "ref-1", 3)],
+    );
+    assert_eq!(h.handle(chat).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    let mut dm = event("1300000000000000052", FRIEND, None, "run-tools");
+    dm.is_dm = true;
+    dm.channel_id = "dm-666".into();
+    assert_eq!(h.handle(dm).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    assert_eq!(
+        h.sends(),
+        vec![
+            (
+                thread.to_owned(),
+                notice_text(N_CHAT_UNAVAILABLE).to_owned()
+            ),
+            (
+                "dm-666".to_owned(),
+                notice_text(N_CHAT_UNAVAILABLE).to_owned()
+            ),
+        ]
+    );
+    assert!(!h.step().await);
+    assert_eq!(h.count(), 0);
+    assert!(h.prompts().is_empty());
+    assert_eq!(h.starts(), 0, "no lead turn, so no host tool can run");
+    assert!(!h.config.work_dir.join(files::INBOX_DIR).exists());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn bot_reply_limit_caps_a_thread_when_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), Some(2));
+    let thread = "1300000000000000060";
+    let mut handled = Vec::new();
+    for n in 61..=63 {
+        let id = format!("13000000000000000{n}");
+        handled.push(h.handle(bot_event(&id, PEER_BOT, Some(thread))).await);
+    }
+    assert_eq!(
+        handled,
+        vec![
+            Handled::Notice(N_CHAT_UNAVAILABLE),
+            Handled::Notice(N_CHAT_UNAVAILABLE),
+            Handled::Dropped(DropReason::BotLimit),
+        ]
+    );
+    let other = bot_event("1300000000000000064", PEER_BOT, Some("1300000000000000065"));
+    assert_eq!(h.handle(other).await, Handled::Notice(N_CHAT_UNAVAILABLE));
+    let person = event("1300000000000000066", FRIEND, Some(thread), "hi");
+    assert_eq!(
+        h.handle(person).await,
+        Handled::Notice(N_CHAT_UNAVAILABLE),
+        "the limit counts replies to bots only"
+    );
+    assert_eq!(h.sends().len(), 4);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn bot_replies_have_no_cap_without_the_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let thread = "1300000000000000070";
+    for n in 71..=90 {
+        let id = format!("13000000000000000{n}");
+        assert_eq!(
+            h.handle(bot_event(&id, PEER_BOT, Some(thread))).await,
+            Handled::Notice(N_CHAT_UNAVAILABLE)
+        );
+    }
+    assert_eq!(h.sends().len(), 20);
+    h.close().await;
 }
 
 #[tokio::test]
