@@ -66,7 +66,7 @@ moraebot은 Discord로 받은 메시지를 이 컴퓨터의 코딩 에이전트 
 | D2 | omp는 yolo 모드 | omp가 도구를 쓸 때 묻지 않고 바로 실행합니다. |
 | D3 | 첫 메신저는 Discord | Gateway WebSocket으로 일반 메시지를 받습니다. 이를 위해 Message Content intent를 켜야 합니다. Telegram, Slack은 나중입니다. |
 | D4 | 게이트웨이는 Rust로 만든 별도 프로그램 | 항상 켜져 있는 프로그램 하나입니다. |
-| D5 | 접근 제어는 바꿀 수 있는 설정 | `owner_only`, `allowlist`, `pairing`, `open` 중 하나를 고릅니다. 기본값은 `owner_only`입니다. (`allowlist`는 적어 둔 사용자만, `pairing`은 모르는 사람이 코드를 받고 주인이 승인하는 방식, 2.6절) |
+| D5 | 접근 제어는 바꿀 수 있는 설정 | `owner_only`와 `allowlist` 중 하나를 고릅니다. 기본값은 `owner_only`입니다. `allowlist`는 메신저 섹션에 적어 둔 사용자와 봇만 추가로 허용합니다(2.6절). `pairing`과 `open`은 지금 계획에 없습니다. |
 | D6 | 먼저 저장하고, 그다음 처리 | 받은 메시지를 SQLite에 먼저 저장하고 처리합니다. dinobot의 원칙만 참고하고 코드는 새로 씁니다. |
 | D7 | 모든 대화에 lead omp 하나 (slice 4) | `omp --mode rpc --session-dir <홈>/lead/session` 하나가 모든 대화를 맡습니다. 그 메시지의 `prompt_result`가 오면 메시지가 온 대화로 답장합니다. 처음 설계(대화마다 omp 하나)는 slice 4에서 바뀌었습니다(3.7절). |
 | D8 | 작게 시작해 하나씩 | 한 번에 기능 하나만 만듭니다. 지금은 문서만 씁니다. |
@@ -90,7 +90,7 @@ moraebot은 세 부분으로 이루어집니다.
  Discord Gateway (WebSocket)
           |
           v
- [1] 접근 제어 검사 ---- 거부 --> 무시, 또는 pairing 안내
+ [1] 접근 제어 검사 ---- 거부 --> 무시
           |
           v
  [2] 제어 명령? (/stop, /new) --예--> 바로 실행 (줄 서지 않음)
@@ -185,18 +185,50 @@ dinobot의 Discord와 Slack은 전체에 큐 하나(동시 처리 1개)를 씁�
 
 ### 2.6 접근 제어: 누가 봇과 말할 수 있나
 
-접근 제어는 코드에 고정하지 않고 **주인이 바꿀 수 있는 설정**입니다. 아래 네 가지 모드는 moraebot이 정한 것입니다. hermes에서는 기본 거부(명단에 없으면 막기), 허용 목록, pairing 방식을 가져옵니다.
+접근 제어는 코드에 고정하지 않고 **주인이 `config.toml`에서 바꾸는 설정**입니다. 채팅으로는 바꿀 수 없습니다. 모드는 두 가지입니다. 기본 거부(명단에 없으면 막기)는 hermes에서 가져온 원칙입니다.
 
 | 모드 | 뜻 | 위험도 |
 |---|---|---|
 | `owner_only` (기본값) | 주인 한 명만 | 가장 낮음 |
-| `allowlist` | 설정에 적은 사용자 id만 | 명단 관리에 달림 |
-| `pairing` | 모르는 사람이 DM하면 짧은 코드를 받고, 주인이 승인해야 허용 | 주인 판단에 달림 |
-| `open` | 누구나 | 매우 높음 |
+| `allowlist` | 주인과, 메신저 섹션의 `allow` 목록에 적은 사용자와 봇 | 목록 관리에 달림 |
 
-hermes의 pairing은 8자리 코드, 1시간 만료, 플랫폼당 대기 요청 3개, 5번 실패하면 잠금 같은 안전장치를 둡니다. 그룹 채널에서는 pairing을 받지 않습니다. moraebot도 같은 제한을 권장합니다.
+처음 설계에 있던 `pairing`(모르는 사람이 코드를 받고 주인이 승인)과 `open`(누구나)은 지금 계획에 없습니다. 필요해지면 따로 설계합니다.
 
-> **경고: omp는 yolo 모드로 돕니다.** 봇과 말할 수 있는 사람은 사실상 이 컴퓨터에서 아무 명령이나 실행할 수 있습니다. 파일 삭제, 비밀번호 파일 읽기, 외부로 데이터 보내기도 됩니다. 접근 설정이 유일한 안전장치입니다. `open`은 "Discord에서 봇을 찾은 누구나 이 컴퓨터를 조작할 수 있다"는 뜻입니다. `allowlist`와 `pairing`에도 정말 믿는 사람만 넣으세요. 모드를 넓힐 때 봇은 이 경고를 다시 보여 줘야 합니다.
+허용 목록은 메신저마다 따로 적습니다. id 모양이 메신저마다 달라서(Discord는 숫자, Slack은 `U...`), 섹션 안에 두어야 기존 id 검사를 그대로 쓸 수 있습니다.
+
+```toml
+access_mode = "allowlist"
+
+[slack]
+owner_id = "U0OWNER"        # 주인은 그대로 owner_id
+max_bot_replies = 30        # 선택. 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수. 없으면 제한 없음
+
+[[slack.allow]]
+id = "U0FRIEND"
+kind = "user"               # "user" 또는 "bot"
+role = "chat"               # 지금은 "chat"만 있음. 빠지면 "chat"
+```
+
+설정을 읽을 때 엄격하게 검사합니다. 애매하면 시작하지 않습니다(`E_CONFIG_VALUE`).
+
+- `allow`나 `max_bot_replies`가 있는데 모드가 `owner_only`면 오류입니다. 목록이 켜진 것처럼 보이지 않게 하려는 것입니다.
+- 모르는 `kind`나 `role`, 빠진 `id`나 `kind`, 같은 id 두 번, 주인 id, 메신저 모양에 맞지 않는 id는 오류입니다.
+- `max_bot_replies = 0`은 오류입니다. 제한을 없애려면 줄을 지웁니다.
+- 예전 moraebot은 이 키를 모르므로 새 설정을 거부합니다.
+- `moraebot check-config`는 허용된 id마다 kind와 role을 `WARN` 줄로 보여 줍니다.
+
+역할은 둘입니다.
+
+- **주인(owner)**: 지금과 같습니다. lead omp, lane, 모든 관리 도구를 씁니다.
+- **chat**: 대화만 합니다. 답은 lead가 아니라 도구가 하나도 없는 별도 omp가 대화마다 따로 세션을 두고 만듭니다. lane을 멈추거나 닫는 관리 도구는 주인만 씁니다. 파일은 보낼 수 있습니다.
+
+일을 시키는 `work` 역할은 v1에 없습니다. lead가 yolo로 돌기 때문에 work는 사실상 이 컴퓨터의 셸을 주는 것과 같고, 봇에게는 앞으로도 주지 않습니다.
+
+봇끼리 끝없이 주고받지 않도록 두 겹으로 막습니다. `max_bot_replies`가 있으면 그 수가 강제 상한이고, 없으면 상한이 없습니다. 그와 별도로 lead 안내문에 "봇과 끝없이 주고받지 말라"는 한 줄을 넣습니다. 이것은 지침일 뿐 강제가 아닙니다.
+
+> **진행 상황.** 이 내용은 세 번에 나눠 들어갑니다. 1) 설정 읽기와 검사, check-config 표시, 문서(지금). 2) 역할을 dispatch에 적용: 관리 도구는 주인만, 다른 사람의 메시지는 주인의 진행 중 턴에 끼어들지 않음, 봇 답장 상한, lead 안내문. 3) 도구 없는 chat용 omp. 2)가 들어가기 전까지는 `allowlist`로 적어도 주인만 봇과 말할 수 있습니다.
+
+> **경고: omp는 yolo 모드로 돕니다.** 주인 대신 lead와 말할 수 있는 사람은 사실상 이 컴퓨터에서 아무 명령이나 실행할 수 있습니다. 파일 삭제, 비밀번호 파일 읽기, 외부로 데이터 보내기도 됩니다. 그래서 chat 역할은 lead에 닿지 않게 만들고, 접근 설정이 유일한 안전장치라는 점은 그대로입니다. `allow`에는 정말 믿는 사람과 봇만 넣으세요.
 
 검사는 두 번 합니다. 메시지를 받을 때 한 번, 큐에서 꺼내 omp로 보내기 직전에 한 번입니다(dinobot 방식). 그 사이에 주인이 권한을 뺐을 수 있기 때문입니다.
 
@@ -607,7 +639,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
   bin/moraebot             install-launchd 또는 install-systemd가 복사해 두는 실행 파일 (launchd나 systemd가 이것을 켬)
   secrets/discord.token    Discord 봇 토큰 (주인만 읽기, 권한 600)
   inbox.sqlite             받은 메시지 보관함
-  state.sqlite             대화 목록, 허용 사용자, pairing 대기
+  state.sqlite             대화 목록
   lead/session/            lead omp 세션 기록 (--session-dir로 넘김)
   lanes/<id>/session/      lane마다 omp 세션 기록
   hints/lead.md            lead 역할 안내문 바꾸기 (선택)
@@ -624,9 +656,10 @@ The lane is still running and moraebot does not stop it; its result comes later 
 | 항목 | 뜻 | 기본값 | 채팅에서 바꾸기 |
 |---|---|---|---|
 | Discord 토큰 위치 | 토큰 파일 경로. 토큰 자체는 설정 파일에 쓰지 않음 | `secrets/discord.token` | 불가 |
-| 접근 모드 | `owner_only`, `allowlist`, `pairing`, `open` | `owner_only` | 주인만 가능 |
+| 접근 모드 | `owner_only`, `allowlist` | `owner_only` | 불가 |
 | 주인 id | 주인의 Discord 사용자 id | 없음 (필수) | 불가 |
-| 허용 사용자 | `allowlist` 모드에서 허용할 사용자 id 목록 | 빈 목록 | 주인만 가능 |
+| 허용 목록 | `allowlist` 모드에서 메신저별로 허용할 id, kind(`user`/`bot`), role(`chat`) | 빈 목록 | 불가 |
+| 봇 답장 상한 | `max_bot_replies`: 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수 | 없음 (제한 없음) | 불가 |
 | 작업 폴더 | omp가 일하는 폴더 (`--cwd`) | 없음 (필수) | 불가 (열린 질문 11) |
 | 모델 | omp가 쓸 AI 모델 | omp 기본값 | 주인만 가능 (열린 질문 12) |
 
@@ -634,7 +667,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 
 토큰과 주인 id가 그런 항목입니다. 채팅으로 주인 id를 바꿀 수 있다면, 주인 계정이 한 번만 털려도 봇을 영영 빼앗깁니다.
 
-접근 모드와 허용 목록은 주인이 채팅으로 바꿀 수 있습니다. 바뀐 값은 `state.sqlite`에 저장해 재시작 뒤에도 유지합니다.
+접근 모드와 허용 목록도 같은 이유로 파일에서만 바꿉니다. 허용 목록을 넓히는 것은 봇을 남에게 여는 일이기 때문입니다.
 
 주인 id가 비어 있으면 게이트웨이는 시작하지 않습니다.
 
@@ -665,7 +698,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 한 번에 하나씩, 앞 단계가 실제로 동작한 뒤에 다음으로 갑니다(D8). 단계 하나는 처음부터 끝까지 실제로 동작하는 작은 기능 단위입니다.
 
 1. **1단계: 왕복 한 번.** Discord 메시지 -> 게이트웨이 -> inbox 저장 -> omp 대화 하나 -> `prompt_result` -> Discord 답장. 주인 한 명(`owner_only`), 대화 하나, 설정 파일만 씁니다. launchd 등록과 재시작 처리(4.4절)를 포함합니다. 토큰은 권한 600(주인만 읽을 수 있음) 파일에서만 읽고, 로그와 자식 프로세스 환경변수에 넣지 않습니다. 메시지 본문은 셸(명령 실행기)을 거치지 않고 JSON 한 줄로만 omp에 보냅니다. 대화는 Discord 스레드 하나입니다. 가짜 Discord와 가짜 omp로 자동 테스트하고, 실제 Discord에서 한 번 수동으로 확인합니다.
-2. **2단계: 접근 모드.** `owner_only`, `allowlist`, `pairing`, `open`과 주인의 채팅 명령. 받을 때와 보내기 직전에 두 번 검사합니다.
+2. **2단계: 접근 모드.** `owner_only`와 `allowlist`(주인 + chat 역할). 받을 때와 보내기 직전에 두 번 검사합니다. `pairing`과 `open`은 빠졌습니다(2.6절).
 3. **3단계: 여러 대화.** Discord 스레드마다 omp 하나, 대화별 큐. 바쁠 때 `followUp`과 `steer`, `/stop`과 `/new`.
 4. **4단계: 일 나누기(나중).** dori-mode는 예전에 쓰던, 큰 일을 여러 에이전트에게 나눠 맡기던 방식입니다. 그 아이디어를 옮깁니다.
    - 주인 채널에 "리드 대화" 하나를 둡니다.
@@ -704,7 +737,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 11. **작업 폴더를 채팅에서 바꿀 수 있게 할까?** 권장: 3단계까지는 설정 파일에서만. 바꿀 수 있으면 에이전트가 다른 폴더를 마음대로 건드리게 됩니다.
 12. **모델을 채팅에서 바꿀까?** 권장: 주인만, 대화 단위로. 2단계 이후.
 13. **로그 보관 기간.** 권장: 하루 단위로 나누고 14일 보관.
-14. **`open` 모드를 아예 허용할까?** 권장: 설정에는 두되, 켤 때 위험 경고와 주인 재확인을 필수로 합니다.
+14. **`open` 모드를 아예 허용할까?** 결정: 허용하지 않습니다. 모드는 `owner_only`와 `allowlist`만 둡니다(2.6절).
 
 ## 7. 근거 (개발자용)
 
@@ -729,7 +762,7 @@ Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 
 - dinobot은 launchd 아래에서 자체 재시작을 하지 않음: waves4/dinobot.md:111
 
 **접근 제어**
-- 네 모드는 moraebot 설계. hermes에서 가져온 것은 기본 거부, 허용 목록, pairing. 기본 거부와 allowlist 순서: `gateway/authz_mixin.py:858-862, 905-935`. pairing 규칙: `gateway/pairing.py:1-32`. 그룹은 pairing 안 함: `run_inbound.py:228-247` (waves4/verify.md:12; waves4/hermes-agent.md:58, :75, :97)
+- 두 모드(`owner_only`, `allowlist`)는 moraebot 설계. hermes에서 가져온 것은 기본 거부와 허용 목록이고, pairing은 참고만 했습니다. 기본 거부와 allowlist 순서: `gateway/authz_mixin.py:858-862, 905-935`. pairing 규칙: `gateway/pairing.py:1-32`. 그룹은 pairing 안 함: `run_inbound.py:228-247` (waves4/verify.md:12; waves4/hermes-agent.md:58, :75, :97)
 - 받을 때와 보낼 때 두 번 검사(dinobot): `authorizeStored`, `messaging.ts:379` (waves4/verify.md:53)
 
 **omp RPC**

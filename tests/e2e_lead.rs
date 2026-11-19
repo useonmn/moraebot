@@ -259,6 +259,7 @@ impl Rig {
                     owner_id: OWNER.parse().unwrap(),
                     channel_id: CHANNEL.parse().unwrap(),
                     token_file,
+                    access: Default::default(),
                 }),
                 None,
             )
@@ -275,6 +276,7 @@ impl Rig {
                     channel_id: SLACK_CHANNEL.into(),
                     bot_token_file: home.join("secrets").join("slack-bot.token"),
                     app_token_file: home.join("secrets").join("slack-app.token"),
+                    access: Default::default(),
                 }),
             )
         })

@@ -64,6 +64,7 @@ fn test_config(root: &Path, omp_path: PathBuf) -> Config {
             owner_id: OWNER.parse().unwrap(),
             channel_id: CHANNEL.parse().unwrap(),
             token_file,
+            access: Default::default(),
         }),
         slack: None,
         omp: OmpConfig::default(),

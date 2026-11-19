@@ -180,6 +180,7 @@ impl Rig {
                 owner_id: OWNER.parse().unwrap(),
                 channel_id: CHANNEL.parse().unwrap(),
                 token_file,
+                access: Default::default(),
             }),
             slack: None,
             omp: OmpConfig::default(),

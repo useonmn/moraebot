@@ -128,6 +128,7 @@ pub fn build_config(answers: &Answers, env: &Env) -> Result<Config, ConfigError>
         owner_id,
         channel_id,
         token_file: env.default_home()?.join("secrets").join(TOKEN_FILE_NAME),
+        access: Default::default(),
     };
     assemble(
         env,
@@ -363,6 +364,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             owner_id: parse_id(&owner_id).expect("validated by ask_id"),
             channel_id: parse_id(&channel_id).expect("validated by ask_id"),
             token_file,
+            access: existing.map(|d| d.access.clone()).unwrap_or_default(),
         };
         Ok((section, vec![token]))
     }
@@ -407,6 +409,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             channel_id,
             bot_token_file,
             app_token_file,
+            access: existing.map(|s| s.access.clone()).unwrap_or_default(),
         };
         Ok((section, vec![bot, app]))
     }
