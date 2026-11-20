@@ -20,7 +20,7 @@ use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
-use crate::memory::{self, MemoryError, MemoryHandle, MemoryStore, Redactor};
+use crate::memory::{self, MemoryError, MemoryExit, MemoryHandle, MemoryStore, Redactor};
 use crate::omp::{OmpManager, lock};
 use crate::onboarding;
 use crate::store::{Store, StoreError};
@@ -36,6 +36,8 @@ pub const E_SHUTDOWN_TIMEOUT: &str = "E_SHUTDOWN_TIMEOUT";
 
 /// Capacity of the queue between the adapter and the dispatcher.
 const EVENT_QUEUE: usize = 64;
+/// How long shutdown waits for the memory worker to finish its last commit and release the lock.
+const MEMORY_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -76,6 +78,7 @@ pub struct Gateway {
     adapter: Arc<dyn MessengerAdapter>,
     store: Arc<Mutex<Store>>,
     memory: MemoryHandle,
+    memory_exit: MemoryExit,
     omp: OmpManager,
 }
 
@@ -90,7 +93,7 @@ impl Gateway {
         let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
-        let memory = MemoryHandle::spawn(MemoryStore::open(
+        let (memory, memory_exit) = MemoryHandle::spawn_with_exit(MemoryStore::open(
             &config.home,
             Redactor::from_config(config),
             memory::system_clock(),
@@ -105,6 +108,7 @@ impl Gateway {
             adapter,
             store,
             memory,
+            memory_exit,
             omp,
         })
     }
@@ -128,6 +132,7 @@ impl Gateway {
             adapter,
             store,
             memory,
+            memory_exit,
             omp,
         } = self;
         let mut inbound = adapter.start().await?;
@@ -166,6 +171,14 @@ impl Gateway {
         // A turn that was cut off is still `processing` and a stopped lane `running`:
         // make them `needs_check`.
         lock(&store).recover_on_start()?;
+        // The dispatcher held the last memory handle; wait for the worker to release the
+        // memory lock so the home is free when `run` returns.
+        let released = tokio::task::spawn_blocking(move || memory_exit.wait(MEMORY_STOP_LIMIT))
+            .await
+            .unwrap_or(false);
+        if !released {
+            tracing::warn!("memory worker still running at shutdown");
+        }
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())

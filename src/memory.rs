@@ -935,8 +935,7 @@ impl MemoryStore {
             .mode(0o600)
             .open(root.join(LOCK_FILE))
             .map_err(|e| MemoryError::io(LOCK_FILE, &e))?;
-        // SAFETY: flock on a file descriptor this function owns.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if !lock_exclusive(&lock) {
             return Err(MemoryError::new(
                 E_MEMORY_LOCKED,
                 "another moraebot holds the memory lock",
@@ -1485,6 +1484,21 @@ struct Job {
     reply: oneshot::Sender<Result<Outcome, MemoryError>>,
 }
 
+/// Resolves when the memory worker has stopped; the worker stops once every [`MemoryHandle`] is
+/// dropped.
+pub struct MemoryExit(mpsc::Receiver<()>);
+
+impl MemoryExit {
+    /// Blocks until the worker has stopped and released the memory lock, at most `limit`.
+    /// Returns `false` when the worker is still running after `limit`.
+    pub fn wait(self, limit: std::time::Duration) -> bool {
+        !matches!(
+            self.0.recv_timeout(limit),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+}
+
 /// The single writer: a worker thread that owns the [`MemoryStore`]. Cheap to clone; the worker
 /// stops when the last handle is dropped. Reads go to the files directly.
 #[derive(Clone)]
@@ -1497,7 +1511,14 @@ pub struct MemoryHandle {
 impl MemoryHandle {
     /// Starts the worker thread for `store`.
     pub fn spawn(store: MemoryStore) -> Result<Self, MemoryError> {
+        Self::spawn_with_exit(store).map(|(handle, _exit)| handle)
+    }
+
+    /// Starts the worker thread for `store` and returns a [`MemoryExit`] that resolves once the
+    /// worker has stopped and released the memory lock.
+    pub fn spawn_with_exit(store: MemoryStore) -> Result<(Self, MemoryExit), MemoryError> {
         let (jobs, queue) = mpsc::channel::<Job>();
+        let (exited, exit) = mpsc::channel::<()>();
         let handle = Self {
             jobs,
             root: store.root.clone(),
@@ -1505,9 +1526,13 @@ impl MemoryHandle {
         };
         std::thread::Builder::new()
             .name("moraebot-memory".into())
-            .spawn(move || worker(store, queue))
+            .spawn(move || {
+                // `worker` owns and drops the store (and its lock) before `exited` drops.
+                worker(store, queue);
+                drop(exited);
+            })
             .map_err(|e| MemoryError::io("memory worker", &e))?;
-        Ok(handle)
+        Ok((handle, MemoryExit(exit)))
     }
 
     async fn submit(&self, op: Op) -> Result<Outcome, MemoryError> {
@@ -1573,6 +1598,24 @@ impl MemoryHandle {
     pub fn core_block(&self, cap: usize) -> String {
         core_block(&self.root, (self.clock)(), cap)
     }
+}
+
+/// Takes the exclusive lock on `file`, retrying briefly: a just-released lock can still be held
+/// for a moment by a child process another thread is forking, which shares the descriptor until
+/// its `exec` closes it. A real second moraebot keeps the lock, so this still returns `false`.
+fn lock_exclusive(file: &File) -> bool {
+    const TRIES: u32 = 50;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(10);
+    for attempt in 0..TRIES {
+        // SAFETY: flock on a file descriptor the caller owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return true;
+        }
+        if attempt + 1 < TRIES {
+            std::thread::sleep(STEP);
+        }
+    }
+    false
 }
 
 /// Takes every queued job (up to [`MAX_BATCH`]), applies them as one batch (one commit),
