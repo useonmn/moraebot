@@ -57,7 +57,10 @@
 //! `"isError": true` arrives, counted over the child's life, before the next
 //! call or the final reply is written. It applies to any fake, lead or lane.
 //!
-//! Steer: in mode `steer` the first prompt answers `agent_start` and waits. A
+//! Steer: in mode `steer` the first prompt answers `agent_start` and waits; with
+//! FAKE_OMP_STEER_FRAME set (a JSON frame), that frame is written as is between the
+//! prompt's response and `agent_start` (for example an `auto_compaction_end` after the
+//! main prompt was accepted, seen before the steer gate opens). A
 //! later prompt with `"streamingBehavior":"steer"` is acknowledged and handled
 //! by FAKE_OMP_STEER_CASE: `merged` (one run answers both), `separate` (two
 //! runs, one answer each), `hold` (writes `{"type":"fake_held",...}` and then
@@ -467,6 +470,11 @@ impl Fake {
         } else if !self.first_prompt_seen {
             self.first_prompt_seen = true;
             respond_ok(out, id, "prompt", json!({"agentInvoked": true}));
+            if let Ok(frame) = std::env::var("FAKE_OMP_STEER_FRAME") {
+                let frame: Value =
+                    serde_json::from_str(&frame).expect("FAKE_OMP_STEER_FRAME is a JSON frame");
+                send(out, &frame);
+            }
             send(out, &json!({"type": "agent_start"}));
             self.steer_turn = Some(SteerTurn {
                 prompt_id: id.clone(),

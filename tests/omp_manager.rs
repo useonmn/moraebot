@@ -2149,3 +2149,23 @@ async fn a_steer_counts_the_main_inputs_memory_block_as_given() {
     );
 }
 
+#[tokio::test]
+async fn a_steer_after_a_mid_turn_compaction_carries_the_memory_block_again() {
+    let h = Harness::new();
+    // omp compacts the lead's context after it accepted the main prompt, before the steer.
+    let compaction = serde_json::json!({
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    });
+    let (main, steer) =
+        main_and_steer_messages(&h, vec![("FAKE_OMP_STEER_FRAME", compaction.to_string())]).await;
+    let open = omp::thread_memory_open(KEY_STEER);
+    assert!(main.contains(&open), "{main}");
+    assert!(
+        steer.contains(&open) && steer.contains("reply in Korean"),
+        "the compaction may have summarised the main input's block away: {steer}"
+    );
+}
