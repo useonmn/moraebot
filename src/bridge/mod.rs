@@ -4,12 +4,15 @@
 //! listens on a unix socket; the core connects to it and talks JSON lines. The wire
 //! contract is `docs/bridge.md`. This module holds the parts both sides share:
 //! [`proto`] (frame types and the line codec), [`peer`] (the peer uid check) and
-//! [`socket`] (the default socket path and its private folder).
+//! [`socket`] (the default socket path and its private folder). [`client`] is the core's
+//! end of the link, the [`BridgeAdapter`].
 
+pub mod client;
 pub mod peer;
 pub mod proto;
 pub mod socket;
 
+pub use client::BridgeAdapter;
 pub use peer::{check_peer, peer_uid};
 pub use proto::{FrameReader, MAX_LINE, PROTO_VERSION};
 
