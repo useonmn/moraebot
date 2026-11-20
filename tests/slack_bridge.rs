@@ -12,7 +12,9 @@ use moraebot::adapter::{
     MessengerAdapter,
 };
 use moraebot::bridge::peer::own_uid;
-use moraebot::bridge::proto::{Decoded, Frame, FrameReader, StatusState, ThreadsCap, write_frame};
+use moraebot::bridge::proto::{
+    Decoded, Frame, FrameReader, Redacted, StatusState, ThreadsCap, WireAttachment, write_frame,
+};
 use moraebot::bridge::{E_BRIDGE_BAD_REQUEST, E_BRIDGE_BUSY, E_BRIDGE_UNSUPPORTED, PROTO_VERSION};
 use moraebot::files::{E_FILE_TOO_LARGE, Progress};
 use moraebot::slack_bridge::slack::{DEFAULT_HINTS, E_SLACK_UPLOAD, MESSAGE_LIMIT, STATUS_TEXT};
@@ -798,5 +800,121 @@ async fn an_upload_into_a_dm_thread_completes_with_the_thread_ts() {
         .expect("the upload completed");
     assert_eq!(complete, ("D333".to_owned(), Some("3.3".to_owned())));
     adapter.shutdown().await;
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn strangers_and_other_channels_never_reach_the_spool_once_a_core_said_who_it_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let mut core = RawCore::accept(bridge.socket(), &["UPEER"], 32).await;
+    // The ping round trip proves the bridge handled `hello_ok`.
+    assert!(core.sync().await.is_empty());
+    drop(core);
+
+    // While no core is connected, a flood from strangers and other channels is acked
+    // and dropped, so it cannot fill the spool and push out the owner's DM.
+    let mut frames: Vec<Value> = (0..20)
+        .map(|i| message(&format!("s{i}"), "U999", "D444", &format!("{i}.1")))
+        .collect();
+    frames.push(message("c1", "U999", TEST_CHANNEL, "30.1"));
+    frames.push(message("c2", OWNER, "C999", "31.1"));
+    frames.push(message("p1", "UPEER", "D555", "32.1"));
+    frames.push(message("o1", OWNER, "D666", "33.1"));
+    from_slack(&bridge, &frames, frames.len()).await;
+    assert_eq!(acked_envelopes(&bridge.fake).len(), frames.len());
+    assert_eq!(spooled(&bridge), 2, "only the peer's and the owner's DMs");
+
+    let mut core = RawCore::accept(bridge.socket(), &["UPEER"], 32).await;
+    let (_, peer_id, _) = core.message().await;
+    let (_, owner_id, _) = core.message().await;
+    assert_eq!(
+        (peer_id.as_str(), owner_id.as_str()),
+        ("D555:32.1", "D666:33.1")
+    );
+    bridge.shutdown().await;
+}
+
+const STALLED_URL: &str = "https://files.slack.com/files-pri/T1-F9/download/big.bin";
+
+fn fetch(id: u64, url: &str, dest: &Path, max_bytes: Option<u64>) -> Frame {
+    Frame::Fetch {
+        id,
+        attachment: WireAttachment {
+            name: "big.bin".to_owned(),
+            size: 100,
+            mime: None,
+            reference: Redacted(url.to_owned()),
+        },
+        dest: dest.to_owned(),
+        max_bytes,
+    }
+}
+
+fn part_of(dest: &Path) -> std::path::PathBuf {
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    part.into()
+}
+
+#[tokio::test]
+async fn a_fetch_reports_progress_and_a_cancel_removes_its_part_file_without_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    bridge.fake.stall_download(STALLED_URL, b"12345".to_vec());
+    let mut core = RawCore::accept(bridge.socket(), &[], 32).await;
+    let dest = dir.path().join("big.bin");
+    core.send(&fetch(7, STALLED_URL, &dest, None)).await;
+
+    assert_eq!(core.next().await, Frame::Progress { re: 7, bytes: 5 });
+    assert!(part_of(&dest).exists());
+
+    core.send(&Frame::Cancel { id: 7 }).await;
+    let after = core.sync().await;
+    assert!(
+        !after
+            .iter()
+            .any(|frame| matches!(frame, Frame::Ok { re: 7, .. } | Frame::Err { re: 7, .. })),
+        "a cancelled request gets no answer: {after:?}"
+    );
+    assert!(!part_of(&dest).exists());
+    assert!(!dest.exists());
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_bridge_itself_refuses_a_fetch_over_max_bytes_and_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let url = "https://files.slack.com/files-pri/T1-F1/download/a.txt";
+    bridge.fake.set_download_bytes(url, b"hello world".to_vec());
+    let mut core = RawCore::accept(bridge.socket(), &[], 32).await;
+    let dest = dir.path().join("a.txt");
+    core.send(&fetch(8, url, &dest, Some(5))).await;
+    match core.next().await {
+        Frame::Err { re, code, .. } => assert_eq!((re, code.as_str()), (8, E_FILE_TOO_LARGE)),
+        other => panic!("expected an err, got {other:?}"),
+    }
+    assert!(!dest.exists());
+    assert!(!part_of(&dest).exists());
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lost_core_stops_its_download_and_removes_the_part_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    bridge.fake.stall_download(STALLED_URL, b"12345".to_vec());
+    let mut core = RawCore::accept(bridge.socket(), &[], 32).await;
+    let dest = dir.path().join("big.bin");
+    core.send(&fetch(9, STALLED_URL, &dest, None)).await;
+    assert_eq!(core.next().await, Frame::Progress { re: 9, bytes: 5 });
+    assert!(part_of(&dest).exists());
+    drop(core);
+
+    // The next core is accepted only after the old session closed, which stops its
+    // requests.
+    let _next = RawCore::accept(bridge.socket(), &[], 32).await;
+    assert!(!part_of(&dest).exists());
     bridge.shutdown().await;
 }

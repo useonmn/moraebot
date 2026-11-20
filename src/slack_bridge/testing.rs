@@ -294,6 +294,7 @@ struct FakeSlackState {
     rate_limit_next_update: bool,
     sessions: Vec<mpsc::UnboundedSender<SocketItem>>,
     download_bytes: HashMap<String, Vec<u8>>,
+    stalled_downloads: HashMap<String, Vec<u8>>,
     step_failures: VecDeque<(UploadStep, String)>,
     bytes_status_failures: VecDeque<u16>,
     upload_url: Option<String>,
@@ -390,6 +391,14 @@ impl FakeSlackTransport {
     pub fn set_download_bytes(&self, url: &str, bytes: Vec<u8>) {
         self.shared.update(|state| {
             state.download_bytes.insert(url.to_owned(), bytes);
+        });
+    }
+
+    /// A download of this URL writes `bytes` to `<dest>.part`, reports them as progress,
+    /// then never finishes; only a cancel or a lost core ends it.
+    pub fn stall_download(&self, url: &str, bytes: Vec<u8>) {
+        self.shared.update(|state| {
+            state.stalled_downloads.insert(url.to_owned(), bytes);
         });
     }
 
@@ -608,14 +617,26 @@ impl SlackTransport for FakeSlackTransport {
         reject_html: bool,
         progress: &Progress,
     ) -> Result<u64, AdapterError> {
-        let bytes = self.shared.update(|state| {
+        let (bytes, stalled) = self.shared.update(|state| {
             state.record.file_calls.push(SlackFileCall::Download {
                 url_host: url_host(url),
                 dest: dest.to_owned(),
                 reject_html,
             });
-            state.download_bytes.get(url).cloned().unwrap_or_default()
+            (
+                state.download_bytes.get(url).cloned().unwrap_or_default(),
+                state.stalled_downloads.get(url).cloned(),
+            )
         });
+        if let Some(stalled) = stalled {
+            let mut part = dest.as_os_str().to_owned();
+            part.push(".part");
+            create_private_file(Path::new(&part))?
+                .write_all(&stalled)
+                .map_err(|e| write_failure(&e))?;
+            progress.record(stalled.len() as u64);
+            return std::future::pending().await;
+        }
         progress.check_limit(bytes.len() as u64)?;
         create_private_file(dest)?
             .write_all(&bytes)
