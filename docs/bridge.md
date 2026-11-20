@@ -316,8 +316,8 @@ Bridge start errors:
 ```toml
 socket = "/run/user/1000/moraebot/slack-bridge.sock"
 channel_id = "C222BBBB"
-bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
-app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+bot_token_file = "~/.moraebot/secrets/slack-bot.token"
+app_token_file = "~/.moraebot/secrets/slack-app.token"
 ```
 
 - `socket` must be the same absolute path as `[bridge] socket` in the core's `config.toml`.
@@ -352,8 +352,8 @@ messenger = "slack"
 [slack]
 owner_id = "U111AAAA"
 channel_id = "C222BBBB"
-bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
-app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+bot_token_file = "~/.moraebot/secrets/slack-bot.token"
+app_token_file = "~/.moraebot/secrets/slack-app.token"
 ```
 
 After, `config.toml`:
@@ -371,8 +371,8 @@ and `slack-bridge.toml`:
 ```toml
 socket = "/run/user/1000/moraebot/slack-bridge.sock"
 channel_id = "C222BBBB"
-bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
-app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+bot_token_file = "~/.moraebot/secrets/slack-bot.token"
+app_token_file = "~/.moraebot/secrets/slack-app.token"
 ```
 
 `moraebot setup slack` writes both files in this layout for a new setup.

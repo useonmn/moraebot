@@ -171,7 +171,7 @@ mod tests {
 
     fn env() -> Env {
         Env {
-            home_dir: Some(PathBuf::from("/home/u")),
+            home_dir: Some(PathBuf::from("/h/u")),
             moraebot_home: None,
             path: None,
         }
@@ -233,15 +233,15 @@ mod tests {
         let config = SlackBridgeConfig::from_toml(input, &env()).unwrap();
         assert_eq!(
             config.socket,
-            PathBuf::from("/home/u/.moraebot/run/slack-bridge.sock")
+            PathBuf::from("/h/u/.moraebot/run/slack-bridge.sock")
         );
         assert_eq!(
             config.bot_token_file,
-            PathBuf::from("/home/u/.moraebot/secrets/slack-bot.token")
+            PathBuf::from("/h/u/.moraebot/secrets/slack-bot.token")
         );
         assert_eq!(
             config.app_token_file,
-            PathBuf::from("/home/u/.moraebot/secrets/slack-app.token")
+            PathBuf::from("/h/u/.moraebot/secrets/slack-app.token")
         );
     }
 
@@ -328,7 +328,7 @@ mod tests {
     fn the_default_path_is_in_the_moraebot_home() {
         assert_eq!(
             default_path(&env()).unwrap(),
-            PathBuf::from("/home/u/.moraebot/slack-bridge.toml")
+            PathBuf::from("/h/u/.moraebot/slack-bridge.toml")
         );
         let custom = Env {
             moraebot_home: Some(PathBuf::from("/srv/mb")),
