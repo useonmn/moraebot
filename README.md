@@ -6,7 +6,7 @@ moraebot lets you talk to a coding agent on your Mac or Linux machine from a cha
 
 This is slice 3. It adds files: you can attach files to a message, and omp can send files back.
 
-- Discord or Slack, one at a time. Other messengers come later.
+- Discord or Slack, one at a time. Other messengers come later. Slack runs through a separate bridge process, `moraebot-slack-bridge`, installed and started next to `moraebot` (see [docs/bridge.md](docs/bridge.md)).
 - Apple Silicon macOS. It runs as a per-user LaunchAgent.
 - Linux x86_64 or aarch64 with glibc 2.35 or newer and OpenSSL 3. It runs as a systemd user service.
 - One owner. Only you can talk to the bot (`access_mode = "owner_only"`, the default). An allowlist for other people and bots is on the way; see [Access](#access).
@@ -145,14 +145,18 @@ Slack first prints a link that creates the app with the manifest filled in, then
 3. The Slack bot token, `xoxb-...` (saved to `~/.moraebot/secrets/slack-bot.token`).
 4. The Slack app-level token, `xapp-...` (saved to `~/.moraebot/secrets/slack-app.token`).
 
-Restart moraebot after setup so it picks up the change.
+For Slack, setup writes two files: `config.toml` with `messenger = "bridge"` and a `[bridge]` section (socket, owner, access list), and `~/.moraebot/slack-bridge.toml` for the bridge (the same socket path, the channel id and the two token files). The socket path is written out in full in both, on macOS too.
+
+If your `config.toml` still has a `[slack]` section from an earlier version, `setup slack` asks nothing. It moves that section into the two files, keeps the old config as `config.toml.pre-bridge`, and prints the install command. This happens once; see [Upgrading](#upgrading-from-an-earlier-version).
+
+setup ends by printing `moraebot install-launchd` (macOS) or `moraebot install-systemd` (Linux). Run it so the services pick up the change. For Slack it installs both services.
 
 ### The config file
 
 The written config looks roughly like this. You can edit it by hand later. Only the section named by `messenger` is used. The other one can stay in the file, so switching back is a one-word change.
 
 ```toml
-# The active messenger: "discord" or "slack". Only one runs at a time.
+# The active messenger: "discord" or "bridge" (Slack). Only one runs at a time.
 messenger = "discord"
 # Folder omp starts in. This is not a sandbox.
 work_dir = "~/moraebot-work"
@@ -169,14 +173,11 @@ channel_id = <YOUR_CHANNEL_ID>
 # File holding the bot token. Must be mode 600.
 token_file = "~/.moraebot/secrets/discord.token"
 
-# [slack]
+# [bridge]
+# # The bridge's socket. The same absolute path as `socket` in slack-bridge.toml.
+# socket = "<SOCKET_PATH>"
 # # Your Slack member id. Only this account can talk to the bot.
 # owner_id = "<YOUR_SLACK_MEMBER_ID>"
-# # The one channel the bot listens in. Thread replies under it and your DMs also work.
-# channel_id = "<YOUR_CHANNEL_ID>"
-# # Token files. Both must be mode 600.
-# bot_token_file = "~/.moraebot/secrets/slack-bot.token"
-# app_token_file = "~/.moraebot/secrets/slack-app.token"
 
 [omp]
 # Optional. No time limit when left out.
@@ -186,6 +187,19 @@ token_file = "~/.moraebot/secrets/discord.token"
 # Optional. No cost limit when left out.
 # max_cost_usd = 5.0
 ```
+
+For Slack, the channel and the tokens live in `~/.moraebot/slack-bridge.toml`, not here:
+
+```toml
+socket = "<SOCKET_PATH>"
+# The one channel the bot listens in. Thread replies under it and your DMs also work.
+channel_id = "<YOUR_CHANNEL_ID>"
+# Token files. Both must be mode 600.
+bot_token_file = "~/.moraebot/secrets/slack-bot.token"
+app_token_file = "~/.moraebot/secrets/slack-app.token"
+```
+
+A config with `messenger = "slack"` or a `[slack]` section fails to load. Run `moraebot setup slack` once to move it.
 
 Configs written by slice 1 (top-level `owner_id` and `token_file`, no `messenger` line) still load as Discord. You don't need to rewrite them.
 
@@ -199,14 +213,14 @@ There are two access modes:
 ```toml
 access_mode = "allowlist"
 
-[slack]
+[bridge]
+socket = "<SOCKET_PATH>"
 owner_id = "<YOUR_SLACK_MEMBER_ID>"
-# ...channel_id and token files as above...
 # Optional. At most this many replies to bot messages per thread in any 10 minutes.
 # Leave it out for no limit (check-config warns when bots are listed without it).
 max_bot_replies = 30
 
-[[slack.allow]]
+[[bridge.allow]]           # Discord: [[discord.allow]]
 id = "<THEIR_MEMBER_ID>"   # Discord: a number, as for owner_id
 kind = "user"              # "user" or "bot"
 role = "chat"              # only "chat" exists; it's also the default
@@ -243,6 +257,8 @@ moraebot install-launchd
 
 This copies the binary to `~/.moraebot/bin/moraebot`, writes `~/Library/LaunchAgents/dev.moraebot.gateway.plist`, and loads it with `launchctl`. macOS keeps moraebot running from now on and starts it again after a crash or a new login. Add `--dry-run` to print the plist and the `launchctl` commands without running them.
 
+With Slack (`messenger = "bridge"`) it installs a second agent too: `moraebot-slack-bridge` is copied next to `moraebot` and runs under the label `dev.moraebot.gateway.slack-bridge`. The two start in any order; the core waits for the bridge and reconnects when it restarts.
+
 On Linux:
 
 ```sh
@@ -256,6 +272,18 @@ systemctl --user daemon-reload
 systemctl --user enable moraebot.service
 systemctl --user restart moraebot.service
 ```
+
+With Slack (`messenger = "bridge"`) it also copies `moraebot-slack-bridge` to `~/.moraebot/bin/` and writes `moraebot-slack-bridge.service`. Then the commands run for the bridge unit first and the core unit second. The core unit `Wants=` the bridge, so stopping the bridge never stops the core:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable moraebot-slack-bridge.service
+systemctl --user restart moraebot-slack-bridge.service
+systemctl --user enable moraebot.service
+systemctl --user restart moraebot.service
+```
+
+If the bridge binary isn't next to `moraebot`, the command fails with `E_BRIDGE_BINARY`. Run the install line from Install again; it puts both binaries in place.
 
 systemd starts moraebot again 10 seconds after it stops and starts it when you log in. Add `--dry-run` to print the unit and those commands without running them, and `--unit NAME` to use another unit name than `moraebot`.
 
@@ -453,6 +481,14 @@ Files need one more permission than earlier versions asked for. If you set up th
 
 The guides hold the exact settings. Restart moraebot afterwards.
 
+Slack now runs through the bridge. If you use Slack, after the install line:
+
+1. Run `moraebot setup slack`. It finds the old `[slack]` section and moves it without asking: it writes `~/.moraebot/slack-bridge.toml`, saves the old config as `config.toml.pre-bridge`, and writes a `config.toml` with `[bridge]` and no `[slack]`. It runs once. There's no alias: `messenger = "slack"` stays an error.
+2. Run the install command it prints, `moraebot install-launchd` or `moraebot install-systemd`. That installs both services.
+3. Update the Slack app from [`slack-manifest.json`](docs/guides/slack-manifest.json) and reinstall it to your workspace. The manifest now asks for `assistant:write` and turns on Slack's agent view. **That switch can't be undone**; read the Agents section of [docs/guides/slack.md](docs/guides/slack.md) first.
+
+After the move, each Slack DM is answered in a thread, and each DM thread is its own conversation.
+
 This version replaces the separate omp per thread or DM with one lead (see Lead and lanes). After the upgrade:
 
 - The lead starts with an empty history. It doesn't pick up what earlier per-thread sessions remembered.
@@ -467,17 +503,17 @@ If you're coming from 0.2.0: the old memory is not carried over. The new memory 
 moraebot uninstall-launchd
 ```
 
-This unloads the LaunchAgent and removes its plist. On Linux:
+This unloads the LaunchAgent and removes its plist, and does the same for the bridge agent if there is one. On Linux:
 
 ```sh
 moraebot uninstall-systemd
 ```
 
-This runs `systemctl --user disable --now moraebot.service`, removes the unit file and reloads systemd. To remove everything else too:
+This runs `systemctl --user disable --now moraebot.service`, removes the unit file and reloads systemd. It removes `moraebot-slack-bridge.service` the same way. To remove everything else too:
 
 ```sh
 rm -rf ~/.moraebot
-rm ~/.local/bin/moraebot
+rm ~/.local/bin/moraebot ~/.local/bin/moraebot-slack-bridge
 ```
 
 That deletes the installed binary, the config, the token file, the message database, and the logs. Your work folder is left alone. Finally, delete the Discord application or the Slack app if you no longer need the bot.

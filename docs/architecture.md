@@ -82,7 +82,7 @@ moraebot은 세 부분으로 이루어집니다.
 2. **SQLite**: 파일 하나로 된 작은 데이터베이스입니다. 별도 서버가 필요 없습니다. 받은 메시지, 대화 목록, 허용 사용자 같은 상태를 저장합니다.
 3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 모든 대화를 맡는 lead omp 하나와, lead가 긴 일을 맡기는 lane omp가 최대 3개 돕니다(3.7절).
 
-> **slice 2 메모.** 이제 Slack도 붙습니다. Slack은 Socket Mode(WebSocket)로 연결하고, 코드는 `src/slack.rs`에 있습니다. 메신저는 한 번에 하나만 켜집니다(`config.toml`의 `messenger`). 앱 설정 방법은 `docs/guides/`의 메신저별 안내서에 있습니다. 아래 그림의 Discord 자리에 Slack이 들어가도 흐름은 같습니다.
+> **slice 2 메모.** 이제 Slack도 붙습니다. Slack은 Socket Mode(WebSocket)로 연결합니다. #40부터 Slack 연결은 코어 밖의 별도 프로세스 `moraebot-slack-bridge`(코드는 `src/slack_bridge/`)가 맡고, 코어는 로컬 unix socket으로 브리지와 이야기합니다(`messenger = "bridge"`, 형식은 `docs/bridge.md`). Discord는 지금도 코어 안 어댑터입니다. 메신저는 한 번에 하나만 켜집니다(`config.toml`의 `messenger`). 앱 설정 방법은 `docs/guides/`의 메신저별 안내서에 있습니다. 아래 그림의 Discord 자리에 Slack이 들어가도 흐름은 같습니다.
 
 메시지 하나가 지나가는 길은 이렇습니다.
 
@@ -124,9 +124,9 @@ dinobot은 Discord를 interactions 웹훅으로만 받습니다. 이 방식은 �
 
 **Rust 라이브러리.** Discord 쪽 후보는 `serenity` 0.12.5와 `twilight-gateway` 0.18.0입니다. serenity는 기능이 다 들어 있어 쓰기 쉽고, twilight는 필요한 부분만 골라 쓰는 가벼운 구성입니다. **serenity로 시작**하기를 권장합니다. 첫 단계는 받아서 저장하고 넘기는 일뿐이라 쉬운 쪽이 낫습니다. SQLite는 Rust용 라이브러리 `rusqlite` 0.43.0을 씁니다. 쓰기는 한 곳(쓰기만 맡는 별도 작업 흐름(스레드) 하나)에서만 합니다.
 
-**Slack은 이렇게 붙습니다(slice 2).** `src/slack.rs`가 Socket Mode로 연결합니다. 공개 HTTP 주소가 필요 없습니다. 고정 설정(scope, event)은 `docs/guides/slack.md`에만 적습니다. 알아 둘 점 두 가지입니다.
+**Slack은 이렇게 붙습니다(slice 2, #40에서 브리지로 이동).** 브리지 `moraebot-slack-bridge`가 Socket Mode로 연결합니다. 공개 HTTP 주소가 필요 없습니다. Slack 토큰과 `channel_id`는 브리지 설정(`<home>/slack-bridge.toml`)에만 있고, 접근 판단은 그대로 코어가 합니다. 고정 설정(scope, event, agent view)은 `docs/guides/slack.md`에만 적습니다. 알아 둘 점 두 가지입니다.
 
-- Slack 이벤트는 저장소에 들어가기 전에 ack합니다. 그래서 ack와 `admit` 사이에 죽으면 그 메시지는 사라집니다. Discord와 같은 위험입니다.
+- 브리지는 Slack 이벤트를 받자마자 ack하고 디스크의 spool에 먼저 씁니다. 코어가 `handle_event`로 행을 저장한 뒤 ack해야 spool에서 지웁니다. 그래서 코어가 꺼져 있거나 ack 전에 죽어도 메시지는 사라지지 않고, 다시 넘어온 메시지는 메시지 id(`<channel>:<ts>`)로 한 번만 저장됩니다. Discord에는 이 보호가 없습니다.
 - Slack의 `file_share` 메시지는 slice 3부터 일반 메시지처럼 받습니다. 첨부 파일 정보가 함께 들어오고, 아래 파일 흐름을 탑니다.
 
 **파일 흐름(slice 3).** 받는 쪽과 보내는 쪽이 따로 있습니다. 코드는 `src/files.rs`(메신저와 무관한 부분)와 `src/dispatch.rs`에 있습니다.
@@ -150,6 +150,9 @@ slice 4부터 모든 대화는 lead omp 하나가 맡습니다. 그래도 답장
 | DM | `discord:dm:<채널id>` | 1:1이라 단순합니다 |
 | 서버 채널 | `discord:ch:<채널id>` | 채널 하나가 대화 하나 |
 | Discord 스레드 | `discord:th:<스레드id>` | **권장 기본 단위** |
+| Slack DM 스레드 | `slack:th:<채널id>:<스레드 ts>` | 브리지가 DM마다 `thread_id`를 채움. 루트 DM은 자기 `ts`가 스레드 |
+
+Slack DM은 브리지(agent mode)부터 스레드 하나가 대화 하나입니다. 루트 DM에는 그 메시지 `ts`로 스레드 답장을 하고, 스레드 안 DM은 같은 스레드에 답합니다. 예전 `slack:dm:<채널id>` 대화는 남은 답장만 그대로 보냅니다. 코어는 `thread_id`를 해석하지 않는 문자열로 다룹니다.
 
 **권장: Discord 스레드 하나가 대화 하나입니다.** 작업마다 스레드를 열면 대화가 깔끔하게 나뉘고, 여러 작업을 동시에 돌리기도 쉽습니다. hermes도 플랫폼, 채팅, 스레드, 사용자를 이어 붙여 키를 만듭니다. 대화 폴더 이름은 대화 키에서 `:`를 `-`로 바꿔 만듭니다(예: `discord-th-111`).
 
@@ -199,11 +202,12 @@ dinobot의 Discord와 Slack은 전체에 큐 하나(동시 처리 1개)를 씁�
 ```toml
 access_mode = "allowlist"
 
-[slack]
+[bridge]
+socket = "<소켓 경로>"       # 브리지 설정과 같은 절대 경로
 owner_id = "U0OWNER"        # 주인은 그대로 owner_id
 max_bot_replies = 30        # 선택. 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수. 없으면 제한 없음
 
-[[slack.allow]]
+[[bridge.allow]]
 id = "U0FRIEND"
 kind = "user"               # "user" 또는 "bot"
 role = "chat"               # 지금은 "chat"만 있음. 빠지면 "chat"
@@ -662,6 +666,10 @@ The lane is still running and moraebot does not stop it; its result comes later 
 ~/.moraebot/
   config.toml              설정 파일 (사람이 읽고 고치는 파일)
   bin/moraebot             install-launchd 또는 install-systemd가 복사해 두는 실행 파일 (launchd나 systemd가 이것을 켬)
+  bin/moraebot-slack-bridge  Slack 브리지 실행 파일. messenger = "bridge"일 때 같이 복사
+  slack-bridge.toml        브리지 설정: 소켓 경로, channel_id, 토큰 파일 경로 (권한 600)
+  slack-bridge/            브리지 상태: lock, spool/ (코어가 아직 ack하지 않은 메시지)
+  config.toml.pre-bridge   setup slack이 예전 [slack] 설정을 옮길 때 남기는 백업
   secrets/discord.token    Discord 봇 토큰 (주인만 읽기, 권한 600)
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록
@@ -706,6 +714,8 @@ The lane is still running and moraebot does not stop it; its result comes later 
 launchd는 macOS가 프로그램을 자동으로 켜고, 죽으면 다시 켜 주는 기능입니다. `~/Library/LaunchAgents/`에 설정 파일(plist) 하나를 두고 `KeepAlive`와 `RunAtLoad`를 켜면, 로그인할 때 시작하고 죽으면 다시 띄웁니다. 이 키의 정확한 동작은 **미검증**입니다. 사용자 로그인 단위(LaunchAgent)로 돌려야 omp가 주인의 홈 폴더와 인증 정보를 쓸 수 있다고 보지만, 근거를 확인하지 못해 **미검증**입니다.
 
 Linux에서는 `moraebot install-systemd`가 systemd 사용자 서비스 파일 `~/.config/systemd/user/moraebot.service`를 씁니다(`XDG_CONFIG_HOME`이 절대 경로면 그 아래 `systemd/user`). 그다음 `systemctl --user daemon-reload`, `enable`, `restart`를 차례로 실행합니다. 서비스 파일에는 `Restart=always`와 `RestartSec=10`(꺼지면 10초 뒤 다시 켜기), `TimeoutStopSec=30`(맥의 `ExitTimeOut`과 같은 값), `WantedBy=default.target`(로그인하면 켜기)이 들어 있습니다. 사용자 서비스는 로그아웃하면 멈추므로, 로그아웃 뒤에도 돌게 하려면 주인이 `loginctl enable-linger`를 직접 실행합니다. moraebot은 이 명령을 안내만 하고 실행하지 않습니다. 설정 키의 뜻은 systemd 설명서 [systemd.unit(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)와 [systemd.exec(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)를 따릅니다. 실제 Linux 컴퓨터에서의 동작은 **미검증**입니다.
+
+**Slack 브리지 서비스.** `messenger = "bridge"`이면 `install-systemd`는 유닛 두 개를 설치합니다. `moraebot-slack-bridge.service`(같은 `Restart=always`, `RestartSec=10`, `TimeoutStopSec=30`, `UMask=0077`)와 `moraebot.service`입니다. 코어 유닛은 브리지 유닛을 `Wants=`와 `After=`로 가리킵니다. `Requires`가 아니라서 브리지를 멈춰도 코어는 멈추지 않습니다. 명령은 `daemon-reload` 뒤에 브리지, 그다음 코어 순서로 `enable`과 `restart`를 실행합니다. 브리지가 아닌 설정이면 예전에 남은 브리지 유닛을 끄고 지웁니다. `install-launchd`도 같은 방식으로 에이전트 두 개(`<label>`, `<label>.slack-bridge`)를 설치합니다. launchd에는 순서가 없으므로 코어의 기다림과 재접속이 순서를 대신합니다. 소켓 경로는 `setup`이 한 번 정해 두 설정 파일에 같은 절대 경로로 씁니다. macOS에는 `$XDG_RUNTIME_DIR`이 없어서 `~/Library/Application Support/moraebot/slack-bridge.sock`을 풀어 쓴 경로가 들어갑니다. `uninstall-*`은 둘 다 지웁니다.
 
 ### 4.4 재시작했을 때
 

@@ -334,9 +334,11 @@ moraebot-slack-bridge --version
 
 `--config` defaults to `<home>/slack-bridge.toml`. It moves only the config: the lock, the spool (`<home>/slack-bridge/`) and the log (`<home>/logs/`) always use the moraebot home (`MORAEBOT_HOME`, else `~/.moraebot`). To run a second bridge, give it its own `MORAEBOT_HOME`, not just another `--config`; with the same home it fails with `E_BRIDGE_RUNNING`. Start the bridge first, then `moraebot run`. Either can restart while the other runs: the core reconnects, and messages that arrive while no core is connected wait in the spool. On SIGTERM or SIGINT the bridge says `bye` with `E_BRIDGE_STOPPING`, removes the socket file and exits 0.
 
-### Moving a Slack config by hand
+### Moving a Slack config
 
-A `config.toml` with a `[slack]` section or `messenger = "slack"` fails with `E_SLACK_MOVED`, because Slack no longer runs inside the core. To move it:
+A `config.toml` with a `[slack]` section or `messenger = "slack"` fails with `E_SLACK_MOVED`, because Slack no longer runs inside the core. Run `moraebot setup slack` to move it. Setup asks nothing when it finds the old section: it writes `<home>/slack-bridge.toml` first, keeps the old file as `config.toml.pre-bridge` (mode 0600), writes the new `config.toml` without `[slack]`, and ends with the install command for your OS (`moraebot install-systemd` or `moraebot install-launchd`), which installs both services. The move runs once. A second run finds no `[slack]` section and asks the normal questions, and `messenger = "slack"` stays an error, with no alias. If setup stops between the two writes, the old section is still there and the next run moves it again.
+
+To do the same by hand:
 
 1. In `config.toml`, set `messenger = "bridge"`.
 2. Rename `[slack]` to `[bridge]` and `[[slack.allow]]` to `[[bridge.allow]]`. Keep `owner_id`, `max_bot_replies` and the allow entries.
@@ -375,6 +377,6 @@ bot_token_file = "~/.moraebot/secrets/slack-bot.token"
 app_token_file = "~/.moraebot/secrets/slack-app.token"
 ```
 
-`moraebot setup slack` writes both files in this layout for a new setup.
+`moraebot setup slack` writes both files in this layout, for a new setup and for a moved one.
 
 After the move, new DMs are threaded: each DM thread is its own conversation, with its own session and memory. An old `slack:dm:<channel>` conversation still gets its pending replies.
