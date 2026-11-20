@@ -28,7 +28,7 @@ The bot only runs while you're logged in to macOS and the Mac is awake. On Linux
 
 ## Install
 
-You'll need Apple Silicon macOS or Linux (x86_64 or aarch64), a Discord or Slack account, and omp already installed and working in your terminal.
+You'll need Apple Silicon macOS or Linux (x86_64 or aarch64), a Discord or Slack account, git, and omp already installed and working in your terminal.
 
 ### 1. Install moraebot
 
@@ -335,7 +335,9 @@ Files involved:
 
 ## Memory
 
-moraebot keeps no memory of its own. The lead and the lanes are ordinary omp processes, and they read your own omp settings, the same ones your terminal omp uses. moraebot adds no memory setting for them.
+moraebot keeps what you ask it to remember in `~/.moraebot/memory/`, a small git repository. Tell it in plain words (`기억해: ...`, `항상 기억해: ...`, `뭐 기억해?`, `m-1a2b3c 지워`); moraebot answers these itself, so they never reach the lead. Your core rules are added to the lead's system prompt before each turn. See [docs/memory.md](docs/memory.md) for the commands, the folder layout and how to remove something from the history for good.
+
+The lead and the lanes are ordinary omp processes, and they read your own omp settings, the same ones your terminal omp uses. moraebot adds no omp memory setting for them.
 
 moraebot always runs omp with `--mode rpc`. In that mode omp leaves `memory.backend` at its default, `off`, unless you set it yourself in omp's settings or environment. So if you want omp's memory inside moraebot, turn it on in omp's own settings, then restart moraebot.
 
@@ -457,7 +459,7 @@ This version replaces the separate omp per thread or DM with one lead (see Lead 
 - The old `~/.moraebot/conversations/*/session` folders are kept as they were and are no longer used. Delete them by hand if you don't need them.
 - Your stored messages and settings keep working without any change.
 
-If you're coming from 0.2.0: this version has no memory system of its own. The memory code is kept on the `memory-full` branch. Nothing of the old memory is deleted or moved. `~/.moraebot/memory/`, `~/.moraebot/omp/config-overlay.yml` and the memory tables in the database stay on disk unused, and you can delete them by hand. The first conversation's state carries over as it was. To make a `persona.md`, run `moraebot onboarding` and restart moraebot. omp memory now follows your own omp settings (see Memory).
+If you're coming from 0.2.0: the old memory is not carried over. The new memory store uses `~/.moraebot/memory/` with a different layout, so while the old files (`~/.moraebot/memory/system` and its sibling folders, `~/.moraebot/omp/config-overlay.yml`) are there, moraebot refuses to start and prints the `rm -rf` command for exactly those paths. moraebot never deletes them itself; run the command, then start again (see [docs/memory.md](docs/memory.md)). The old memory tables in the database are left unused. The first conversation's state carries over as it was. To make a `persona.md`, run `moraebot onboarding` and restart moraebot. omp memory now follows your own omp settings (see Memory).
 
 ## Stop and uninstall
 

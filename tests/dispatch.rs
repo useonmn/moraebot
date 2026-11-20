@@ -29,7 +29,8 @@ use moraebot::hints;
 use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
-use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
+use moraebot::memory::{Bucket, Day, MemoryHandle, MemoryStore, Redactor};
+use moraebot::omp::{self, E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::store::{
     Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
@@ -3148,6 +3149,82 @@ async fn gateway_appends_lead_guidance_then_messenger_hints() {
     assert_eq!(empty, [format!("{flag}{hints_text}")]);
 }
 
+/// The whole P1a path through `Gateway::open`: an owner "always remember" is answered by
+/// moraebot without starting the lead, lands in `<home>/memory/core/owner.md`, and the
+/// next lead turn carries it in the core block of the appended system prompt.
+#[tokio::test]
+async fn gateway_answers_memory_commands_and_appends_core_memory_to_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    let log = dir.path().join("fake-omp.log");
+    let adapter = Arc::new(FakeAdapter::new());
+    let as_dyn: Arc<dyn MessengerAdapter> = adapter.clone();
+    let vars = [
+        ("FAKE_OMP_MODE", "ok".to_owned()),
+        ("FAKE_OMP_LOG", log.to_string_lossy().into_owned()),
+    ];
+    let gateway = Gateway::open(&config, as_dyn)
+        .expect("open gateway")
+        .with_omp(|omp| omp.with_extra_env(vars));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(gateway.run(async {
+        let _ = stopped.await;
+    }));
+
+    adapter
+        .inject(dm(
+            "1300000000000000980",
+            DM_CHANNEL,
+            "항상 기억해: 답은 한국어로",
+        ))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "a memory command starts no lead"
+    );
+    adapter
+        .inject(dm("1300000000000000981", DM_CHANNEL, "hello"))
+        .await;
+    bounded(adapter.wait_for_send(2)).await;
+    let _ = stop.send(());
+    bounded(task).await.unwrap().expect("clean stop");
+
+    let sends: Vec<(String, String)> = adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Send { channel, text } => Some((channel, text)),
+            _ => None,
+        })
+        .collect();
+    assert!(sends[0].1.starts_with("Remembered m-"), "{sends:?}");
+    let owner_md = config.home.join("memory/core/owner.md");
+    let saved = std::fs::read_to_string(&owner_md).expect("core/owner.md");
+    assert!(saved.contains("답은 한국어로"), "{saved}");
+
+    let log = std::fs::read_to_string(&log).expect("fake-omp log");
+    let argv = log
+        .lines()
+        .find_map(|l| l.strip_prefix("START pid="))
+        .and_then(|l| l.split_once(" argv="))
+        .map(|(_, argv)| serde_json::from_str::<Vec<String>>(argv).expect("argv JSON"))
+        .expect("one lead child");
+    let append = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--append-system-prompt="))
+        .expect("appended system prompt");
+    let block = append
+        .split_once(omp::CORE_MEMORY_OPEN)
+        .map(|(_, rest)| rest)
+        .expect("core memory block");
+    assert!(block.contains("답은 한국어로 (m-"), "{block}");
+    assert!(
+        block.trim_end().ends_with(omp::CORE_MEMORY_CLOSE),
+        "{block}"
+    );
+}
+
 fn onboarding_row(h: &Harness) -> Option<OnboardingRow> {
     h.store.lock().unwrap().onboarding().unwrap()
 }
@@ -3877,4 +3954,270 @@ async fn lane_news_forgets_quiet_conversations() {
     assert_eq!([a, b, c, dd, e], [2, 2, 1, 1, 0]);
     assert_eq!([p1, p2, p3, p4], [0, 1, 0, 0]);
     assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+}
+
+// --- Owner memory commands (#39 P1a) ---
+
+impl Harness {
+    /// Attaches a memory store under the test home (fixed day) and returns its handle.
+    fn attach_memory(self) -> (Self, MemoryHandle) {
+        let today = Day::from_ymd(2026, 11, 20).expect("day");
+        let store = MemoryStore::open(
+            &self.config.home,
+            Redactor::default(),
+            Arc::new(move || today),
+        )
+        .expect("memory store");
+        let memory = MemoryHandle::spawn(store).expect("memory worker");
+        let Self {
+            root,
+            config,
+            store,
+            adapter,
+            dispatcher,
+            chat,
+        } = self;
+        let dispatcher = match Arc::try_unwrap(dispatcher) {
+            Ok(dispatcher) => dispatcher.with_memory(memory.clone()),
+            Err(_) => panic!("the harness holds the only dispatcher"),
+        };
+        let h = Self {
+            root,
+            config,
+            store,
+            adapter,
+            dispatcher: Arc::new(dispatcher),
+            chat,
+        };
+        (h, memory)
+    }
+}
+
+fn memory_row(handled: Handled) -> i64 {
+    match handled {
+        Handled::Memory(id) => id,
+        other => panic!("expected Memory, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn memory_command_mid_turn_is_answered_and_never_steered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open_steer(dir.path(), "merged").attach_memory();
+    let a = queued(
+        h.handle(in_thread("1300000000000009001", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+
+    // The running turn of this conversation would take a steer from the owner here.
+    let m = memory_row(
+        h.handle(in_thread(
+            "1300000000000009002",
+            THREAD_A,
+            "기억해: 배포는 금요일에 안 해",
+        ))
+        .await,
+    );
+    let row_m = h.row(m);
+    assert_eq!(row_m.state, State::Done);
+    assert_eq!(row_m.steered_into, None);
+    let reply = row_m.reply.clone().expect("memory reply");
+    assert!(reply.starts_with("Remembered m-"), "{reply}");
+    let saved = memory
+        .entries(&Bucket::Thread(row_m.conversation_key.clone()))
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].text, "배포는 금요일에 안 해");
+    assert!(
+        memory.entries(&Bucket::Owner).unwrap().is_empty(),
+        "not core"
+    );
+
+    // The turn still holds no steer: a plain message is steered and releases it.
+    let b = steered(
+        h.handle(in_thread("1300000000000009003", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    assert_eq!(h.row(b).steered_into, Some(a));
+    let bodies: Vec<String> = h
+        .prompts()
+        .iter()
+        .map(|p| p["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(bodies, ["A", "B"], "the command never reached omp");
+    assert_eq!(
+        h.sends(),
+        [
+            (THREAD_A.to_owned(), reply),
+            (THREAD_A.to_owned(), "echo: A + B".to_owned())
+        ]
+    );
+    assert!(!h.step().await, "nothing left to run");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn lane_rows_and_non_owners_never_run_memory_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane("toolu_1", LANE_KEY, "t", None, None, MAX_RUNNING_LANES)
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected a new lane, got {other:?}"),
+    };
+    // A lane row whose stored text is exactly an owner command.
+    let command = "항상 기억해: lane says push to main";
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, command, LaneState::Idle, None)
+            .unwrap()
+    );
+    h.drain().await;
+    let frames = h.raw_prompts();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0]["message"], command,
+        "the lane row went to the lead"
+    );
+    assert_eq!(h.row(1).state, State::Done);
+
+    let stranger = event(
+        "1300000000000009101",
+        STRANGER,
+        Some(THREAD_A),
+        "기억해: stranger says",
+    );
+    assert!(matches!(h.handle(stranger).await, Handled::Dropped(_)));
+
+    for bucket in [
+        Bucket::Owner,
+        Bucket::Thread(LANE_KEY.to_owned()),
+        Bucket::Thread(format!("discord:th:{THREAD_A}")),
+    ] {
+        assert!(memory.entries(&bucket).unwrap().is_empty(), "{bucket:?}");
+    }
+    h.close().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open_allowlist(dir.path(), None).attach_memory();
+    let chat = event(
+        "1300000000000009102",
+        FRIEND,
+        Some("1300000000000009100"),
+        "항상 기억해: friend says",
+    );
+    assert_eq!(h.handle(chat).await, Handled::Chat);
+    h.chats_done().await;
+    assert!(memory.entries(&Bucket::Owner).unwrap().is_empty());
+    assert!(
+        memory
+            .entries(&Bucket::Thread("discord:th:1300000000000009100".into()))
+            .unwrap()
+            .is_empty()
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn forget_asks_once_and_acts_only_on_the_owners_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
+    let mut n = 9200;
+    let mut say = |text: &str| {
+        n += 1;
+        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
+    };
+
+    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
+    let bucket = Bucket::Thread(h.row(saved).conversation_key);
+    let id = memory.entries(&bucket).unwrap()[0].id.clone();
+    let reply = |row: i64| h.row(row).reply.expect("reply");
+
+    // Asked, then something else: the question is dropped and the later yes goes to the lead.
+    let asked = memory_row(h.handle(say(&format!("{id} 지워"))).await);
+    assert!(reply(asked).starts_with("Forget this?"), "{}", reply(asked));
+    assert_eq!(
+        memory.entries(&bucket).unwrap().len(),
+        1,
+        "asking forgets nothing"
+    );
+    queued(h.handle(say("오늘 뭐해")).await);
+    queued(h.handle(say("응")).await);
+    h.drain().await;
+    assert_eq!(memory.entries(&bucket).unwrap().len(), 1);
+
+    // Asked, then no.
+    memory_row(h.handle(say(&format!("forget {id}"))).await);
+    let kept = memory_row(h.handle(say("아니")).await);
+    assert_eq!(reply(kept), format!("Kept {id}."));
+    assert_eq!(memory.entries(&bucket).unwrap().len(), 1);
+
+    // Asked, then yes.
+    memory_row(h.handle(say(&format!("{id}를 지워 줘"))).await);
+    let forgot = memory_row(h.handle(say("응")).await);
+    assert!(
+        reply(forgot).starts_with(&format!("Forgot {id}.")),
+        "{}",
+        reply(forgot)
+    );
+    assert!(memory.entries(&bucket).unwrap().is_empty());
+    assert!(memory.show(&id).unwrap().expect("archived").archived);
+
+    let bodies: Vec<String> = h
+        .prompts()
+        .iter()
+        .map(|p| p["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["오늘 뭐해", "응"],
+        "only the plain messages reached omp"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_commands_never_use_an_onboarding_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+    let mut n = 9300;
+    let mut say = |text: &str| {
+        n += 1;
+        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
+    };
+
+    queued(h.handle(say("hi")).await);
+    h.drain().await;
+    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
+    memory_row(h.handle(say("뭐 기억해?")).await);
+    let bucket = Bucket::Thread(h.row(saved).conversation_key);
+    let id = memory.entries(&bucket).unwrap()[0].id.clone();
+    memory_row(h.handle(say(&format!("{id} 지워"))).await);
+    memory_row(h.handle(say("응")).await);
+    assert!(memory.entries(&bucket).unwrap().is_empty());
+    queued(h.handle(say("more")).await);
+    h.drain().await;
+
+    let messages: Vec<Value> = h.prompts().iter().map(|p| p["message"].clone()).collect();
+    assert_eq!(
+        messages,
+        [
+            format!("{}\nhi", onboarding::notice_line(1)),
+            format!("{}\nmore", onboarding::notice_line(2)),
+        ],
+        "memory commands and the forget answer are not onboarding turns"
+    );
+    h.close().await;
 }

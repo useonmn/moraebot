@@ -34,6 +34,16 @@
 //! the saved-files block); a lane-result row (`origin = 'lane'`) carries its stored text
 //! and skips the owner check. Every reply goes to `reply_target(row.conversation_key)`.
 //!
+//! Owner memory commands ([`crate::memory_commands`]): once a memory store is attached
+//! ([`Dispatcher::with_memory`]), an owner row without attachments is checked right after
+//! admission (and its thread), before any steer: a remember / show / correct / forget /
+//! restore request is claimed, answered by moraebot itself as the row's reply and never
+//! reaches the lead, also while a lead turn of its conversation is running. Forget only asks;
+//! the owner's next message in that conversation answers (yes forgets, no keeps, anything
+//! else drops the question and is handled as usual). The question lives in memory only. A
+//! command row queued without that check (a race with the worker, a restart) is answered
+//! by the worker the same way; lane-result rows are never checked.
+//!
 //! A message of the conversation whose lead turn is running is steered into that turn
 //! once its files are saved, only when it comes from the same sender as the turn, when the store accepts the claim ([`Store::steer_into`]);
 //! otherwise it is queued. A turn and its steered row form one group: one reply on the
@@ -88,6 +98,8 @@ use crate::files::{self, OutFile, SavedFile};
 use crate::gateway::{E_GATEWAY_TASK, GatewayError};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
+use crate::memory::MemoryHandle;
+use crate::memory_commands::{self, Command};
 use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug, lock};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
 pub use crate::store::E_DISPATCH_HELD;
@@ -309,6 +321,16 @@ pub enum Handled {
     /// A listed chat sender's message, handed to the chat runtime on its own task; nothing
     /// stored.
     Chat,
+    /// An owner memory command, answered by moraebot itself as the row's reply; never sent to
+    /// the lead.
+    Memory(i64),
+}
+
+/// What an owner row asks of the memory store.
+enum MemoryAct {
+    Run(Command),
+    /// The owner's yes (`true`) or no to the forget question about this id.
+    Confirm(String, bool),
 }
 
 /// How often a conversation saw an owner message, a delivered reply or posted news, and
@@ -345,6 +367,10 @@ pub struct Dispatcher {
     wake: Notify,
     /// Talk per conversation key, for lane news.
     talk: Mutex<HashMap<String, Talk>>,
+    /// The memory store; without it no message is a memory command.
+    memory: Option<MemoryHandle>,
+    /// The id each conversation was last asked to confirm forgetting.
+    forget_asked: Mutex<HashMap<String, String>>,
 }
 
 impl Dispatcher {
@@ -370,7 +396,15 @@ impl Dispatcher {
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
             talk: Mutex::default(),
+            memory: None,
+            forget_asked: Mutex::default(),
         }
+    }
+
+    /// Turns on the owner memory commands, served by `memory`.
+    pub fn with_memory(mut self, memory: MemoryHandle) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -724,6 +758,19 @@ impl Dispatcher {
             id
         };
 
+        if sender == Sender::Owner {
+            if event.attachments.is_empty() {
+                if let Some(handled) = self
+                    .memory_command(id, key.as_str(), &event.text, true)
+                    .await?
+                {
+                    return Ok(handled);
+                }
+            } else {
+                lock(&self.forget_asked).remove(key.as_str());
+            }
+        }
+
         let mut saved: Vec<SavedFile> = Vec::new();
         if !event.attachments.is_empty() {
             let fetched = self.fetch_files(id, &key, &event.attachments).await;
@@ -847,6 +894,16 @@ impl Dispatcher {
             return Ok(true);
         }
 
+        if from_owner
+            && row.attachments.is_none()
+            && self
+                .memory_command(row.id, key, &row.text, false)
+                .await?
+                .is_some()
+        {
+            return Ok(true);
+        }
+
         let prompt = if from_owner {
             let saved: Vec<SavedFile> = match row.attachments.as_deref().map(serde_json::from_str) {
                 None => Vec::new(),
@@ -893,6 +950,62 @@ impl Dispatcher {
         drop(typing);
         self.settle_group(row.id, target, group).await?;
         Ok(true)
+    }
+
+    /// Answers owner row `id` of conversation `key` when its `text` is a memory command (or,
+    /// on `arrival`, the answer to this conversation's forget question): the reply is stored
+    /// and sent like a lead reply and the row ends `done`. On `arrival` the row is still
+    /// `queued` and is claimed first (a row the worker took meanwhile is left to it), and any
+    /// other message drops the forget question. The worker passes `arrival = false` for its
+    /// already claimed row: it never answers a forget question, because the row may predate
+    /// it. Returns `None` when the row is not for the memory store.
+    async fn memory_command(
+        &self,
+        id: i64,
+        key: &str,
+        text: &str,
+        arrival: bool,
+    ) -> Result<Option<Handled>, StoreError> {
+        let Some(memory) = &self.memory else {
+            return Ok(None);
+        };
+        let asked = if arrival {
+            lock(&self.forget_asked).get(key).cloned()
+        } else {
+            None
+        };
+        let act = asked
+            .and_then(|target| {
+                memory_commands::confirmation(text).map(|yes| MemoryAct::Confirm(target, yes))
+            })
+            .or_else(|| memory_commands::parse(text).map(MemoryAct::Run));
+        let Some(act) = act else {
+            if arrival {
+                lock(&self.forget_asked).remove(key);
+            }
+            return Ok(None);
+        };
+        if arrival {
+            let _gate = self.admission.lock().await;
+            if !self.store().claim(id)? {
+                return Ok(None);
+            }
+            lock(&self.forget_asked).remove(key);
+        }
+        let reply = match act {
+            MemoryAct::Confirm(target, yes) => memory_commands::forget(memory, &target, yes).await,
+            MemoryAct::Run(command) => {
+                let answer = memory_commands::run(memory, key, id, command).await;
+                if let Some(target) = answer.confirm_forget {
+                    lock(&self.forget_asked).insert(key.to_owned(), target);
+                }
+                answer.reply
+            }
+        };
+        tracing::info!(row = id, conversation = key, "memory command answered");
+        self.store().finish_memory(id, &reply)?;
+        self.send_reply(id).await?;
+        Ok(Some(Handled::Memory(id)))
     }
 
     /// Stores the outcome of a lead turn and its steered row, if any: one reply on the

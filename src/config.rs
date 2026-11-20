@@ -22,6 +22,7 @@ pub const E_TOKEN_MISSING: &str = "E_TOKEN_MISSING";
 pub const E_TOKEN_NOT_FILE: &str = "E_TOKEN_NOT_FILE";
 pub const E_TOKEN_MODE: &str = "E_TOKEN_MODE";
 pub const E_OMP_MISSING: &str = "E_OMP_MISSING";
+pub const E_GIT_MISSING: &str = "E_GIT_MISSING";
 pub const E_WORK_DIR: &str = "E_WORK_DIR";
 pub const E_HOME_UNKNOWN: &str = "E_HOME_UNKNOWN";
 pub const E_HOME_LAYOUT: &str = "E_HOME_LAYOUT";
@@ -535,6 +536,11 @@ impl Config {
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
     }
 
+    /// The memory store folder, `<home>/memory`.
+    pub fn memory_dir(&self) -> PathBuf {
+        crate::memory::memory_dir(&self.home)
+    }
+
     /// The active messenger's owner id as text.
     pub fn owner_id(&self) -> String {
         match self.messenger {
@@ -623,6 +629,11 @@ impl Config {
             Check {
                 name: "omp_path",
                 result: self.check_omp(),
+                advisory: false,
+            },
+            Check {
+                name: "git",
+                result: check_git(Path::new("git")),
                 advisory: false,
             },
             Check {
@@ -740,6 +751,30 @@ impl Config {
         }
         Ok(path.display().to_string())
     }
+}
+
+/// Runs `<git> --version`: the memory store is a git repository, so moraebot needs git.
+fn check_git(git: &Path) -> Result<String, ConfigError> {
+    let output = std::process::Command::new(git)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            ConfigError::io(
+                E_GIT_MISSING,
+                &format!(
+                    "cannot run {}; install git (the memory store needs it)",
+                    git.display()
+                ),
+                &e,
+            )
+        })?;
+    if !output.status.success() {
+        return Err(ConfigError::new(
+            E_GIT_MISSING,
+            format!("{} --version failed; check the git install", git.display()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn check_token_file(path: &Path) -> Result<String, ConfigError> {
@@ -1449,6 +1484,19 @@ mod tests {
         assert_eq!(code(cfg.validate()), E_OMP_MISSING);
         fs::remove_file(&fx.omp).expect("remove");
         assert_eq!(code(cfg.validate()), E_OMP_MISSING);
+    }
+
+    #[test]
+    fn git_check_runs_git_version() {
+        let fx = Fixture::new();
+        assert!(
+            check_git(Path::new("git"))
+                .expect("git")
+                .starts_with("git version")
+        );
+        let missing = fx.dir.path().join("no-git");
+        assert_eq!(code(check_git(&missing)), E_GIT_MISSING);
+        assert_eq!(code(check_git(Path::new("false"))), E_GIT_MISSING);
     }
 
     #[test]
