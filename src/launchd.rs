@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -175,8 +176,14 @@ pub fn install(
 ) -> Result<(), ConfigError> {
     let source = std::env::current_exe()
         .map_err(|e| ConfigError::io(E_IO, "cannot find the running moraebot binary", &e))?;
+    let (launchctl, plutil) = ([OsStr::new("launchctl")], [OsStr::new("plutil")]);
+    let tools = Tools {
+        launchctl: &launchctl,
+        plutil: &plutil,
+    };
     install_on(
         std::env::consts::OS,
+        &tools,
         &source,
         config,
         env,
@@ -186,6 +193,13 @@ pub fn install(
     )
 }
 
+/// The programs `install` and `uninstall` run, each as `program[0] program[1..] <args>`;
+/// tests pass stand-ins that log their arguments.
+struct Tools<'a> {
+    launchctl: &'a [&'a OsStr],
+    plutil: &'a [&'a OsStr],
+}
+
 /// One launchd agent to write and load.
 struct Agent {
     label: String,
@@ -193,10 +207,12 @@ struct Agent {
     file: PathBuf,
 }
 
-/// `install` with the system name and the `moraebot` binary to copy (`source`; the bridge
-/// binary is taken from its folder) as parameters.
+/// `install` with the system name, the programs to run and the `moraebot` binary to copy
+/// (`source`; the bridge binary is taken from its folder) as parameters.
+#[allow(clippy::too_many_arguments)]
 fn install_on(
     os: &str,
+    tools: &Tools,
     source: &Path,
     config: &Config,
     env: &Env,
@@ -230,6 +246,11 @@ fn install_on(
     // The bridge first: launchd has no ordering, but a bridge that is already up spares
     // the gateway its wait for the first hello.
     let order: Vec<&Agent> = bridge.iter().chain([&core]).collect();
+    // Checked before the dry run too, so `--dry-run` fails where the real run would.
+    let bridge_binary = match bridge {
+        Some(_) => Some(bridge_source(source)?),
+        None => None,
+    };
     if dry_run {
         for agent in [&core].into_iter().chain(&bridge) {
             write!(out, "{}", agent.plist)?;
@@ -241,10 +262,6 @@ fn install_on(
         return Ok(());
     }
 
-    let bridge_binary = match bridge {
-        Some(_) => Some(bridge_source(source)?),
-        None => None,
-    };
     let bin_dir = config.home.join("bin");
     fs::create_dir_all(&bin_dir)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", bin_dir.display()), &e))?;
@@ -262,21 +279,26 @@ fn install_on(
         let file = utf8(&agent.file)?;
         fs::write(&agent.file, &agent.plist)
             .map_err(|e| ConfigError::io(E_IO, &format!("cannot write {file}"), &e))?;
-        run_command("plutil", &["-lint", file], E_PLIST_LINT)?;
+        run_command(tools.plutil, &["-lint", file], E_PLIST_LINT)?;
     }
 
     if bridge.is_none() {
         let leftover = bridge_label(label);
         let file = agents_dir.join(format!("{leftover}.plist"));
         if fs::symlink_metadata(&file).is_ok() {
-            bootout_and_wait(&domain, &leftover, "retry `moraebot install-launchd`")?;
+            bootout_and_wait(
+                tools.launchctl,
+                &domain,
+                &leftover,
+                "retry `moraebot install-launchd`",
+            )?;
             remove_plist(&file)?;
             writeln!(out, "removed {leftover}")?;
         }
     }
     for agent in &order {
         let file = utf8(&agent.file)?;
-        reload(&domain, &agent.label, file)?;
+        reload(tools.launchctl, &domain, &agent.label, file)?;
         writeln!(out, "installed {} at {file}", agent.label)?;
     }
     Ok(())
@@ -340,10 +362,15 @@ pub(crate) fn install_binary(source: &Path, binary: &Path) -> Result<(), ConfigE
 
 /// Boots out an already loaded job (ignoring "not loaded"), waits until launchd has
 /// really dropped it, then bootstraps the new plist, so a re-run upgrades and restarts.
-fn reload(domain: &str, label: &str, plist_text: &str) -> Result<(), ConfigError> {
+fn reload(
+    launchctl: &[&OsStr],
+    domain: &str,
+    label: &str,
+    plist_text: &str,
+) -> Result<(), ConfigError> {
     let retry = format!("run `moraebot uninstall-launchd --label {label}` and retry");
-    bootout_and_wait(domain, label, &retry)?;
-    run_command("launchctl", &["bootstrap", domain, plist_text], E_LAUNCHCTL)
+    bootout_and_wait(launchctl, domain, label, &retry)?;
+    run_command(launchctl, &["bootstrap", domain, plist_text], E_LAUNCHCTL)
         .map_err(|e| ConfigError::new(E_LAUNCHCTL, format!("{}; {retry}", e.message)))?;
     Ok(())
 }
@@ -351,15 +378,20 @@ fn reload(domain: &str, label: &str, plist_text: &str) -> Result<(), ConfigError
 /// Boots out `domain/label`, ignoring the exit status (a job that is not loaded is
 /// fine), then waits until `launchctl print` no longer finds it, bounded by the
 /// plist `ExitTimeOut` plus a margin.
-fn bootout_and_wait(domain: &str, label: &str, hint: &str) -> Result<(), ConfigError> {
+fn bootout_and_wait(
+    launchctl: &[&OsStr],
+    domain: &str,
+    label: &str,
+    hint: &str,
+) -> Result<(), ConfigError> {
     let target = format!("{domain}/{label}");
-    Command::new("launchctl")
+    command(launchctl, E_LAUNCHCTL)?
         .args(["bootout", target.as_str()])
         .output()
         .map_err(|e| ConfigError::io(E_LAUNCHCTL, "cannot run launchctl", &e))?;
     let deadline = Instant::now() + Duration::from_secs(EXIT_TIMEOUT_SECS + 5);
     loop {
-        let loaded = Command::new("launchctl")
+        let loaded = command(launchctl, E_LAUNCHCTL)?
             .args(["print", target.as_str()])
             .output()
             .map_err(|e| ConfigError::io(E_LAUNCHCTL, "cannot run launchctl", &e))?
@@ -386,16 +418,33 @@ fn bootout_and_wait(domain: &str, label: &str, hint: &str) -> Result<(), ConfigE
 /// removes their plists (fine when already gone); returns only after launchd has
 /// really dropped both jobs.
 pub fn uninstall(env: &Env, label: &str, out: &mut impl Write) -> Result<(), ConfigError> {
-    uninstall_on(std::env::consts::OS, env, label, out)
+    uninstall_on(
+        std::env::consts::OS,
+        &[OsStr::new("launchctl")],
+        env,
+        label,
+        out,
+    )
 }
 
-fn uninstall_on(os: &str, env: &Env, label: &str, out: &mut impl Write) -> Result<(), ConfigError> {
+fn uninstall_on(
+    os: &str,
+    launchctl: &[&OsStr],
+    env: &Env,
+    label: &str,
+    out: &mut impl Write,
+) -> Result<(), ConfigError> {
     require_os(os, "macos")?;
     check_label(label)?;
     let domain = format!("gui/{}", current_uid()?);
     let agents_dir = launch_agents_dir(env)?;
     for label in [label.to_owned(), bridge_label(label)] {
-        bootout_and_wait(&domain, &label, "retry `moraebot uninstall-launchd`")?;
+        bootout_and_wait(
+            launchctl,
+            &domain,
+            &label,
+            "retry `moraebot uninstall-launchd`",
+        )?;
         remove_plist(&agents_dir.join(format!("{label}.plist")))?;
         writeln!(out, "removed {label}")?;
     }
@@ -439,23 +488,38 @@ fn launch_agents_dir(env: &Env) -> Result<PathBuf, ConfigError> {
 }
 
 fn current_uid() -> Result<String, ConfigError> {
-    run_command("id", &["-u"], E_LAUNCHCTL)
+    run_command(&[OsStr::new("id")], &["-u"], E_LAUNCHCTL)
 }
 
-pub(crate) fn run_command(
-    program: &str,
+/// A `Command` for `program[0] program[1..]`; `code` when `program` is empty.
+fn command(program: &[&OsStr], code: &'static str) -> Result<Command, ConfigError> {
+    let (first, prefix) = program
+        .split_first()
+        .ok_or_else(|| ConfigError::new(code, "no program given"))?;
+    let mut command = Command::new(first);
+    command.args(prefix);
+    Ok(command)
+}
+
+/// Runs `program[0] program[1..] <args>` and returns its trimmed stdout; a spawn failure
+/// or a non-zero exit is `code`.
+fn run_command(
+    program: &[&OsStr],
     args: &[&str],
     code: &'static str,
 ) -> Result<String, ConfigError> {
-    let output = Command::new(program)
+    let name = program
+        .last()
+        .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+    let output = command(program, code)?
         .args(args)
         .output()
-        .map_err(|e| ConfigError::io(code, &format!("cannot run {program}"), &e))?;
+        .map_err(|e| ConfigError::io(code, &format!("cannot run {name}"), &e))?;
     if !output.status.success() {
         return Err(ConfigError::new(
             code,
             format!(
-                "{program} {} failed: {}",
+                "{name} {} failed: {}",
                 args.join(" "),
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
@@ -634,8 +698,21 @@ mod tests {
     fn bridge_dry_run_prints_both_plists_and_loads_the_bridge_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (config, env) = bridge_fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let source = release(dir.path(), true);
         let mut out = Vec::new();
-        install(&config, &env, DEFAULT_LABEL, true, &mut out).expect("dry run");
+        install_on(
+            "linux",
+            &fake.tools(),
+            &source,
+            &config,
+            &env,
+            DEFAULT_LABEL,
+            true,
+            &mut out,
+        )
+        .expect("dry run");
+        assert_eq!(fake.logged(), Vec::<String>::new());
         let text = String::from_utf8(out).expect("utf-8 output");
         let core = render_plist(DEFAULT_LABEL, &config.home, &config.omp_path).expect("core");
         let bridge = render_bridge_plist(DEFAULT_LABEL, &config.home).expect("bridge");
@@ -675,8 +752,10 @@ mod tests {
         fs::create_dir(&source_dir).expect("mkdir release");
         let source = source_dir.join("moraebot");
         write_file(&source, b"core", 0o755);
+        let fake = FakeTools::new(dir.path());
         let err = install_on(
             "macos",
+            &fake.tools(),
             &source,
             &config,
             &env,
@@ -689,6 +768,230 @@ mod tests {
         assert!(err.message.contains("install script"), "{}", err.message);
         assert!(!config.home.join("bin").exists());
         assert!(!dir.path().join("Library").exists());
+    }
+
+    /// Stand-ins for launchctl and plutil, run through `/bin/sh`: each logs
+    /// `<name> <args>` to one file and exits 0, except `launchctl print`, which exits 1
+    /// (the job is not loaded) so the bootout wait ends at once.
+    struct FakeTools {
+        launchctl: [&'static OsStr; 2],
+        plutil: [&'static OsStr; 2],
+        log: PathBuf,
+    }
+
+    impl FakeTools {
+        fn new(dir: &Path) -> Self {
+            let log = dir.join("tools.log");
+            let fake = |name: &str| {
+                let script = dir.join(format!("fake-{name}.sh"));
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"{name} $*\" >> '{}'\n\
+                     [ \"$1\" = print ] && exit 1\nexit 0\n",
+                    log.display()
+                );
+                fs::write(&script, body).expect("write fake tool");
+                // Leaked so `Tools` can borrow it for the whole test; a few bytes per test.
+                let script: &'static Path = Box::leak(script.into_boxed_path());
+                [OsStr::new("/bin/sh"), script.as_os_str()]
+            };
+            Self {
+                launchctl: fake("launchctl"),
+                plutil: fake("plutil"),
+                log,
+            }
+        }
+
+        fn tools(&self) -> Tools<'_> {
+            Tools {
+                launchctl: &self.launchctl,
+                plutil: &self.plutil,
+            }
+        }
+
+        /// Every logged call except the `launchctl print` polls.
+        fn logged(&self) -> Vec<String> {
+            fs::read_to_string(&self.log)
+                .map(|text| {
+                    text.lines()
+                        .filter(|line| !line.starts_with("launchctl print "))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// A release folder with `moraebot`, and the bridge binary when `bridge` is set.
+    fn release(dir: &Path, bridge: bool) -> PathBuf {
+        let folder = dir.join("release");
+        fs::create_dir_all(&folder).expect("mkdir release");
+        let core = folder.join("moraebot");
+        write_file(&core, b"core binary", 0o755);
+        if bridge {
+            write_file(&folder.join(BRIDGE_BINARY), b"bridge binary", 0o755);
+        }
+        core
+    }
+
+    #[test]
+    fn bridge_install_loads_the_bridge_agent_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, env) = bridge_fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let source = release(dir.path(), true);
+        let mut out = Vec::new();
+        install_on(
+            "macos",
+            &fake.tools(),
+            &source,
+            &config,
+            &env,
+            DEFAULT_LABEL,
+            false,
+            &mut out,
+        )
+        .expect("installs");
+        let domain = format!("gui/{}", current_uid().expect("uid"));
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        let bridge = bridge_label(DEFAULT_LABEL);
+        let bridge_file = agents.join(format!("{bridge}.plist"));
+        let core_file = agents.join(format!("{DEFAULT_LABEL}.plist"));
+        assert_eq!(
+            fake.logged(),
+            [
+                format!("plutil -lint {}", bridge_file.display()),
+                format!("plutil -lint {}", core_file.display()),
+                format!("launchctl bootout {domain}/{bridge}"),
+                format!("launchctl bootstrap {domain} {}", bridge_file.display()),
+                format!("launchctl bootout {domain}/{DEFAULT_LABEL}"),
+                format!("launchctl bootstrap {domain} {}", core_file.display()),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&bridge_file).expect("bridge plist"),
+            render_bridge_plist(DEFAULT_LABEL, &config.home).expect("bridge")
+        );
+        assert_eq!(
+            fs::read_to_string(&core_file).expect("core plist"),
+            render_plist(DEFAULT_LABEL, &config.home, &config.omp_path).expect("core")
+        );
+        let bin = config.home.join("bin");
+        assert_eq!(
+            fs::read(bin.join("moraebot")).expect("core"),
+            b"core binary"
+        );
+        assert_eq!(
+            fs::read(bin.join(BRIDGE_BINARY)).expect("bridge"),
+            b"bridge binary"
+        );
+        let logs = config.home.join("logs");
+        for name in CORE_LOGS.iter().chain(&BRIDGE_LOGS) {
+            assert_eq!(mode_of(&logs.join(name)), 0o600, "{name}");
+        }
+        let text = String::from_utf8(out).expect("utf-8 output");
+        assert!(text.contains(&format!("installed {bridge} at")), "{text}");
+        assert!(
+            text.contains(&format!("installed {DEFAULT_LABEL} at")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn discord_install_removes_a_leftover_bridge_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, env) = fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let source = release(dir.path(), false);
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        fs::create_dir_all(&agents).expect("mkdir LaunchAgents");
+        let bridge = bridge_label(DEFAULT_LABEL);
+        let leftover = agents.join(format!("{bridge}.plist"));
+        fs::write(&leftover, "<plist/>").expect("write leftover");
+        let mut out = Vec::new();
+        install_on(
+            "macos",
+            &fake.tools(),
+            &source,
+            &config,
+            &env,
+            DEFAULT_LABEL,
+            false,
+            &mut out,
+        )
+        .expect("installs");
+        let domain = format!("gui/{}", current_uid().expect("uid"));
+        let core_file = agents.join(format!("{DEFAULT_LABEL}.plist"));
+        assert_eq!(
+            fake.logged(),
+            [
+                format!("plutil -lint {}", core_file.display()),
+                format!("launchctl bootout {domain}/{bridge}"),
+                format!("launchctl bootout {domain}/{DEFAULT_LABEL}"),
+                format!("launchctl bootstrap {domain} {}", core_file.display()),
+            ]
+        );
+        assert!(!leftover.exists());
+        assert!(!config.home.join("bin").join(BRIDGE_BINARY).exists());
+        let text = String::from_utf8(out).expect("utf-8 output");
+        assert!(text.contains(&format!("removed {bridge}\n")), "{text}");
+    }
+
+    #[test]
+    fn uninstall_removes_both_agents_core_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_config, env) = fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        fs::create_dir_all(&agents).expect("mkdir LaunchAgents");
+        let bridge = bridge_label(DEFAULT_LABEL);
+        let files = [DEFAULT_LABEL, bridge.as_str()].map(|l| agents.join(format!("{l}.plist")));
+        for file in &files {
+            fs::write(file, "<plist/>").expect("write plist");
+        }
+        let mut out = Vec::new();
+        uninstall_on(
+            "macos",
+            fake.tools().launchctl,
+            &env,
+            DEFAULT_LABEL,
+            &mut out,
+        )
+        .expect("uninstalls");
+        let domain = format!("gui/{}", current_uid().expect("uid"));
+        assert_eq!(
+            fake.logged(),
+            [
+                format!("launchctl bootout {domain}/{DEFAULT_LABEL}"),
+                format!("launchctl bootout {domain}/{bridge}"),
+            ]
+        );
+        assert!(files.iter().all(|file| !file.exists()));
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8 output"),
+            format!("removed {DEFAULT_LABEL}\nremoved {bridge}\n")
+        );
+    }
+
+    #[test]
+    fn bridge_dry_run_refuses_a_missing_bridge_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, env) = bridge_fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let source = release(dir.path(), false);
+        let mut out = Vec::new();
+        let err = install_on(
+            "linux",
+            &fake.tools(),
+            &source,
+            &config,
+            &env,
+            DEFAULT_LABEL,
+            true,
+            &mut out,
+        )
+        .expect_err("no bridge binary");
+        assert_eq!(err.code, E_BRIDGE_BINARY);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -905,9 +1208,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (config, env) = fixture(&dir);
         let source = std::env::current_exe().expect("current exe");
+        let fake = FakeTools::new(dir.path());
         let mut out = Vec::new();
         let err = install_on(
             "linux",
+            &fake.tools(),
             &source,
             &config,
             &env,
@@ -920,6 +1225,7 @@ mod tests {
         assert!(out.is_empty());
         let reach = install_on(
             "linux",
+            &fake.tools(),
             &source,
             &config,
             &env,
@@ -929,6 +1235,7 @@ mod tests {
         )
         .expect_err("dry run reaches the label check");
         assert_eq!(reach.code, E_LABEL_INVALID);
+        assert_eq!(fake.logged(), Vec::<String>::new());
     }
 
     #[test]
@@ -939,9 +1246,10 @@ mod tests {
         fs::create_dir_all(&agents).expect("mkdir LaunchAgents");
         let plist = agents.join("bad label.plist");
         fs::write(&plist, "<plist/>").expect("write plist");
+        let fake = FakeTools::new(dir.path());
         let mut out = Vec::new();
-        let err =
-            uninstall_on("linux", &env, "bad label", &mut out).expect_err("refuses off macOS");
+        let err = uninstall_on("linux", fake.tools().launchctl, &env, "bad label", &mut out)
+            .expect_err("refuses off macOS");
         assert_eq!(err.code, E_SERVICE_PLATFORM);
         assert!(plist.exists());
         assert_eq!(

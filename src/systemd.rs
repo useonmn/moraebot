@@ -200,6 +200,11 @@ fn install_with(
     let leftover_service = format!("{bridge_name}.service");
     let leftover = unit_dir.join(&leftover_service);
     let remove_leftover = bridge.is_none() && fs::symlink_metadata(&leftover).is_ok();
+    // Checked before the dry run too, so `--dry-run` fails where the real run would.
+    let bridge_binary = match bridge {
+        Some(_) => Some(launchd::bridge_source(source)?),
+        None => None,
+    };
     if dry_run {
         for unit in [&core].into_iter().chain(&bridge) {
             writeln!(out, "# {}", unit_path(&unit.file)?)?;
@@ -217,10 +222,6 @@ fn install_with(
         return Ok(());
     }
 
-    let bridge_binary = match bridge {
-        Some(_) => Some(launchd::bridge_source(source)?),
-        None => None,
-    };
     let bin_dir = config.home.join("bin");
     fs::create_dir_all(&bin_dir)
         .map_err(|e| ConfigError::io(E_IO, &format!("cannot create {}", bin_dir.display()), &e))?;
@@ -517,11 +518,12 @@ WantedBy=default.target
         let config = bridge_fixture(&dir);
         let (fake, log) = fake_systemctl(dir.path(), 0);
         let units = dir.path().join("units");
+        let source = release(dir.path(), true);
         let mut out = Vec::new();
         install_with(
             "linux",
             &program(&fake),
-            &exe(),
+            &source,
             &config,
             &units,
             UNIT,
@@ -620,18 +622,22 @@ WantedBy=default.target
         let (fake, log) = fake_systemctl(dir.path(), 0);
         let units = dir.path().join("units");
         let source = release(dir.path(), false);
-        let err = install_with(
-            "linux",
-            &program(&fake),
-            &source,
-            &config,
-            &units,
-            UNIT,
-            false,
-            &mut Vec::new(),
-        )
-        .expect_err("no bridge binary");
-        assert_eq!(err.code, launchd::E_BRIDGE_BINARY);
+        for dry_run in [true, false] {
+            let mut out = Vec::new();
+            let err = install_with(
+                "linux",
+                &program(&fake),
+                &source,
+                &config,
+                &units,
+                UNIT,
+                dry_run,
+                &mut out,
+            )
+            .expect_err("no bridge binary");
+            assert_eq!(err.code, launchd::E_BRIDGE_BINARY, "dry run: {dry_run}");
+            assert!(out.is_empty(), "dry run: {dry_run}");
+        }
         assert!(!units.exists());
         assert!(!config.home.join("bin").exists());
         assert_eq!(logged(&log), Vec::<String>::new());
