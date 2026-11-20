@@ -29,8 +29,8 @@ use tokio::time::Instant;
 use super::{BRIDGE_NAME, BridgeError, E_BRIDGE_STOPPING};
 use crate::adapter::{AdapterError, AttachmentRef, InboundAttachment, MessengerAdapter};
 use crate::bridge::proto::{
-    Caps, Decoded, Frame, FrameReader, ProtoError, Redacted, RequestKind, StatusState, ThreadsCap,
-    WireAttachment, map_error, write_frame,
+    Caps, Decoded, Frame, FrameReader, MAX_LINE, ProtoError, Redacted, RequestKind, StatusState,
+    ThreadsCap, WireAttachment, map_error, write_frame,
 };
 use crate::bridge::spool::{Attempt, Spool};
 use crate::bridge::{
@@ -39,7 +39,8 @@ use crate::bridge::{
 };
 use crate::files::{self, Progress};
 use crate::slack_bridge::slack::{
-    DEFAULT_HINTS, MESSAGE_LIMIT, PLATFORM, Scope, SlackLink, StatusKeeper, map_event, unix_now,
+    DEFAULT_HINTS, MESSAGE_LIMIT, PLATFORM, Scope, SlackLink, SpoolFilter, StatusKeeper, map_event,
+    unix_now,
 };
 
 /// A link with no frame from the core for this long is closed (the core pings every 15 s).
@@ -63,6 +64,9 @@ pub struct ServerOptions {
 struct Ctx {
     link: Arc<SlackLink>,
     spool: Arc<Spool>,
+    /// Learns each core's owner and allow list, so the Slack side spools only what a
+    /// core would take.
+    filter: Arc<SpoolFilter>,
     channel_id: String,
     appended: watch::Receiver<u64>,
     bot_user_id: watch::Receiver<Option<String>>,
@@ -82,6 +86,7 @@ impl Server {
         options: ServerOptions,
         link: Arc<SlackLink>,
         spool: Arc<Spool>,
+        filter: Arc<SpoolFilter>,
         appended: watch::Receiver<u64>,
         bot_user_id: watch::Receiver<Option<String>>,
     ) -> Result<Self, BridgeError> {
@@ -102,6 +107,7 @@ impl Server {
         let ctx = Arc::new(Ctx {
             link,
             spool,
+            filter,
             channel_id: options.channel_id,
             appended,
             bot_user_id,
@@ -369,6 +375,7 @@ async fn serve_core(stream: UnixStream, ctx: Arc<Ctx>, mut stop: watch::Receiver
         }
     };
     tracing::info!(window = accepted.window, "core connected");
+    ctx.filter.set_access(&accepted.owner_id, &accepted.allow);
 
     let (out, out_rx) = mpsc::unbounded_channel();
     let mut writer = tokio::spawn(write_frames(write, out_rx));
@@ -626,9 +633,7 @@ impl Session {
                 }
                 continue;
             };
-            tracing::debug!(seq, redelivery, "message to the core");
-            self.unacked.insert(seq);
-            let _ = self.out.send(Frame::Message {
+            let frame = Frame::Message {
                 seq,
                 message_id: event.message_id,
                 author_id: event.author_id,
@@ -648,7 +653,22 @@ impl Session {
                     })
                     .collect(),
                 redelivery,
-            });
+            };
+            if frame.encode().len() > MAX_LINE {
+                // The core would drop the link on this line, again on every connection.
+                tracing::error!(
+                    seq,
+                    limit = MAX_LINE,
+                    "spooled message too large for one line, removed"
+                );
+                if let Err(err) = self.ctx.spool.remove(seq) {
+                    tracing::error!(seq, error = %err, "could not remove a spool entry");
+                }
+                continue;
+            }
+            tracing::debug!(seq, redelivery, "message to the core");
+            self.unacked.insert(seq);
+            let _ = self.out.send(frame);
         }
     }
 

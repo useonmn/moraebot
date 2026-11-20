@@ -11,9 +11,9 @@ pub mod slack;
 pub mod testing;
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,11 +22,12 @@ use tokio::sync::watch;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
 use crate::bridge::peer::own_uid;
+use crate::bridge::socket::prepare_private_dir;
 use crate::bridge::spool::{Spool, SpoolError};
 use crate::config::ConfigError;
 use config::SlackBridgeConfig;
 use server::{Server, ServerOptions};
-use slack::{HttpTransport, SlackLink, SlackTransport, unix_now};
+use slack::{HttpTransport, SlackLink, SlackTransport, SpoolFilter, unix_now};
 
 /// The bridge name in `hello`, and the binary's name.
 pub const BRIDGE_NAME: &str = "moraebot-slack-bridge";
@@ -105,17 +106,9 @@ pub struct Bridge {
 impl Bridge {
     /// Locks the state folder, opens the spool, starts the Slack link and binds the
     /// socket. A second bridge on the same state folder fails with `E_BRIDGE_RUNNING`.
+    /// The state folder gets the same checks as the socket and spool folders.
     pub async fn start(parts: BridgeParts) -> Result<Self, BridgeError> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&parts.state_dir)
-            .map_err(|err| {
-                BridgeError::new(
-                    E_BRIDGE_STATE,
-                    format!("cannot create {}: {err}", parts.state_dir.display()),
-                )
-            })?;
+        prepare_private_dir(&parts.state_dir, E_BRIDGE_STATE).map_err(BridgeError::from_config)?;
         let lock = take_lock(&parts.state_dir.join("lock"))?;
         let spool = Arc::new(Spool::open(&parts.state_dir.join("spool"), unix_now())?);
         // The owner and allow list come from each core's hello_ok, not from here.
@@ -124,8 +117,9 @@ impl Bridge {
             String::new(),
             parts.channel_id.clone(),
         ));
+        let filter = Arc::new(SpoolFilter::new(parts.channel_id.clone()));
         let (appended, appended_rx) = watch::channel(0);
-        let bot_user_id = link.start_spooling(Arc::clone(&spool), appended)?;
+        let bot_user_id = link.start_spooling(Arc::clone(&spool), Arc::clone(&filter), appended)?;
         let bound = Server::bind(
             ServerOptions {
                 socket: parts.socket,
@@ -134,6 +128,7 @@ impl Bridge {
             },
             Arc::clone(&link),
             spool,
+            filter,
             appended_rx,
             bot_user_id,
         );

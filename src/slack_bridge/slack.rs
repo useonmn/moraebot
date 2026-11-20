@@ -30,6 +30,7 @@ use crate::adapter::{
     SendResult, TypingHandle, next_backoff,
 };
 use crate::bridge::E_BRIDGE_SPOOL;
+use crate::bridge::proto::MAX_LINE;
 use crate::bridge::spool::Spool;
 use crate::files::{self, E_FILE_REMOTE, Progress};
 
@@ -671,7 +672,11 @@ impl SlackTransport for HttpTransport {
 
     async fn connect(&self, url: &str) -> Result<Box<dyn SlackSocket>, AdapterError> {
         // The URL carries a connection ticket, so it never goes into an error message.
-        let (stream, _) = tokio_tungstenite::connect_async(url)
+        // A Slack event far above the bridge's line limit could never reach the core.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_LINE))
+            .max_frame_size(Some(MAX_LINE));
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
             .await
             .map_err(|err| api_error(E_SLACK_API, format!("websocket connect failed: {err}")))?;
         Ok(Box::new(WsSocket { stream }))
@@ -885,21 +890,84 @@ enum Sink {
     Spool {
         bot_user_id: String,
         spool: Arc<Spool>,
+        filter: Arc<SpoolFilter>,
         appended: watch::Sender<u64>,
     },
 }
 
-/// Whether a payload goes to the spool: a `message` event not posted by the bot itself.
-/// Everything else is acked and dropped at once.
-fn wants_spool(payload: &Value, bot_user_id: &str) -> bool {
-    let Some(event) = payload
-        .get("event")
-        .filter(|_| payload.get("type").and_then(Value::as_str) == Some("event_callback"))
-    else {
-        return false;
-    };
-    event.get("type").and_then(Value::as_str) == Some("message")
-        && event.get("user").and_then(Value::as_str) != Some(bot_user_id)
+/// The owner and allow list of the last core that said `hello_ok`.
+#[derive(Debug, Clone)]
+struct KnownAccess {
+    owner_id: String,
+    allow: Vec<String>,
+}
+
+/// Decides which Slack payloads the bridge writes to its spool, so traffic the core
+/// would never take cannot fill the spool while the core is away. The exact mapping
+/// still happens at handover ([`map_event`] with the scope of the connected core).
+pub struct SpoolFilter {
+    channel_id: String,
+    access: std::sync::RwLock<Option<KnownAccess>>,
+}
+
+impl SpoolFilter {
+    /// A filter for the configured channel that knows no owner yet.
+    pub fn new(channel_id: String) -> Self {
+        Self {
+            channel_id,
+            access: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Remembers the owner and allow list a core sent in `hello_ok`. They stay in
+    /// memory only: after a bridge restart the sender check waits for the next core.
+    pub fn set_access(&self, owner_id: &str, allow: &[String]) {
+        *self.access.write().expect("spool filter lock") = Some(KnownAccess {
+            owner_id: owner_id.to_owned(),
+            allow: allow.to_vec(),
+        });
+    }
+
+    /// Whether `payload` goes to the spool:
+    /// - a `message` event not posted by the bot itself;
+    /// - in a DM, or in the configured channel;
+    /// - once a core said who it accepts, from the owner or a listed id (`user` or
+    ///   `bot_id`). An event with neither (some subtypes) is kept, so the handover logs
+    ///   its subtype.
+    ///
+    /// Everything else is acked and dropped at once.
+    pub fn wants(&self, payload: &Value, bot_user_id: &str) -> bool {
+        let Some(event) = payload
+            .get("event")
+            .filter(|_| payload.get("type").and_then(Value::as_str) == Some("event_callback"))
+        else {
+            return false;
+        };
+        let field = |key: &str| event.get(key).and_then(Value::as_str);
+        if field("type") != Some("message") || field("user") == Some(bot_user_id) {
+            return false;
+        }
+        if field("channel_type") != Some("im") && field("channel") != Some(&self.channel_id) {
+            tracing::debug!("slack message from another channel not spooled");
+            return false;
+        }
+        let access = self.access.read().expect("spool filter lock");
+        let Some(access) = access.as_ref() else {
+            return true;
+        };
+        let senders: Vec<&str> = [field("user"), field("bot_id")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let known = senders
+            .iter()
+            .any(|id| *id == access.owner_id || access.allow.iter().any(|a| a == id));
+        if !senders.is_empty() && !known {
+            tracing::debug!("slack message from an unlisted sender not spooled");
+            return false;
+        }
+        true
+    }
 }
 
 /// Seconds since the unix epoch, the spool's clock.
@@ -1047,7 +1115,7 @@ impl SocketTask {
                 } => {
                     // Spool before the ack: a message that could not be stored is not
                     // acked, so Slack delivers it again.
-                    if !self.spool(&payload) {
+                    if !self.spool(&payload).await {
                         continue;
                     }
                     if let Err(err) = socket.send_text(ack_frame(&envelope_id)).await {
@@ -1076,20 +1144,36 @@ impl SocketTask {
 
     /// Writes a message payload to the spool when the sink is one. `false` when it should
     /// have been stored and was not, so the envelope must stay unacked.
-    fn spool(&self, payload: &Value) -> bool {
+    async fn spool(&self, payload: &Value) -> bool {
         let Sink::Spool {
             bot_user_id,
             spool,
+            filter,
             appended,
         } = &self.sink
         else {
             return true;
         };
-        if !wants_spool(payload, bot_user_id) {
+        if !filter.wants(payload, bot_user_id) {
             return true;
         }
-        // Small files; the spool is meant to be called in place.
-        match spool.append(payload, unix_now()) {
+        // The append syncs the file and the folder; off the runtime workers, so a slow
+        // disk does not hold other tasks. The read loop still waits for it before the ack.
+        let (spool, payload) = (Arc::clone(spool), payload.clone());
+        let appended_seq =
+            tokio::task::spawn_blocking(move || spool.append(&payload, unix_now())).await;
+        let appended_seq = match appended_seq {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(
+                    code = E_BRIDGE_SPOOL,
+                    error = %err,
+                    "the spool write task failed, left unacked so slack sends it again"
+                );
+                return false;
+            }
+        };
+        match appended_seq {
             Ok(Some(seq)) => {
                 tracing::debug!(seq, "slack message spooled");
                 appended.send_modify(|count| *count += 1);
@@ -1155,12 +1239,14 @@ impl SlackLink {
 
     /// Starts the bridge's Slack side: `auth.test`, retried with backoff until it passes
     /// (the bridge keeps serving its socket while Slack is unreachable), then Socket Mode
-    /// with every message written to `spool` before its ack and `appended` bumped after
-    /// it. The returned receiver holds the bot user id once `auth.test` passed. The owner
-    /// and allow list this link was built with are not used on this path.
+    /// with every message `filter` wants written to `spool` before its ack and `appended`
+    /// bumped after it. The returned receiver holds the bot user id once `auth.test`
+    /// passed. The owner and allow list this link was built with are not used on this
+    /// path; `filter` gets them from the bridge server.
     pub fn start_spooling(
         &self,
         spool: Arc<Spool>,
+        filter: Arc<SpoolFilter>,
         appended: watch::Sender<u64>,
     ) -> Result<watch::Receiver<Option<String>>, AdapterError> {
         let mut runtime = self.runtime.lock().expect("runtime lock");
@@ -1182,6 +1268,7 @@ impl SlackLink {
                 sink: Sink::Spool {
                     bot_user_id,
                     spool,
+                    filter,
                     appended,
                 },
                 reconnects,
@@ -2030,5 +2117,50 @@ mod tests {
                 .code,
             E_SLACK_AUTH
         );
+    }
+
+    fn spool_event(event: Value) -> Value {
+        json!({ "type": "event_callback", "event": event })
+    }
+
+    #[test]
+    fn the_spool_filter_keeps_only_what_a_core_could_take() {
+        let filter = SpoolFilter::new("C222".to_owned());
+        let msg = |user: &str, channel: &str| {
+            let channel_type = if channel.starts_with('D') {
+                "im"
+            } else {
+                "channel"
+            };
+            spool_event(json!({
+                "type": "message", "user": user, "channel": channel,
+                "channel_type": channel_type, "ts": "1.1"
+            }))
+        };
+        let bot = spool_event(json!({
+            "type": "message", "bot_id": "B777", "channel": "C222",
+            "channel_type": "channel", "ts": "1.1"
+        }));
+        let edited = spool_event(json!({
+            "type": "message", "subtype": "message_changed", "channel": "C222",
+            "channel_type": "channel", "ts": "1.1"
+        }));
+
+        // Before any core: every sender, but only DMs and the configured channel.
+        assert!(filter.wants(&msg("U999", "D444"), "UBOT"));
+        assert!(filter.wants(&msg("U999", "C222"), "UBOT"));
+        assert!(!filter.wants(&msg("U111", "C999"), "UBOT"));
+        assert!(!filter.wants(&msg("UBOT", "C222"), "UBOT"));
+        assert!(!filter.wants(&json!({ "type": "event_callback" }), "UBOT"));
+
+        filter.set_access("U111", &["UPEER".to_owned(), "B777".to_owned()]);
+        assert!(filter.wants(&msg("U111", "D444"), "UBOT"));
+        assert!(filter.wants(&msg("U111", "C222"), "UBOT"));
+        assert!(filter.wants(&msg("UPEER", "D555"), "UBOT"));
+        assert!(filter.wants(&bot, "UBOT"), "a listed bot_id");
+        assert!(!filter.wants(&msg("U999", "D444"), "UBOT"));
+        assert!(!filter.wants(&msg("U999", "C222"), "UBOT"));
+        // No sender to check: kept, so the handover logs its subtype.
+        assert!(filter.wants(&edited, "UBOT"));
     }
 }
