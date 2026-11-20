@@ -884,14 +884,17 @@ impl MessengerAdapter for BridgeAdapter {
             return Err(unsupported(E_ADAPTER_FILES, "files"));
         }
         let kind = RequestKind::File;
+        // No `REQUEST_DEADLINE` here: the dispatcher's `files::UPLOAD_TIMEOUT` bounds
+        // an upload, and dropping this future cancels it.
         let answer = self
             .shared
-            .request(kind, |id| Frame::File {
+            .begin(kind, None, |id| Frame::File {
                 id,
                 target: target.to_owned(),
                 path: path.to_owned(),
                 name: name.to_owned(),
-            })
+            })?
+            .wait()
             .await?;
         let message_id = answer
             .message_id

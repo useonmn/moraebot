@@ -659,6 +659,34 @@ async fn an_unanswered_request_fails_after_its_deadline_and_typing_never_waits()
     assert_eq!(elapsed, REQUEST_DEADLINE);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_file_upload_has_no_request_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_bridge, adapter, mut conn) = connected(dir.path(), FakeBridge::hello()).await;
+    let adapter = Arc::new(adapter);
+
+    let file = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        async move {
+            adapter
+                .send_file("C222:1.0", Path::new("/abs/big.zip"), "big.zip")
+                .await
+        }
+    });
+    let Frame::File { id, .. } = conn.recv().await else {
+        panic!("file frame");
+    };
+    // A slow upload: the answer comes after a message request would have given up.
+    // Only the dispatcher's upload time limit bounds `file`, so no `cancel` is sent.
+    tokio::time::sleep(REQUEST_DEADLINE + Duration::from_secs(1)).await;
+    conn.send(&bridge_ok_message(id, "C222:3.0")).await;
+    let sent = bounded(file)
+        .await
+        .unwrap()
+        .expect("the late upload succeeds");
+    assert_eq!(sent.message_id, "C222:3.0");
+}
+
 #[tokio::test]
 async fn a_bridge_that_overruns_the_window_is_disconnected() {
     let dir = tempfile::tempdir().unwrap();
