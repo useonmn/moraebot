@@ -79,6 +79,9 @@ pub const E_MEMORY_BUCKET: &str = "E_MEMORY_BUCKET";
 pub const E_MEMORY_PROVENANCE: &str = "E_MEMORY_PROVENANCE";
 /// The memory worker has stopped.
 pub const E_MEMORY_STOPPED: &str = "E_MEMORY_STOPPED";
+/// A new entry was written (logged with its id, file and bucket, never its text). Saves are
+/// internal: moraebot never posts them in a conversation; the owner lists them on request.
+pub const I_MEMORY_SAVED: &str = "I_MEMORY_SAVED";
 
 /// Folders of the 0.2.0 store (`memory-full`) inside the memory folder, and its omp overlay.
 const OLD_LAYOUT: [&str; 6] = [
@@ -1904,6 +1907,16 @@ impl MemoryStore {
             Some(added) => added,
             None => self.add_entry(entry)?,
         };
+        if added.created {
+            tracing::info!(
+                code = I_MEMORY_SAVED,
+                id = %added.id,
+                file = %added.bucket.rel_path(),
+                bucket = %added.bucket.label(),
+                prov = prov.as_str(),
+                "memory entry saved"
+            );
+        }
         let part = added.created.then(|| CommitPart {
             prov: prov.as_str(),
             bucket,
@@ -2809,6 +2822,35 @@ mod tests {
             Outcome::Added(added) => added,
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_new_entry_is_logged_with_its_id_file_and_bucket_never_its_text() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        let capture = crate::logging::Capture::default();
+        let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
+            Some("info"),
+            FmtSpan::NONE,
+            capture.clone(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let text = "Always write PR titles in English, LOGPROBE-7f3.";
+        let added = unique(&mut store, owner(text, Bucket::Owner, 1));
+        let log = capture.contents();
+        let line = log
+            .lines()
+            .find(|line| line.contains(I_MEMORY_SAVED))
+            .unwrap_or_else(|| panic!("no {I_MEMORY_SAVED} line in {log:?}"));
+        assert!(line.contains(&added.id), "{line}");
+        assert!(line.contains("core/owner.md"), "{line}");
+        assert!(line.contains("bucket=core/owner"), "{line}");
+        assert!(!log.contains("LOGPROBE"), "{log}");
+
+        // Saving the same entry again writes nothing, so nothing more is logged.
+        let again = unique(&mut store, owner(text, Bucket::Owner, 1));
+        assert!(!again.created);
+        assert_eq!(capture.contents().matches(I_MEMORY_SAVED).count(), 1);
     }
 
     #[test]

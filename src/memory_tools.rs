@@ -20,9 +20,9 @@
 //!   text came from a lane that may have read the web), else `inference`.
 //!
 //! `core` and `boundary` take only owner sentences; any other entry goes to the conversation.
-//! An owner sentence saved to `core` or `boundary` is also named to the owner under the
-//! turn's reply, or after its notice when the turn did not reply
-//! ([`TurnContext::memory_notes`]), so a wrong save is visible.
+//! Saves stay internal: nothing about them is posted in the conversation (the memory writer
+//! logs each one as [`memory::I_MEMORY_SAVED`]), and the tool tells the lead not to mention
+//! them; the owner sees what was saved through the memory listing.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -173,7 +173,9 @@ pub fn write_tool(
          conversation, the default), project:<owner/name>, project (no repository), core \
          (a standing rule) or boundary (something the owner said not to do); core and \
          boundary take only the owner's exact sentence, other notes go to this conversation. \
-         `why` is one short line. You cannot change or delete entries; the owner does that.",
+         `why` is one short line. You cannot change or delete entries; the owner does that. \
+         Saves are internal: do not mention or confirm the save in your reply unless the \
+         owner asked you to remember something.",
         schema(json!({
             "type": "object",
             "properties": {
@@ -219,14 +221,10 @@ pub fn write_tool(
                 memory.redactor(),
             )
             .map_err(coded)?;
-            let (prov, core) = (planned.entry.prov, planned.entry.bucket.is_core());
+            let prov = planned.entry.prov;
             let bucket = planned.entry.bucket.label();
-            let text = planned.entry.text.clone();
             let id = memory.queue_add(planned.entry).map_err(coded)?;
             tracing::info!(id = %id, prov = prov.as_str(), bucket = %bucket, "memory_write queued");
-            if core && let Some(running) = lock(&turn).as_mut() {
-                running.memory_notes.push(core_note(&id, &bucket, &text));
-            }
             let mut result = json!({
                 "id": id,
                 "provenance": prov.as_str(),
@@ -339,20 +337,6 @@ fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
         .map(|(_, sentence)| sentence)
         .find(|sentence| sentence == text)
         .map(|sentence| (sentence, Source::lane(lane, seq)))
-}
-
-/// The line shown to the owner that names an owner sentence saved to `core` or `boundary`:
-/// with the turn's outcome for a `memory_write` save, or under the next reply for an observer
-/// save.
-pub fn core_note(id: &str, bucket: &str, text: &str) -> String {
-    const SHOWN: usize = 80;
-    let mut shown: String = text.chars().take(SHOWN).collect();
-    if text.chars().count() > SHOWN {
-        shown.push('…');
-    }
-    format!(
-        "[memory] saved {id} to {bucket}: \"{shown}\" (say `forget {id}` if that was not meant)"
-    )
 }
 
 /// `why` as one commit-message line: control characters and line breaks become spaces,
