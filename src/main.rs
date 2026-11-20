@@ -374,7 +374,7 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
         .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
     config.validate()?;
     memory::check_old_layout(&config.home)?;
-    let _log_guard = logging::init(&config.home)?;
+    let _log_guard = logging::init(&config.home, logging::CORE_LOG_PREFIX)?;
     let overlay = omp_overlay::check(&config.omp_path)?;
     match &overlay.warning {
         Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),
