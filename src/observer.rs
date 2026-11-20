@@ -20,6 +20,13 @@
 //!   cannot run, the pass waits and the job keeps its attempts; an answer that does not fit
 //!   the picks counts one attempt ([`E_MEMORY_SUMMARY`]). The sentence is never saved
 //!   instead.
+//! - A `group` job also records the owner's corrections of the bot (#59): an owner sentence
+//!   that holds a `[memory.self] correction_patterns` phrase as whole words becomes a summary
+//!   in `self/observations.md`, its source marked `firm=1` when the sentence itself holds an
+//!   always or never word. It runs only while jev is on (`MemoryConfig::self_file_on`), so a
+//!   default install starts no summarizer child for it; lane, subagent and tool text never
+//!   becomes an observation. Once a day, while the lead is quiet, [`crate::consolidate`]
+//!   promotes observations into `self/self.md`.
 //! - A `scan` job, and every group and lane job, first scans a session folder for subagent
 //!   output files ([`Observer::scan_root`]); a new or changed file becomes a `subagent` job.
 //!
@@ -47,6 +54,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, watch};
 
 use crate::config::Config;
+use crate::consolidate::{
+    self, CONSOLIDATE_GUIDANCE, E_SELF_CONSOLIDATE, M_SELF_CONSOLIDATED, W_SELF_GROUP_DROPPED,
+};
 use crate::jev::{Answer, Jev, JevError, JevStatus, Now, Question, Request};
 use crate::jev::{E_JEV_REQUEST, E_JEV_RESPONSE};
 use crate::lead;
@@ -54,7 +64,7 @@ use crate::memory::{
     self, Bucket, E_MEMORY_STOPPED, ExcerptFilter, MAX_ENTRY_BYTES, MemoryHandle, NewEntry, Op,
     Outcome, Prov, Redactor, Source,
 };
-use crate::memory_commands::{says_always, says_boundary};
+use crate::memory_commands::{says_always, says_boundary, says_correction};
 use crate::omp;
 use crate::store::{
     GroupJob, JobEnd, JobKind, LaneJob, LogLevel, LogRow, MemoryJob, Settled, Store, StoreError,
@@ -166,6 +176,8 @@ struct Work {
     entries: Vec<NewEntry>,
     /// The sentences jev picked, summarized together once the job's windows are judged.
     picked: Vec<Picked>,
+    /// The owner's corrections of the bot, summarized together in a call of their own.
+    corrections: Vec<Picked>,
     requests: u32,
     tokens: u64,
     model: Option<String>,
@@ -178,6 +190,7 @@ impl Work {
             code: M_JOB_DONE,
             entries: Vec::new(),
             picked: Vec::new(),
+            corrections: Vec::new(),
             requests: 0,
             tokens: 0,
             model: None,
@@ -242,6 +255,8 @@ pub struct Observer {
     memory_stopped: AtomicBool,
     /// The last pass panicked outside a job.
     down: AtomicBool,
+    /// The day (`day=<date>`) self consolidation last ran or found nothing to do.
+    consolidated: Mutex<Option<String>>,
 }
 
 impl Observer {
@@ -274,6 +289,7 @@ impl Observer {
             pause_logged: AtomicBool::new(false),
             memory_stopped: AtomicBool::new(false),
             down: AtomicBool::new(false),
+            consolidated: Mutex::new(None),
         }
     }
 
@@ -395,6 +411,10 @@ impl Observer {
             tracing::warn!(error = %err, "memory jobs not expired");
         }
         self.maintain(now);
+        self.consolidate_self(now).await;
+        if self.memory_stopped.load(Ordering::SeqCst) {
+            return Pass::Waiting { until: None };
+        }
         let mut failed_here: HashSet<i64> = HashSet::new();
         loop {
             let pending = lock(&self.store).pending_memory_jobs(BATCH + failed_here.len());
@@ -737,6 +757,7 @@ impl Observer {
         {
             self.layout_missing(job.id, now);
         }
+        self.corrections(group, work)?;
         if off {
             return Ok(());
         }
@@ -796,6 +817,133 @@ impl Observer {
             }
         }
         Ok(())
+    }
+
+    /// Records every owner sentence of `group` that corrects the bot as a self observation
+    /// (`self/observations.md`), to be summarized. Only owner rows are read.
+    fn corrections(&self, group: &GroupJob, work: &mut Work) -> Result<(), Failure> {
+        let settings = &self.config.memory.self_file;
+        let Some(turn) = group.rows.first().map(|row| row.id) else {
+            return Ok(());
+        };
+        if !self.config.memory.self_file_on() {
+            return Ok(());
+        }
+        let owner_rows = group.rows.iter().filter(|row| row.origin == "owner");
+        for id in owner_rows.map(|row| row.id) {
+            let row = lock(&self.store).get(id)?;
+            let Some(row) = row.filter(|row| row.origin == "owner") else {
+                continue;
+            };
+            // As for the owner's other sentences (#63): secrets are taken out first, and a
+            // sentence that was nothing but a secret is no candidate.
+            let found = memory::own_sentences(&row.text)
+                .into_iter()
+                .map(|(n, s)| (n, self.redactor.redact(&s).0))
+                .filter(|(_, s)| {
+                    self.candidate(s)
+                        && self.candidate(&without_markers(s))
+                        && says_correction(s, &settings.correction_patterns)
+                })
+                .take(OWNER_WINDOWS);
+            for (n, sentence) in found {
+                let firm = says_always(&sentence) || says_boundary(&sentence);
+                work.corrections.push(Picked {
+                    src: Source::observation(row.id, n, turn, firm),
+                    sentence,
+                    prov: Prov::Owner,
+                    bucket: Bucket::SelfObs,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Self consolidation ([`consolidate`]), at most once a day and only while the lead has
+    /// been quiet for [`consolidate::IDLE_SECONDS`]. A day is marked done in the memory log
+    /// ([`M_SELF_CONSOLIDATED`]) once it ran, even when its call failed: the observations then
+    /// wait for the next day and `self/self.md` stays as it is.
+    async fn consolidate_self(&self, now: i64) {
+        if !self.config.memory.self_file_on() {
+            return;
+        }
+        let today = self.memory.today();
+        let day = format!("day={today}");
+        if lock(&self.consolidated).as_deref() == Some(day.as_str()) {
+            return;
+        }
+        match lock(&self.store).lead_quiet(now, consolidate::IDLE_SECONDS) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "lead activity not readable; self consolidation waits");
+                return;
+            }
+        }
+        *lock(&self.consolidated) = Some(day.clone());
+        let done = lock(&self.store).memory_logged(M_SELF_CONSOLIDATED, &day);
+        if done.unwrap_or(false) {
+            return;
+        }
+        let offer = consolidate::offer(&memory::self_state(self.memory.root()), today);
+        if offer.is_empty() {
+            return;
+        }
+        let row = |level, code, detail: String| LogRow {
+            at: now,
+            level,
+            code,
+            job_id: None,
+            omp_version: Some(self.omp_version.clone()),
+            jev_model: None,
+            detail: Some(detail),
+        };
+        let mut groups = Vec::new();
+        if !offer.pending.is_empty() {
+            let answer = self
+                .summarizer
+                .ask(CONSOLIDATE_GUIDANCE, consolidate::message(&offer))
+                .await;
+            match answer.as_deref().map(consolidate::parse_reply) {
+                Ok(Some(found)) => groups = found,
+                Ok(None) => {
+                    tracing::warn!(
+                        code = E_SELF_CONSOLIDATE,
+                        "self consolidation answer not usable"
+                    );
+                    self.log(row(LogLevel::Error, E_SELF_CONSOLIDATE, "answer".into()));
+                }
+                Err(detail) => {
+                    tracing::warn!(code = E_SELF_CONSOLIDATE, %detail, "self consolidation could not run");
+                    self.log(row(LogLevel::Error, E_SELF_CONSOLIDATE, "run".into()));
+                }
+            }
+        }
+        let (ops, dropped) = consolidate::plan(&offer, groups, today, |text| {
+            self.check_summary(text, Prov::Owner)
+        });
+        for reason in dropped {
+            self.log(row(
+                LogLevel::Warn,
+                W_SELF_GROUP_DROPPED,
+                format!("reason={reason}"),
+            ));
+        }
+        if !ops.is_empty() {
+            match self.memory.apply_batch(ops).await {
+                Ok(results) => {
+                    for err in results.into_iter().filter_map(Result::err) {
+                        tracing::warn!(code = err.code, "self reading not written");
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(code = err.code, "memory writer stopped");
+                    self.memory_stopped.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+        self.log(row(LogLevel::Info, M_SELF_CONSOLIDATED, day));
     }
 
     async fn lane(
@@ -977,12 +1125,20 @@ impl Observer {
     /// redactor, and every line comes out through it again.
     async fn summarize(&self, work: &mut Work) -> Result<(), Failure> {
         let picked = std::mem::take(&mut work.picked);
+        self.summarize_picks(picked, work).await?;
+        let corrections = std::mem::take(&mut work.corrections);
+        self.summarize_picks(corrections, work).await
+    }
+
+    /// [`Self::summarize`] for picks of one kind.
+    async fn summarize_picks(&self, picked: Vec<Picked>, work: &mut Work) -> Result<(), Failure> {
         let Some(first) = picked.first() else {
             return Ok(());
         };
-        let kind = match first.prov {
-            Prov::Owner => "owner_message",
-            Prov::Lane => "lane_result",
+        let kind = match (&first.bucket, first.prov) {
+            (Bucket::SelfObs, _) => "owner_correction",
+            (_, Prov::Owner) => "owner_message",
+            (_, Prov::Lane) => "lane_result",
             _ => "subagent_report",
         };
         let notes: Vec<String> = picked

@@ -2040,6 +2040,159 @@ async fn observer_adds_nothing_for_a_lane_sentence_the_lead_already_saved() {
     assert_eq!(texts(&fx, &Bucket::Thread(KEY.into())), [text]);
 }
 
+/// #59: with jev on, an owner sentence that corrects the bot becomes a summarized self
+/// observation; `firm=1` comes from the owner's own always or never word.
+#[tokio::test]
+async fn observer_records_the_owners_corrections_as_self_observations() {
+    let fx = Fixture::new().await;
+    let row = owner_turn(
+        &fx,
+        "m1",
+        "왜 또 영어로 답해? 앞으로 절대 그러지 마. 몇 번 버스 타?",
+    );
+    fx.jev.answer(NOTHING.clone());
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let saved = fx.entries(&Bucket::SelfObs);
+    let got: Vec<(&str, Option<&str>, Prov)> = saved
+        .iter()
+        .map(|e| (e.text.as_str(), e.src.as_deref(), e.prov))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "echo: 왜 또 영어로 답해?",
+                Some(format!("obs row={row} s=0 turn={row}").as_str()),
+                Prov::Owner
+            ),
+            (
+                "echo: 앞으로 절대 그러지 마.",
+                Some(format!("obs row={row} s=1 turn={row} firm=1").as_str()),
+                Prov::Owner
+            ),
+        ]
+    );
+    assert!(
+        fx.entries(&Bucket::SelfModel).is_empty(),
+        "nothing is promoted by a job"
+    );
+}
+
+#[tokio::test]
+async fn observer_never_records_a_lane_correction_or_one_with_the_self_file_off() {
+    let fx = Fixture::new().await;
+    fx.lane("call-1", None, "왜 또 그러지 마. I told you so.");
+    // A lane window offers only the thread and project buckets.
+    fx.jev.answer(json!({
+        "save": {"type": "noul", "noul": 0.0},
+        "bucket": {"type": "choice", "choice": "thread"},
+        "span": {"type": "choice", "choice": "none"},
+    }));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::SelfObs).is_empty());
+
+    let fx = Fixture::with(|config| config.memory.self_file.enabled = false).await;
+    owner_turn(&fx, "m1", "왜 또 영어로 답해?");
+    fx.jev.answer(NOTHING.clone());
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::SelfObs).is_empty());
+}
+
+/// moraedang on #65: with jev off (the default) a correction starts no summarizer child, so a
+/// summarizer outage cannot hold up jev-off jobs; they settle as before this PR.
+#[tokio::test]
+async fn observer_with_jev_off_records_nothing_and_never_waits_on_the_summarizer() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("fake-omp.log");
+    let fx = Fixture::with(|config| config.memory.jev.enabled = false)
+        .await
+        .with_summarizer(&[
+            ("FAKE_OMP_MODE", "error"),
+            ("FAKE_OMP_LOG", log.to_str().unwrap()),
+        ]);
+    owner_turn(&fx, "m1", "왜 또 영어로 답해? 앞으로 절대 그러지 마.");
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.backlog(), Backlog::default(), "the job settled at once");
+    assert!(
+        fx.store()
+            .memory_logged(
+                M_JEV_OFF,
+                "kind=group saved=0 skipped=0 requests=0 tokens=0"
+            )
+            .unwrap()
+    );
+    assert!(fx.entries(&Bucket::SelfObs).is_empty());
+    // Quiet for long enough: still no consolidation call.
+    fx.set_clock(fx.t0 + 11 * 60);
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(!log.exists(), "no summarizer child started");
+}
+
+/// Seeds one self observation the way the observer saves it.
+async fn seed_observation(fx: &Fixture, row: i64, text: &str) -> String {
+    fx.memory
+        .add(NewEntry {
+            text: text.into(),
+            prov: Prov::Owner,
+            bucket: Bucket::SelfObs,
+            src: Source::observation(row, 0, row, false),
+            expires: None,
+            why: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// #59: once a day, while the lead is quiet, two corrections of one behavior become a reading
+/// in `self/self.md`; a single plain one waits.
+#[tokio::test]
+async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
+    let fx = Fixture::new().await;
+    owner_turn(&fx, "m0", "안녕");
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let a = seed_observation(&fx, 1, "I answered in English").await;
+    let b = seed_observation(&fx, 2, "I answered in English again").await;
+    let c = seed_observation(&fx, 3, "I pushed to main").await;
+    let reply = format!(
+        "{{\"groups\":[{{\"obs\":[\"{a}\",\"{b}\"],\"text\":\"I answer in English; the owner wants Korean\",\"reconfirms\":null}},{{\"obs\":[\"{c}\"],\"text\":\"I push to main\"}}]}}"
+    );
+    let fx = fx.with_summarizer(&[("FAKE_OMP_REPLY", reply.as_str())]);
+
+    // The owner's turn just ended: not quiet yet.
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::SelfModel).is_empty());
+
+    fx.set_clock(fx.t0 + 11 * 60);
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let readings = fx.entries(&Bucket::SelfModel);
+    assert_eq!(readings.len(), 1, "{readings:?}");
+    assert_eq!(
+        readings[0].text,
+        "I answer in English; the owner wants Korean"
+    );
+    assert_eq!(
+        readings[0].src.as_deref(),
+        Some(format!("from={a}.{b}").as_str())
+    );
+    assert!(readings[0].expires.is_some());
+    assert!(
+        fx.store()
+            .memory_logged("W_SELF_GROUP_DROPPED", "reason=below_bar")
+            .unwrap()
+    );
+
+    // Once a day: a second quiet pass asks nothing again.
+    let log = fx.root.path().join("fake-omp.log");
+    let fx = fx.with_summarizer(&[
+        ("FAKE_OMP_REPLY", reply.as_str()),
+        ("FAKE_OMP_LOG", log.to_str().unwrap()),
+    ]);
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(!log.exists(), "no second consolidation call the same day");
+    assert_eq!(fx.entries(&Bucket::SelfModel).len(), 1);
+}
+
 /// The first 12 hex digits of the sha256 of `text`, as a subagent source holds them.
 fn sha12(text: &str) -> String {
     use sha2::{Digest, Sha256};
