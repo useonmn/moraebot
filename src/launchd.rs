@@ -438,15 +438,21 @@ fn uninstall_on(
     check_label(label)?;
     let domain = format!("gui/{}", current_uid()?);
     let agents_dir = launch_agents_dir(env)?;
-    for label in [label.to_owned(), bridge_label(label)] {
+    let bridge = bridge_label(label);
+    for name in [label, bridge.as_str()] {
         bootout_and_wait(
             launchctl,
             &domain,
-            &label,
+            name,
             "retry `moraebot uninstall-launchd`",
         )?;
-        remove_plist(&agents_dir.join(format!("{label}.plist")))?;
-        writeln!(out, "removed {label}")?;
+        let plist = agents_dir.join(format!("{name}.plist"));
+        // Like systemd::uninstall_with: the bridge line only when its agent was installed.
+        let present = fs::symlink_metadata(&plist).is_ok();
+        remove_plist(&plist)?;
+        if name == label || present {
+            writeln!(out, "removed {name}")?;
+        }
     }
     Ok(())
 }
@@ -969,6 +975,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("utf-8 output"),
             format!("removed {DEFAULT_LABEL}\nremoved {bridge}\n")
+        );
+    }
+
+    #[test]
+    fn uninstall_without_a_bridge_plist_prints_no_bridge_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_config, env) = fixture(&dir);
+        let fake = FakeTools::new(dir.path());
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        fs::create_dir_all(&agents).expect("mkdir LaunchAgents");
+        let core_file = agents.join(format!("{DEFAULT_LABEL}.plist"));
+        fs::write(&core_file, "<plist/>").expect("write plist");
+        let mut out = Vec::new();
+        uninstall_on(
+            "macos",
+            fake.tools().launchctl,
+            &env,
+            DEFAULT_LABEL,
+            &mut out,
+        )
+        .expect("uninstalls");
+        assert!(!core_file.exists());
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8 output"),
+            format!("removed {DEFAULT_LABEL}\n")
         );
     }
 
