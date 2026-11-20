@@ -11,6 +11,7 @@ pub mod files;
 pub mod gateway;
 pub mod hints;
 pub mod init;
+pub mod jev;
 pub mod lane;
 pub mod launchd;
 pub mod lead;
