@@ -143,6 +143,9 @@ pub const N_OMP_VERSION: &str = "N_OMP_VERSION";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
+/// Log code: a notice skipped its channel fallback because there is no channel (a bridge
+/// whose hello names no `home`).
+pub const W_NO_HOME_CHANNEL: &str = "W_NO_HOME_CHANNEL";
 
 /// Longer replies are cut with a note.
 pub const MAX_REPLY_MESSAGES: usize = 10;
@@ -370,7 +373,7 @@ pub struct Dispatcher {
     /// The moraebot home: never a source of sent files.
     home: PathBuf,
     /// The configured channel: the onboarding greeting goes there when asked, or when the
-    /// owner's DM fails.
+    /// owner's DM fails. Empty for a bridge whose hello names no `home`.
     channel_id: String,
     /// Held while a row is admitted and its thread opened, and while the worker dequeues,
     /// so the worker never picks a row whose thread does not exist yet.
@@ -502,8 +505,8 @@ impl Dispatcher {
         if self.store().memory_logged(W_OMP_VERSION, &check.version)? {
             return Ok(());
         }
-        let sent = self.notify_in_dm(N_OMP_VERSION).await
-            || self.notify(&self.channel_id, N_OMP_VERSION).await;
+        let sent =
+            self.notify_in_dm(N_OMP_VERSION).await || self.notify_in_channel(N_OMP_VERSION).await;
         if !sent {
             tracing::warn!(omp = %check.version, "omp version notice not sent");
             return Ok(());
@@ -544,7 +547,7 @@ impl Dispatcher {
         let place = match target {
             GreetTarget::Dm if self.greet_in_dm().await => Some(GreetTarget::Dm),
             _ => self
-                .notify(&self.channel_id, N_ONBOARDING_HELLO)
+                .notify_in_channel(N_ONBOARDING_HELLO)
                 .await
                 .then_some(GreetTarget::Channel),
         };
@@ -557,6 +560,20 @@ impl Dispatcher {
     /// Opens the owner's DM and sends the greeting there; false when either step fails.
     async fn greet_in_dm(&self) -> bool {
         self.notify_in_dm(N_ONBOARDING_HELLO).await
+    }
+
+    /// Sends notice `code` in the configured channel; false when the send fails or there is
+    /// no channel, which logs [`W_NO_HOME_CHANNEL`] instead of sending to an empty target.
+    async fn notify_in_channel(&self, code: &'static str) -> bool {
+        if self.channel_id.is_empty() {
+            tracing::warn!(
+                code = W_NO_HOME_CHANNEL,
+                notice = code,
+                "no home channel; channel fallback skipped"
+            );
+            return false;
+        }
+        self.notify(&self.channel_id, code).await
     }
 
     /// Opens the owner's DM and sends notice `code` there; false when either step fails.

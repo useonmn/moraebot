@@ -17,6 +17,7 @@ use moraebot::bridge::proto::{Decoded, Frame, FrameReader, Redacted, write_frame
 use moraebot::bridge::{E_BRIDGE_PLATFORM, check_peer};
 use moraebot::config::{AccessMode, BridgeConfig, Config, MemoryConfig, OmpConfig, Platform};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
+use moraebot::onboarding::{self, GreetTarget};
 use moraebot::store::{State, Store};
 use moraebot::testing::{FakeBridge, FakeBridgeConn, bridge_ok};
 use serde_json::Value;
@@ -392,6 +393,90 @@ async fn the_gateway_starts_from_the_cached_hello_and_serves_once_the_bridge_app
     running.stop().await;
     assert_eq!(rig.row_state(1), State::Done);
     rig.tap.assert_prompts(1).await;
+}
+
+/// A hello like [`FakeBridge::hello`] without `home`, with the `dm` capability set to
+/// `dm_cap`.
+fn hello_without_home(dm_cap: bool) -> Frame {
+    let Frame::Hello {
+        proto,
+        bridge,
+        version,
+        platform,
+        message_limit,
+        hints,
+        mut caps,
+        spooled,
+        ..
+    } = FakeBridge::hello()
+    else {
+        unreachable!("hello() is a hello");
+    };
+    caps.dm = dm_cap;
+    Frame::Hello {
+        proto,
+        bridge,
+        version,
+        platform,
+        message_limit,
+        hints,
+        home: None,
+        caps,
+        spooled,
+    }
+}
+
+/// Runs the gateway behind a bridge whose hello has no `home`, with an onboarding request
+/// for the owner's DM, until a marker message is answered. Returns every `send` frame.
+async fn sends_without_home(dm_cap: bool) -> Vec<(String, String)> {
+    let rig = Rig::new();
+    onboarding::request(&rig.config.home, GreetTarget::Dm).unwrap();
+    let (adapter, conn) = tokio::join!(
+        BridgeAdapter::open_with(rig.options(Duration::from_secs(5)), rig.bridge.clone()),
+        async {
+            let mut conn = rig.bridge.accept().await;
+            conn.handshake(&hello_without_home(dm_cap)).await;
+            conn
+        }
+    );
+    let running = rig.start(adapter.expect("open"));
+    let bridge = conn.auto();
+    // The greeting is sent at startup, before the marker is served. The marker's reply
+    // carries the onboarding notice, so it is matched by its target.
+    bridge.push(dm(1, "100.0", "marker"));
+    bridge
+        .wait_until(|r| r.sends().iter().any(|(target, _)| target == "D111:100.0"))
+        .await;
+    let sends = bridge
+        .record()
+        .requests
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Send { target, text, .. } => Some(sent(target, &text.0)),
+            _ => None,
+        })
+        .collect();
+    running.stop().await;
+    sends
+}
+
+#[tokio::test]
+async fn without_home_and_dm_the_greeting_sends_no_frame_with_an_empty_target() {
+    let sends = sends_without_home(false).await;
+    assert!(
+        sends.iter().all(|(target, _)| !target.is_empty()),
+        "{sends:?}"
+    );
+    let targets: Vec<&str> = sends.iter().map(|(target, _)| target.as_str()).collect();
+    assert_eq!(targets, ["D111:100.0"]);
+}
+
+#[tokio::test]
+async fn without_home_the_greeting_still_goes_to_the_owner_dm() {
+    let sends = sends_without_home(true).await;
+    // The fake bridge opens the DM as the owner's id.
+    let targets: Vec<&str> = sends.iter().map(|(target, _)| target.as_str()).collect();
+    assert_eq!(targets, [OWNER, "D111:100.0"], "{sends:?}");
 }
 
 #[tokio::test]

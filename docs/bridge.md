@@ -78,7 +78,7 @@ The bridge speaks first.
 | `platform` | The conversation key prefix, for example `slack`. Keys look like `slack:th:...` and `slack:dm:...`. |
 | `message_limit` | The longest message the messenger takes, in characters. The core splits longer replies. |
 | `hints` | Text the core gives the model about how replies are shown. |
-| `home` | The send target for messages that belong to no conversation, for example the greeting fallback. |
+| `home` | The send target for messages that belong to no conversation, for example the greeting fallback. Optional; see below. |
 | `caps` | Capabilities, see below. |
 | `spooled` | How many inbound messages wait in the spool. |
 
@@ -93,6 +93,8 @@ The bridge speaks first.
 After `hello_ok` the bridge starts the spool handover and the core bumps `reconnects()`, so replies that failed while the link was down are sent again.
 
 The core keeps the last `hello` in `<home>/bridge-hello.json` (mode 0600). When no bridge answers within 10 seconds of start, the core starts from that copy. With neither a bridge nor a copy, it fails with `E_ADAPTER_START` and `E_BRIDGE_DOWN` in the message, and the service manager retries.
+
+Without `home`, the core has no channel for messages that belong to no conversation. The onboarding greeting and the omp version notice still go to the owner's DM when the bridge has the `dm` capability and the DM opens. They never fall back to a channel: the core sends no frame with an empty target and logs one warning with code `W_NO_HOME_CHANNEL` instead. A greeting that reached nobody is not retried; the omp version notice is tried again at the next start.
 
 `platform`, `hints` and `home` come from the hello used at start. `message_limit` and `caps` follow the latest hello. A later hello with another `platform` is refused with `E_BRIDGE_PLATFORM` and the core stops, so the service manager starts it again with the new hello. Changed `hints` or `home` are logged and apply at the next start.
 
