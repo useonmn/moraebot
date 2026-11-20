@@ -28,6 +28,7 @@ pub mod persona;
 pub mod secret;
 pub mod slack_bridge;
 pub mod store;
+pub mod summarizer;
 pub mod systemd;
 pub mod testing;
 pub mod worktree;

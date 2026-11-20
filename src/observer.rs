@@ -2,12 +2,18 @@
 //! entries without the lead's help.
 //!
 //! - A `group` job (a settled, failed or restart-cut lead turn) judges the owner's own
-//!   sentences of its owner rows. An entry is always one whole owner sentence, word for word,
-//!   with `prov: owner` and its row and sentence number; jev only picks which sentence and
-//!   which file.
+//!   sentences of its owner rows, with `prov: owner` and its row, sentence and turn number;
+//!   jev only picks which sentence and which file, and the code checks the `core/` gates
+//!   against the picked sentence itself.
 //! - A `lane` job judges a lane result once, a `subagent` job one subagent output file. Their
 //!   sentences pass the excerpt filter ([`ExcerptFilter`]) before anything is sent, and are
 //!   saved as reference (`lane` or `subagent`), never in `core/`.
+//! - Every picked sentence is saved as a short summary, never as the sentence itself (#57):
+//!   the locked summarizer ([`Summarizer`]) writes it, and it is kept only when it is one
+//!   line of at most [`MAX_SUMMARY_CHARS`] characters, the redactor would not change it and
+//!   the excerpt filter allows it; otherwise it is dropped ([`W_MEMORY_SUMMARY_DROPPED`]). A
+//!   summarizer failure counts one attempt of the job and the pass waits
+//!   ([`E_MEMORY_SUMMARY`]); the sentence is never saved instead.
 //! - A `scan` job, and every group and lane job, first scans a session folder for subagent
 //!   output files ([`Observer::scan_root`]); a new or changed file becomes a `subagent` job.
 //!
@@ -48,6 +54,8 @@ use crate::store::{
     GroupJob, JobEnd, JobKind, LaneJob, LogLevel, LogRow, MemoryJob, Settled, Store, StoreError,
     SubagentJob, ToolUse,
 };
+pub use crate::summarizer::E_MEMORY_SUMMARY;
+use crate::summarizer::Summarizer;
 
 /// A job settled after it was processed (`detail` holds the counts).
 pub const M_JOB_DONE: &str = "M_JOB_DONE";
@@ -70,6 +78,15 @@ pub const E_OBSERVER_JOB: &str = "E_OBSERVER_JOB";
 /// Processing a job panicked (counts as one attempt), or a pass panicked outside a job (the
 /// pass ends, the observer reports itself down until a pass ends normally).
 pub const E_OBSERVER_PANIC: &str = "E_OBSERVER_PANIC";
+/// A summary was not saved: empty, too long, holding a secret, or refused by the excerpt
+/// filter (`detail` names the reason).
+pub const W_MEMORY_SUMMARY_DROPPED: &str = "W_MEMORY_SUMMARY_DROPPED";
+
+/// The longest summary that is saved, in characters; a longer one is dropped, never cut.
+pub const MAX_SUMMARY_CHARS: usize = 280;
+/// The first wait after a summarizer failure; it doubles up to [`SUMMARY_WAIT_MAX`].
+const SUMMARY_WAIT: i64 = 60;
+const SUMMARY_WAIT_MAX: i64 = 30 * 60;
 
 /// Pending `lane`, `subagent` and `scan` jobs older than this expire (7 days).
 const JOB_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -138,6 +155,7 @@ impl Kind {
 /// What processing one job produced.
 #[derive(Debug)]
 struct Work {
+    job: i64,
     code: &'static str,
     entries: Vec<NewEntry>,
     requests: u32,
@@ -146,8 +164,9 @@ struct Work {
 }
 
 impl Work {
-    fn new() -> Self {
+    fn new(job: i64) -> Self {
         Self {
+            job,
             code: M_JOB_DONE,
             entries: Vec::new(),
             requests: 0,
@@ -163,6 +182,8 @@ enum Failure {
     Jev(JevError),
     /// A processing error that is not jev's: one failed attempt.
     Job(&'static str),
+    /// The summarizer failed: one failed attempt, and the pass waits.
+    Summary,
 }
 
 impl From<StoreError> for Failure {
@@ -184,6 +205,9 @@ pub struct Observer {
     store: Arc<Mutex<Store>>,
     memory: MemoryHandle,
     jev: Arc<Jev>,
+    summarizer: Summarizer,
+    /// Summarizer failures in a row; sets the wait after the next one.
+    summary_failures: std::sync::atomic::AtomicU32,
     redactor: Redactor,
     filter: ExcerptFilter,
     now: Now,
@@ -212,6 +236,8 @@ impl Observer {
     ) -> Self {
         Self {
             filter: ExcerptFilter::from_config(&config.memory.filter),
+            summarizer: Summarizer::new(config),
+            summary_failures: std::sync::atomic::AtomicU32::new(0),
             config: config.clone(),
             store,
             memory,
@@ -232,6 +258,16 @@ impl Observer {
     /// The omp version written with every settled job (`unknown` until set).
     pub fn with_omp_version(mut self, version: &str) -> Self {
         self.omp_version = version.to_owned();
+        self
+    }
+
+    /// Adds variables to the summarizer's child environment (tests script the fake omp).
+    pub fn with_summarizer_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        self.summarizer = self.summarizer.with_extra_env(vars);
         self
     }
 
@@ -363,6 +399,7 @@ impl Observer {
             }
             let mut finished: Vec<(MemoryJob, Work)> = Vec::new();
             let mut refused = None;
+            let mut summary_wait = None;
             for job in jobs {
                 let processed = AssertUnwindSafe(self.process(&job, now))
                     .catch_unwind()
@@ -388,6 +425,16 @@ impl Observer {
                         self.fail_attempt(job.id, code, now);
                         failed_here.insert(job.id);
                     }
+                    Ok(Err(Failure::Summary)) => {
+                        // Like an answer that does not fit: one attempt of this job, and the
+                        // jobs behind it wait rather than fail on the same outage.
+                        if self.fail_attempt(job.id, E_MEMORY_SUMMARY, now) {
+                            failed_here.insert(job.id);
+                            continue;
+                        }
+                        summary_wait = Some(now + self.summary_wait());
+                        break;
+                    }
                     Err(_) => {
                         tracing::error!(job = job.id, "memory job panicked");
                         self.fail_attempt(job.id, E_OBSERVER_PANIC, now);
@@ -403,7 +450,19 @@ impl Observer {
                     until: self.jev_refused(&err, now),
                 };
             }
+            if let Some(until) = summary_wait {
+                return Pass::Waiting { until: Some(until) };
+            }
         }
+    }
+
+    /// The wait after one more summarizer failure: [`SUMMARY_WAIT`] seconds, doubled for each
+    /// failure in a row before it, at most [`SUMMARY_WAIT_MAX`].
+    fn summary_wait(&self) -> i64 {
+        let before = self.summary_failures.fetch_add(1, Ordering::SeqCst);
+        SUMMARY_WAIT
+            .saturating_mul(1i64 << before.min(16))
+            .min(SUMMARY_WAIT_MAX)
     }
 
     /// Settles pending rows whose kind or payload does not decode as `failed`, one
@@ -603,7 +662,7 @@ impl Observer {
     }
 
     async fn process(&self, job: &MemoryJob, now: i64) -> Result<Work, Failure> {
-        let mut work = Work::new();
+        let mut work = Work::new(job.id);
         let off = self.jev.status() == JevStatus::Off;
         match &job.payload {
             crate::store::JobPayload::Group(group) => {
@@ -654,6 +713,9 @@ impl Observer {
             return Ok(());
         }
         let tools: &[ToolUse] = group.trace.as_ref().map_or(&[], |t| &t.tools);
+        let Some(turn) = group.rows.first().map(|row| row.id) else {
+            return Ok(());
+        };
         let mut rows: Vec<i64> = group
             .rows
             .iter()
@@ -692,14 +754,24 @@ impl Observer {
                     "core" | "boundary" => thread,
                     _ => continue,
                 };
-                // `pick` is a sentence of this window, cut from `row.text` above: the entry
-                // is the owner's own sentence, verbatim.
-                work.entries.push(entry(
-                    pick.sentence,
-                    Prov::Owner,
-                    bucket,
-                    Source::row_sentence(row.id, pick.n),
-                ));
+                // The bucket was decided on the owner's own sentence above; only the stored
+                // text is the summary.
+                let Some(summary) = self.summary(Kind::Owner, &pick.sentence, work).await? else {
+                    continue;
+                };
+                // A rule's summary must still state it as one (#57, point 3): it may not
+                // lose the always or never word that let the sentence into core/.
+                let keeps_rule = match bucket {
+                    Bucket::Owner => says_always(&summary),
+                    Bucket::Boundaries => says_boundary(&summary),
+                    _ => true,
+                };
+                if !keeps_rule {
+                    self.dropped(work, "rule_lost");
+                    continue;
+                }
+                let src = Source::row_sentence(row.id, pick.n, turn);
+                work.entries.push(entry(summary, Prov::Owner, bucket, src));
             }
         }
         Ok(())
@@ -858,10 +930,82 @@ impl Observer {
             } else {
                 place.project.clone()
             };
-            work.entries
-                .push(entry(pick.sentence, prov, bucket, src.clone()));
+            // One source per sentence, so each summary has its own and a job read again
+            // finds it whatever the summary says.
+            let Ok(src) = Source::new(&format!("{} s={}", src.as_str(), pick.n)) else {
+                self.dropped(work, "source");
+                continue;
+            };
+            let Some(summary) = self.summary(kind, &pick.sentence, work).await? else {
+                continue;
+            };
+            work.entries.push(entry(summary, prov, bucket, src));
         }
         Ok(())
+    }
+
+    /// The summary to save for `sentence`, a sentence of a `kind` text; `None` when the
+    /// summary was dropped (logged as [`W_MEMORY_SUMMARY_DROPPED`]). The sentence goes in
+    /// through the redactor and the summary comes out through it again.
+    async fn summary(
+        &self,
+        kind: Kind,
+        sentence: &str,
+        work: &mut Work,
+    ) -> Result<Option<String>, Failure> {
+        let (input, _) = self.redactor.redact(sentence);
+        let reply = match self.summarizer.summarize(kind.state_kind(), &input).await {
+            Ok(reply) => reply,
+            Err(detail) => {
+                tracing::warn!(
+                    job = work.job,
+                    code = E_MEMORY_SUMMARY,
+                    %detail,
+                    "memory summarizer failed"
+                );
+                return Err(Failure::Summary);
+            }
+        };
+        self.summary_failures.store(0, Ordering::SeqCst);
+        match self.check_summary(&reply) {
+            Ok(summary) => Ok(Some(summary)),
+            Err(reason) => {
+                self.dropped(work, &reason);
+                Ok(None)
+            }
+        }
+    }
+
+    /// One [`W_MEMORY_SUMMARY_DROPPED`] row for a summary of `work`'s job that is not saved.
+    fn dropped(&self, work: &Work, reason: &str) {
+        tracing::info!(job = work.job, reason, "memory summary dropped");
+        self.log(LogRow {
+            at: (self.now)(),
+            level: LogLevel::Warn,
+            code: W_MEMORY_SUMMARY_DROPPED,
+            job_id: Some(work.job),
+            omp_version: Some(self.omp_version.clone()),
+            jev_model: None,
+            detail: Some(format!("reason={reason}")),
+        });
+    }
+
+    /// `reply` folded to one line, or why it may not be saved.
+    fn check_summary(&self, reply: &str) -> Result<String, String> {
+        let summary = reply.split_whitespace().collect::<Vec<_>>().join(" ");
+        if summary.is_empty() {
+            return Err("empty".into());
+        }
+        if self.redactor.redact(&summary).1 {
+            return Err("secret".into());
+        }
+        if summary.chars().count() > MAX_SUMMARY_CHARS {
+            return Err("too_long".into());
+        }
+        self.filter
+            .allows(&summary, &self.redactor)
+            .map_err(|drop| format!("{drop:?}").to_lowercase())?;
+        Ok(summary)
     }
 
     fn window(&self) -> usize {

@@ -18,7 +18,8 @@
 //!
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
-//! echoed whole. The log keeps the full frame.
+//! echoed whole. The log keeps the full frame. With FAKE_OMP_REPLY set, an
+//! echoed prompt is answered with that text instead.
 //!
 //! Host tools: `set_host_tools` is acknowledged in every mode with the tool
 //! names of the frame. Mode `send_file` answers a prompt with one
@@ -674,7 +675,8 @@ fn prompt_message(frame: &Value) -> &str {
 }
 
 fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
-    end_run(&format!("echo: {message}"), json!({}), out);
+    let text = std::env::var("FAKE_OMP_REPLY").unwrap_or_else(|_| format!("echo: {message}"));
+    end_run(&text, json!({}), out);
     completed(id, out);
 }
 
