@@ -439,6 +439,26 @@ moraebot은 자기 기억 저장소(`~/.moraebot/memory`, git)를 둡니다. lea
 
 **0.2.0에서 올라올 때.** 새 기억 저장소(#39, docs/memory.md)가 `~/.moraebot/memory/`를 씁니다. 옛 배치(`memory/system` 등, `omp/config-overlay.yml`)가 남아 있으면 moraebot은 시작을 거부하고 지울 경로와 `rm -rf` 명령을 한 줄로 알려 줍니다. 코드가 지우지는 않습니다. 데이터베이스의 옛 기억 표는 쓰지 않습니다.
 
+### 3.10a Memory P2: observer, jev, private prompt files
+
+This subsection is in English (#39 P2); docs/memory.md has the owner-facing details, the settings and the log codes.
+
+**Job queue.** Every settled lead turn, lane result and lane close queues a row in `memory_jobs` (`inbox.sqlite`) inside the same `Immediate` transaction that settles it, so a crash never loses a job and never leaves one for an unsettled turn. A lead job carries the turn's group (owner rows, steered rows, lane rows read in that turn) and the turn trace: tool names and kinds from the event callback, never arguments or output.
+
+**Observer** (`src/observer.rs`). A task spawned by `Gateway::run` beside the dispatcher, not one of its supervised tasks, so a memory fault never stops the gateway. `run_once` does all the work: a start scan, expiry (lane, subagent and scan jobs after 7 days; owner turns never), a daily prune of log rows and settled jobs after 30 days, then the pending jobs in id order. Each job asks jev per window of sentences; code, not jev, sets provenance (`owner` only for a whole sentence of an owner row, re-checked verbatim), source and the allowed buckets. A pass writes all its entries in one `MemoryHandle::apply_batch` (one commit, `Op::AddUnique` so a re-read job adds nothing) and settles its jobs in one transaction. Shutdown stops it after the dispatcher and before waiting for the memory writer.
+
+**jev client** (`src/jev.rs`). One `POST /v1/systemone` per call, no retry loop and no sleep: a transient failure sets a gate time (backoff, then a breaker that lets one probe through every `breaker_probe_seconds`), a permanent one (401, 403, other 4xx) pauses until restart. The clock is injected, so tests move time instead of waiting.
+
+**Core saves the owner should see.** When the observer saves an owner sentence to `core/owner.md` or `core/boundaries.md`, it stores a `memory_notices` row in the transaction that settles the job. `save_reply` and `finish_memory` append every pending notice of that conversation under the next stored reply and delete them in the same transaction, so the line survives a restart and is sent once (owner decision on the default of plan question 1, recorded in the stage 4 report).
+
+**Plain-language memory requests.** `Dispatcher::memory_command` keeps the rule parser first. On arrival only, a message the rules do not match goes to `memory_commands::classify` when it holds memory words or an entry id; one jev call with `classify_timeout_ms`, any error meaning "not a command". jev picks the intent and the remember sentence, `memory_commands::from_intent` takes every other argument from the owner's text. The worker's second look at a queued row uses the rules only, so a row costs at most one jev call. The classifier shares the observer's `Jev`, and with it the gate.
+
+**Prompts out of argv.** The lead's appended system prompt is written to `<home>/lead/append.md` and a lane's memory block to `<home>/lanes/<id>/append.md` (0600, temp file, fsync, rename) right before the child starts; argv holds `--append-system-prompt=<absolute path>`. omp 18.22.2 reads a one-line value as a file once at start (`resolvePromptInput`, `system-prompt.ts`), so later rewrites cannot reach a running child. `CHECKED_OMP_VERSION` covers this fact too. Chat children keep their fixed literal guidance. A lane still runs as the same Unix user and can read these files.
+
+**omp version notice.** `Gateway::with_omp_check` hands the start check to the observer (the omp version logged with every job) and to the dispatcher. At the end of `startup`, a warning with no `W_OMP_VERSION` log row for that version sends `N_OMP_VERSION` to the owner's DM, or to the configured channel when the DM fails, and then writes the row. Rows are pruned after 30 days.
+
+**Secrets.** The jev key comes from `TYPESAFE_API_KEY` or `memory.jev.api_key_file`, never from `config.toml`. `child_env` drops every variable whose name holds `TYPESAFE` for every omp child, and the memory store's redactor (`Redactor::with_own`) hides the key.
+
 ### 3.11 레인 작업 폴더 (lanes L1)
 
 **언제 쓰나.** `lane_start`는 선택 인자 `repo`(git 저장소 경로)를 받습니다. 없거나 `null`이면 lane은 지금처럼 lead와 같은 작업 폴더에서 일합니다. 있으면 그 저장소의 lane 전용 git worktree에서 일합니다. `repo`는 절대 경로, `~/`로 시작하는 경로(`HOME` 기준), 작업 폴더 기준 상대 경로 중 하나이고, 풀어서 `canonicalize`한 경로를 `lanes.repo` 열에 저장하고 `lane_status`에도 보여 줍니다. 문자열이 아니거나 비면 `E_LANE_ARGS`, 있는 폴더가 아니면 `E_LANE_REPO`로 거절하고, 거절된 호출은 lane을 저장하지도 자식을 띄우지도 않습니다. 도구 처리기는 git을 부르지 않습니다.
@@ -646,7 +666,11 @@ The lane is still running and moraebot does not stop it; its result comes later 
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록
   lead/session/            lead omp 세션 기록 (--session-dir로 넘김)
+  lead/append.md           the lead's appended system prompt, 0600 (--append-system-prompt=<path>)
   lanes/<id>/session/      lane마다 omp 세션 기록
+  lanes/<id>/append.md     a lane's memory block, 0600
+  memory/                  the memory store, a git repository (docs/memory.md)
+  omp-overlay.yml          turns omp's own memory off for the lead and lanes
   hints/lead.md            lead 역할 안내문 바꾸기 (선택)
   conversations/           slice 3까지 쓰던 대화별 세션 기록. 더 쓰지 않고 지우지도 않음
   logs/
@@ -667,6 +691,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 | 봇 답장 상한 | `max_bot_replies`: 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수 | 없음 (제한 없음) | 불가 |
 | 작업 폴더 | omp가 일하는 폴더 (`--cwd`) | 없음 (필수) | 불가 (열린 질문 11) |
 | 모델 | omp가 쓸 AI 모델 | omp 기본값 | 주인만 가능 (열린 질문 12) |
+| jev (memory observer) | `[memory.jev]` and `[memory.filter]`; the key only from `TYPESAFE_API_KEY` or `api_key_file`; `enabled = false` turns it off (docs/memory.md) | on when a key is found | 불가 |
 
 규칙은 하나입니다. **봇을 빼앗을 수 있는 항목은 파일에서만 바꿉니다.**
 
