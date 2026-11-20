@@ -124,10 +124,30 @@ where
 
 /// Test-only log sink: keeps every written byte and wakes `wait_for` after each write.
 #[cfg(test)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Capture {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     written: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// Creating a `Capture` registers a second `Dispatch` that lives for the rest of the process.
+/// tracing-core 0.1.36 computes a new callsite's interest from the registering thread's
+/// default while only one `Dispatch` is registered, so a parallel test without a subscriber
+/// can cache `Interest::never` for a callsite a capturing test asserts on and its event is
+/// dropped (tokio-rs/tracing#3611). With two registered, interest comes from all of them.
+#[cfg(test)]
+impl Default for Capture {
+    fn default() -> Self {
+        static SECOND_DISPATCH: std::sync::LazyLock<tracing::Dispatch> =
+            std::sync::LazyLock::new(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+        std::sync::LazyLock::force(&SECOND_DISPATCH);
+        Self {
+            buf: Default::default(),
+            written: Default::default(),
+        }
+    }
 }
 
 #[cfg(test)]
