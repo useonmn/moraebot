@@ -43,8 +43,8 @@ use super::proto::{
     WireAttachment, map_error, write_frame,
 };
 use super::{
-    E_BRIDGE_BAD_REQUEST, E_BRIDGE_DOWN, E_BRIDGE_PEER, E_BRIDGE_PLATFORM, E_BRIDGE_PROTO,
-    E_BRIDGE_UNSUPPORTED, PROTO_VERSION, check_peer,
+    E_BRIDGE_BAD_REQUEST, E_BRIDGE_BUSY, E_BRIDGE_DOWN, E_BRIDGE_PEER, E_BRIDGE_PLATFORM,
+    E_BRIDGE_PROTO, E_BRIDGE_UNSUPPORTED, PROTO_VERSION, check_peer,
 };
 use crate::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_EDIT, E_ADAPTER_FILES, E_ADAPTER_START,
@@ -106,6 +106,67 @@ impl Connector for UnixConnector {
         let stream = UnixStream::connect(&self.path).await?;
         check_peer(&stream).map_err(peer_refused)?;
         Ok(Box::new(stream))
+    }
+}
+
+/// How long `check-config` waits for a bridge to connect and say its first frame.
+pub const PROBE_WAIT: Duration = Duration::from_secs(3);
+
+/// What a bridge socket answered to [`probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The bridge said hello.
+    Hello {
+        bridge: String,
+        version: String,
+        platform: String,
+    },
+    /// The bridge serves another core (`E_BRIDGE_BUSY`), so it is up.
+    Busy,
+}
+
+/// Connects to the bridge at `path` (with the peer uid check), reads its first frame and
+/// closes without a `hello_ok`, so the bridge hands the probe no message. `Err` says why
+/// nothing usable answered within `wait`.
+pub async fn probe(path: &Path, wait: Duration) -> Result<Probe, String> {
+    let attempt = async {
+        let link = UnixConnector::new(path.to_path_buf())
+            .connect()
+            .await
+            .map_err(|err| format!("cannot connect: {err}"))?;
+        probe_link(link).await
+    };
+    tokio::time::timeout(wait, attempt)
+        .await
+        .unwrap_or_else(|_| Err(format!("no hello within {}s", wait.as_secs())))
+}
+
+/// [`probe`] on a connected link.
+pub async fn probe_link(link: impl Link) -> Result<Probe, String> {
+    let mut frames = FrameReader::new(BufReader::new(link));
+    match frames.next().await {
+        Ok(Some(Decoded::Frame(Frame::Hello {
+            bridge,
+            version,
+            platform,
+            ..
+        }))) => Ok(Probe::Hello {
+            bridge,
+            version,
+            platform,
+        }),
+        Ok(Some(Decoded::Frame(Frame::Bye { code, .. }))) if code == E_BRIDGE_BUSY => {
+            Ok(Probe::Busy)
+        }
+        Ok(Some(Decoded::Frame(Frame::Bye { code, message }))) => Err(format!(
+            "the bridge refused the connection: {code}: {message}"
+        )),
+        Ok(Some(other)) => Err(format!(
+            "the bridge did not start with hello but with {}",
+            kind_of(&other)
+        )),
+        Ok(None) => Err("the bridge closed the link before hello".to_owned()),
+        Err(err) => Err(format!("unreadable hello from the bridge: {err}")),
     }
 }
 
@@ -1373,6 +1434,65 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             "socket mode"
         )));
+    }
+
+    /// The answer of [`probe_link`] to a bridge that writes `lines` and then closes.
+    async fn probe_lines(lines: &str) -> Result<Probe, String> {
+        let (core, mut bridge) = tokio::io::duplex(4096);
+        tokio::io::AsyncWriteExt::write_all(&mut bridge, lines.as_bytes())
+            .await
+            .expect("write");
+        drop(bridge);
+        probe_link(core).await
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_the_hello_or_a_busy_bye() {
+        let hello = r#"{"t":"hello","proto":1,"bridge":"moraebot-slack-bridge","version":"0.9.0","platform":"slack","message_limit":3900,"hints":"h"}"#;
+        assert_eq!(
+            probe_lines(&format!("{hello}\n")).await,
+            Ok(Probe::Hello {
+                bridge: "moraebot-slack-bridge".to_owned(),
+                version: "0.9.0".to_owned(),
+                platform: "slack".to_owned(),
+            })
+        );
+        assert_eq!(
+            probe_lines("{\"t\":\"bye\",\"code\":\"E_BRIDGE_BUSY\",\"message\":\"x\"}\n").await,
+            Ok(Probe::Busy)
+        );
+        for (lines, expected) in [
+            (
+                "{\"t\":\"bye\",\"code\":\"E_BRIDGE_PROTO\",\"message\":\"x\"}\n",
+                "E_BRIDGE_PROTO",
+            ),
+            ("{\"t\":\"ping\",\"n\":1}\n", "ping"),
+            ("", "closed"),
+            ("not json\n", "unreadable"),
+        ] {
+            let err = probe_lines(lines).await.expect_err(lines);
+            assert!(err.contains(expected), "{lines:?}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_a_socket_nobody_listens_on_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = probe(&dir.path().join("none.sock"), PROBE_WAIT)
+            .await
+            .expect_err("nothing listens");
+        assert!(err.starts_with("cannot connect"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_gives_up_on_a_silent_bridge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let err = probe(&path, PROBE_WAIT).await.expect_err("silent");
+        assert_eq!(err, "no hello within 3s");
+        drop(accept);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
-use moraebot::bridge::client::BridgeAdapter;
+use moraebot::bridge::client::{self as bridge_client, BridgeAdapter, Probe};
 use moraebot::bridge::socket;
 use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
@@ -34,13 +34,15 @@ Commands:
   check-config [--config PATH]  Check the config and the things it points at
   run [--config PATH]           Run the gateway until SIGTERM or SIGINT
   install-launchd [--config PATH] [--label LABEL] [--dry-run]
-                                Install the launchd agent (macOS)
+                                Install the launchd agent (macOS), and the Slack
+                                bridge agent too when messenger = \"bridge\"
   uninstall-launchd [--label LABEL]
-                                Remove the launchd agent
+                                Remove the launchd agent and its bridge agent
   install-systemd [--config PATH] [--unit NAME] [--dry-run]
-                                Install the systemd user service (Linux)
+                                Install the systemd user service (Linux), and the
+                                Slack bridge service too when messenger = \"bridge\"
   uninstall-systemd [--unit NAME]
-                                Remove the systemd user service
+                                Remove the systemd user service and its bridge service
   onboarding [--greet dm|channel] [--config PATH]
                                 Greet (in a DM by default) and ask the first-meeting questions again at the next start
   --version, -V                 Print the version
@@ -220,6 +222,11 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
         .jev
         .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
     let checks_ok = report_checks(&config.checks(), &mut stdout)?;
+    if config.messenger == Platform::Bridge
+        && let Some(bridge) = &config.bridge
+    {
+        report_bridge(&bridge.socket, &mut stdout)?;
+    }
     // The same start check `run` makes, so a dry check catches it before a restart.
     let overlay_ok = match omp_overlay::check(&config.omp_path) {
         Ok(found) => {
@@ -243,6 +250,24 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The advisory `bridge` line of `check-config`: whether a bridge answers on `socket`.
+/// A bridge that serves another core (`E_BRIDGE_BUSY`) counts as reachable.
+fn report_bridge(socket: &std::path::Path, out: &mut impl Write) -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let at = socket.display();
+    match runtime.block_on(bridge_client::probe(socket, bridge_client::PROBE_WAIT)) {
+        Ok(Probe::Hello {
+            bridge,
+            version,
+            platform,
+        }) => writeln!(out, "OK   bridge: {bridge} {version} ({platform}) at {at}"),
+        Ok(Probe::Busy) => writeln!(out, "OK   bridge: up and serving another core at {at}"),
+        Err(why) => writeln!(out, "WARN bridge: nothing answers at {at}: {why}"),
+    }
 }
 
 /// The bridge socket path `init` and `setup slack` write into both configs.
