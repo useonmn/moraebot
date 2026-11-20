@@ -150,18 +150,21 @@ pub fn chat_args(config: &Config, key: &str, cwd: &Path) -> Vec<OsString> {
         cwd,
         &chat_overlay_path(config),
         CHAT_GUIDANCE,
+        None,
     )
 }
 
 /// Exact omp argv (without the program) for a child that cannot act on this machine: the
-/// chat child and the memory summarizer. `overlay` must hold [`CHAT_OVERLAY`]; `guidance`
-/// is appended to the system prompt.
+/// chat child, the memory summarizer and the recall advisor. `overlay` must hold
+/// [`CHAT_OVERLAY`]; `guidance` is appended to the system prompt; `model` becomes `--model=`
+/// (`None`: omp's default model, as for every chat child).
 pub fn locked_args(
     config: &Config,
     session_dir: &Path,
     cwd: &Path,
     overlay: &Path,
     guidance: &str,
+    model: Option<&str>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
@@ -185,6 +188,9 @@ pub fn locked_args(
         args.push(flag.into());
     }
     args.push(format!("--append-system-prompt={guidance}").into());
+    if let Some(model) = model {
+        args.push(format!("--model={model}").into());
+    }
     if let Some(usd) = config.omp.max_cost_usd {
         args.push("--max-cost".into());
         args.push(usd.to_string().into());

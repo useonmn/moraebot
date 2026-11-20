@@ -289,14 +289,102 @@ pub struct MemoryConfig {
     pub filter: FilterConfig,
     /// `[memory.self]`.
     pub self_file: SelfConfig,
+    /// `[memory.recall]`.
+    pub recall: RecallConfig,
 }
 
 impl MemoryConfig {
+    /// The recall advisor's mode: `memory.recall.mode` when set, else `shadow` with jev
+    /// turned on and `off` without it.
+    pub fn recall_mode(&self) -> RecallMode {
+        self.recall.mode.unwrap_or(if self.jev.enabled {
+            RecallMode::Shadow
+        } else {
+            RecallMode::Off
+        })
+    }
+
+    /// `memory.recall.model`, or `None` when it is empty (omp's default model then).
+    pub fn recall_model(&self) -> Option<&str> {
+        let model = self.recall.model.trim();
+        (!model.is_empty()).then_some(model)
+    }
+
     /// Whether the self file runs: `[memory.self] enabled` and jev turned on. With jev off
     /// (the default) moraebot records no correction, runs no consolidation and adds no self
     /// block, so a default install starts no summarizer child for it (moraedang on #65).
     pub fn self_file_on(&self) -> bool {
         self.self_file.enabled && self.jev.enabled
+    }
+}
+
+/// What the recall advisor does (#59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallMode {
+    /// No advisor runs.
+    Off,
+    /// The advisor runs after each owner input and its picks are only logged, never given to
+    /// the lead.
+    Shadow,
+}
+
+impl RecallMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, ConfigError> {
+        match text {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "on" => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "memory.recall.mode = \"on\" is not available yet: recalled notes reach the lead \
+                 in a later release; use \"shadow\" or \"off\"",
+            )),
+            other => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("memory.recall.mode '{other}' must be \"off\" or \"shadow\""),
+            )),
+        }
+    }
+}
+
+/// The `[memory.recall]` settings: the recall advisor (#59) and the model of self
+/// consolidation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallConfig {
+    /// `None`: `shadow` when jev is on, `off` otherwise ([`MemoryConfig::recall_mode`]).
+    pub mode: Option<RecallMode>,
+    /// The omp model of the advisor and of self consolidation (`--model`); empty is omp's
+    /// default model.
+    pub model: String,
+    /// The most entries one advisor answer may pick.
+    pub max_items: usize,
+    /// The most entries offered to the advisor in one call.
+    pub max_candidates: usize,
+    /// Advisor calls allowed in any hour; a wake over it is skipped and logged.
+    pub max_calls_per_hour: u32,
+    /// The largest advisor message, in bytes; candidates that do not fit are left out.
+    pub max_input_bytes: usize,
+    /// How long one advisor call may take.
+    pub timeout_seconds: u64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            model: String::new(),
+            max_items: 3,
+            max_candidates: 32,
+            max_calls_per_hour: 30,
+            max_input_bytes: 16 * 1024,
+            timeout_seconds: 60,
+        }
     }
 }
 
@@ -684,6 +772,27 @@ struct MemorySection {
     filter: Option<FilterSection>,
     #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
     self_file: Option<SelfSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall: Option<RecallSection>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecallSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_calls_per_hour: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_input_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -839,10 +948,27 @@ impl MemoryConfig {
         if let Some(section) = section.self_file {
             take!(self_file, section, [enabled, correction_patterns]);
         }
+        let mut recall = RecallConfig::default();
+        if let Some(section) = section.recall {
+            recall.mode = section.mode.as_deref().map(RecallMode::parse).transpose()?;
+            take!(
+                recall,
+                section,
+                [
+                    model,
+                    max_items,
+                    max_candidates,
+                    max_calls_per_hour,
+                    max_input_bytes,
+                    timeout_seconds
+                ]
+            );
+        }
         let memory = Self {
             jev,
             filter,
             self_file,
+            recall,
         };
         memory.check_values()?;
         Ok(memory)
@@ -921,6 +1047,21 @@ impl MemoryConfig {
         {
             return bad("memory.self.correction_patterns must not hold an empty pattern".into());
         }
+        let r = &self.recall;
+        for (name, value) in [
+            ("max_items", r.max_items as u64),
+            ("max_candidates", r.max_candidates as u64),
+            ("max_calls_per_hour", u64::from(r.max_calls_per_hour)),
+            ("max_input_bytes", r.max_input_bytes as u64),
+            ("timeout_seconds", r.timeout_seconds),
+        ] {
+            if value == 0 {
+                return bad(format!("memory.recall.{name} must be greater than zero"));
+            }
+        }
+        if r.max_items > r.max_candidates {
+            return bad("memory.recall.max_items must not exceed max_candidates".into());
+        }
         Ok(())
     }
 
@@ -973,12 +1114,43 @@ impl MemoryConfig {
                 &ds.correction_patterns,
             ),
         };
+        let (r, dr) = (&self.recall, RecallConfig::default());
+        let recall = RecallSection {
+            mode: r.mode.map(|mode| mode.as_str().to_owned()),
+            model: changed(&r.model, &dr.model),
+            max_items: changed(&r.max_items, &dr.max_items),
+            max_candidates: changed(&r.max_candidates, &dr.max_candidates),
+            max_calls_per_hour: changed(&r.max_calls_per_hour, &dr.max_calls_per_hour),
+            max_input_bytes: changed(&r.max_input_bytes, &dr.max_input_bytes),
+            timeout_seconds: changed(&r.timeout_seconds, &dr.timeout_seconds),
+        };
         let section = MemorySection {
             jev: (!is_empty_section(&jev_section)).then_some(jev_section),
             filter: (!is_empty_section(&filter)).then_some(filter),
             self_file: (!is_empty_section(&self_file)).then_some(self_file),
+            recall: (!is_empty_section(&recall)).then_some(recall),
         };
         (!is_empty_section(&section)).then_some(section)
+    }
+
+    /// The `check-config` line for the recall advisor. Advisory: a missing model only means
+    /// the advisor runs on omp's default model.
+    fn recall_check(&self) -> Check {
+        let mode = self.recall_mode();
+        let result = match (mode, self.recall_model()) {
+            (RecallMode::Off, _) => Ok("off".to_owned()),
+            (RecallMode::Shadow, Some(model)) => Ok(format!("shadow, model {model}")),
+            (RecallMode::Shadow, None) => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "shadow without memory.recall.model: the advisor runs on omp's default model; \
+                 set a small fast model there",
+            )),
+        };
+        Check {
+            name: "memory.recall",
+            result,
+            advisory: true,
+        }
     }
 
     /// The `check-config` line for the jev key. Advisory: a missing key pauses only the jev
@@ -1402,6 +1574,7 @@ impl Config {
             });
         }
         checks.push(self.memory.key_check());
+        checks.push(self.memory.recall_check());
         checks.extend([
             Check {
                 name: "work_dir",
@@ -2064,6 +2237,65 @@ mod tests {
             fx.valid_toml()
         );
         assert_eq!(fx.load(&empty).expect_err("refused").code, E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn memory_recall_is_shadow_with_jev_on_off_without_and_refuses_on() {
+        let fx = Fixture::new();
+        let plain = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(plain.memory.recall, RecallConfig::default());
+        assert_eq!(plain.memory.recall_mode(), RecallMode::Off);
+        assert_eq!(plain.memory.recall_model(), None);
+        let jev = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
+        let jev = fx.load(&jev).expect("loads");
+        assert_eq!(jev.memory.recall_mode(), RecallMode::Shadow);
+        assert!(
+            !jev.to_toml().unwrap().contains("[memory.recall]"),
+            "the default stays implicit"
+        );
+
+        let text = format!(
+            "{}[memory.jev]\nenabled = true\n[memory.recall]\nmode = \"off\"\nmodel = \"claude-haiku-5-5\"\nmax_calls_per_hour = 5\n",
+            fx.valid_toml()
+        );
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.memory.recall_mode(), RecallMode::Off);
+        assert_eq!(cfg.memory.recall_model(), Some("claude-haiku-5-5"));
+        assert_eq!(cfg.memory.recall.max_calls_per_hour, 5);
+        let written = cfg.to_toml().expect("serializes");
+        assert!(written.contains("[memory.recall]"), "{written}");
+        assert_eq!(fx.load(&written).expect("reloads").memory, cfg.memory);
+
+        let with = |body: &str| format!("{}[memory.recall]\n{body}\n", fx.valid_toml());
+        for bad in [
+            "mode = \"on\"",
+            "mode = \"live\"",
+            "max_items = 0",
+            "timeout_seconds = 0",
+            "max_items = 40",
+        ] {
+            assert_eq!(code(fx.load(&with(bad))), E_CONFIG_VALUE, "{bad}");
+        }
+    }
+
+    #[test]
+    fn check_config_warns_about_a_shadow_advisor_without_a_model() {
+        let fx = Fixture::new();
+        let check = |text: &str| {
+            let cfg = fx.load(text).expect("loads");
+            let check = cfg
+                .checks()
+                .into_iter()
+                .find(|c| c.name == "memory.recall")
+                .expect("recall check");
+            assert!(check.advisory);
+            check.result.map_err(|e| e.code)
+        };
+        assert_eq!(check(&fx.valid_toml()), Ok("off".to_owned()));
+        let jev = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
+        assert_eq!(check(&jev), Err(E_CONFIG_VALUE));
+        let model = format!("{jev}[memory.recall]\nmodel = \"qa-small\"\n");
+        assert_eq!(check(&model), Ok("shadow, model qa-small".to_owned()));
     }
 
     #[test]
