@@ -148,6 +148,8 @@ The recall advisor looks for saved entries the lead does not have in front of it
 
 It runs only in shadow mode. Left unset, the mode is `shadow` when jev is on (`memory.jev.enabled = true`) **and** `memory.recall.model` names a model, and `off` otherwise: a default install, or an upgraded one with jev on but no model, starts no advisor child and never one on the lead's model unasked. To turn it on, set `memory.recall.model` to a small fast model of your omp providers; with jev on and no model, `moraebot check-config` prints one line saying so. `memory.recall.mode = "shadow"` turns it on without a model too, and then it runs on omp's default model (usually the lead's, the expensive one), which `check-config` warns about. `"off"` turns it off whatever else is set; `"on"` is refused for now.
 
+How well it picks is measured offline on a fixed set of synthetic conversations, against no advisor and against plain `memory_search`: see [Recall advisor eval](recall-eval.md).
+
 ### What leaves this machine
 
 When jev is on, moraebot sends TypeSafe's System One API (`https://api.typesafe.ai`, servers in the US):
