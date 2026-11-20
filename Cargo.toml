@@ -47,6 +47,8 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # sha256 of subagent output files, for the memory observer's cursor.
 sha2 = "0.10"
+# NFKC for the memory excerpt filter, so compatibility look-alikes match the filter lists.
+unicode-normalization = "0.1"
 # Standard base64 for chat image attachments.
 base64 = "0.22"
 # Official omp RPC client, pinned to the oh-my-pi v18.20.2 commit.
