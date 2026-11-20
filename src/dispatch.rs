@@ -1022,6 +1022,7 @@ impl Dispatcher {
             main,
             steered,
             memory_notes,
+            trace,
         } = group;
         let notes = memory_notes.join("\n");
         let steered_id = steered.as_ref().map(|(id, _)| *id);
@@ -1036,7 +1037,7 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn interrupted");
-            self.store().interrupt_group(&ids, code)?;
+            self.store().interrupt_group(&ids, code, &trace)?;
             self.post_needs_check_notices().await?;
             self.post_memory_notes(main_id, target, &notes).await;
             return Ok(());
@@ -1046,7 +1047,7 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn failed");
-            self.store().fail_group(&ids, code)?;
+            self.store().fail_group(&ids, code, &trace)?;
             let notice = if code == E_COST_CAP {
                 N_COST_CAP
             } else {
@@ -1065,7 +1066,7 @@ impl Dispatcher {
         );
         let out_files = out_files_json(main.files);
         self.store()
-            .finish_group(main_id, &reply, out_files.as_deref(), steered_id)?;
+            .finish_group(main_id, &reply, out_files.as_deref(), steered_id, &trace)?;
         self.send_reply(main_id).await?;
         Ok(())
     }

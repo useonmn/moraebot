@@ -1801,6 +1801,108 @@ async fn a_core_save_is_reported_when_the_turn_needs_check() {
     );
 }
 
+const TRACE_SENTINEL: &str = "TRACE_SENTINEL_41d9";
+
+/// Runs one owner turn of KEY_A in which omp reports a `web_search` and a `task` call (both
+/// with [`TRACE_SENTINEL`] in their arguments) and the lead then calls `memory_write`, whose
+/// handler waits until the event drain applied its own start, so every earlier frame is
+/// applied before the turn can end. The turn ends as FAKE_OMP_TOOLS_END=`end` says.
+async fn traced_turn(end: &str, timeout: Duration) -> GroupReport {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let start = |id: &str, name: &str, args: Value| {
+        serde_json::json!({"frame": {
+            "type": "tool_execution_start",
+            "toolCallId": id,
+            "toolName": name,
+            "args": args
+        }})
+        .to_string()
+    };
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": "rusqlite 0.43 needs Rust 1.89", "bucket_hint": "thread", "why": "qa"}
+    })
+    .to_string();
+    let script = [
+        start(
+            "web-1",
+            "web_search",
+            serde_json::json!({"query": TRACE_SENTINEL}),
+        ),
+        start(
+            "task-1",
+            "task",
+            serde_json::json!({"prompt": TRACE_SENTINEL}),
+        ),
+        start("web-2", "web_search", serde_json::json!({"query": "again"})),
+        write,
+    ]
+    .join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([
+            ("FAKE_OMP_TOOL_CALLS", script),
+            ("FAKE_OMP_TOOLS_END", end.to_owned()),
+        ])
+        .with_turn_timeout(timeout)
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory);
+    let row = owner_row(&h, "m-trace-1", "run-tools");
+    let report = bounded(m.prompt(
+        KEY_A,
+        row,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, row, "run-tools"),
+    ))
+    .await;
+    assert_eq!(h.tool_results().len(), 1, "the write ran");
+    bounded(m.shutdown_all()).await;
+    report
+}
+
+fn expected_tools() -> Vec<moraebot::store::ToolUse> {
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+    use moraebot::store::{ToolSource, ToolUse};
+    vec![
+        ToolUse::new("web_search", ToolSource::Web),
+        ToolUse::new("task", ToolSource::Task),
+        ToolUse::new(MEMORY_WRITE_TOOL, ToolSource::Host),
+    ]
+}
+
+#[tokio::test]
+async fn turn_trace_lists_tool_names_and_sources_without_arguments() {
+    let report = traced_turn("", Duration::from_secs(30)).await;
+    assert_eq!(report.main.outcome.code(), None, "{report:?}");
+    assert_eq!(
+        report.trace.tools,
+        expected_tools(),
+        "distinct, first seen first"
+    );
+    assert!(report.trace.task);
+    let json = serde_json::to_string(&report.trace).expect("trace json");
+    assert!(!json.contains(TRACE_SENTINEL), "{json}");
+    assert!(!format!("{:?}", report.trace).contains(TRACE_SENTINEL));
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["tools"][0],
+        serde_json::json!({"name": "web_search", "source": "web"})
+    );
+}
+
+#[tokio::test]
+async fn turn_trace_survives_a_timed_out_turn() {
+    let report = traced_turn("hang", Duration::from_secs(1)).await;
+    assert_eq!(report.main.outcome.code(), Some(omp::E_TURN_TIMEOUT));
+    assert_eq!(report.trace.tools, expected_tools());
+    assert!(report.trace.task);
+}
+
 #[tokio::test]
 async fn an_outside_tool_call_makes_later_writes_tool_provenance() {
     use moraebot::memory::MemoryHandle;

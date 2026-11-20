@@ -51,7 +51,7 @@ use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory;
 use crate::persona;
-use crate::store::Store;
+use crate::store::{MAX_TRACE_TOOLS, Store, ToolSource, ToolUse, TurnTrace};
 
 /// The line above the core memory block in the lead's system prompt.
 pub const CORE_MEMORY_OPEN: &str = "<<<moraebot-memory core>>>";
@@ -166,7 +166,7 @@ impl TurnReport {
 
 /// Result of one lead turn: the main row's report (with every file `send_file` queued
 /// during the turn), when a row was steered into it, that row's id and outcome, and the
-/// turn's memory notes ([`TurnContext::memory_notes`]).
+/// turn's memory notes ([`TurnContext::memory_notes`]) and its content-free trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReport {
     pub main: TurnReport,
@@ -174,6 +174,9 @@ pub struct GroupReport {
     /// Shown to the owner whatever the outcome: a `memory_write` to core or boundary is
     /// committed even when the turn fails or is interrupted.
     pub memory_notes: Vec<String>,
+    /// The tools the group started and whether its session settled, for the memory job;
+    /// also present for a failed or timed-out turn.
+    pub trace: TurnTrace,
 }
 
 /// The lead turn that is running: its main row, conversation and the sender of the main
@@ -193,6 +196,11 @@ pub struct TurnContext {
     /// owner sees every standing rule the lead saved: dispatch posts them under the group's
     /// reply, or after its failure notice when it did not reply ([`GroupReport::memory_notes`]).
     pub memory_notes: Vec<String>,
+    /// Distinct tools the lead started in this group (names and sources only), first seen
+    /// first, at most [`MAX_TRACE_TOOLS`]; they become the group's [`TurnTrace`].
+    pub tools: Vec<ToolUse>,
+    /// The group started the `task` tool (a subagent).
+    pub task: bool,
 }
 
 impl TurnContext {
@@ -205,6 +213,8 @@ impl TurnContext {
             steered_row_id: None,
             outside_tools: false,
             memory_notes: Vec::new(),
+            tools: Vec::new(),
+            task: false,
         }
     }
 
@@ -254,21 +264,30 @@ impl ToolStarts {
     }
 }
 
-/// Marks the lead child (`seen`) and its running turn when `event` starts a tool call that
-/// may read outside text.
-fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event: &Event) {
+/// Records a tool call `event` starts: its name and source go into the running turn's
+/// trace (never its arguments), and when it may read outside text the lead child (`seen`)
+/// and the running turn are marked.
+fn note_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event: &Event) {
     let Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::ToolExecutionStart(
         start,
     ))) = event
     else {
         return;
     };
-    if !crate::memory_tools::reads_outside(&start.tool_name, start.args.as_ref()) {
-        return;
+    let source = crate::memory_tools::tool_source(&start.tool_name, start.args.as_ref());
+    let outside = !matches!(source, ToolSource::Fs | ToolSource::Host);
+    if outside {
+        seen.store(true, Ordering::Relaxed);
     }
-    seen.store(true, Ordering::Relaxed);
-    if let Some(turn) = lock(turn).as_mut() {
-        turn.outside_tools = true;
+    let mut turn = lock(turn);
+    let Some(turn) = turn.as_mut() else {
+        return;
+    };
+    turn.outside_tools |= outside;
+    turn.task |= source == ToolSource::Task;
+    let tool = ToolUse::new(&start.tool_name, source);
+    if turn.tools.len() < MAX_TRACE_TOOLS && !turn.tools.contains(&tool) {
+        turn.tools.push(tool);
     }
 }
 
@@ -436,10 +455,11 @@ pub fn stderr_log_path(config: &Config, name: &str) -> PathBuf {
         .join(format!("omp-{}.stderr.log", key_slug(name)))
 }
 
-/// Messenger names: a variable whose name contains one (any case) never reaches omp.
-const MESSENGER_ENV_WORDS: [&str; 2] = ["DISCORD", "SLACK"];
+/// Messenger names and the jev provider's name: a variable whose name contains one (any
+/// case) never reaches omp, so no child gets a messenger token or the jev key.
+const MESSENGER_ENV_WORDS: [&str; 3] = ["DISCORD", "SLACK", "TYPESAFE"];
 
-/// Drops every variable whose name contains a messenger name, and omp's session-folder
+/// Drops every variable whose name contains a messenger or jev name, and omp's session-folder
 /// override; everything else (PATH, HOME, model-provider credentials) is kept so omp
 /// can authenticate.
 fn child_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
@@ -1074,6 +1094,7 @@ impl OmpManager {
                         main: TurnReport::without_files(outcome),
                         steered: None,
                         memory_notes: Vec::new(),
+                        trace: TurnTrace::default(),
                     };
                 }
             }
@@ -1190,9 +1211,9 @@ impl OmpManager {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
         }
-        let memory_notes = lock(&self.turn)
+        let (memory_notes, tools, task) = lock(&self.turn)
             .take()
-            .map(|turn| turn.memory_notes)
+            .map(|turn| (turn.memory_notes, turn.tools, turn.task))
             .unwrap_or_default();
         lock(&self.lead_watch).end();
         self.running.send_replace(None);
@@ -1200,6 +1221,11 @@ impl OmpManager {
             main: report(key, main, files),
             steered,
             memory_notes,
+            trace: TurnTrace {
+                tools,
+                task,
+                settled,
+            },
         }
     }
 
@@ -1373,7 +1399,7 @@ impl OmpManager {
                         // Counted first: whoever sees the turn start also sees its progress.
                         lock(&lead_watch).note(event);
                         note_agent_start(&gate, &running, event);
-                        note_outside_tool(&turn, &seen, event);
+                        note_tool(&turn, &seen, event);
                         note_compaction(&compacted, event);
                         // Last: a host tool waiting on its own start sees every effect above.
                         tool_starts.note(event);
@@ -1685,27 +1711,35 @@ mod tests {
         let turn = Mutex::new(None);
         let seen = AtomicBool::new(false);
         let web = tool_start("web_search", serde_json::json!({"query": "x"}));
-        note_outside_tool(&turn, &seen, &web);
+        note_tool(&turn, &seen, &web);
         assert_eq!(*turn.lock().unwrap(), None, "no turn, nothing to mark");
         assert!(seen.load(Ordering::Relaxed), "the child stays marked");
 
         let seen = AtomicBool::new(false);
         *turn.lock().unwrap() = Some(TurnContext::new(4, "discord:th:1", Sender::Owner));
-        note_outside_tool(&turn, &seen, &agent_event());
-        note_outside_tool(
+        note_tool(&turn, &seen, &agent_event());
+        note_tool(
             &turn,
             &seen,
             &tool_start("grep", serde_json::json!({"pattern": "x"})),
         );
         assert!(!turn.lock().unwrap().as_ref().unwrap().outside_tools);
         assert!(!seen.load(Ordering::Relaxed));
-        note_outside_tool(
+        note_tool(
             &turn,
             &seen,
             &tool_start("bash", serde_json::json!({"command": "gh issue view 39"})),
         );
         let marked = turn.lock().unwrap().clone().unwrap();
         assert!(marked.outside_tools);
+        assert_eq!(
+            marked.tools,
+            [
+                ToolUse::new("grep", ToolSource::Fs),
+                ToolUse::new("bash", ToolSource::Shell)
+            ]
+        );
+        assert!(!marked.task);
         assert!(seen.load(Ordering::Relaxed));
         assert_eq!(marked.group_rows(), [4]);
         let steered = TurnContext {
@@ -2127,6 +2161,33 @@ mod tests {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PATH", "HOME", "PROVIDER_API_KEY"]);
+    }
+
+    #[test]
+    fn typesafe_variables_never_reach_omp_children() {
+        let vars = [
+            ("PATH", "p"),
+            ("TYPESAFE_API_KEY", "jev-secret"),
+            ("my_typesafe_token", "t"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let names: Vec<String> = child_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PATH"]);
+        // The environment of every child and Done check, extra variables included.
+        let names: Vec<String> = check_env(&[("TYPESAFE_API_KEY".into(), "jev-secret".into())])
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_ascii_uppercase().contains("TYPESAFE")),
+            "{names:?}"
+        );
     }
 
     #[test]

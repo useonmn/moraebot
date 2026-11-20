@@ -33,7 +33,8 @@ use moraebot::memory::{Bucket, Day, MemoryHandle, MemoryStore, Redactor};
 use moraebot::omp::{self, E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::store::{
-    Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
+    Admitted, JobKind, JobPayload, LaneJob, LaneStart, LaneState, MemoryJob, OnboardingRow,
+    OnboardingState, State, Store, TurnTrace,
 };
 use moraebot::testing::{Call, FakeAdapter};
 use serde_json::Value;
@@ -4354,4 +4355,175 @@ async fn a_core_save_in_a_replied_turn_follows_the_reply() {
         reply.starts_with("echo: ") && reply.ends_with("\n\n"),
         "{reply:?}"
     );
+}
+
+// --- Memory jobs (P2 stage 1) ---
+
+impl Harness {
+    /// Every pending memory job of `kind`, oldest first.
+    fn memory_jobs(&self, kind: JobKind) -> Vec<MemoryJob> {
+        self.store
+            .lock()
+            .unwrap()
+            .pending_memory_jobs(100)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.kind == kind)
+            .collect()
+    }
+}
+
+fn group_rows(job: &MemoryJob) -> Vec<(i64, String)> {
+    match &job.payload {
+        JobPayload::Group(group) => group
+            .rows
+            .iter()
+            .map(|row| (row.id, row.origin.clone()))
+            .collect(),
+        other => panic!("expected a group job, got {other:?}"),
+    }
+}
+
+fn group_trace(job: &MemoryJob) -> Option<TurnTrace> {
+    match &job.payload {
+        JobPayload::Group(group) => group.trace.clone(),
+        other => panic!("expected a group job, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn memory_job_exists_after_a_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(h.handle(channel_msg("1300000000000002001", "hello")).await);
+    assert!(h.step().await);
+    assert_eq!(h.row(id).state, State::Done);
+    let jobs = h.memory_jobs(JobKind::Group);
+    assert_eq!(jobs.len(), 1);
+    assert!(!jobs[0].partial);
+    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
+    assert!(
+        group_trace(&jobs[0]).is_some(),
+        "a settled turn has its trace"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_job_exists_after_a_failed_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "error");
+    let id = queued(h.handle(channel_msg("1300000000000002002", "hello")).await);
+    assert!(h.step().await);
+    assert_eq!(h.row(id).state, State::Failed);
+    let jobs = h.memory_jobs(JobKind::Group);
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].partial);
+    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
+    assert!(group_trace(&jobs[0]).is_some());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_job_exists_after_a_timed_out_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    let h = Harness::with_lead(dir.path(), config, "hang", false, Vec::new(), |omp| {
+        omp.with_turn_timeout(Duration::from_secs(1))
+    });
+    let id = queued(h.handle(channel_msg("1300000000000002003", "hello")).await);
+    // The step returns once the group is settled, so the row state is final here.
+    assert!(h.step().await);
+    let row = h.row(id);
+    assert_eq!(row.state, State::NeedsCheck);
+    assert_eq!(row.error.as_deref(), Some(omp::E_TURN_TIMEOUT));
+    let jobs = h.memory_jobs(JobKind::Group);
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].partial);
+    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
+    assert!(
+        group_trace(&jobs[0]).is_some(),
+        "a timed-out turn keeps its trace"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_job_exists_after_a_lane_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane("toolu_1", LANE_KEY, "t", None, None, MAX_RUNNING_LANES)
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected a new lane, got {other:?}"),
+    };
+    let input = lead::lane_result(LANE_KEY, lane, &LaneResult::Text("lane done"));
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, &input, LaneState::Idle, None)
+            .unwrap()
+    );
+    let row = h.store.lock().unwrap().count().unwrap();
+    let jobs = h.memory_jobs(JobKind::Lane);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].payload,
+        JobPayload::Lane(LaneJob { row, lane, seq: 1 })
+    );
+    // The lead turn that reads the result is a group of its own.
+    h.drain().await;
+    let groups = h.memory_jobs(JobKind::Group);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(group_rows(&groups[0]), [(row, "lane".to_owned())]);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_job_of_a_lane_result_turn_lists_the_steered_owner_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    // The owner's thread B is conversation `fake:th:222`; the lane reports there.
+    let key = format!("fake:th:{THREAD_B}");
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane("toolu_1", &key, "t", None, None, MAX_RUNNING_LANES)
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected a new lane, got {other:?}"),
+    };
+    let input = lead::lane_result(&key, lane, &LaneResult::Text("lane done"));
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, &input, LaneState::Idle, None)
+            .unwrap()
+    );
+    let lane_row = h.store.lock().unwrap().count().unwrap();
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let owner = steered(
+        h.handle(in_thread("1300000000000002005", THREAD_B, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    assert_eq!(h.row(owner).steered_into, Some(lane_row));
+    let jobs = h.memory_jobs(JobKind::Group);
+    assert_eq!(jobs.len(), 1);
+    assert!(!jobs[0].partial);
+    assert_eq!(
+        group_rows(&jobs[0]),
+        [(lane_row, "lane".to_owned()), (owner, "owner".to_owned())]
+    );
+    h.close().await;
 }
