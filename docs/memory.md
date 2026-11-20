@@ -99,7 +99,7 @@ After a turn, a lane result or a subagent's report, moraebot queues a job in `in
 | A lane's subagent report | a `subagent` reference line | the lane's project, or this conversation |
 | The lead's subagent report | a `subagent` reference line | `projects/_general.md` |
 
-Only your sentences become rules; lane and subagent lines stay reference lines, never sit in the core and expire after 30 days. A lane result is judged once, by its own job, not again by the lead turn that reads it. Subagent reports are found by scanning the session folders of the lead and the lanes for omp 18.22.2's `<task>.md` output files (at most 256 KiB, no symlinks), after a turn and at start, and each file is read once per content.
+Only your sentences become rules; lane and subagent lines stay reference lines, never sit in the core and expire after 30 days. A lane result is judged once, by its own job, not again by the lead turn that reads it. Subagent reports are found by scanning the session folders of the lead and the lanes for omp 18.22.2's `<task>.md` output files (at most 256 KiB, no symlinks), after a turn and at start; a file whose size and modification time are unchanged is not read again, and each content is judged once.
 
 A lane or subagent sentence is dropped before anything is sent when it talks about approval or permission, credentials or tokens, holds a secret moraebot recognizes, a URL, or a shell command (`[memory.filter]` below). Your own sentences are not filtered this way, but a sentence the redactor would change, one shorter than 4 characters, or one longer than an entry may be is never sent and never saved. The same entry is never written twice, and an entry you forgot does not come back when a job is read again. All entries of one pass are one git commit whose message ends in `observed`.
 
@@ -153,7 +153,7 @@ Each filter list replaces its built-in list. A pattern of only ASCII letters, di
 
 ### When jev fails
 
-Nothing is lost: pending jobs wait in `inbox.sqlite`. A busy (408, 429, 5xx) or network error waits 2, 4, 8, 16 seconds, then after five failures in a row tries once every 5 minutes; a `Retry-After` header is honored. A refused key (401, 403) or a request jev rejects (another 4xx) pauses jev until the next restart, so a wrong key or model name never marks your turns as failed. Lane, subagent and scan jobs that wait more than 7 days are dropped; jobs of your own turns never expire. A job that fails three times for another reason (an unreadable row or file) is marked failed and the next one goes on.
+Nothing is lost: pending jobs wait in `inbox.sqlite`. A busy (408, 429, 5xx) or network error waits 2, 4, 8, 16 seconds, then after five failures in a row tries once every 5 minutes; a `Retry-After` header is honored. A refused key (401, 403) or a request jev rejects (another 4xx) pauses jev until the next restart, so a wrong key or model name never marks your turns as failed. Lane, subagent and scan jobs that wait more than 7 days are dropped; jobs of your own turns never expire. A job that fails three times for another reason (an unreadable row or file) is marked failed and the next one goes on; a queued job that can no longer be decoded is marked failed at once.
 
 ### Codes in the memory log
 
@@ -170,7 +170,7 @@ The `memory_log` table of `inbox.sqlite` keeps one row per settled job and per p
 | `W_JEV_BUSY` | jev was busy (408, 429, 5xx); retried later. |
 | `W_JEV_NETWORK` | jev could not be reached; retried later. |
 | `E_JEV_RESPONSE` | jev's answer could not be read; retried later. |
-| `E_OBSERVER_JOB` | A job could not be read (one attempt of three). |
+| `E_OBSERVER_JOB` | A job could not be read (one attempt of three), or could not be decoded at all (`detail` is `unreadable`; failed at once). |
 | `E_OBSERVER_PANIC` | Reading a job crashed (one attempt of three). |
 | `E_OBSERVER_VERBATIM` | A sentence did not match your message when it was saved; it was kept as a guess, not as your words. |
 | `W_MEMORY_WRITE` | One entry could not be written (too long, unusable bucket name). |
