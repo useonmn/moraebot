@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use moraebot::adapter::{AdapterError, E_ADAPTER_START, MessengerAdapter};
+use moraebot::adapter::MessengerAdapter;
+use moraebot::bridge::client::BridgeAdapter;
 use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
 use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
@@ -381,14 +382,8 @@ async fn serve(config: Config, overlay: OverlayCheck) -> Result<(), GatewayError
     let adapter: Arc<dyn MessengerAdapter> = match config.messenger {
         Platform::Discord => Arc::new(DiscordAdapter::from_config(&config)?),
         Platform::Slack => Arc::new(SlackAdapter::from_config(&config)?),
-        // Replaced by `BridgeAdapter::open` once the adapter lands (#40, PR 1).
-        Platform::Bridge => {
-            return Err(AdapterError {
-                code: E_ADAPTER_START,
-                message: "messenger = \"bridge\" is not available in this build yet".into(),
-            }
-            .into());
-        }
+        // Waits up to 10 s for the bridge's hello, else starts from the cached one.
+        Platform::Bridge => Arc::new(BridgeAdapter::open(&config).await?),
     };
     tracing::info!(platform = adapter.platform(), "starting messenger");
     let gateway = Gateway::open(&config, Arc::clone(&adapter))?.with_omp_check(&overlay);
