@@ -8,7 +8,8 @@
 # MORAEBOT_INSTALL_DIR  where the binaries go (default: $HOME/.local/bin)
 # MORAEBOT_DOWNLOAD_BASE  release base URL (default: the GitHub releases page)
 #
-# Exit codes: 0 installed, 1 any failure (nothing is replaced on failure).
+# Exit codes: 0 installed, 1 any failure. Nothing is replaced on failure, except when the
+# last rename fails after the first one worked; the error then names the file replaced.
 set -eu
 
 SUMS="SHA256SUMS.txt"
@@ -134,7 +135,7 @@ main() {
         fail "$E_REPLACE" "could not replace $install_dir/moraebot"
     new=""
     mv -f "$new_bridge" "$install_dir/$BRIDGE" ||
-        fail "$E_REPLACE" "could not replace $install_dir/$BRIDGE"
+        fail "$E_REPLACE" "replaced $install_dir/moraebot, but could not replace $install_dir/$BRIDGE; run the install line again"
     new_bridge=""
 
     printf 'Installed %s to %s\n' "$installed" "$install_dir/moraebot"
@@ -154,11 +155,17 @@ main() {
             ;;
     esac
 
-    if [ -e "${MORAEBOT_HOME:-$HOME/.moraebot}/bin/moraebot" ]; then
-        printf 'A background copy exists: run "moraebot %s" to update it.\n' "$SERVICE"
+    moraebot_home="${MORAEBOT_HOME:-$HOME/.moraebot}"
+    if [ -e "$moraebot_home/bin/moraebot" ]; then
+        # A pre-bridge config makes the install command fail until setup slack moved it.
+        if grep -q '^\[slack\]' "$moraebot_home/config.toml" 2>/dev/null; then
+            printf 'A background copy exists and config.toml still has a [slack] section: run "moraebot setup slack", then "moraebot %s".\n' "$SERVICE"
+        else
+            printf 'A background copy exists: run "moraebot %s" to update it.\n' "$SERVICE"
+        fi
     fi
 
-    if [ ! -e "${MORAEBOT_HOME:-$HOME/.moraebot}/config.toml" ]; then
+    if [ ! -e "$moraebot_home/config.toml" ]; then
         printf 'Next steps:\n  %s init\n  %s check-config\n  %s %s\nThen send the bot a message in its channel or a DM.\n' \
             "$cmd" "$cmd" "$cmd" "$SERVICE"
     fi

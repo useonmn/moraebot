@@ -682,3 +682,24 @@ fn background_copy_hint_names_the_platform_service() {
         assert!(stdout_lines(&output).contains(&hint), "{os}: {output:?}");
     }
 }
+
+#[test]
+fn background_copy_hint_sends_a_legacy_slack_config_to_setup_first() {
+    let sb = Sandbox::new();
+    publish_all(&sb);
+    sb.platform("Linux", "x86_64", "0");
+    let home = sb.root().join("user/.moraebot");
+    fs::create_dir_all(home.join("bin")).expect("create background bin");
+    fs::write(home.join("bin/moraebot"), "").expect("write background copy");
+    fs::write(home.join("config.toml"), "messenger = \"slack\"\n[slack]\n").expect("write config");
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    let hint = "A background copy exists and config.toml still has a [slack] section: \
+                run \"moraebot setup slack\", then \"moraebot install-systemd\".";
+    assert!(
+        stdout_lines(&output).iter().any(|line| line == hint),
+        "{output:?}"
+    );
+}

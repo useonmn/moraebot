@@ -483,7 +483,7 @@ The guides hold the exact settings. Restart moraebot afterwards.
 
 Slack now runs through the bridge. If you use Slack, after the install line:
 
-1. Run `moraebot setup slack`. It finds the old `[slack]` section and moves it without asking: it writes `~/.moraebot/slack-bridge.toml`, saves the old config as `config.toml.pre-bridge`, and writes a `config.toml` with `[bridge]` and no `[slack]`. It runs once. There's no alias: `messenger = "slack"` stays an error.
+1. Run `moraebot setup slack`. It finds the old `[slack]` section and moves it without asking: it writes `~/.moraebot/slack-bridge.toml`, saves the old config as `config.toml.pre-bridge`, and writes a `config.toml` with `[bridge]` and no `[slack]`. It runs once. There's no alias: `messenger = "slack"` stays an error. Do step 2 right after: the background service still running cannot read the moved config, so it fails on its next restart until the new services are installed.
 2. Run the install command it prints, `moraebot install-launchd` or `moraebot install-systemd`. That installs both services.
 3. Update the Slack app from [`slack-manifest.json`](docs/guides/slack-manifest.json) and reinstall it to your workspace. The manifest now asks for `assistant:write` and turns on Slack's agent view. **That switch can't be undone**; read the Agents section of [docs/guides/slack.md](docs/guides/slack.md) first.
 
