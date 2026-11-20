@@ -1491,11 +1491,18 @@ impl LaneManager {
         let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
         let session_dir = omp::lane_session_dir(&self.config, job.id);
-        let memory = memory::lane_block(
-            &self.config.memory_dir(),
-            job.repo.as_deref(),
-            (self.memory_clock)(),
-        );
+        let memory_dir = self.config.memory_dir();
+        let projects = job
+            .repo
+            .as_deref()
+            .map(|repo| memory::lane_projects(&memory_dir, repo))
+            .unwrap_or_default();
+        let memory = memory::lane_block(&memory_dir, &projects, (self.memory_clock)());
+        // Written again before every start: another lane's shell may have edited it.
+        crate::omp_overlay::write_overlay(&self.config.home).map_err(|e| Outcome::Failed {
+            code: crate::omp_overlay::E_OMP_OVERLAY,
+            detail: e.to_string(),
+        })?;
         let command = omp::private_dir(&session_dir)
             .and_then(|()| {
                 omp::child_command(
@@ -1515,9 +1522,14 @@ impl LaneManager {
             None => Vec::new(),
         };
         tools.push(self.lane_report_tool(job, activity));
-        tools.push(crate::memory_tools::search_tool(
-            self.config.memory_dir(),
+        let searchable = [memory::Bucket::Boundaries, memory::Bucket::General]
+            .into_iter()
+            .chain(projects.into_iter().map(memory::Bucket::Project))
+            .collect();
+        tools.push(crate::memory_tools::lane_search_tool(
+            memory_dir,
             Arc::clone(&self.memory_clock),
+            searchable,
         ));
         let OpenedChild {
             client, session_id, ..
