@@ -1251,7 +1251,8 @@ impl Config {
         if let Some(bridge) = &self.bridge {
             checks.push(Check {
                 name: "bridge socket",
-                result: check_socket_path(&bridge.socket),
+                result: crate::bridge::socket::check_path(&bridge.socket)
+                    .map(|()| bridge.socket.display().to_string()),
                 advisory: active != Platform::Bridge,
             });
         }
@@ -1732,27 +1733,6 @@ fn check_bridge_id(name: &str, id: &str) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
-}
-
-/// The bridge socket must be an absolute path that fits a unix socket address
-/// (`sockaddr_un`, about 104 bytes on macOS and 108 on Linux).
-fn check_socket_path(path: &Path) -> Result<String, ConfigError> {
-    if !path.is_absolute() {
-        return Err(ConfigError::new(
-            E_CONFIG_VALUE,
-            format!("bridge.socket {} must be an absolute path", path.display()),
-        ));
-    }
-    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|e| {
-        ConfigError::new(
-            E_CONFIG_VALUE,
-            format!(
-                "bridge.socket {} cannot be a unix socket address ({e}); choose a shorter path",
-                path.display()
-            ),
-        )
-    })?;
-    Ok(path.display().to_string())
 }
 
 /// A Slack id is an uppercase letter or digit string with a kind prefix.
@@ -2807,14 +2787,21 @@ mod tests {
         assert!(check(&checks, "hints").result.is_ok());
         cfg.validate().expect("a valid bridge config passes");
 
+        // The one socket-path checker (`bridge::socket::check_path`) reports
+        // `E_BRIDGE_SOCKET` for a relative path and for one too long for `sockaddr_un`.
         let relative = fx.load(&bridge_toml(&fx, "run/b.sock")).expect("loads");
-        assert_eq!(code(relative.validate()), E_CONFIG_VALUE);
+        assert_eq!(
+            code(check(&relative.checks(), "bridge socket").result.clone()),
+            crate::bridge::E_BRIDGE_SOCKET
+        );
+        assert_eq!(code(relative.validate()), crate::bridge::E_BRIDGE_SOCKET);
         let long = format!("/{}/b.sock", "d".repeat(120));
         let long = fx.load(&bridge_toml(&fx, &long)).expect("loads");
         assert_eq!(
             code(check(&long.checks(), "bridge socket").result.clone()),
-            E_CONFIG_VALUE
+            crate::bridge::E_BRIDGE_SOCKET
         );
+        assert_eq!(code(long.validate()), crate::bridge::E_BRIDGE_SOCKET);
 
         // A bridge section next to an active Discord is advisory only.
         let discord = format!(
