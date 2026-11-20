@@ -125,6 +125,9 @@ fn alive(pid: u32) -> bool {
 fn expected_argv(config: &Config) -> Vec<String> {
     let session = omp::lead_session_dir(config).to_string_lossy().into_owned();
     let work = config.work_dir.to_string_lossy().into_owned();
+    let overlay = moraebot::omp_overlay::overlay_path(&config.home)
+        .to_string_lossy()
+        .into_owned();
     [
         "--mode",
         "rpc",
@@ -133,6 +136,8 @@ fn expected_argv(config: &Config) -> Vec<String> {
         &session,
         "--cwd",
         &work,
+        "--config",
+        &overlay,
         "--approval-mode",
         "yolo",
     ]
@@ -1613,4 +1618,304 @@ async fn turn_timeout_with_steer_kills_lead_before_waiting() {
     assert_eq!(pids.len(), 1);
     assert!(!alive(pids[0]), "the lead child is gone");
     assert_eq!(manager.child_pid().await, None);
+}
+
+fn qa_memory_store(h: &Harness) -> moraebot::memory::MemoryStore {
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    moraebot::memory::MemoryStore::open(
+        &h.config.home,
+        moraebot::memory::Redactor::default(),
+        Arc::new(move || today),
+    )
+    .expect("memory store")
+}
+
+fn qa_note(text: &str, bucket: moraebot::memory::Bucket) -> moraebot::memory::NewEntry {
+    moraebot::memory::NewEntry {
+        text: text.into(),
+        prov: moraebot::memory::Prov::Owner,
+        bucket,
+        src: moraebot::memory::Source::row(1),
+        expires: None,
+        why: None,
+    }
+}
+
+#[tokio::test]
+async fn memory_write_through_the_lead_decides_provenance_in_code() {
+    use moraebot::memory::{Bucket, MemoryHandle, Prov};
+    use moraebot::memory_tools::{MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL};
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let r = owner_row(&h, "m-mw-1", "run-tools. 릴리스는 금요일에 하자");
+    let write = |text: &str, hint: &str| {
+        serde_json::json!({
+            "tool": MEMORY_WRITE_TOOL,
+            "arguments": {"text": text, "bucket_hint": hint, "why": "qa"}
+        })
+    };
+    let search =
+        |arguments: Value| serde_json::json!({"tool": MEMORY_SEARCH_TOOL, "arguments": arguments});
+    let calls = [
+        write("릴리스는 금요일에 하자", "core"),
+        write("릴리스는 금요일", "core"),
+        search(serde_json::json!({"query": "  "})),
+        search(serde_json::json!({"query": "x", "scope": "people"})),
+    ];
+    let lines: Vec<String> = calls.iter().map(Value::to_string).collect();
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", lines.join("\n"))])
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory.clone());
+    let report = bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, "run-tools"),
+    ))
+    .await;
+
+    // The lead's memory tools are exactly these two: nothing deletes, corrects or restores.
+    let names: Vec<String> = h.frames("set_host_tools")[0]["tools"]
+        .as_array()
+        .expect("tool list")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .filter(|n| n.starts_with("memory"))
+        .collect();
+    assert_eq!(names, [MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL]);
+    let results = h.tool_results();
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(results[..2].iter().all(|(error, _)| !error), "{results:?}");
+    for (error, text) in &results[2..] {
+        assert!(*error && text.starts_with("E_MEMORY_ARGS"), "{text}");
+    }
+    let whole: Value = serde_json::from_str(&results[0].1).expect("write json");
+    let part: Value = serde_json::from_str(&results[1].1).expect("write json");
+    assert_eq!(whole["provenance"], "owner");
+    assert_eq!(whole["bucket"], "core/owner");
+    assert_eq!(part["provenance"], "inference");
+    assert_eq!(part["bucket"], format!("thread:{KEY_A}"));
+    assert!(part["note"].is_string(), "{part}");
+    // The worker takes jobs in order, so once a later add is answered both writes are done.
+    let flush = qa_note("flush", Bucket::Thread(KEY_B.into()));
+    bounded(memory.add(flush)).await.expect("flush");
+    let owner = memory
+        .show(whole["id"].as_str().unwrap())
+        .expect("show")
+        .expect("owner entry saved");
+    assert_eq!(owner.bucket, Bucket::Owner);
+    assert_eq!(owner.entry.prov, Prov::Owner);
+    assert_eq!(
+        owner.entry.src.as_deref(),
+        Some(format!("row={r} s=1").as_str())
+    );
+    let guess = memory
+        .show(part["id"].as_str().unwrap())
+        .expect("show")
+        .expect("inference entry saved");
+    assert_eq!(guess.entry.prov, Prov::Inference);
+    assert!(guess.entry.expires.is_some());
+    // The owner sees the standing rule the lead saved, under the reply.
+    let Outcome::Reply(reply) = &report.main.outcome else {
+        panic!("reply: {report:?}");
+    };
+    let id = whole["id"].as_str().unwrap();
+    let note = format!(
+        "\n\n[memory] saved {id} to core/owner: \"릴리스는 금요일에 하자\" (say `forget {id}` if that was not meant)"
+    );
+    assert!(reply.ends_with(&note), "{reply}");
+    assert_eq!(reply.matches("[memory] saved").count(), 1, "{reply}");
+    bounded(m.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn an_outside_tool_call_makes_later_writes_tool_provenance() {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": "rusqlite 0.43 needs Rust 1.89", "bucket_hint": "thread", "why": "qa"}
+    });
+    // omp reports a web search the lead ran, then the lead saves what it read.
+    let web = serde_json::json!({"frame": {
+        "type": "tool_execution_start",
+        "toolCallId": "web-1",
+        "toolName": "web_search",
+        "args": {"query": "rusqlite msrv"}
+    }});
+    let script = [web, write.clone()].map(|v| v.to_string()).join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", script)])
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory.clone());
+    let first = owner_row(&h, "m-out-1", "run-tools");
+    bounded(m.prompt(
+        KEY_A,
+        first,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, first, "run-tools"),
+    ))
+    .await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let saved: Value = serde_json::from_str(&results[0].1).expect("write json");
+    assert_eq!(saved["provenance"], "tool", "{saved}");
+    bounded(m.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn an_owner_row_steered_into_a_lane_result_turn_gives_owner_provenance() {
+    use moraebot::memory::{Bucket, MemoryHandle, Prov};
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    // A lane result row of KEY_STEER, the main row of the turn.
+    let lane_row = {
+        let mut store = h.store.lock().unwrap();
+        store
+            .start_lane("call-1", KEY_STEER, "t", None, None, 3)
+            .expect("lane");
+        assert!(
+            store
+                .finish_lane(
+                    1,
+                    1,
+                    "CI는 cargo test를 돌린다. 끝",
+                    moraebot::store::LaneState::Idle,
+                    None
+                )
+                .expect("finish")
+        );
+        // Row ids count up: the lane result is the newest row.
+        let id = store.count().expect("count");
+        let row = store.get(id).expect("get").expect("lane row");
+        assert_eq!(row.origin, "lane");
+        id
+    };
+    let owner_text = "알았어. 릴리스는 금요일에 하자";
+    let owner = h.admit("m-steer-owner", owner_text);
+    let write = |text: &str, hint: &str| {
+        serde_json::json!({
+            "tool": MEMORY_WRITE_TOOL,
+            "arguments": {"text": text, "bucket_hint": hint, "why": "qa"}
+        })
+        .to_string()
+    };
+    let script = [
+        write("릴리스는 금요일에 하자", "core"),
+        write("CI는 cargo test를 돌린다.", "core"),
+    ]
+    .join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = Arc::new(
+        h.manager("steer")
+            .with_extra_env([
+                ("FAKE_OMP_STEER_CASE", "tools".to_owned()),
+                ("FAKE_OMP_TOOL_CALLS", script),
+            ])
+            .with_memory_clock(Arc::new(move || today))
+            .with_memory(memory.clone()),
+    );
+    let turn = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .prompt(KEY_STEER, lane_row, Sender::Owner, "lane result")
+                .await
+        })
+    };
+    turn_running(&manager, KEY_STEER).await;
+    assert!(manager.try_steer(
+        KEY_STEER,
+        owner,
+        Sender::Owner,
+        &lead::owner_input(KEY_STEER, owner, owner_text),
+        |_| true
+    ));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(codes(&report), (None, Some((owner, None))));
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let owned: Value = serde_json::from_str(&results[0].1).expect("write json");
+    let lane: Value = serde_json::from_str(&results[1].1).expect("write json");
+    assert_eq!(owned["provenance"], "owner", "{owned}");
+    assert_eq!(owned["bucket"], "core/owner");
+    assert_eq!(
+        lane["provenance"], "tool",
+        "a lane row never gives owner: {lane}"
+    );
+    assert_eq!(lane["bucket"], format!("thread:{KEY_STEER}"));
+    let flush = qa_note("flush", Bucket::Thread(KEY_B.into()));
+    bounded(memory.add(flush)).await.expect("flush");
+    let saved = memory
+        .show(owned["id"].as_str().unwrap())
+        .expect("show")
+        .expect("owner entry saved");
+    assert_eq!(saved.entry.prov, Prov::Owner);
+    assert_eq!(
+        saved.entry.src.as_deref(),
+        Some(format!("row={owner} s=1").as_str())
+    );
+    bounded(manager.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn conversation_memory_follows_the_body_once_until_it_changes() {
+    let h = Harness::new();
+    let mut store = qa_memory_store(&h);
+    let thread = moraebot::memory::Bucket::Thread(KEY_A.into());
+    store
+        .add(qa_note("reply in Korean", thread.clone()))
+        .expect("add");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h.manager("ok").with_memory_clock(Arc::new(move || today));
+    let inputs = [
+        lead::owner_input(KEY_A, 1, "first"),
+        lead::owner_input(KEY_A, 2, "second"),
+        lead::owner_input(KEY_B, 3, "other conversation"),
+    ];
+    for (n, input) in inputs.iter().enumerate() {
+        bounded(manager.prompt(
+            if n == 2 { KEY_B } else { KEY_A },
+            n as i64 + 1,
+            Sender::Owner,
+            input,
+        ))
+        .await;
+    }
+    store
+        .add(qa_note("keep PRs small", thread.clone()))
+        .expect("add");
+    let last = lead::owner_input(KEY_A, 4, "third");
+    bounded(manager.prompt(KEY_A, 4, Sender::Owner, &last)).await;
+
+    let messages: Vec<String> = h
+        .frames("prompt")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(messages.len(), 4);
+    let open = omp::thread_memory_open(KEY_A);
+    let (body, block) = messages[0].split_once("\n\n").expect("memory block");
+    assert_eq!(body, inputs[0], "the owner body comes first");
+    assert!(
+        block.starts_with(&open) && block.contains("reply in Korean"),
+        "{block}"
+    );
+    assert_eq!(messages[1], inputs[1], "unchanged memory is not sent again");
+    assert_eq!(messages[2], inputs[2], "KEY_B has no memory");
+    assert!(messages[3].starts_with(&format!("{last}\n\n{open}")));
+    assert!(messages[3].contains("keep PRs small"));
+    bounded(manager.shutdown_all()).await;
 }

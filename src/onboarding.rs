@@ -266,11 +266,7 @@ mod tests {
             Admitted::New(1)
         );
         assert!(store.claim(1).unwrap());
-        let turn = TurnContext {
-            row_id: 1,
-            conversation_key: "p:th:111".into(),
-            sender: Sender::Owner,
-        };
+        let turn = TurnContext::new(1, "p:th:111", Sender::Owner);
         (dir, home, Mutex::new(store), turn)
     }
 
@@ -359,11 +355,7 @@ mod tests {
             assert!(s.finish_lane(1, 1, "r", LaneState::Idle, None).unwrap());
             assert_eq!(s.get(2).unwrap().expect("lane row").origin, "lane");
         }
-        let lane_turn = TurnContext {
-            row_id: 2,
-            conversation_key: "p:th:111".into(),
-            sender: Sender::Owner,
-        };
+        let lane_turn = TurnContext::new(2, "p:th:111", Sender::Owner);
         assert_eq!(
             code(finish(&store, &home, Some(&lane_turn), &done)),
             E_ONBOARDING_ORIGIN

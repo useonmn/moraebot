@@ -12,6 +12,7 @@ use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::memory;
+use moraebot::omp_overlay;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
@@ -213,8 +214,26 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
             return Ok(ExitCode::FAILURE);
         }
     };
-    let all_ok = report_checks(&config.checks(), &mut stdout)?;
-    Ok(if all_ok {
+    let checks_ok = report_checks(&config.checks(), &mut stdout)?;
+    // The same start check `run` makes, so a dry check catches it before a restart.
+    let overlay_ok = match omp_overlay::check(&config.omp_path) {
+        Ok(found) => {
+            match found.warning {
+                Some(warning) => writeln!(stdout, "WARN omp overlay: {warning}")?,
+                None => writeln!(
+                    stdout,
+                    "OK   omp overlay: omp {} knows every overlay setting",
+                    found.version
+                )?,
+            }
+            true
+        }
+        Err(err) => {
+            writeln!(stdout, "FAIL omp overlay: {err}")?;
+            false
+        }
+    };
+    Ok(if checks_ok && overlay_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -332,6 +351,11 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     config.validate()?;
     memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home)?;
+    let overlay = omp_overlay::check(&config.omp_path)?;
+    match &overlay.warning {
+        Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),
+        None => tracing::info!(omp = %overlay.version, "omp memory overlay checked"),
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

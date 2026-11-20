@@ -4047,12 +4047,23 @@ async fn memory_command_mid_turn_is_answered_and_never_steered() {
         .iter()
         .map(|p| p["message"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(bodies, ["A", "B"], "the command never reached omp");
+    // The saved note follows B, the first input after it was saved.
+    let open = format!(
+        "\n\n{}",
+        omp::thread_memory_open(&h.row(a).conversation_key)
+    );
+    let (b_body, b_memory) = bodies[1].split_once(&open).expect("memory after B");
+    assert_eq!(
+        [bodies[0].as_str(), b_body],
+        ["A", "B"],
+        "the command never reached omp"
+    );
+    assert!(b_memory.contains("배포는 금요일에 안 해"), "{b_memory}");
     assert_eq!(
         h.sends(),
         [
             (THREAD_A.to_owned(), reply),
-            (THREAD_A.to_owned(), "echo: A + B".to_owned())
+            (THREAD_A.to_owned(), format!("echo: A + {}", bodies[1]))
         ]
     );
     assert!(!h.step().await, "nothing left to run");
@@ -4139,7 +4150,8 @@ async fn forget_asks_once_and_acts_only_on_the_owners_answer() {
     };
 
     let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
-    let bucket = Bucket::Thread(h.row(saved).conversation_key);
+    let bucket_key = h.row(saved).conversation_key;
+    let bucket = Bucket::Thread(bucket_key.clone());
     let id = memory.entries(&bucket).unwrap()[0].id.clone();
     let reply = |row: i64| h.row(row).reply.expect("reply");
 
@@ -4178,11 +4190,15 @@ async fn forget_asks_once_and_acts_only_on_the_owners_answer() {
         .iter()
         .map(|p| p["message"].as_str().unwrap().to_owned())
         .collect();
+    // The saved note follows the first plain message only: it did not change before the second.
+    let open = format!("\n\n{}", omp::thread_memory_open(&bucket_key));
+    let (first, first_memory) = bodies[0].split_once(&open).expect("memory after it");
     assert_eq!(
-        bodies,
+        [first, bodies[1].as_str()],
         ["오늘 뭐해", "응"],
         "only the plain messages reached omp"
     );
+    assert!(first_memory.contains("회의는 3시"), "{first_memory}");
     h.close().await;
 }
 

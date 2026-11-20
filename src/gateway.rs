@@ -22,6 +22,7 @@ use crate::hints;
 use crate::lead;
 use crate::memory::{self, MemoryError, MemoryExit, MemoryHandle, MemoryStore, Redactor};
 use crate::omp::{OmpManager, lock};
+use crate::omp_overlay;
 use crate::onboarding;
 use crate::store::{Store, StoreError};
 
@@ -88,8 +89,10 @@ impl Gateway {
     /// `E_HINTS_FILE` when unusable). A second gateway on the same home fails here with
     /// `E_ALREADY_RUNNING`. It also opens the memory store under `<home>/memory` (refusing an
     /// old 0.2.0 layout with `E_MEMORY_OLD_LAYOUT`) and starts its writer thread, which
-    /// serves the owner's memory commands; nothing else is started yet.
+    /// serves the owner's memory commands, and writes the omp overlay the lead and lanes run
+    /// with (`E_OMP_OVERLAY` when it cannot); nothing else is started yet.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
+        omp_overlay::write_overlay(&config.home)?;
         let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
@@ -99,7 +102,8 @@ impl Gateway {
             memory::system_clock(),
         )?)?;
         let omp = OmpManager::new(config.clone(), Arc::clone(&store))
-            .with_hints(lead::system_prompt(&guidance, &hints));
+            .with_hints(lead::system_prompt(&guidance, &hints))
+            .with_memory(memory.clone());
         let tools =
             onboarding::host_tools(Arc::clone(&store), config.home.clone(), omp.turn_context());
         let omp = omp.with_host_tools(tools);
