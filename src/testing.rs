@@ -929,7 +929,7 @@ struct FakeJevState {
 }
 
 /// A loopback jev HTTP server. Replies are queued; without one it answers 200 with every
-/// noul 0.0 and every choice "none". Every reply closes its connection.
+/// noul 0.0 and every choice "none" where offered. Every reply closes its connection.
 pub struct FakeJev {
     base_url: String,
     state: Arc<Mutex<FakeJevState>>,
@@ -1013,7 +1013,8 @@ fn jev_reply_body(answers: Value) -> Value {
     })
 }
 
-/// Every noul 0.0 and every choice "none" for the questions of `body`.
+/// Every noul 0.0 and every choice "none" (the first option when "none" is not offered) for
+/// the questions of `body`.
 fn jev_default_answers(body: &Value) -> Value {
     let answers = body
         .get("questions")
@@ -1024,7 +1025,16 @@ fn jev_default_answers(body: &Value) -> Value {
                 .map(|(name, question)| {
                     let answer = match question.get("type").and_then(Value::as_str) {
                         Some("noul") => serde_json::json!({"type": "noul", "noul": 0.0}),
-                        _ => serde_json::json!({"type": "choice", "choice": "none"}),
+                        _ => {
+                            let options = question.get("criteria").and_then(Value::as_object);
+                            let choice = match options {
+                                Some(options) if !options.contains_key("none") => {
+                                    options.keys().next().cloned().unwrap_or_default()
+                                }
+                                _ => "none".to_owned(),
+                            };
+                            serde_json::json!({"type": "choice", "choice": choice})
+                        }
                     };
                     (name.clone(), answer)
                 })

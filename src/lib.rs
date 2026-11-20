@@ -19,6 +19,7 @@ pub mod logging;
 pub mod memory;
 pub mod memory_commands;
 pub mod memory_tools;
+pub mod observer;
 pub mod omp;
 pub mod omp_overlay;
 pub mod onboarding;

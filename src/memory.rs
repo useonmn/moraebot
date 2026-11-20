@@ -651,6 +651,15 @@ impl ExcerptFilter {
         }
     }
 
+    /// The filter of the `[memory.filter]` lists.
+    pub fn from_config(filter: &crate::config::FilterConfig) -> Self {
+        Self::new(
+            filter.approval.clone(),
+            filter.credentials.clone(),
+            filter.commands.clone(),
+        )
+    }
+
     /// `Ok` when `sentence` may be saved, else the first reason it may not.
     pub fn allows(&self, sentence: &str, redactor: &Redactor) -> Result<(), ExcerptDrop> {
         let lower = sentence.to_lowercase();
@@ -2554,6 +2563,16 @@ impl MemoryHandle {
     /// The live, unexpired entries of one bucket, oldest first.
     pub fn entries(&self, bucket: &Bucket) -> Result<Vec<Entry>, MemoryError> {
         entries(&self.root, bucket, (self.clock)())
+    }
+
+    /// The memory folder.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The store's redactor (moraebot's own secrets and the secret patterns).
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     /// The core block for the lead's system prompt, at most `cap` bytes (see [`core_block`]).

@@ -12,7 +12,7 @@ use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::memory;
-use moraebot::omp_overlay;
+use moraebot::omp_overlay::{self, OverlayCheck};
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
@@ -207,13 +207,17 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
         None => env.default_config_path()?,
     };
     let mut stdout = io::stdout().lock();
-    let config = match Config::load(&path, env) {
+    let mut config = match Config::load(&path, env) {
         Ok(config) => config,
         Err(err) => {
             writeln!(stdout, "FAIL config: {err}")?;
             return Ok(ExitCode::FAILURE);
         }
     };
+    config
+        .memory
+        .jev
+        .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
     let checks_ok = report_checks(&config.checks(), &mut stdout)?;
     // The same start check `run` makes, so a dry check catches it before a restart.
     let overlay_ok = match omp_overlay::check(&config.omp_path) {
@@ -347,7 +351,11 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
         Some(path) => path,
         None => env.default_config_path()?,
     };
-    let config = Config::load(&path, env)?;
+    let mut config = Config::load(&path, env)?;
+    config
+        .memory
+        .jev
+        .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
     config.validate()?;
     memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home)?;
@@ -359,7 +367,7 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(serve(config));
+    let result = runtime.block_on(serve(config, overlay));
     // A stuck blocking task must not delay the exit.
     runtime.shutdown_background();
     if let Err(err) = &result {
@@ -369,13 +377,13 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     Ok(ExitCode::SUCCESS)
 }
 
-async fn serve(config: Config) -> Result<(), GatewayError> {
+async fn serve(config: Config, overlay: OverlayCheck) -> Result<(), GatewayError> {
     let adapter: Arc<dyn MessengerAdapter> = match config.messenger {
         Platform::Discord => Arc::new(DiscordAdapter::from_config(&config)?),
         Platform::Slack => Arc::new(SlackAdapter::from_config(&config)?),
     };
     tracing::info!(platform = adapter.platform(), "starting messenger");
-    let gateway = Gateway::open(&config, Arc::clone(&adapter))?;
+    let gateway = Gateway::open(&config, Arc::clone(&adapter))?.with_omp_check(&overlay);
 
     let mut terminate = signal(SignalKind::terminate()).map_err(GatewayError::Signal)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(GatewayError::Signal)?;

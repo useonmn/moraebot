@@ -1370,6 +1370,7 @@ impl OmpManager {
                 Arc::clone(&self.store),
                 Arc::clone(&self.turn),
                 Arc::clone(&self.tool_starts),
+                memory::ExcerptFilter::from_config(&self.config.memory.filter),
             ));
         }
         let turn = Arc::clone(&self.turn);

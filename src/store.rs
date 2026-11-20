@@ -501,6 +501,14 @@ pub struct LogRow {
     pub detail: Option<String>,
 }
 
+/// A line for the owner about an owner sentence the observer saved to `core/`, shown under
+/// the next reply in `conversation_key` ([`Store::settle_memory_jobs`], [`Store::finish_group`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNotice {
+    pub conversation_key: String,
+    pub text: String,
+}
+
 /// Pending memory jobs ([`Store::memory_backlog`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Backlog {
@@ -603,6 +611,12 @@ CREATE TABLE IF NOT EXISTS memory_cursor(
     sha256 TEXT NOT NULL,
     seen_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS memory_notices(
+    id INTEGER PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 ";
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
@@ -662,6 +676,33 @@ fn insert_job(
         ),
         params![payload.kind().as_str(), key, partial, json],
     )? != 0)
+}
+
+/// `reply` with the observer's pending notices of row `row_id`'s conversation appended (one
+/// line each, after a blank line), and those notices deleted, in the caller's transaction:
+/// the stored reply carries them, so a restart resends them with it.
+fn with_notices(tx: &Transaction, row_id: i64, reply: &str) -> rusqlite::Result<String> {
+    let notices: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "DELETE FROM memory_notices
+             WHERE conversation_key = (SELECT conversation_key FROM inbox WHERE id = ?1)
+             RETURNING id, text",
+        )?;
+        let mut rows: Vec<(i64, String)> = stmt
+            .query_map([row_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows.sort_by_key(|(id, _)| *id);
+        rows.into_iter().map(|(_, text)| text).collect()
+    };
+    if notices.is_empty() {
+        return Ok(reply.to_owned());
+    }
+    let notes = notices.join("\n");
+    Ok(if reply.is_empty() {
+        notes
+    } else {
+        format!("{reply}\n\n{notes}")
+    })
 }
 
 /// Inserts the `group` job for `ids` (main row first), keyed by the main row. Origins are
@@ -883,12 +924,24 @@ impl Store {
             .collect()
     }
 
-    /// Moves each job out of `pending` (payload cleared) and writes its log row, in one
-    /// transaction. A job that is no longer pending is left as it is and gets no row.
-    pub fn settle_memory_jobs(&mut self, settled: &[Settled], now: i64) -> Result<(), StoreError> {
+    /// Moves each job out of `pending` (payload cleared) and writes its log row, and stores
+    /// `notices` for the next reply in their conversations, in one transaction. A job that is
+    /// no longer pending is left as it is and gets no row.
+    pub fn settle_memory_jobs(
+        &mut self,
+        settled: &[Settled],
+        notices: &[MemoryNotice],
+        now: i64,
+    ) -> Result<(), StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for notice in notices {
+            tx.execute(
+                "INSERT INTO memory_notices(conversation_key, text, created_at) VALUES (?1, ?2, ?3)",
+                params![notice.conversation_key, notice.text, now],
+            )?;
+        }
         for job in settled {
             let changed = tx.execute(
                 "UPDATE memory_jobs SET state = ?2, payload = NULL, updated_at = ?3
@@ -1398,6 +1451,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reply = with_notices(&tx, main_id, reply)?;
         let changed = tx.execute(
             &format!(
                 "UPDATE inbox SET reply = ?2, out_files = ?3, state = 'reply_pending', error = NULL, updated_at = {NOW} WHERE id = ?1"
@@ -1428,8 +1482,12 @@ impl Store {
     /// Stores the memory store's answer to an owner memory command on `id`
     /// (`reply_pending`, as [`Store::save_reply`]) and marks the row `memory_answered`, so
     /// it is never counted as an onboarding turn.
-    pub fn finish_memory(&self, id: i64, reply: &str) -> Result<(), StoreError> {
-        let changed = self.conn.execute(
+    pub fn finish_memory(&mut self, id: i64, reply: &str) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reply = with_notices(&tx, id, reply)?;
+        let changed = tx.execute(
             &format!(
                 "UPDATE inbox SET reply = ?2, out_files = NULL, state = 'reply_pending', error = NULL, memory_answered = 1, updated_at = {NOW} WHERE id = ?1"
             ),
@@ -1438,7 +1496,22 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::Invalid("no such inbox row"));
         }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The observer's notices still waiting for a reply in `conversation_key`, oldest first.
+    pub fn pending_memory_notices(
+        &self,
+        conversation_key: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text FROM memory_notices WHERE conversation_key = ?1 ORDER BY id")?;
+        let texts = stmt
+            .query_map([conversation_key], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(texts)
     }
 
     /// Marks every row of a turn group `failed` with `code`, in one transaction that also
@@ -3780,6 +3853,7 @@ mod tests {
                 jev_model: Some("jev-1".into()),
                 detail: Some("kind=subagent saved=0".into()),
             }],
+            &[],
             1000,
         )
         .unwrap();
@@ -3868,5 +3942,65 @@ mod tests {
                 .is_err()
         );
         assert_eq!(onboarding_rows(&s), 0);
+    }
+
+    #[test]
+    fn memory_notices_go_under_the_next_reply_once_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sqlite");
+        let notice = |key: &str, text: &str| MemoryNotice {
+            conversation_key: key.into(),
+            text: text.into(),
+        };
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.settle_memory_jobs(
+                &[],
+                &[
+                    notice("k:a", "[memory] saved m-1 to core/owner"),
+                    notice("k:b", "[memory] saved m-2 to core/boundaries"),
+                    notice("k:a", "[memory] saved m-3 to core/boundaries"),
+                ],
+                100,
+            )
+            .unwrap();
+        }
+        // A restart keeps them.
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.pending_memory_notices("k:a").unwrap().len(), 2);
+        let admit = |s: &mut Store, mid: &str, key: &str| match s
+            .admit("discord", mid, key, "ch", "111", "hi")
+            .unwrap()
+        {
+            Admitted::New(id) => id,
+            Admitted::Duplicate => panic!("new row"),
+        };
+        let a1 = admit(&mut s, "m1", "k:a");
+        s.finish_group(a1, "the reply", None, None, &TurnTrace::default())
+            .unwrap();
+        assert_eq!(
+            s.get(a1).unwrap().unwrap().reply.as_deref(),
+            Some(
+                "the reply\n\n[memory] saved m-1 to core/owner\n[memory] saved m-3 to core/boundaries"
+            )
+        );
+        // Only once, and only in their own conversation.
+        let a2 = admit(&mut s, "m2", "k:a");
+        s.finish_memory(a2, "Remembered").unwrap();
+        assert_eq!(
+            s.get(a2).unwrap().unwrap().reply.as_deref(),
+            Some("Remembered")
+        );
+        assert_eq!(
+            s.pending_memory_notices("k:b").unwrap(),
+            ["[memory] saved m-2 to core/boundaries"]
+        );
+        let b = admit(&mut s, "m3", "k:b");
+        s.finish_memory(b, "Shown").unwrap();
+        assert_eq!(
+            s.get(b).unwrap().unwrap().reply.as_deref(),
+            Some("Shown\n\n[memory] saved m-2 to core/boundaries")
+        );
+        assert!(s.pending_memory_notices("k:b").unwrap().is_empty());
     }
 }
