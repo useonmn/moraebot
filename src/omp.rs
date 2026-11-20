@@ -281,6 +281,7 @@ fn turn_settled(turn: &Result<PromptTurn, RpcError>) -> bool {
 /// Exact omp argv (without the program) for one child. Non-empty `hints` become one
 /// `--append-system-prompt=<hints>` element; message text never goes into argv. `cwd` is
 /// the work folder for the lead and for a lane without a repo, else the lane's worktree.
+/// `--config <home>/omp-overlay.yml` turns omp's own memory off ([`crate::omp_overlay`]).
 pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
@@ -289,6 +290,8 @@ pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) ->
     args.push(session_dir.into());
     args.push("--cwd".into());
     args.push(cwd.into());
+    args.push("--config".into());
+    args.push(crate::omp_overlay::overlay_path(&config.home).into());
     args.push("--approval-mode".into());
     args.push("yolo".into());
     if !hints.is_empty() {

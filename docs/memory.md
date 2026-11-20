@@ -46,6 +46,15 @@ When the core changes (always-remember, correct, forget, restore), the lead rest
 
 Conversation and project entries are saved but not shown to the lead yet; that comes in the next part of #39.
 
+## omp's own memory is off
+
+The lead and every lane run omp with `--config ~/.moraebot/omp-overlay.yml`, which sets only `memory.backend: "off"` and `autolearn.enabled: false`. omp merges that file key by key over your own omp settings, so your models and providers stay as they are, but omp's memory (mnemopi, hindsight, local, ...) does not run inside moraebot and does not mix with the memory of your terminal omp. moraebot writes the file each time it starts; edits to it are overwritten.
+
+moraebot can't read the settings omp finally uses, so at start `moraebot run` asks omp two things without calling a model:
+
+- `omp config get <key> --json` for both keys. If omp doesn't know one (a newer omp renamed it), the overlay would be silently ignored, so moraebot refuses to start with `E_OMP_OVERLAY`. Update moraebot.
+- `omp --version`. If it isn't the version the overlay was checked against (18.22.2), the log gets a `W_OMP_VERSION` warning and moraebot starts anyway.
+
 ## Coming from 0.2.0
 
 The 0.2.0 memory used the same folder with a different layout. moraebot does not delete or convert it. If it finds `memory/system`, `memory/reference`, `memory/notes`, `memory/people`, `memory/skills` or `omp/config-overlay.yml` in the home, it refuses to start and prints one line ending in the `rm -rf ...` command for exactly those paths. Check them, run it, and start again. The 0.2.0 memory tables in `inbox.sqlite` are not used.

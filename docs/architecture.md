@@ -424,15 +424,17 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **저장소.** `inbox.sqlite`의 `onboarding` 표에는 줄이 많아야 하나입니다(`state`는 `active`/`done`/`skipped`, `after_row`는 시작 때의 마지막 줄 번호). 예전 데이터베이스도 그대로 열립니다.
 
-### 3.10 omp 자체 기억 (light)
+### 3.10 기억
 
-moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memory-full` 브랜치에 남아 있습니다.
+moraebot은 자기 기억 저장소(`~/.moraebot/memory`, git)를 둡니다. lead와 lane에서는 omp 자체 기억을 끕니다(`--config <home>/omp-overlay.yml`: `memory.backend: "off"`, `autolearn.enabled: false`). 오너 터미널의 omp 기억과 섞이지 않게 하기 위해서입니다(결정 L-D10 변경, 2026-11-20). 자세한 내용은 docs/memory.md에 있습니다.
 
-**주인 설정을 따름.** lead와 lane은 v0.1.0처럼 주인의 omp 설정을 그대로 읽습니다. moraebot은 설정 덮어쓰기 파일도, 기억 관련 환경변수도 넘기지 않습니다. 그래서 주인 터미널의 omp와 같은 기억 저장소를 씁니다(결정 L-D10).
+**오버레이는 키 단위로 합쳐집니다.** omp는 `--config` 파일을 오너의 전역·프로젝트 설정 위에 키 단위로 합칩니다(우선순위: 실행 중 덮어쓰기 > `--config` > 프로젝트 > 전역). 그래서 오버레이는 두 키만 바꾸고, 오너의 모델과 provider 설정은 그대로 씁니다. omp 18.22.2의 `packages/coding-agent/src/config/settings.ts`(`#mergeOwnLayers`, `getProvenance`)에서 확인했습니다. RPC 모드가 기억을 기본 `off`로 두더라도 오너가 전역 설정에서 켜 두면(예: `memory.backend: mnemopi`) 켜지므로 오버레이가 필요합니다.
 
-**RPC 모드의 기본값.** moraebot은 omp를 늘 `--mode rpc`로 띄웁니다. 이 모드에서 omp는 `memory.backend`를 기본값 `off`로 둡니다. 주인이 omp 설정이나 환경변수에 직접 켜 둔 경우에만 기억이 동작합니다. 그러니 moraebot 안에서 omp 기억을 쓰려면 omp 쪽 설정에서 켜고 moraebot을 다시 켭니다.
+**시작할 때 확인.** omp가 실제로 적용한 설정은 moraebot이 읽을 수 없습니다. `omp config`는 `--config` 오버레이를 읽지 않고, RPC `get_state`에는 설정이 없습니다. 그래서 `moraebot run`은 시작할 때 모델을 부르지 않고 두 가지를 확인합니다(#39 대안).
+- `omp config get <key> --json`으로 오버레이의 두 키를 omp가 아는지 봅니다. 모르면(omp가 키 이름을 바꾼 경우) 오버레이가 조용히 무시되어 omp 기억이 되살아나므로 `E_OMP_OVERLAY`로 시작을 거부합니다.
+- `omp --version`이 합치기를 확인한 버전(`omp_overlay::CHECKED_OMP_VERSION`, 지금 18.22.2)과 다르면 `W_OMP_VERSION` 경고를 로그에 남깁니다. 시작은 합니다.
 
-**저장소를 나누지 않는 까닭.** 저장소를 나누는 설정이 기억 방식마다 다릅니다. hindsight는 `hindsight.bankId`(환경변수 `HINDSIGHT_BANK_ID`), mnemopi는 설정 파일의 `mnemopi.bank`/`mnemopi.dbPath`뿐이고, local은 omp의 agent 폴더를 통째로 바꾸는 방법(로그인 정보까지 옮겨짐)밖에 없습니다. 하나로 모두 나눌 수 없고, 나누려면 moraebot이 주인의 기억 설정을 다시 건드려야 합니다. hindsight와 mnemopi는 기본이 "프로젝트별"이라, moraebot에서 생긴 기억은 작업 폴더 이름 아래에 모입니다.
+오버레이 파일은 gateway가 열 때마다 새로 씁니다(손으로 고쳐도 덮어씁니다). 이름이 0.2.0의 `omp/config-overlay.yml`과 다르므로 아래 옛 배치 검사와 겹치지 않습니다.
 
 **0.2.0에서 올라올 때.** 새 기억 저장소(#39, docs/memory.md)가 `~/.moraebot/memory/`를 씁니다. 옛 배치(`memory/system` 등, `omp/config-overlay.yml`)가 남아 있으면 moraebot은 시작을 거부하고 지울 경로와 `rm -rf` 명령을 한 줄로 알려 줍니다. 코드가 지우지는 않습니다. 데이터베이스의 옛 기억 표는 쓰지 않습니다.
 

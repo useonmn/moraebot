@@ -368,6 +368,11 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
     assert_eq!(starts.len(), 1);
     let argv = start_argv(&lines[starts[0]]);
     assert!(session_dir_arg(&lines[starts[0]]).ends_with("/lanes/1/session"));
+    let overlay = argv.iter().position(|a| a == "--config").expect("--config");
+    assert_eq!(
+        Path::new(&argv[overlay + 1]),
+        moraebot::omp_overlay::overlay_path(&h.config.home)
+    );
     assert!(
         !argv.iter().any(|a| a.starts_with("--append-system-prompt")),
         "{argv:?}"

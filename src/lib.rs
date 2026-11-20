@@ -18,6 +18,7 @@ pub mod logging;
 pub mod memory;
 pub mod memory_commands;
 pub mod omp;
+pub mod omp_overlay;
 pub mod onboarding;
 pub mod persona;
 pub mod secret;

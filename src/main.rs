@@ -12,6 +12,7 @@ use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::memory;
+use moraebot::omp_overlay;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
@@ -332,6 +333,11 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     config.validate()?;
     memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home)?;
+    let overlay = omp_overlay::check(&config.omp_path)?;
+    match &overlay.warning {
+        Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),
+        None => tracing::info!(omp = %overlay.version, "omp memory overlay checked"),
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

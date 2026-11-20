@@ -125,6 +125,9 @@ fn alive(pid: u32) -> bool {
 fn expected_argv(config: &Config) -> Vec<String> {
     let session = omp::lead_session_dir(config).to_string_lossy().into_owned();
     let work = config.work_dir.to_string_lossy().into_owned();
+    let overlay = moraebot::omp_overlay::overlay_path(&config.home)
+        .to_string_lossy()
+        .into_owned();
     [
         "--mode",
         "rpc",
@@ -133,6 +136,8 @@ fn expected_argv(config: &Config) -> Vec<String> {
         &session,
         "--cwd",
         &work,
+        "--config",
+        &overlay,
         "--approval-mode",
         "yolo",
     ]

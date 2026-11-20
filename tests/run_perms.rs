@@ -15,9 +15,13 @@ fn moraebot(home: &Path) -> Command {
     cmd
 }
 
+/// Answers the start check of `moraebot run` (`omp_overlay::check`) like omp 18.22.2.
 fn fake_executable(dir: &Path) -> PathBuf {
     let path = dir.join("omp-stand-in");
-    fs::write(&path, "#!/bin/sh\n").expect("write executable");
+    let script = "#!/bin/sh\n\
+                  if [ \"$1\" = --version ]; then echo omp/18.22.2; exit 0; fi\n\
+                  printf '{\"key\": \"%s\"}\\n' \"$3\"\n";
+    fs::write(&path, script).expect("write executable");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
     path
 }
