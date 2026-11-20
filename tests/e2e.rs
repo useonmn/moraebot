@@ -184,6 +184,7 @@ impl Rig {
             }),
             slack: None,
             omp: OmpConfig::default(),
+            memory: moraebot::config::MemoryConfig::default(),
         };
         Self {
             _dir: dir,

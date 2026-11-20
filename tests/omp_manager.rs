@@ -49,6 +49,7 @@ impl Harness {
             }),
             slack: None,
             omp,
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");
         for (n, key) in [KEY_A, KEY_B].into_iter().enumerate() {

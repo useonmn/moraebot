@@ -1877,6 +1877,7 @@ mod tests {
             }),
             slack: None,
             omp: OmpConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");
         let started = store
@@ -2010,6 +2011,7 @@ mod tests {
             }),
             slack: None,
             omp: OmpConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
         Arc::new(LaneManager::new(

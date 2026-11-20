@@ -1793,6 +1793,7 @@ mod tests {
                 turn_timeout_minutes,
                 ..OmpConfig::default()
             },
+            memory: crate::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
         let manager = OmpManager::new(config, Arc::new(Mutex::new(store)));

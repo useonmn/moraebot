@@ -256,6 +256,10 @@ impl OmpConfig {
     }
 }
 
+/// Memory settings. Only the defaults exist so far; the jev and filter sections come later.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryConfig {}
+
 #[derive(Clone)]
 pub struct Config {
     pub messenger: Platform,
@@ -266,6 +270,7 @@ pub struct Config {
     pub home: PathBuf,
     pub access_mode: AccessMode,
     pub omp: OmpConfig,
+    pub memory: MemoryConfig,
 }
 
 impl fmt::Debug for Config {
@@ -496,6 +501,7 @@ impl Config {
                 max_cost_usd: omp.max_cost_usd,
                 stall_after_minutes: omp.stall_after_minutes,
             },
+            memory: MemoryConfig::default(),
         })
     }
 

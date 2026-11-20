@@ -75,6 +75,7 @@ fn test_config(root: &Path, omp_path: PathBuf) -> Config {
         }),
         slack: None,
         omp: OmpConfig::default(),
+        memory: moraebot::config::MemoryConfig::default(),
     }
 }
 

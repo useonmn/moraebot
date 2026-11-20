@@ -57,6 +57,7 @@ impl Harness {
             }),
             slack: None,
             omp: OmpConfig::default(),
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
         Self {

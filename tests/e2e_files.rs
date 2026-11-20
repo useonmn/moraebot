@@ -195,6 +195,7 @@ impl Rig {
             discord,
             slack,
             omp: OmpConfig::default(),
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let tap = LogTap::create(&root.join("fake-omp.log"));
         Self {
