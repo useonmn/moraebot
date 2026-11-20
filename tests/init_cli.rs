@@ -413,6 +413,15 @@ fn setup_prints_manifest_link_that_decodes_to_manifest() {
     )
     .expect("manifest JSON");
     assert_eq!(printed, file);
+
+    let description = printed["features"]["agent_view"]["agent_description"]
+        .as_str()
+        .expect("agent_description");
+    assert!((1..=300).contains(&description.chars().count()));
+    let scopes = printed["oauth_config"]["scopes"]["bot"]
+        .as_array()
+        .expect("bot scopes");
+    assert!(scopes.iter().any(|scope| scope == "assistant:write"));
 }
 
 #[test]
