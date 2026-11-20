@@ -27,10 +27,11 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -51,7 +52,7 @@ use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory;
 use crate::persona;
-use crate::store::Store;
+use crate::store::{MAX_TRACE_TOOLS, Store, ToolSource, ToolUse, TurnTrace};
 
 /// The line above the core memory block in the lead's system prompt.
 pub const CORE_MEMORY_OPEN: &str = "<<<moraebot-memory core>>>";
@@ -166,7 +167,7 @@ impl TurnReport {
 
 /// Result of one lead turn: the main row's report (with every file `send_file` queued
 /// during the turn), when a row was steered into it, that row's id and outcome, and the
-/// turn's memory notes ([`TurnContext::memory_notes`]).
+/// turn's memory notes ([`TurnContext::memory_notes`]) and its content-free trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReport {
     pub main: TurnReport,
@@ -174,6 +175,9 @@ pub struct GroupReport {
     /// Shown to the owner whatever the outcome: a `memory_write` to core or boundary is
     /// committed even when the turn fails or is interrupted.
     pub memory_notes: Vec<String>,
+    /// The tools the group started and whether its session settled, for the memory job;
+    /// also present for a failed or timed-out turn.
+    pub trace: TurnTrace,
 }
 
 /// The lead turn that is running: its main row, conversation and the sender of the main
@@ -193,6 +197,11 @@ pub struct TurnContext {
     /// owner sees every standing rule the lead saved: dispatch posts them under the group's
     /// reply, or after its failure notice when it did not reply ([`GroupReport::memory_notes`]).
     pub memory_notes: Vec<String>,
+    /// Distinct tools the lead started in this group (names and sources only), first seen
+    /// first, at most [`MAX_TRACE_TOOLS`]; they become the group's [`TurnTrace`].
+    pub tools: Vec<ToolUse>,
+    /// The group started the `task` tool (a subagent).
+    pub task: bool,
 }
 
 impl TurnContext {
@@ -205,6 +214,8 @@ impl TurnContext {
             steered_row_id: None,
             outside_tools: false,
             memory_notes: Vec::new(),
+            tools: Vec::new(),
+            task: false,
         }
     }
 
@@ -254,21 +265,30 @@ impl ToolStarts {
     }
 }
 
-/// Marks the lead child (`seen`) and its running turn when `event` starts a tool call that
-/// may read outside text.
-fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event: &Event) {
+/// Records a tool call `event` starts: its name and source go into the running turn's
+/// trace (never its arguments), and when it may read outside text the lead child (`seen`)
+/// and the running turn are marked.
+fn note_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event: &Event) {
     let Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::ToolExecutionStart(
         start,
     ))) = event
     else {
         return;
     };
-    if !crate::memory_tools::reads_outside(&start.tool_name, start.args.as_ref()) {
-        return;
+    let source = crate::memory_tools::tool_source(&start.tool_name, start.args.as_ref());
+    let outside = !matches!(source, ToolSource::Fs | ToolSource::Host);
+    if outside {
+        seen.store(true, Ordering::Relaxed);
     }
-    seen.store(true, Ordering::Relaxed);
-    if let Some(turn) = lock(turn).as_mut() {
-        turn.outside_tools = true;
+    let mut turn = lock(turn);
+    let Some(turn) = turn.as_mut() else {
+        return;
+    };
+    turn.outside_tools |= outside;
+    turn.task |= source == ToolSource::Task;
+    let tool = ToolUse::new(&start.tool_name, source);
+    if turn.tools.len() < MAX_TRACE_TOOLS && !turn.tools.contains(&tool) {
+        turn.tools.push(tool);
     }
 }
 
@@ -373,13 +393,19 @@ fn turn_settled(turn: &Result<PromptTurn, RpcError>) -> bool {
         .is_none_or(|r| r.session_settled)
 }
 
-/// Exact omp argv (without the program) for one child. Non-empty `hints` become one
-/// `--append-system-prompt=<hints>` element; message text never goes into argv, but the hints
-/// carry the lead's core memory and a lane's memory block, so they are visible in the
-/// process list to other local users of this machine and count against `ARG_MAX`. `cwd` is
-/// the work folder for the lead and for a lane without a repo, else the lane's worktree.
-/// `--config <home>/omp-overlay.yml` turns omp's own memory off ([`crate::omp_overlay`]).
-pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) -> Vec<OsString> {
+/// Exact omp argv (without the program) for one child. `append` is the private file
+/// [`write_append_file`] wrote; it becomes one `--append-system-prompt=<absolute path>`
+/// element, so the lead's core memory and a lane's memory block never appear in the process
+/// list (omp 18.22.2 reads a one-line value as a file, once, at start). Message text never
+/// goes into argv either. `cwd` is the work folder for the lead and for a lane without a
+/// repo, else the lane's worktree. `--config <home>/omp-overlay.yml` turns omp's own memory
+/// off ([`crate::omp_overlay`]).
+pub fn omp_args(
+    config: &Config,
+    cwd: &Path,
+    session_dir: &Path,
+    append: Option<&Path>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
@@ -391,8 +417,10 @@ pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) ->
     args.push(crate::omp_overlay::overlay_path(&config.home).into());
     args.push("--approval-mode".into());
     args.push("yolo".into());
-    if !hints.is_empty() {
-        args.push(format!("--append-system-prompt={hints}").into());
+    if let Some(path) = append {
+        let mut arg = OsString::from("--append-system-prompt=");
+        arg.push(path);
+        args.push(arg);
     }
     if let Some(usd) = config.omp.max_cost_usd {
         args.push("--max-cost".into());
@@ -428,6 +456,70 @@ pub fn lane_session_dir(config: &Config, lane_id: i64) -> PathBuf {
         .join("session")
 }
 
+/// `<home>/lead/append.md`: the lead's appended system prompt.
+pub fn lead_append_path(config: &Config) -> PathBuf {
+    config.home.join("lead").join("append.md")
+}
+
+/// `<home>/lanes/<id>/append.md`: a lane's appended system prompt.
+pub fn lane_append_path(config: &Config, lane_id: i64) -> PathBuf {
+    config
+        .home
+        .join("lanes")
+        .join(lane_id.to_string())
+        .join("append.md")
+}
+
+/// Numbers the temp files of [`write_append_file`] within this process.
+static APPEND_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Writes a child's appended system prompt `text` to `path` (mode `0o600`, parent `0o700`)
+/// through a temp file that is synced and renamed over it, and returns the absolute path for
+/// [`omp_args`]. Empty `text` removes an earlier file (it may hold memory text the owner has
+/// since forgotten) and returns `None` (no argument). A path with a
+/// line break is refused: omp reads such a value as literal text, not as a file. Written
+/// before every start; a running child never reads it again.
+pub fn write_append_file(path: &Path, text: &str) -> std::io::Result<Option<PathBuf>> {
+    if text.is_empty() {
+        return match std::fs::remove_file(path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(None),
+        };
+    }
+    let path = std::path::absolute(path)?;
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\n' | b'\r'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} holds a line break", path.display()),
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        private_dir(dir)?;
+    }
+    let n = APPEND_TMP.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("md.{}.{n}.tmp", std::process::id()));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, &path));
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(Some(path))
+}
+
 /// `<home>/logs/omp-<name>.stderr.log`; `name` is `lead::LEAD_SESSION` or `lane-<id>`.
 pub fn stderr_log_path(config: &Config, name: &str) -> PathBuf {
     config
@@ -436,10 +528,11 @@ pub fn stderr_log_path(config: &Config, name: &str) -> PathBuf {
         .join(format!("omp-{}.stderr.log", key_slug(name)))
 }
 
-/// Messenger names: a variable whose name contains one (any case) never reaches omp.
-const MESSENGER_ENV_WORDS: [&str; 2] = ["DISCORD", "SLACK"];
+/// Messenger names and the jev provider's name: a variable whose name contains one (any
+/// case) never reaches omp, so no child gets a messenger token or the jev key.
+const MESSENGER_ENV_WORDS: [&str; 3] = ["DISCORD", "SLACK", "TYPESAFE"];
 
-/// Drops every variable whose name contains a messenger name, and omp's session-folder
+/// Drops every variable whose name contains a messenger or jev name, and omp's session-folder
 /// override; everything else (PATH, HOME, model-provider credentials) is kept so omp
 /// can authenticate.
 fn child_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
@@ -1077,6 +1170,7 @@ impl OmpManager {
                         main: TurnReport::without_files(outcome),
                         steered: None,
                         memory_notes: Vec::new(),
+                        trace: TurnTrace::default(),
                     };
                 }
             }
@@ -1194,9 +1288,9 @@ impl OmpManager {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
         }
-        let memory_notes = lock(&self.turn)
+        let (memory_notes, tools, task) = lock(&self.turn)
             .take()
-            .map(|turn| turn.memory_notes)
+            .map(|turn| (turn.memory_notes, turn.tools, turn.task))
             .unwrap_or_default();
         lock(&self.lead_watch).end();
         self.running.send_replace(None);
@@ -1204,6 +1298,11 @@ impl OmpManager {
             main: report(key, main, files),
             steered,
             memory_notes,
+            trace: TurnTrace {
+                tools,
+                task,
+                settled,
+            },
         }
     }
 
@@ -1317,10 +1416,16 @@ impl OmpManager {
         crate::omp_overlay::write_overlay(&self.config.home)
             .map_err(|e| Outcome::failed(crate::omp_overlay::E_OMP_OVERLAY, e))?;
         let command = private_dir(&session_dir)
-            .and_then(|()| {
+            .and_then(|()| write_append_file(&lead_append_path(&self.config), &append))
+            .and_then(|append_file| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &self.config.work_dir, &session_dir, &append),
+                    omp_args(
+                        &self.config,
+                        &self.config.work_dir,
+                        &session_dir,
+                        append_file.as_deref(),
+                    ),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )
@@ -1348,6 +1453,7 @@ impl OmpManager {
                 Arc::clone(&self.store),
                 Arc::clone(&self.turn),
                 Arc::clone(&self.tool_starts),
+                memory::ExcerptFilter::from_config(&self.config.memory.filter),
             ));
         }
         let turn = Arc::clone(&self.turn);
@@ -1377,7 +1483,7 @@ impl OmpManager {
                         // Counted first: whoever sees the turn start also sees its progress.
                         lock(&lead_watch).note(event);
                         note_agent_start(&gate, &running, event);
-                        note_outside_tool(&turn, &seen, event);
+                        note_tool(&turn, &seen, event);
                         note_compaction(&compacted, event);
                         // Last: a host tool waiting on its own start sees every effect above.
                         tool_starts.note(event);
@@ -1697,27 +1803,35 @@ mod tests {
         let turn = Mutex::new(None);
         let seen = AtomicBool::new(false);
         let web = tool_start("web_search", serde_json::json!({"query": "x"}));
-        note_outside_tool(&turn, &seen, &web);
+        note_tool(&turn, &seen, &web);
         assert_eq!(*turn.lock().unwrap(), None, "no turn, nothing to mark");
         assert!(seen.load(Ordering::Relaxed), "the child stays marked");
 
         let seen = AtomicBool::new(false);
         *turn.lock().unwrap() = Some(TurnContext::new(4, "discord:th:1", Sender::Owner));
-        note_outside_tool(&turn, &seen, &agent_event());
-        note_outside_tool(
+        note_tool(&turn, &seen, &agent_event());
+        note_tool(
             &turn,
             &seen,
             &tool_start("grep", serde_json::json!({"pattern": "x"})),
         );
         assert!(!turn.lock().unwrap().as_ref().unwrap().outside_tools);
         assert!(!seen.load(Ordering::Relaxed));
-        note_outside_tool(
+        note_tool(
             &turn,
             &seen,
             &tool_start("bash", serde_json::json!({"command": "gh issue view 39"})),
         );
         let marked = turn.lock().unwrap().clone().unwrap();
         assert!(marked.outside_tools);
+        assert_eq!(
+            marked.tools,
+            [
+                ToolUse::new("grep", ToolSource::Fs),
+                ToolUse::new("bash", ToolSource::Shell)
+            ]
+        );
+        assert!(!marked.task);
         assert!(seen.load(Ordering::Relaxed));
         assert_eq!(marked.group_rows(), [4]);
         let steered = TurnContext {
@@ -1805,6 +1919,7 @@ mod tests {
                 turn_timeout_minutes,
                 ..OmpConfig::default()
             },
+            memory: crate::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
         let manager = OmpManager::new(config, Arc::new(Mutex::new(store)));
@@ -2141,16 +2256,63 @@ mod tests {
     }
 
     #[test]
+    fn typesafe_variables_never_reach_omp_children() {
+        let vars = [
+            ("PATH", "p"),
+            ("TYPESAFE_API_KEY", "jev-secret"),
+            ("my_typesafe_token", "t"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let names: Vec<String> = child_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PATH"]);
+        // The environment of every child and Done check, extra variables included.
+        let names: Vec<String> = check_env(&[("TYPESAFE_API_KEY".into(), "jev-secret".into())])
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_ascii_uppercase().contains("TYPESAFE")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_prompt_removes_the_earlier_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lanes").join("1").join("append.md");
+        assert_eq!(
+            write_append_file(&path, "never force-push").expect("write"),
+            Some(path.clone())
+        );
+        assert!(path.exists());
+        assert_eq!(write_append_file(&path, "").expect("empty"), None);
+        assert!(
+            !path.exists(),
+            "a forgotten entry does not stay in the file"
+        );
+        assert_eq!(write_append_file(&path, "").expect("again"), None);
+    }
+
+    #[test]
     fn check_env_drops_messenger_names() {
-        let names: Vec<String> =
-            check_env(&[("SLACK_X".into(), "1".into()), ("OTHER".into(), "1".into())])
-                .into_iter()
-                .map(|(k, _)| k.to_string_lossy().into_owned())
-                .collect();
+        let names: Vec<String> = check_env(&[
+            ("SLACK_X".into(), "1".into()),
+            ("TYPESAFE_API_KEY".into(), "1".into()),
+            ("OTHER".into(), "1".into()),
+        ])
+        .into_iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
         assert!(names.iter().any(|name| name == "OTHER"));
         assert!(!names.iter().any(|name| {
             let name = name.to_ascii_uppercase();
-            name.contains("SLACK") || name.contains("DISCORD")
+            name.contains("SLACK") || name.contains("DISCORD") || name.contains("TYPESAFE")
         }));
     }
 

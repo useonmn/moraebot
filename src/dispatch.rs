@@ -103,10 +103,13 @@ use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
 use crate::memory::MemoryHandle;
 use crate::memory_commands::{self, Command};
+use crate::observer::Observer;
 use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug, lock};
+use crate::omp_overlay::{OverlayCheck, W_OMP_VERSION};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
 pub use crate::store::E_DISPATCH_HELD;
 use crate::store::{Admitted, InboxRow, State, Store, StoreError};
+use crate::store::{LogLevel, LogRow};
 
 /// Empty message without attachments, or `/` message: not forwarded to omp.
 pub const N_UNSUPPORTED_INPUT: &str = "N_UNSUPPORTED_INPUT";
@@ -134,6 +137,9 @@ pub const N_LANE_INTERRUPTED: &str = "N_LANE_INTERRUPTED";
 pub const N_ONBOARDING_HELLO: &str = "N_ONBOARDING_HELLO";
 /// The running lead turn showed no progress for `omp.stall_after_minutes`; it keeps running.
 pub const N_TURN_STALLED: &str = "N_TURN_STALLED";
+/// omp is not the version moraebot's memory settings were checked against; sent to the owner
+/// once per omp version.
+pub const N_OMP_VERSION: &str = "N_OMP_VERSION";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -180,6 +186,10 @@ pub fn notice_text(code: &str) -> &'static str {
             "Hi! I'm your moraebot agent, and this is our first chat. When you reply, I'll ask \
              what to call me, how I should talk to you, and a little about you. Reply skip if \
              you'd rather not."
+        }
+        N_OMP_VERSION => {
+            "The installed omp is not the version moraebot's memory settings were checked \
+             against. Run `moraebot check-config` for the details."
         }
         _ => "Something went wrong.",
     }
@@ -374,6 +384,11 @@ pub struct Dispatcher {
     memory: Option<MemoryHandle>,
     /// The id each conversation was last asked to confirm forgetting.
     forget_asked: Mutex<HashMap<String, String>>,
+    /// The memory observer: its jev classifies plain-language memory requests the rules did
+    /// not match, and its state heads the memory listing. Without it only the rules run.
+    observer: Option<Arc<Observer>>,
+    /// What the start check found about omp; a warning is sent to the owner once per version.
+    omp_check: Option<OverlayCheck>,
 }
 
 impl Dispatcher {
@@ -401,12 +416,28 @@ impl Dispatcher {
             talk: Mutex::default(),
             memory: None,
             forget_asked: Mutex::default(),
+            observer: None,
+            omp_check: None,
         }
     }
 
     /// Turns on the owner memory commands, served by `memory`.
     pub fn with_memory(mut self, memory: MemoryHandle) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Lets `observer`'s jev classify memory requests the rules did not match, and shows its
+    /// state in the memory listing.
+    pub fn with_observer(mut self, observer: Arc<Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// What the start check found about omp: [`Self::startup`] tells the owner about a version
+    /// warning once per omp version.
+    pub fn with_omp_check(mut self, check: OverlayCheck) -> Self {
+        self.omp_check = Some(check);
         self
     }
 
@@ -421,7 +452,8 @@ impl Dispatcher {
     /// replies are re-sent. A row cut off by a crash and one marked by a graceful shutdown
     /// are treated the same. A lane a restart interrupted gets one notice in its
     /// conversation. The memory notes of a turn that did not reply and were not delivered
-    /// yet are posted. Last, an onboarding request gets its one greeting.
+    /// yet are posted. Then an onboarding request gets its one greeting, and last an omp
+    /// version warning is sent once per version ([`N_OMP_VERSION`]).
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
         self.post_needs_check_notices().await?;
@@ -453,7 +485,40 @@ impl Dispatcher {
         for row in recovered.reply_pending {
             self.send_reply(row.id).await?;
         }
-        self.greet_if_requested().await
+        self.greet_if_requested().await?;
+        self.tell_omp_version().await
+    }
+
+    /// Sends [`N_OMP_VERSION`] when the start check warned and no `W_OMP_VERSION` log row
+    /// names this omp version: in the owner's DM, or in the configured channel when the DM
+    /// fails. The log row is written only after a send, so a notice that reached nobody is
+    /// tried again at the next start. Log rows are pruned after 30 days, so a lasting mismatch
+    /// is mentioned at most once a month.
+    async fn tell_omp_version(&self) -> Result<(), StoreError> {
+        let Some(check) = self.omp_check.as_ref().filter(|c| c.warning.is_some()) else {
+            return Ok(());
+        };
+        if self.store().memory_logged(W_OMP_VERSION, &check.version)? {
+            return Ok(());
+        }
+        let sent = self.notify_in_dm(N_OMP_VERSION).await
+            || self.notify(&self.channel_id, N_OMP_VERSION).await;
+        if !sent {
+            tracing::warn!(omp = %check.version, "omp version notice not sent");
+            return Ok(());
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.store().memory_log(&LogRow {
+            at,
+            level: LogLevel::Warn,
+            code: W_OMP_VERSION,
+            job_id: None,
+            omp_version: Some(check.version.clone()),
+            jev_model: None,
+            detail: Some(check.version.clone()),
+        })
     }
 
     /// Starts the onboarding and posts [`N_ONBOARDING_HELLO`] once when a request file is
@@ -490,10 +555,15 @@ impl Dispatcher {
 
     /// Opens the owner's DM and sends the greeting there; false when either step fails.
     async fn greet_in_dm(&self) -> bool {
+        self.notify_in_dm(N_ONBOARDING_HELLO).await
+    }
+
+    /// Opens the owner's DM and sends notice `code` there; false when either step fails.
+    async fn notify_in_dm(&self, code: &'static str) -> bool {
         match self.adapter.open_dm(&self.owner_id).await {
-            Ok(target) => self.notify(&target, N_ONBOARDING_HELLO).await,
+            Ok(target) => self.notify(&target, code).await,
             Err(err) => {
-                tracing::warn!(code = err.code, "owner DM not opened for the greeting");
+                tracing::warn!(code = err.code, notice = code, "owner DM not opened");
                 false
             }
         }
@@ -966,7 +1036,9 @@ impl Dispatcher {
     /// `queued` and is claimed first (a row the worker took meanwhile is left to it), and any
     /// other message drops the forget question. The worker passes `arrival = false` for its
     /// already claimed row: it never answers a forget question, because the row may predate
-    /// it. Returns `None` when the row is not for the memory store.
+    /// it. A message the rules do not match is asked of jev ([`memory_commands::classify`])
+    /// on `arrival` only, so one row costs at most one jev call. Returns `None` when the row is
+    /// not for the memory store.
     async fn memory_command(
         &self,
         id: i64,
@@ -987,6 +1059,11 @@ impl Dispatcher {
                 memory_commands::confirmation(text).map(|yes| MemoryAct::Confirm(target, yes))
             })
             .or_else(|| memory_commands::parse(text).map(MemoryAct::Run));
+        let act = match act {
+            Some(act) => Some(act),
+            None if arrival => self.classify(text).await.map(MemoryAct::Run),
+            None => None,
+        };
         let Some(act) = act else {
             if arrival {
                 lock(&self.forget_asked).remove(key);
@@ -1003,7 +1080,12 @@ impl Dispatcher {
         let reply = match act {
             MemoryAct::Confirm(target, yes) => memory_commands::forget(memory, &target, yes).await,
             MemoryAct::Run(command) => {
-                let answer = memory_commands::run(memory, key, id, command).await;
+                let status = self
+                    .observer
+                    .as_ref()
+                    .map(|observer| observer.status_line())
+                    .unwrap_or_default();
+                let answer = memory_commands::run(memory, key, id, &status, command).await;
                 if let Some(target) = answer.confirm_forget {
                     lock(&self.forget_asked).insert(key.to_owned(), target);
                 }
@@ -1014,6 +1096,16 @@ impl Dispatcher {
         self.store().finish_memory(id, &reply)?;
         self.send_reply(id).await?;
         Ok(Some(Handled::Memory(id)))
+    }
+
+    /// jev's reading of an owner message the rules did not match, when an observer is attached
+    /// and the message holds memory words or an entry id.
+    async fn classify(&self, text: &str) -> Option<Command> {
+        let observer = self.observer.as_ref()?;
+        if !memory_commands::looks_like_memory_request(text) {
+            return None;
+        }
+        memory_commands::classify(observer.jev(), observer.redactor(), text).await
     }
 
     /// Stores the outcome of a lead turn and its steered row, if any: one reply on the
@@ -1031,6 +1123,7 @@ impl Dispatcher {
             main,
             steered,
             memory_notes,
+            trace,
         } = group;
         let notes = memory_notes.join("\n");
         let steered_id = steered.as_ref().map(|(id, _)| *id);
@@ -1045,7 +1138,7 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn interrupted");
-            self.store().interrupt_group(&ids, code, &notes)?;
+            self.store().interrupt_group(&ids, code, &notes, &trace)?;
             self.post_needs_check_notices().await?;
             self.send_notes(main_id).await?;
             return Ok(());
@@ -1055,7 +1148,7 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn failed");
-            self.store().fail_group(&ids, code, &notes)?;
+            self.store().fail_group(&ids, code, &notes, &trace)?;
             let notice = if code == E_COST_CAP {
                 N_COST_CAP
             } else {
@@ -1074,7 +1167,7 @@ impl Dispatcher {
         );
         let out_files = out_files_json(main.files);
         self.store()
-            .finish_group(main_id, &reply, out_files.as_deref(), steered_id)?;
+            .finish_group(main_id, &reply, out_files.as_deref(), steered_id, &trace)?;
         self.send_reply(main_id).await?;
         Ok(())
     }

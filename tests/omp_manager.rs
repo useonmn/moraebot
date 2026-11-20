@@ -12,6 +12,7 @@ use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
 use moraebot::onboarding;
 use moraebot::persona;
 use moraebot::store::{Admitted, OnboardingRow, OnboardingState, Store};
+use moraebot::testing::appended;
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -49,6 +50,7 @@ impl Harness {
             }),
             slack: None,
             omp,
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");
         for (n, key) in [KEY_A, KEY_B].into_iter().enumerate() {
@@ -240,9 +242,78 @@ async fn flag_present_when_hints_set() {
         .find(|l| l.starts_with("START pid="))
         .unwrap();
     let mut expected = expected_argv(&h.config);
-    expected.extend(["--append-system-prompt=probe hints", "--max-cost", "2.5"].map(str::to_owned));
+    let flag = format!(
+        "--append-system-prompt={}",
+        omp::lead_append_path(&h.config).display()
+    );
+    expected.extend([flag, "--max-cost".to_owned(), "2.5".to_owned()]);
     assert_eq!(start_argv(&start), expected);
+    assert_eq!(appended(&start), "probe hints");
     manager.shutdown_all().await;
+}
+
+/// The lead's hints, persona and core memory reach omp as a private file: argv names the file
+/// and holds none of the text, the file is the owner's only (`0600`, folder `0700`), and omp
+/// read exactly the appended prompt from it at start.
+#[tokio::test]
+async fn lead_prompt_is_passed_as_a_private_file() {
+    let h = Harness::new();
+    save_sora(&h);
+    let mut store = qa_memory_store(&h);
+    store
+        .add(qa_note(
+            "Answer in Korean always",
+            moraebot::memory::Bucket::Owner,
+        ))
+        .expect("core rule");
+    drop(store);
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("ok")
+        .with_hints("probe hints".into())
+        .with_memory_clock(Arc::new(move || today));
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
+    bounded(manager.shutdown_all()).await;
+
+    let path = omp::lead_append_path(&h.config);
+    assert!(path.is_absolute());
+    let argv = start_argv(&start);
+    let flags: Vec<&String> = argv
+        .iter()
+        .filter(|a| a.starts_with("--append-system-prompt"))
+        .collect();
+    assert_eq!(
+        flags,
+        [&format!("--append-system-prompt={}", path.display())]
+    );
+    for secret in [
+        "probe hints",
+        "Name: Sora",
+        "Answer in Korean",
+        omp::CORE_MEMORY_OPEN,
+    ] {
+        assert!(
+            !start.split_once(" argv=").unwrap().1.contains(secret),
+            "{secret} in argv"
+        );
+    }
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("probe hints"), "{text}");
+    assert!(text.contains("Name: Sora"), "{text}");
+    let core = text
+        .split_once(omp::CORE_MEMORY_OPEN)
+        .expect("core memory block")
+        .1;
+    assert!(core.contains("Answer in Korean always"), "{core}");
+    assert_eq!(appended(&start), text, "omp read the file at start");
 }
 
 #[tokio::test]
@@ -263,17 +334,13 @@ async fn no_flag_when_hints_empty() {
     manager.shutdown_all().await;
 }
 
-/// Per `START` line in log order, its `--append-system-prompt=` argv elements.
-fn appends(h: &Harness) -> Vec<Vec<String>> {
+/// Per `START` line in log order, the appended system prompt that child read at start (empty
+/// when it had none).
+fn appends(h: &Harness) -> Vec<String> {
     h.log_lines()
         .iter()
         .filter(|l| l.starts_with("START pid="))
-        .map(|l| {
-            start_argv(l)
-                .into_iter()
-                .filter(|a| a.starts_with("--append-system-prompt="))
-                .collect()
-        })
+        .map(|l| appended(l))
         .collect()
 }
 
@@ -294,13 +361,10 @@ async fn lead_appends_persona_after_hints() {
     let manager = h.manager("ok").with_hints("H".into());
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let loaded = persona::load(&h.config.home).unwrap();
-    let expected = format!(
-        "--append-system-prompt={}",
-        persona::append("H", loaded.as_deref())
-    );
+    let expected = persona::append("H", loaded.as_deref());
     let appends = appends(&h);
-    assert_eq!(appends, vec![vec![expected]]);
-    assert!(appends[0][0].contains("Name: Sora"));
+    assert_eq!(appends, vec![expected]);
+    assert!(appends[0].contains("Name: Sora"));
     bounded(manager.shutdown_all()).await;
 }
 
@@ -353,8 +417,8 @@ async fn persona_change_restarts_the_lead_before_the_next_turn() {
         assert_eq!(argv, &expected_argv(&h.config));
     }
     assert_eq!(appends.len(), 2);
-    let first = appends[0].concat();
-    let second = appends[1].concat();
+    let first = &appends[0];
+    let second = &appends[1];
     assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
     assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
 }
@@ -378,10 +442,7 @@ async fn unchanged_persona_keeps_the_lead() {
 async fn removed_persona_restarts_without_it() {
     let h = Harness::new();
     save_sora(&h);
-    let first = format!(
-        "--append-system-prompt={}",
-        persona::append("H", persona::load(&h.config.home).unwrap().as_deref())
-    );
+    let first = persona::append("H", persona::load(&h.config.home).unwrap().as_deref());
     let m = h.manager("ok").with_hints("H".into());
     bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     std::fs::remove_file(persona::path(&h.config.home)).unwrap();
@@ -389,10 +450,7 @@ async fn removed_persona_restarts_without_it() {
     let appends = appends(&h);
     bounded(m.shutdown_all()).await;
 
-    assert_eq!(
-        appends,
-        vec![vec![first], vec!["--append-system-prompt=H".to_owned()]]
-    );
+    assert_eq!(appends, vec![first, "H".to_owned()]);
 }
 
 #[tokio::test]
@@ -414,8 +472,8 @@ async fn refused_persona_change_restarts_without_it() {
     bounded(m.shutdown_all()).await;
 
     assert_eq!(appends.len(), 2);
-    assert!(appends[0][0].contains("Name: Sora"));
-    assert_eq!(appends[1], vec!["--append-system-prompt=H".to_owned()]);
+    assert!(appends[0].contains("Name: Sora"));
+    assert_eq!(appends[1], "H");
     assert_eq!(code, persona::E_PERSONA_SECRET);
 }
 
@@ -448,8 +506,8 @@ async fn onboarding_finish_applies_from_the_next_turn() {
 
     assert_eq!(after_first, 1);
     assert_eq!(pids.len(), 2);
-    assert!(!appends[0].concat().contains("Name: Sora"));
-    assert!(appends[1].concat().contains("Name: Sora"));
+    assert!(!appends[0].contains("Name: Sora"));
+    assert!(appends[1].contains("Name: Sora"));
     assert_eq!(tools.len(), 2);
     for frame in &tools {
         let names: Vec<&str> = frame["tools"]
@@ -492,8 +550,8 @@ async fn unsettled_session_defers_the_restart_until_settled() {
     assert_eq!(after_second, 1);
     assert_eq!(pids.len(), 2);
     assert_eq!(appends.len(), 2);
-    let first = appends[0].concat();
-    let second = appends[1].concat();
+    let first = &appends[0];
+    let second = &appends[1];
     assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
     assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
 }
@@ -536,7 +594,7 @@ async fn failed_restart_reports_the_start_failure_then_starts_again() {
     assert_eq!(r3, Outcome::Reply("echo: more".into()));
     assert_eq!(pids.len(), 2);
     assert_eq!(appends.len(), 2);
-    assert!(appends[1].concat().contains("Name: Kai"));
+    assert!(appends[1].contains("Name: Kai"));
 }
 
 #[tokio::test]
@@ -550,10 +608,7 @@ async fn refused_persona_is_left_out() {
     .unwrap();
     let manager = h.manager("ok").with_hints("H".into());
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
-    assert_eq!(
-        appends(&h),
-        vec![vec!["--append-system-prompt=H".to_owned()]]
-    );
+    assert_eq!(appends(&h), vec!["H".to_owned()]);
     assert_eq!(
         persona::load(&h.config.home).unwrap_err().code,
         persona::E_PERSONA_SECRET
@@ -1798,6 +1853,108 @@ async fn a_core_save_is_reported_when_the_turn_needs_check() {
         report.memory_notes,
         [core_owner_note(&id, "릴리스는 금요일에 하자")]
     );
+}
+
+const TRACE_SENTINEL: &str = "TRACE_SENTINEL_41d9";
+
+/// Runs one owner turn of KEY_A in which omp reports a `web_search` and a `task` call (both
+/// with [`TRACE_SENTINEL`] in their arguments) and the lead then calls `memory_write`, whose
+/// handler waits until the event drain applied its own start, so every earlier frame is
+/// applied before the turn can end. The turn ends as FAKE_OMP_TOOLS_END=`end` says.
+async fn traced_turn(end: &str, timeout: Duration) -> GroupReport {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let start = |id: &str, name: &str, args: Value| {
+        serde_json::json!({"frame": {
+            "type": "tool_execution_start",
+            "toolCallId": id,
+            "toolName": name,
+            "args": args
+        }})
+        .to_string()
+    };
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": "rusqlite 0.43 needs Rust 1.89", "bucket_hint": "thread", "why": "qa"}
+    })
+    .to_string();
+    let script = [
+        start(
+            "web-1",
+            "web_search",
+            serde_json::json!({"query": TRACE_SENTINEL}),
+        ),
+        start(
+            "task-1",
+            "task",
+            serde_json::json!({"prompt": TRACE_SENTINEL}),
+        ),
+        start("web-2", "web_search", serde_json::json!({"query": "again"})),
+        write,
+    ]
+    .join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([
+            ("FAKE_OMP_TOOL_CALLS", script),
+            ("FAKE_OMP_TOOLS_END", end.to_owned()),
+        ])
+        .with_turn_timeout(timeout)
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory);
+    let row = owner_row(&h, "m-trace-1", "run-tools");
+    let report = bounded(m.prompt(
+        KEY_A,
+        row,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, row, "run-tools"),
+    ))
+    .await;
+    assert_eq!(h.tool_results().len(), 1, "the write ran");
+    bounded(m.shutdown_all()).await;
+    report
+}
+
+fn expected_tools() -> Vec<moraebot::store::ToolUse> {
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+    use moraebot::store::{ToolSource, ToolUse};
+    vec![
+        ToolUse::new("web_search", ToolSource::Web),
+        ToolUse::new("task", ToolSource::Task),
+        ToolUse::new(MEMORY_WRITE_TOOL, ToolSource::Host),
+    ]
+}
+
+#[tokio::test]
+async fn turn_trace_lists_tool_names_and_sources_without_arguments() {
+    let report = traced_turn("", Duration::from_secs(30)).await;
+    assert_eq!(report.main.outcome.code(), None, "{report:?}");
+    assert_eq!(
+        report.trace.tools,
+        expected_tools(),
+        "distinct, first seen first"
+    );
+    assert!(report.trace.task);
+    let json = serde_json::to_string(&report.trace).expect("trace json");
+    assert!(!json.contains(TRACE_SENTINEL), "{json}");
+    assert!(!format!("{:?}", report.trace).contains(TRACE_SENTINEL));
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["tools"][0],
+        serde_json::json!({"name": "web_search", "source": "web"})
+    );
+}
+
+#[tokio::test]
+async fn turn_trace_survives_a_timed_out_turn() {
+    let report = traced_turn("hang", Duration::from_secs(1)).await;
+    assert_eq!(report.main.outcome.code(), Some(omp::E_TURN_TIMEOUT));
+    assert_eq!(report.trace.tools, expected_tools());
+    assert!(report.trace.task);
 }
 
 #[tokio::test]

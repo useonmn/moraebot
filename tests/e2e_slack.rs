@@ -17,7 +17,7 @@ use moraebot::lead;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::{DEFAULT_HINTS, SlackAdapter, escape_text};
 use moraebot::store::{State, Store};
-use moraebot::testing::{FakeSlackSession, FakeSlackTransport};
+use moraebot::testing::{FakeSlackSession, FakeSlackTransport, appended};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -106,11 +106,12 @@ impl LogTap {
     }
 
     /// The argv of every fake-omp start, as logged.
-    fn argvs(&self) -> Vec<Vec<String>> {
+    /// The `START` lines, in log order.
+    fn starts(&self) -> Vec<&str> {
         self.seen
             .iter()
-            .filter_map(|line| line.split_once(" argv="))
-            .map(|(_, argv)| serde_json::from_str(argv).expect("argv is JSON"))
+            .filter(|line| line.starts_with("START pid="))
+            .map(String::as_str)
             .collect()
     }
 }
@@ -174,6 +175,7 @@ impl Rig {
                 access: Default::default(),
             }),
             omp: OmpConfig::default(),
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let tap = LogTap::create(&root.join("fake-omp.log"));
         Self {
@@ -289,12 +291,9 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
     assert_eq!(rig.row_state(2), State::Done);
     rig.tap.wait_for_prompts(2).await;
     assert_eq!(rig.tap.pids().len(), 1, "one omp child serves the thread");
-    let hints_flag = format!(
-        "--append-system-prompt={}",
-        lead::system_prompt(lead::DEFAULT_GUIDANCE, DEFAULT_HINTS)
-    );
-    assert!(
-        rig.tap.argvs()[0].contains(&hints_flag),
+    assert_eq!(
+        appended(rig.tap.starts()[0]),
+        lead::system_prompt(lead::DEFAULT_GUIDANCE, DEFAULT_HINTS),
         "omp gets the Slack default hints"
     );
     rig.assert_no_child_left();

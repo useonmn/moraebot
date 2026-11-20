@@ -208,6 +208,33 @@ fn check_config_fails_on_loose_token_mode() {
     assert!(String::from_utf8_lossy(&check.stdout).contains("E_TOKEN_MODE"));
 }
 
+/// moraedang on #46: `check-config` never prints a jev key written into `config.toml`.
+#[test]
+fn check_config_never_prints_a_key_written_into_the_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    assert!(run_init(&home, &input).status.success());
+    let config = home.join("config.toml");
+    let mut text = fs::read_to_string(&config).expect("config.toml");
+    text.push_str("\n[memory.jev]\napi_key = \"JEV_KEY_SENTINEL_5a0c\"\n");
+    fs::write(&config, text).expect("write config");
+
+    let check = moraebot(&home)
+        .arg("check-config")
+        .output()
+        .expect("check-config");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert_eq!(check.status.code(), Some(1), "{out}");
+    assert!(out.contains("E_CONFIG_PARSE"), "{out}");
+    assert!(!out.contains("JEV_KEY_SENTINEL_5a0c"), "{out}");
+}
+
 #[test]
 fn unknown_subcommand_exits_2() {
     let tmp = tempfile::tempdir().expect("tempdir");

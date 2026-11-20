@@ -25,7 +25,7 @@ use moraebot::onboarding::{self, GreetTarget};
 use moraebot::persona;
 use moraebot::slack::SlackAdapter;
 use moraebot::store::{LaneState, OnboardingRow, OnboardingState, State, Store};
-use moraebot::testing::{Call, FakeAdapter, FakeSlackTransport};
+use moraebot::testing::{Call, FakeAdapter, FakeSlackTransport, appended};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -132,7 +132,8 @@ impl LogTap {
             .iter()
             .filter_map(|line| line.strip_prefix("START pid="))
             .map(|rest| {
-                let (pid, argv) = rest.split_once(" argv=").expect("argv");
+                let pid = rest.split_whitespace().next().expect("pid");
+                let (_, argv) = rest.split_once(" argv=").expect("argv");
                 let argv: Vec<String> = serde_json::from_str(argv).expect("argv is JSON");
                 let is_lane = argv.iter().any(|arg| arg.contains("/lanes/"));
                 (pid.parse().expect("pid"), is_lane)
@@ -301,6 +302,7 @@ impl Rig {
             discord,
             slack,
             omp: OmpConfig::default(),
+            memory: moraebot::config::MemoryConfig::default(),
         };
         let tap = LogTap::create(&root.join("fake-omp.log"));
         Self {
@@ -1073,21 +1075,17 @@ async fn shutdown_during_a_check_leaves_no_process_and_the_next_run_posts_one_no
     rig.tap.assert_no_child_left();
 }
 
-/// The `--append-system-prompt=` elements of each lead (non-lane) start, in log order.
-fn lead_appends(tap: &LogTap) -> Vec<Vec<String>> {
+/// The appended system prompt each lead (non-lane) start read, in log order.
+fn lead_appends(tap: &LogTap) -> Vec<String> {
     tap.seen
         .iter()
-        .filter_map(|line| line.strip_prefix("START pid="))
-        .map(|rest| {
-            let (_, argv) = rest.split_once(" argv=").expect("argv");
-            serde_json::from_str::<Vec<String>>(argv).expect("argv is JSON")
+        .filter(|line| line.starts_with("START pid="))
+        .filter(|line| {
+            let (_, argv) = line.split_once(" argv=").expect("argv");
+            let argv: Vec<String> = serde_json::from_str(argv).expect("argv is JSON");
+            !argv.iter().any(|arg| arg.contains("/lanes/"))
         })
-        .filter(|argv| !argv.iter().any(|arg| arg.contains("/lanes/")))
-        .map(|argv| {
-            argv.into_iter()
-                .filter(|arg| arg.starts_with("--append-system-prompt="))
-                .collect()
-        })
+        .map(|line| appended(line))
         .collect()
 }
 
@@ -1197,12 +1195,8 @@ async fn onboarding_through_the_gateway() {
     );
     let appends = lead_appends(&rig.tap);
     assert_eq!(appends.len(), 3);
-    assert!(!appends[0].concat().contains("Name: Sora"));
-    assert!(
-        appends[1..]
-            .iter()
-            .all(|a| a.concat().contains("Name: Sora"))
-    );
+    assert!(!appends[0].contains("Name: Sora"));
+    assert!(appends[1..].iter().all(|a| a.contains("Name: Sora")));
     assert_eq!(
         std::fs::read_to_string(persona::path(&rig.config.home)).expect("persona file"),
         persona::render("Sora", "short and warm", "Owner 111 likes short replies").unwrap()

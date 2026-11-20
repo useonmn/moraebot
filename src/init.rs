@@ -169,6 +169,7 @@ fn assemble(
         home: env.default_home()?,
         access_mode: AccessMode::OwnerOnly,
         omp: OmpConfig::default(),
+        memory: crate::config::MemoryConfig::default(),
     })
 }
 

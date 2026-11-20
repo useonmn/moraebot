@@ -5,7 +5,10 @@
 //! contains `/lanes/`, FAKE_OMP_LANE_MODE (default `ok`) is used instead, so a
 //! lead and its lanes run different scripts from one environment. When
 //! FAKE_OMP_LOG is set, the process appends a trace line at startup
-//! (`START pid=<pid> argv=<json>`), a line with the environment variable NAMES
+//! (`START pid=<pid> prompt=<json> argv=<json>`; `prompt` is the appended system prompt
+//! resolved like omp 18.22.2 does it, once, at start: a one-line `--append-system-prompt`
+//! value names a file that is read, a value with a line break or an unreadable file is the
+//! text itself, `null` without the option), a line with the environment variable NAMES
 //! only (`ENV <names>`), a line with the number of entries in the `--cwd`
 //! folder at startup (`CWD_ENTRIES <pid> <n>`; `-1` when it cannot be read or
 //! there is no `--cwd`), and then every received stdin line.
@@ -139,9 +142,23 @@ fn main() {
     let log = std::env::var_os("FAKE_OMP_LOG").map(std::path::PathBuf::from);
     if let Some(path) = &log {
         let json = serde_json::to_string(&argv).expect("argv is serializable");
+        let prompt = argv
+            .iter()
+            .find_map(|a| a.strip_prefix("--append-system-prompt="))
+            .map(|value| {
+                if value.contains('\n') {
+                    value.to_owned()
+                } else {
+                    std::fs::read_to_string(value).unwrap_or_else(|_| value.to_owned())
+                }
+            });
+        let prompt = serde_json::to_string(&prompt).expect("prompt is serializable");
         log_line(
             path,
-            &format!("START pid={} argv={json}", std::process::id()),
+            &format!(
+                "START pid={} prompt={prompt} argv={json}",
+                std::process::id()
+            ),
         );
         let mut names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
         names.sort();

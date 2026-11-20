@@ -256,6 +256,224 @@ impl OmpConfig {
     }
 }
 
+/// A secret value held in memory. `Debug` never shows it, and it is never serialized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[secret]")
+    }
+}
+
+/// The `[memory]` settings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryConfig {
+    pub jev: JevConfig,
+    pub filter: FilterConfig,
+}
+
+/// The `[memory.jev]` settings: how moraebot asks jev (TypeSafe System One).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JevConfig {
+    /// jev runs only when this is true and a key is found; a key alone turns nothing on.
+    pub enabled: bool,
+    /// A file holding the key. `TYPESAFE_API_KEY` wins over it.
+    pub api_key_file: Option<PathBuf>,
+    /// The `TYPESAFE_API_KEY` value, handed over by `main.rs`. Never read from or written to
+    /// `config.toml`.
+    pub env_key: Option<Secret>,
+    pub base_url: String,
+    pub model: String,
+    pub timeout_seconds: u64,
+    pub classify_timeout_ms: u64,
+    pub save_threshold: f64,
+    pub classify_threshold: f64,
+    pub window_sentences: u32,
+    pub backoff_initial_seconds: u64,
+    pub backoff_max_seconds: u64,
+    pub breaker_failures: u32,
+    pub breaker_probe_seconds: u64,
+    pub questions: JevQuestions,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_file: None,
+            env_key: None,
+            base_url: "https://api.typesafe.ai".to_owned(),
+            model: "jev-latest".to_owned(),
+            timeout_seconds: 10,
+            classify_timeout_ms: 1500,
+            save_threshold: 0.5,
+            classify_threshold: 0.7,
+            window_sentences: 20,
+            backoff_initial_seconds: 2,
+            backoff_max_seconds: 60,
+            breaker_failures: 5,
+            breaker_probe_seconds: 300,
+            questions: JevQuestions::default(),
+        }
+    }
+}
+
+impl JevConfig {
+    /// Sets the key taken from the `TYPESAFE_API_KEY` variable. An empty value is no key.
+    pub fn set_env_key(&mut self, key: Option<String>) {
+        self.env_key = key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+            .map(Secret::new);
+    }
+
+    /// The env key, else the trimmed content of `api_key_file`. `None` when neither gives a
+    /// non-empty key.
+    pub fn api_key(&self) -> Option<Secret> {
+        if let Some(key) = &self.env_key {
+            return Some(key.clone());
+        }
+        let text = fs::read_to_string(self.api_key_file.as_ref()?).ok()?;
+        let key = text.trim();
+        (!key.is_empty()).then(|| Secret::new(key))
+    }
+
+    /// Whether `memory.jev.enabled` is true. Without a key jev then stays paused.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_seconds)
+    }
+
+    pub fn classify_timeout(&self) -> Duration {
+        Duration::from_millis(self.classify_timeout_ms)
+    }
+}
+
+/// The jev question texts (`[memory.jev.questions]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JevQuestions {
+    pub save: String,
+    pub save_yes: String,
+    pub save_no: String,
+    pub span: String,
+    pub bucket: String,
+    pub bucket_thread: String,
+    pub bucket_project: String,
+    pub bucket_core: String,
+    pub bucket_boundary: String,
+    pub bucket_none: String,
+}
+
+impl Default for JevQuestions {
+    fn default() -> Self {
+        let text = |s: &str| s.to_owned();
+        Self {
+            save: text(
+                "Do the sentences hold a fact, preference, decision or prohibition that will \
+                 still matter in later conversations?",
+            ),
+            save_yes: text(
+                "At least one sentence states something lasting: a rule, a preference, a \
+                 decision, a fact about the owner or a project, or something that must not be \
+                 done.",
+            ),
+            save_no: text(
+                "Only small talk, a one-off request, a question, a status update, or something \
+                 that stops mattering when this task ends.",
+            ),
+            span: text(
+                "Which one sentence best states the thing worth keeping? Pick none when no \
+                 sentence does.",
+            ),
+            bucket: text("Where does the sentence picked in span belong?"),
+            bucket_thread: text(
+                "It matters only in this conversation or for the next few days, or it is not \
+                 clearly meant as a standing rule.",
+            ),
+            bucket_project: text("A lasting fact or rule about one code project or repository."),
+            bucket_core: text(
+                "A standing rule or preference the owner says applies always or from now on, in \
+                 every conversation.",
+            ),
+            bucket_boundary: text(
+                "Something the owner says must never be done, in every conversation.",
+            ),
+            bucket_none: text("Nothing here should be kept."),
+        }
+    }
+}
+
+/// The `[memory.filter]` lists for lane and subagent excerpts. Each configured list replaces
+/// its built-in default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterConfig {
+    pub approval: Vec<String>,
+    pub credentials: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        let list = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect();
+        Self {
+            approval: list(&[
+                "오너",
+                "승인",
+                "허락",
+                "허가",
+                "권한",
+                "owner",
+                "approve",
+                "approved",
+                "approval",
+                "permission",
+                "permitted",
+                "allowed",
+                "authorize",
+                "authorized",
+                "consent",
+            ]),
+            credentials: list(&[
+                "토큰",
+                "비밀번호",
+                "패스워드",
+                "자격 증명",
+                "자격증명",
+                "token",
+                "tokens",
+                "password",
+                "passwd",
+                "credential",
+                "credentials",
+                "secret",
+                "secrets",
+                "api key",
+                "apikey",
+                "api_key",
+                "private key",
+            ]),
+            commands: list(&[
+                "$ ", "./", "| sh", "| bash", "&&", "rm -rf", "sudo", "curl", "wget", "sh", "bash",
+                "zsh", "chmod", "eval",
+            ]),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub messenger: Platform,
@@ -266,6 +484,7 @@ pub struct Config {
     pub home: PathBuf,
     pub access_mode: AccessMode,
     pub omp: OmpConfig,
+    pub memory: MemoryConfig,
 }
 
 impl fmt::Debug for Config {
@@ -279,6 +498,7 @@ impl fmt::Debug for Config {
             .field("home", &self.home)
             .field("access_mode", &self.access_mode)
             .field("omp", &self.omp)
+            .field("memory", &self.memory)
             .finish()
     }
 }
@@ -308,6 +528,8 @@ struct ConfigFile {
     slack: Option<SlackSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     omp: Option<OmpSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<MemorySection>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -376,6 +598,353 @@ struct OmpSection {
     stall_after_minutes: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jev: Option<JevSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<FilterSection>,
+}
+
+/// On-disk `[memory.jev]`. There is deliberately no key field: the key lives in the
+/// environment or in `api_key_file`.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JevSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_sentences: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backoff_initial_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backoff_max_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    breaker_failures: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    breaker_probe_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questions: Option<QuestionsSection>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionsSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_yes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_no: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_thread: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_core: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_boundary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_none: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FilterSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commands: Option<Vec<String>>,
+}
+
+/// `Some(value)` when it differs from the default, so `to_toml` writes only changed values.
+fn changed<T: PartialEq + Clone>(value: &T, default: &T) -> Option<T> {
+    (value != default).then(|| value.clone())
+}
+
+/// `true` when every field of a section is absent.
+fn is_empty_section<T: Serialize>(section: &T) -> bool {
+    toml::Value::try_from(section)
+        .ok()
+        .and_then(|v| v.as_table().map(toml::Table::is_empty))
+        .unwrap_or(false)
+}
+
+impl MemoryConfig {
+    fn from_section(section: Option<MemorySection>, env: &Env) -> Result<Self, ConfigError> {
+        let section = section.unwrap_or_default();
+        let jev_section = section.jev.unwrap_or_default();
+        let mut jev = JevConfig {
+            enabled: jev_section.enabled.unwrap_or(false),
+            api_key_file: jev_section
+                .api_key_file
+                .map(|path| env.expand_tilde(&path))
+                .transpose()?,
+            ..JevConfig::default()
+        };
+        macro_rules! take {
+            ($target:expr, $source:expr, [$($field:ident),*]) => {
+                $(if let Some(value) = $source.$field { $target.$field = value; })*
+            };
+        }
+        take!(
+            jev,
+            jev_section,
+            [
+                base_url,
+                model,
+                timeout_seconds,
+                classify_timeout_ms,
+                save_threshold,
+                classify_threshold,
+                window_sentences,
+                backoff_initial_seconds,
+                backoff_max_seconds,
+                breaker_failures,
+                breaker_probe_seconds
+            ]
+        );
+        if let Some(questions) = jev_section.questions {
+            take!(
+                jev.questions,
+                questions,
+                [
+                    save,
+                    save_yes,
+                    save_no,
+                    span,
+                    bucket,
+                    bucket_thread,
+                    bucket_project,
+                    bucket_core,
+                    bucket_boundary,
+                    bucket_none
+                ]
+            );
+        }
+        let mut filter = FilterConfig::default();
+        if let Some(lists) = section.filter {
+            take!(filter, lists, [approval, credentials, commands]);
+        }
+        let memory = Self { jev, filter };
+        memory.check_values()?;
+        Ok(memory)
+    }
+
+    fn check_values(&self) -> Result<(), ConfigError> {
+        let bad = |message: String| Err(ConfigError::new(E_CONFIG_VALUE, message));
+        let jev = &self.jev;
+        if !base_url_is_safe(&jev.base_url) {
+            return bad(format!(
+                "memory.jev.base_url '{}' must start with https:// (http:// only for 127.0.0.1 \
+                 or localhost), so the key never travels in plain text",
+                jev.base_url
+            ));
+        }
+        if jev.model.trim().is_empty() {
+            return bad("memory.jev.model must not be empty".to_owned());
+        }
+        for (name, value) in [
+            ("save_threshold", jev.save_threshold),
+            ("classify_threshold", jev.classify_threshold),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                return bad(format!("memory.jev.{name} must be within 0 and 1"));
+            }
+        }
+        for (name, value) in [
+            ("timeout_seconds", jev.timeout_seconds),
+            ("classify_timeout_ms", jev.classify_timeout_ms),
+            ("backoff_initial_seconds", jev.backoff_initial_seconds),
+            ("backoff_max_seconds", jev.backoff_max_seconds),
+            ("breaker_failures", u64::from(jev.breaker_failures)),
+            ("breaker_probe_seconds", jev.breaker_probe_seconds),
+        ] {
+            if value == 0 {
+                return bad(format!("memory.jev.{name} must be greater than zero"));
+            }
+        }
+        if !(1..=64).contains(&jev.window_sentences) {
+            return bad("memory.jev.window_sentences must be within 1 and 64".to_owned());
+        }
+        let q = &jev.questions;
+        for (name, text) in [
+            ("save", &q.save),
+            ("save_yes", &q.save_yes),
+            ("save_no", &q.save_no),
+            ("span", &q.span),
+            ("bucket", &q.bucket),
+            ("bucket_thread", &q.bucket_thread),
+            ("bucket_project", &q.bucket_project),
+            ("bucket_core", &q.bucket_core),
+            ("bucket_boundary", &q.bucket_boundary),
+            ("bucket_none", &q.bucket_none),
+        ] {
+            if text.trim().is_empty() {
+                return bad(format!("memory.jev.questions.{name} must not be empty"));
+            }
+        }
+        let f = &self.filter;
+        for (name, list) in [
+            ("approval", &f.approval),
+            ("credentials", &f.credentials),
+            ("commands", &f.commands),
+        ] {
+            if list.iter().any(|pattern| pattern.trim().is_empty()) {
+                return bad(format!(
+                    "memory.filter.{name} must not hold an empty pattern"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The on-disk section holding only the values that differ from their defaults.
+    fn to_section(&self) -> Option<MemorySection> {
+        let (jev, d) = (&self.jev, JevConfig::default());
+        let (q, dq) = (&jev.questions, &d.questions);
+        let questions = QuestionsSection {
+            save: changed(&q.save, &dq.save),
+            save_yes: changed(&q.save_yes, &dq.save_yes),
+            save_no: changed(&q.save_no, &dq.save_no),
+            span: changed(&q.span, &dq.span),
+            bucket: changed(&q.bucket, &dq.bucket),
+            bucket_thread: changed(&q.bucket_thread, &dq.bucket_thread),
+            bucket_project: changed(&q.bucket_project, &dq.bucket_project),
+            bucket_core: changed(&q.bucket_core, &dq.bucket_core),
+            bucket_boundary: changed(&q.bucket_boundary, &dq.bucket_boundary),
+            bucket_none: changed(&q.bucket_none, &dq.bucket_none),
+        };
+        let jev_section = JevSection {
+            enabled: jev.enabled.then_some(true),
+            api_key_file: jev.api_key_file.clone(),
+            base_url: changed(&jev.base_url, &d.base_url),
+            model: changed(&jev.model, &d.model),
+            timeout_seconds: changed(&jev.timeout_seconds, &d.timeout_seconds),
+            classify_timeout_ms: changed(&jev.classify_timeout_ms, &d.classify_timeout_ms),
+            save_threshold: changed(&jev.save_threshold, &d.save_threshold),
+            classify_threshold: changed(&jev.classify_threshold, &d.classify_threshold),
+            window_sentences: changed(&jev.window_sentences, &d.window_sentences),
+            backoff_initial_seconds: changed(
+                &jev.backoff_initial_seconds,
+                &d.backoff_initial_seconds,
+            ),
+            backoff_max_seconds: changed(&jev.backoff_max_seconds, &d.backoff_max_seconds),
+            breaker_failures: changed(&jev.breaker_failures, &d.breaker_failures),
+            breaker_probe_seconds: changed(&jev.breaker_probe_seconds, &d.breaker_probe_seconds),
+            questions: (!is_empty_section(&questions)).then_some(questions),
+        };
+        let df = FilterConfig::default();
+        let filter = FilterSection {
+            approval: changed(&self.filter.approval, &df.approval),
+            credentials: changed(&self.filter.credentials, &df.credentials),
+            commands: changed(&self.filter.commands, &df.commands),
+        };
+        let section = MemorySection {
+            jev: (!is_empty_section(&jev_section)).then_some(jev_section),
+            filter: (!is_empty_section(&filter)).then_some(filter),
+        };
+        (!is_empty_section(&section)).then_some(section)
+    }
+
+    /// The `check-config` line for the jev key. Advisory: a missing key pauses only the jev
+    /// stage, so it must not stop the gateway from starting.
+    fn key_check(&self) -> Check {
+        let jev = &self.jev;
+        let result = if !jev.is_enabled() {
+            Ok(if jev.api_key().is_some() {
+                "off (a key is set; memory.jev.enabled = true turns jev on)".to_owned()
+            } else {
+                "off".to_owned()
+            })
+        } else if jev.env_key.is_some() {
+            Ok("key from TYPESAFE_API_KEY".to_owned())
+        } else if let Some(path) = &jev.api_key_file {
+            check_token_file(path).and_then(|detail| match jev.api_key() {
+                Some(_) => Ok(detail),
+                None => Err(ConfigError::new(
+                    crate::jev::E_JEV_AUTH,
+                    format!("key file {} is empty", path.display()),
+                )),
+            })
+        } else {
+            Err(ConfigError::new(
+                crate::jev::E_JEV_AUTH,
+                "memory.jev.enabled is true but no key is set; set TYPESAFE_API_KEY or \
+                 memory.jev.api_key_file",
+            ))
+        };
+        Check {
+            name: "memory.jev key",
+            result,
+            advisory: true,
+        }
+    }
+}
+
+/// `https://` to any host, or plain `http://` to the loopback host only (tests and local
+/// proxies), judged by a URL parser: `http://127.0.0.1:80@evil.com/` names `evil.com`. A URL
+/// with a user name or password is refused.
+fn base_url_is_safe(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
+        _ => false,
+    }
+}
+
+/// The `E_CONFIG_PARSE` error for `text`. toml's message quotes the offending line, so when
+/// the file holds an `api_key` key (never valid: the key lives in the environment or in
+/// `api_key_file`) or the error names it, a fixed message is returned instead, so the key is
+/// never printed by `check-config` or the gateway's start error.
+fn parse_error(text: &str, err: &toml::de::Error) -> ConfigError {
+    let names_key = |key: &str| {
+        key.rsplit('.')
+            .next()
+            .is_some_and(|last| last.trim().trim_matches(['"', '\'']) == "api_key")
+    };
+    let key_line = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .any(|(key, _)| names_key(key));
+    if key_line || err.message().contains("`api_key`") {
+        return ConfigError::new(
+            E_CONFIG_PARSE,
+            "config.toml holds an `api_key` key, which is not allowed (the line is not shown, so \
+             the key is not printed): remove it and set TYPESAFE_API_KEY or \
+             memory.jev.api_key_file instead",
+        );
+    }
+    ConfigError::new(E_CONFIG_PARSE, err.to_string())
+}
+
 /// One line of `check-config` output.
 #[derive(Debug)]
 pub struct Check {
@@ -400,8 +969,7 @@ impl Config {
 
     /// Parses config text and resolves defaults. Filesystem checks live in [`Config::validate`].
     pub fn from_toml(text: &str, env: &Env) -> Result<Config, ConfigError> {
-        let file: ConfigFile =
-            toml::from_str(text).map_err(|e| ConfigError::new(E_CONFIG_PARSE, e.to_string()))?;
+        let file: ConfigFile = toml::from_str(text).map_err(|e| parse_error(text, &e))?;
 
         let access_mode = match file.access_mode.as_deref() {
             None | Some("owner_only") => AccessMode::OwnerOnly,
@@ -476,6 +1044,8 @@ impl Config {
             ));
         }
 
+        let memory = MemoryConfig::from_section(file.memory, env)?;
+
         let home = match file.home {
             Some(home) => env.expand_tilde(&home)?,
             None => env.default_home()?,
@@ -496,6 +1066,7 @@ impl Config {
                 max_cost_usd: omp.max_cost_usd,
                 stall_after_minutes: omp.stall_after_minutes,
             },
+            memory,
         })
     }
 
@@ -532,6 +1103,7 @@ impl Config {
                 max_cost_usd: self.omp.max_cost_usd,
                 stall_after_minutes: self.omp.stall_after_minutes,
             }),
+            memory: self.memory.to_section(),
         };
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
     }
@@ -620,6 +1192,7 @@ impl Config {
                 advisory,
             });
         }
+        checks.push(self.memory.key_check());
         checks.extend([
             Check {
                 name: "work_dir",
@@ -1147,6 +1720,255 @@ mod tests {
 
     fn code<T: fmt::Debug>(result: Result<T, ConfigError>) -> &'static str {
         result.expect_err("expected an error").code
+    }
+
+    fn key_file(fx: &Fixture, content: &str) -> PathBuf {
+        let path = fx.dir.path().join("jev.key");
+        fs::write(&path, content).expect("write key");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod key");
+        path
+    }
+
+    #[test]
+    fn memory_config_defaults() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(cfg.memory, MemoryConfig::default());
+        let jev = &cfg.memory.jev;
+        assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.model, "jev-latest");
+        assert_eq!(jev.timeout(), Duration::from_secs(10));
+        assert_eq!(jev.classify_timeout(), Duration::from_millis(1500));
+        assert_eq!((jev.save_threshold, jev.classify_threshold), (0.5, 0.7));
+        assert_eq!(jev.window_sentences, 20);
+        assert_eq!(
+            (
+                jev.backoff_initial_seconds,
+                jev.backoff_max_seconds,
+                jev.breaker_failures,
+                jev.breaker_probe_seconds
+            ),
+            (2, 60, 5, 300)
+        );
+        assert!(cfg.memory.filter.commands.contains(&"sh".to_owned()));
+        assert!(!jev.is_enabled(), "off by default");
+        let mut env_only = cfg.memory.jev.clone();
+        env_only.set_env_key(Some("k".into()));
+        assert!(!env_only.is_enabled(), "a key alone is off");
+    }
+
+    #[test]
+    fn memory_config_env_key_beats_the_key_file() {
+        let fx = Fixture::new();
+        let key = key_file(&fx, "  FILE_KEY_1\n");
+        let text = format!(
+            "{}[memory.jev]\napi_key_file = {}\n",
+            fx.valid_toml(),
+            quoted(&key)
+        );
+        let mut jev = fx.load(&text).expect("loads").memory.jev;
+        assert_eq!(jev.api_key(), Some(Secret::new("FILE_KEY_1")));
+        jev.set_env_key(Some("ENV_KEY_2".into()));
+        assert_eq!(jev.api_key(), Some(Secret::new("ENV_KEY_2")));
+        jev.set_env_key(Some("  ".into()));
+        assert_eq!(jev.api_key(), Some(Secret::new("FILE_KEY_1")));
+    }
+
+    #[test]
+    fn memory_config_key_is_never_printed_or_written() {
+        let fx = Fixture::new();
+        let key = key_file(&fx, "FILE_SENTINEL_51c2");
+        let text = format!(
+            "{}[memory.jev]\napi_key_file = {}\n",
+            fx.valid_toml(),
+            quoted(&key)
+        );
+        let mut cfg = fx.load(&text).expect("loads");
+        cfg.memory.jev.set_env_key(Some("ENV_SENTINEL_77ad".into()));
+        let shown = format!("{cfg:?}");
+        let written = cfg.to_toml().expect("serializes");
+        for out in [&shown, &written] {
+            assert!(!out.contains("FILE_SENTINEL_51c2"));
+            assert!(!out.contains("ENV_SENTINEL_77ad"));
+            assert!(out.contains(key.to_str().expect("utf-8 path")));
+        }
+        let checks = cfg.checks();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "memory.jev key")
+            .expect("key check");
+        assert!(check.advisory);
+        let detail = check.result.as_ref().expect("env key passes");
+        assert!(!detail.contains("ENV_SENTINEL_77ad"));
+        let literal = format!("{}[memory.jev]\napi_key = \"x\"\n", fx.valid_toml());
+        assert_eq!(code(fx.load(&literal)), E_CONFIG_PARSE);
+    }
+
+    #[test]
+    fn memory_config_without_a_key_fails_its_check_when_enabled() {
+        let fx = Fixture::new();
+        let text = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
+        let cfg = fx.load(&text).expect("loads");
+        let check = cfg
+            .checks()
+            .into_iter()
+            .find(|c| c.name == "memory.jev key")
+            .expect("key check");
+        assert!(check.advisory);
+        assert_eq!(code(check.result), crate::jev::E_JEV_AUTH);
+    }
+
+    #[test]
+    fn memory_config_survives_a_to_toml_round_trip() {
+        let fx = Fixture::new();
+        let unchanged = fx.load(&fx.valid_toml()).expect("loads");
+        assert!(
+            !unchanged.to_toml().expect("serializes").contains("memory"),
+            "defaults are not written"
+        );
+        let key = key_file(&fx, "k");
+        let text = format!(
+            "{}[memory.jev]\nenabled = true\napi_key_file = {}\nbase_url = \"http://127.0.0.1:9\"\n\
+             model = \"jev-1.14.0\"\nsave_threshold = 0.6\nwindow_sentences = 8\nbreaker_failures = 3\n\
+             [memory.jev.questions]\nspan = \"Pick one.\"\n[memory.filter]\ncommands = []\napproval = [\"ok\"]\n",
+            fx.valid_toml(),
+            quoted(&key)
+        );
+        let cfg = fx.load(&text).expect("loads");
+        let written = cfg.to_toml().expect("serializes");
+        assert!(!written.contains("timeout_seconds"), "defaults stay out");
+        let again = fx.load(&written).expect("reloads");
+        assert_eq!(again.memory, cfg.memory);
+        assert_eq!(again.memory.jev.model, "jev-1.14.0");
+        assert_eq!(again.memory.jev.questions.span, "Pick one.");
+        assert!(again.memory.filter.commands.is_empty());
+        assert_eq!(again.memory.filter.approval, vec!["ok".to_owned()]);
+        assert_eq!(
+            again.memory.filter.credentials,
+            FilterConfig::default().credentials
+        );
+    }
+
+    #[test]
+    fn memory_config_refuses_plain_http() {
+        let fx = Fixture::new();
+        let with_url =
+            |url: &str| format!("{}[memory.jev]\nbase_url = \"{url}\"\n", fx.valid_toml());
+        for bad in [
+            "http://api.typesafe.ai",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com/",
+            "ftp://api.typesafe.ai",
+        ] {
+            assert_eq!(code(fx.load(&with_url(bad))), E_CONFIG_VALUE, "{bad}");
+        }
+        for good in [
+            "https://api.typesafe.ai",
+            "http://127.0.0.1:4100",
+            "http://localhost/",
+        ] {
+            fx.load(&with_url(good)).expect(good);
+        }
+    }
+
+    /// moraedang on #46: a URL parser reads `127.0.0.1:80@` as userinfo, so the host of these
+    /// is `evil.com` and the key would travel there in plain text.
+    #[test]
+    fn memory_config_refuses_userinfo_in_the_jev_url() {
+        let fx = Fixture::new();
+        let with_url =
+            |url: &str| format!("{}[memory.jev]\nbase_url = \"{url}\"\n", fx.valid_toml());
+        for bad in [
+            "http://127.0.0.1:80@evil.com/",
+            "http://localhost:x@evil.com/",
+            "https://user:pw@api.typesafe.ai",
+            "https://user@api.typesafe.ai",
+            "not a url",
+        ] {
+            assert_eq!(code(fx.load(&with_url(bad))), E_CONFIG_VALUE, "{bad}");
+        }
+        fx.load(&with_url("http://[::1]:4100/"))
+            .expect("IPv6 loopback");
+    }
+
+    /// moraedang on #46: toml's parse error quotes the offending line, so a key written into
+    /// `config.toml` must never reach the error text.
+    #[test]
+    fn memory_config_never_echoes_a_key_written_into_the_file() {
+        let fx = Fixture::new();
+        let sentinel = "KEY_SENTINEL_e41f";
+        for text in [
+            format!(
+                "{}[memory.jev]\napi_key = \"{sentinel}\"\n",
+                fx.valid_toml()
+            ),
+            format!("{}[memory.jev]\napi_key = \"{sentinel}\n", fx.valid_toml()),
+            format!(
+                "{}[memory]\njev.api_key = \"{sentinel}\"\n",
+                fx.valid_toml()
+            ),
+        ] {
+            let err = fx.load(&text).expect_err("refused");
+            assert_eq!(err.code, E_CONFIG_PARSE);
+            assert!(!err.to_string().contains(sentinel), "{err}");
+            assert!(!format!("{err:?}").contains(sentinel), "{err:?}");
+        }
+    }
+
+    /// Owner decision on #46: jev is opt-in. A key alone turns nothing on.
+    #[test]
+    fn memory_config_jev_needs_enabled_and_a_key() {
+        let fx = Fixture::new();
+        let key = key_file(&fx, "k\n");
+        let with_key = format!(
+            "{}[memory.jev]\napi_key_file = {}\n",
+            fx.valid_toml(),
+            quoted(&key)
+        );
+        let keyed = fx.load(&with_key).expect("loads");
+        assert!(!keyed.memory.jev.is_enabled(), "a key alone is off");
+        let check = keyed
+            .checks()
+            .into_iter()
+            .find(|c| c.name == "memory.jev key")
+            .expect("key check");
+        let detail = check.result.expect("passes");
+        assert!(detail.starts_with("off"), "{detail}");
+        let on = format!("{with_key}enabled = true\n");
+        assert!(fx.load(&on).expect("loads").memory.jev.is_enabled());
+    }
+
+    #[test]
+    fn memory_config_refuses_out_of_range_values() {
+        let fx = Fixture::new();
+        for line in [
+            "save_threshold = 1.5",
+            "classify_threshold = -0.1",
+            "timeout_seconds = 0",
+            "breaker_failures = 0",
+            "window_sentences = 0",
+            "window_sentences = 65",
+            "model = \" \"",
+        ] {
+            let text = format!("{}[memory.jev]\n{line}\n", fx.valid_toml());
+            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "{line}");
+        }
+        let empty = format!("{}[memory.filter]\ncommands = [\"\"]\n", fx.valid_toml());
+        assert_eq!(code(fx.load(&empty)), E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn memory_config_refuses_unknown_keys() {
+        let fx = Fixture::new();
+        for section in [
+            "[memory]\nnope = 1\n",
+            "[memory.jev]\nnope = 1\n",
+            "[memory.jev.questions]\nnope = \"x\"\n",
+            "[memory.filter]\nnope = []\n",
+        ] {
+            let text = format!("{}{section}", fx.valid_toml());
+            assert_eq!(code(fx.load(&text)), E_CONFIG_PARSE, "{section}");
+        }
     }
 
     #[test]

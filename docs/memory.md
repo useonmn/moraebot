@@ -1,6 +1,6 @@
 # Memory
 
-moraebot keeps a small memory of what you, the owner, asked it to remember. This page covers what the first part of it (issue #39, P1) does: the store, the commands you type in plain words, the two memory tools, what the lead and the lanes see, and how omp's own memory is kept out.
+moraebot keeps a small memory of what you, the owner, asked it to remember. This page covers the store, the commands you type in plain words, the two memory tools, what the lead and the lanes see, how omp's own memory is kept out (issue #39, P1), and the observer that takes notes after each turn with the help of jev, a classifier run by TypeSafe (P2).
 
 ## Where it lives
 
@@ -34,7 +34,23 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `m-1a2b3c 지워`, `forget m-1a2b3c` | Asks once; your next message there answers it (`응`/`yes` forgets, `아니`/`no` keeps). |
 | `m-1a2b3c 되살려`, `restore m-1a2b3c` | Brings a forgotten entry back. |
 
-A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when the lead saves a note for a conversation or project without a command (`memory_write` below); `뭐 기억해?` lists what this conversation got that way. When the lead saves one of your sentences as a core rule or a boundary, moraebot posts a line naming its id (`[memory] saved m-1a2b3c to core/owner: "..." (say \`forget m-1a2b3c\` if that was not meant)`), so a wrong save is visible. The save stands however the turn ends. When the lead replies, the line goes under the reply, at its end. When the turn fails or is interrupted, the line is posted as its own message right after the failure or interrupted notice. A line that could not be sent is sent again after the messenger reconnects or moraebot restarts, like a reply.
+A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual, unless jev reads it as a memory request (next section). moraebot sends no notice when the lead or the observer saves a note for a conversation or project (`memory_write` below, and [The observer](#the-observer)); `뭐 기억해?` lists what this conversation got that way. When one of your sentences is saved as a core rule or a boundary without a command, by the lead or by the observer, you see a line naming its id (`[memory] saved m-1a2b3c to core/owner: "..." (say \`forget m-1a2b3c\` if that was not meant)`), so a wrong save is visible. The lead's save stands however the turn ends. When the lead replies, the line goes under the reply, at its end. When the turn fails or is interrupted, the line is posted as its own message right after the failure or interrupted notice. A line that could not be sent is sent again after the messenger reconnects or moraebot restarts, like a reply. An observer save is shown under the next reply in that conversation (the observer runs after the reply has gone out); the observer shows no line for a sentence the lead already saved to the same place, so one save is never shown twice.
+
+`뭐 기억해?` starts with one line about the observer: `Observer: jev ok, 0 waiting`, `Observer: jev off, 3 waiting`, `Observer: jev busy, retrying, 12 waiting`, `Observer: paused (E_JEV_AUTH), 12 waiting` or, after the observer crashed outside a job, `Observer: down (E_OBSERVER_PANIC), retrying, 12 waiting` (until a later pass ends normally), where the number counts the turns, lane results and subagent files still waiting to be read.
+
+### The same requests in your own words
+
+When jev is on, a message the rules above don't match is asked of jev if it holds an entry id or one of the words `기억`, `잊어`, `잊지`, `remember`, `forget`, `memory`, `memories` (case ignored). Verbs such as `지워`, `고쳐`, `delete` or `fix` alone don't count: without an id they are ordinary coding requests. jev answers whether you are asking about moraebot's memory, which of remember, show, correct, forget or restore you mean, and, for remember, which one of your sentences is the thing to keep. moraebot takes every other part from your own text:
+
+| jev reads | moraebot does |
+| --- | --- |
+| show | Lists everything, or shows one entry when the message holds exactly one id. |
+| forget | Asks about the one id in the message (and acts on your answer, as above). Without exactly one id, the message goes to the lead. |
+| restore | Restores the one id in the message; otherwise the lead gets it. |
+| correct | Replaces the one id in the message with the message's other sentences (the ones without the id); otherwise the lead gets it. |
+| remember | Saves the sentence jev picked, word for word, for this conversation. It goes to the core only when the message states a standing rule: `항상` anywhere, or `always`, `앞으로` or `앞으로는` as a whole word, or the phrase "from now on". It goes to the boundaries when that sentence also says not to do something. |
+
+Only your own messages without attachments are asked, and only when they arrive; lane results and chat senders never are. jev is asked once, with a 1.5 second limit (`classify_timeout_ms`) and no retry. When jev is off, paused, backing off, slow or unsure (below `classify_threshold`), the message simply goes to the lead, and the rules above keep working the same.
 
 The lead has no tool that corrects, forgets or restores an entry; only your commands above do that.
 
@@ -45,7 +61,7 @@ The lead has no tool that corrects, forgets or restores an entry; only your comm
 
 ## What the lead sees
 
-Before every lead turn moraebot reads `core/owner.md` and `core/boundaries.md` and appends them to the lead's system prompt, after the persona, between `<<<moraebot-memory core>>>` and `<<<end>>>`. The block stays within 6 KiB; when it doesn't fit, the newest entries are kept and the block ends with `[기억 N개 생략: memory_search로 찾을 수 있음]`. Expired entries are skipped.
+Before every lead turn moraebot reads `core/owner.md` and `core/boundaries.md` and appends them to the lead's system prompt, after the persona, between `<<<moraebot-memory core>>>` and `<<<end>>>`. The appended text (guidance, messenger hints, persona and this block) is written to `~/.moraebot/lead/append.md` (mode 0600, folder 0700) just before the lead starts, and omp gets only the file's path (`--append-system-prompt=<path>`), so the memory never shows in the process list. omp reads the file once, when it starts. The block stays within 6 KiB; when it doesn't fit, the newest entries are kept and the block ends with `[기억 N개 생략: memory_search로 찾을 수 있음]`. Expired entries are skipped.
 
 When the core changes (always-remember, correct, forget, restore), the lead restarts before its next turn, the same way it does when `persona.md` changes. That is why a plain `기억해` goes to the conversation, not the core.
 
@@ -59,7 +75,7 @@ Each bucket keeps to its file's `budget_bytes` (3000 for a project, 2000 for a c
 
 ## What a lane sees
 
-A lane's system prompt gets `core/boundaries.md` and, for a lane started with `repo`, the notes of its project. The checkout's `origin` remote names it (`git@github.com:usunmn/moraebot.git` reads `projects/usunmn/moraebot`, or a one-part `projects/moraebot`); a checkout without `origin` reads the project whose last part is its folder name, but only when exactly one project has that name. From the project it reads only your own words and earlier lanes' results; subagent, tool and guessed entries never reach a lane on their own. `core/owner.md` is not given to lanes.
+A lane's system prompt gets `core/boundaries.md` and, for a lane started with `repo`, the notes of its project, passed the same way as the lead's: in `~/.moraebot/lanes/<id>/append.md` (mode 0600), never in argv. The checkout's `origin` remote names it (`git@github.com:usunmn/moraebot.git` reads `projects/usunmn/moraebot`, or a one-part `projects/moraebot`); a checkout without `origin` reads the project whose last part is its folder name, but only when exactly one project has that name. From the project it reads only your own words and earlier lanes' results; subagent, tool and guessed entries never reach a lane on their own. `core/owner.md` is not given to lanes.
 
 ## omp's own memory is off
 
@@ -68,9 +84,106 @@ The lead and every lane run omp with `--config ~/.moraebot/omp-overlay.yml`, whi
 moraebot can't read the settings omp finally uses, so at start `moraebot run` asks omp two things without calling a model:
 
 - `omp config get <key> --json` for both keys. If omp doesn't know one (a newer omp renamed it), the overlay would be silently ignored, so moraebot refuses to start with `E_OMP_OVERLAY`. Update moraebot.
-- `omp --version`. If it isn't the version the overlay was checked against (18.22.2), the log gets a `W_OMP_VERSION` warning and moraebot starts anyway.
+- `omp --version`. If it isn't the version the overlay was checked against (18.22.2), the log gets a `W_OMP_VERSION` warning and moraebot starts anyway. That version was also checked to read a one-line `--append-system-prompt` value as a file, once, at start, which is what keeps memory out of argv; an omp upgrade needs both facts checked again. moraebot tells you once per omp version, in your DM (or the configured channel when the DM can't be opened): "The installed omp is not the version moraebot's memory settings were checked against. Run `moraebot check-config` for the details." A `W_OMP_VERSION` row in the memory log remembers that you were told; rows are kept 30 days, so a lasting mismatch is mentioned at most about once a month.
 
 `moraebot check-config` asks the same two things and prints `OK`, `WARN` or `FAIL omp overlay`, so you can check an omp upgrade before you restart the service.
+
+## The observer
+
+After a turn, a lane result or a subagent's report, moraebot queues a job in `inbox.sqlite` (in the same write that settles the turn), and the observer, a task of its own beside the dispatcher, reads it later. A fault in the observer never stops the gateway, and your memory commands never wait for it. For each job it asks jev, a window of up to 20 sentences at a time, whether something in it will still matter later, which one sentence states it best, and where it belongs. One window gives at most one entry, and the code, not jev, decides whose words it is and which buckets it may use:
+
+| Read from | Saved as | May go to |
+| --- | --- | --- |
+| Your message (a turn's own row or one steered into it) | your words (`owner`), the whole sentence as you wrote it, source `row=<id> s=<n>` | this conversation, the one project the message names, or the core rules or the boundaries (see below) |
+| A lane's result | a `lane` reference line, source `lane=<id> seq=<n>` | the lane's project, or this conversation |
+| A lane's subagent report | a `subagent` reference line | the lane's project, or this conversation |
+| The lead's subagent report | a `subagent` reference line | `projects/_general.md` |
+
+jev's `core` or `boundary` answer alone never puts a sentence in the core; the code checks the sentence itself:
+
+- `core/owner.md` takes it only when it states a standing rule: `항상` anywhere, or `always`, `앞으로` or `앞으로는` as a whole word, or the phrase "from now on" ("From now on, reply in English.").
+- `core/boundaries.md` takes it only when it holds `always`, `never`, `항상`, `절대` or `절대로` as a whole word. A word is a run of letters and digits, so "Push to main: never." counts and "Whenever you're unsure, ask me." does not. A plain "don't" or "하지 마" is not enough ("Don't add emoji in this PR." is often meant for one task only).
+
+Otherwise the sentence is saved for this conversation instead.
+
+Only your sentences become rules; lane and subagent lines stay reference lines, never sit in the core and expire after 30 days. A lane result is judged once, by its own job, not again by the lead turn that reads it. Subagent reports are found by scanning the session folders of the lead and the lanes for omp 18.22.2's `<task>.md` output files (at most 256 KiB, no symlinks), after a turn and at start; a file whose size and modification time are unchanged is not read again, and each content is judged once.
+
+A lane or subagent sentence is dropped before anything is sent when it talks about approval or permission, credentials or tokens, holds a secret moraebot recognizes, a URL, or a shell command (`[memory.filter]` below). Your own sentences are not filtered this way, but a sentence the redactor would change, one shorter than 4 characters, or one longer than an entry may be is never sent and never saved. The same entry is never written twice, and an entry you forgot does not come back when a job is read again. All entries of one pass are one git commit whose message ends in `observed`.
+
+### What leaves this machine
+
+When jev is on, moraebot sends TypeSafe's System One API (`https://api.typesafe.ai`, servers in the US):
+
+- the redacted candidate sentences of your messages, of lane results and of subagent reports, each numbered (`s3: ...`);
+- for a lead turn, the names and kinds of the tools it used (`web_search`, `web`), never their arguments or output;
+- the fixed question texts, and the jev key in the `Authorization` header;
+- for a plain-language memory request, the redacted sentences of that one message.
+
+It never sends the lead's reply, a tool's output, row ids, conversation keys or user ids. TypeSafe documents that requests are not used for training; retention follows its Data Processing Agreement.
+
+### Turning it on and off
+
+jev is off unless you turn it on. It runs only when `memory.jev.enabled = true` and moraebot finds a key: the `TYPESAFE_API_KEY` environment variable of `moraebot run`, or else the file named by `api_key_file`. A key alone turns nothing on; moraebot then logs one line at start saying jev is off, and `check-config` says so too. The key is never written to `config.toml`, never passed to the lead, lanes, chat children, Done checks, the `omp --version` check or the `git remote get-url` moraebot runs in a lane's checkout (every variable with `TYPESAFE` in its name is dropped from their environment) and is saved only as a `[redacted]` marker if it ever turns up in text moraebot writes to the memory store. Lanes run as the same Unix user as moraebot, so a lane can read any file moraebot can read, `api_key_file` included; keeping the key out of the environment hides it from a lane, a file does not. Prefer the environment variable, or accept that a lane could read the file. To turn jev on:
+
+```toml
+[memory.jev]
+enabled = true
+```
+
+With jev off, jobs are settled without a request (`M_JEV_OFF`), so turning it on later does not replay old history, and the rule commands work as before. `enabled = true` without a key pauses jev with `E_JEV_AUTH`.
+
+### Settings
+
+Every key is optional.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `memory.jev.enabled` | `false` | `true` turns jev on; it also needs a key. |
+| `memory.jev.api_key_file` | none | A file holding the key; `TYPESAFE_API_KEY` wins over it. |
+| `memory.jev.base_url` | `https://api.typesafe.ai` | Must be `https://` (or `http://` to the host `127.0.0.1`, `localhost` or `[::1]`, for tests), without a user name or password. |
+| `memory.jev.model` | `jev-latest` | The model; the version that answered is logged with every job. |
+| `memory.jev.timeout_seconds` | 10 | Limit of one observer request. |
+| `memory.jev.classify_timeout_ms` | 1500 | Limit of the plain-language memory request check. |
+| `memory.jev.save_threshold` | 0.5 | How sure jev must be that a window holds something to keep (0 to 1). |
+| `memory.jev.classify_threshold` | 0.7 | How sure jev must be that a message is a memory request (0 to 1). |
+| `memory.jev.window_sentences` | 20 | Sentences per request (1 to 64). |
+| `memory.jev.backoff_initial_seconds` | 2 | First wait after a busy or network error; doubles each time. |
+| `memory.jev.backoff_max_seconds` | 60 | Longest such wait. |
+| `memory.jev.breaker_failures` | 5 | Failures in a row after which jev is tried only once per probe interval. |
+| `memory.jev.breaker_probe_seconds` | 300 | That probe interval. |
+| `memory.jev.questions.*` | built in | The texts of the questions: `save`, `save_yes`, `save_no`, `span`, `bucket`, `bucket_thread`, `bucket_project`, `bucket_core`, `bucket_boundary`, `bucket_none`. |
+| `memory.filter.approval` | built in (`오너`, `승인`, `owner`, `approve`, `permission`, ...) | Lane or subagent sentences with one of these are dropped. |
+| `memory.filter.credentials` | built in (`토큰`, `비밀번호`, `token`, `password`, `secret`, `api key`, ...) | Same. |
+| `memory.filter.commands` | built in (`$ `, `./`, `\| sh`, `&&`, `rm -rf`, `sudo`, `curl`, ...) | Same. |
+
+Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Sentences are NFKC-normalized first, so full-width and mathematical letters and other compatibility forms are matched as their plain letters, and look-alikes of `.`, `/`, `|` and `:` as those characters. A lane or subagent sentence is dropped when it holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents), a word that mixes Latin with Cyrillic or Greek letters (a Cyrillic `о` in "owner"), or Hangul typed as conjoining jamo, so none of these can hide a listed word.
+
+### When jev fails
+
+Nothing is lost: pending jobs wait in `inbox.sqlite`. A busy (408, 429, 5xx) or network error waits 2, 4, 8, 16 seconds, then after five failures in a row tries once every 5 minutes; a `Retry-After` header is honored. A refused key (401, 403) pauses jev until the next restart and never marks a job as failed. A request jev rejects (another 4xx) also pauses jev until the next restart, and counts one attempt of the job it was sent for, since it may be that job's own request (too long, say). An answer that does not fit counts one attempt too, and waits like a busy error. A job reaches three attempts at most, whatever their reason: then it is marked failed, jev is no longer paused or backing off because of it, and the next job goes on, so one bad job never holds the queue. A wrong model name therefore costs the oldest job one attempt per restart, and fails it on the third. Lane, subagent and scan jobs that wait more than 7 days are dropped; jobs of your own turns never expire. A job that cannot be read (an unreadable row or file) also counts one attempt; a queued job that can no longer be decoded is marked failed at once. When the store cannot settle jobs (a full disk, say), the pass stops and the observer tries again when new work arrives or a minute later, not at once, so jev is not asked about the same jobs over and over; a core rule it already saved still gets its line under the next reply when the job settles.
+
+### Codes in the memory log
+
+The `memory_log` table of `inbox.sqlite` keeps one row per settled job and per problem for 30 days, with the omp version and the jev model that answered.
+
+| Code | Meaning |
+| --- | --- |
+| `M_JOB_DONE` | A job was read; `detail` counts saved and skipped sentences, requests and tokens. |
+| `M_JEV_OFF` | A job was settled without a request because jev is off. |
+| `M_JOB_EXPIRED` | A lane, subagent or scan job waited more than 7 days. |
+| `M_ARTIFACT_CHANGED` | A subagent file changed before its job ran; the new content has its own job. |
+| `E_JEV_AUTH` | No key, or the key was refused. jev is paused until restart. |
+| `E_JEV_REQUEST` | jev rejected the request (bad model, URL or shape). Paused until restart; counts one attempt of the job (`detail` `attempts=3` when it failed). |
+| `W_JEV_BUSY` | jev was busy (408, 429, 5xx); retried later. |
+| `W_JEV_NETWORK` | jev could not be reached; retried later. |
+| `E_JEV_RESPONSE` | jev's answer could not be read; retried later, counting one attempt of the job. |
+| `E_OBSERVER_JOB` | A job could not be read (one attempt of three), or could not be decoded at all (`detail` is `unreadable`; failed at once). |
+| `E_OBSERVER_PANIC` | Reading a job crashed (one attempt of three), or a pass crashed outside a job (`detail` is `pass`; the observer shows as down and tries again later). |
+| `W_MEMORY_WRITE` | One entry could not be written (too long, unusable bucket name). |
+| `W_MEMORY_BACKLOG` | More than 10,000 jobs are waiting. |
+| `W_SUBAGENT_SKIPPED` | A subagent file was skipped (symlink, too large, outside its folder, bad name). |
+| `E_SUBAGENT_LAYOUT` | A lead turn ran a subagent but no output file was found where omp 18.22.2 writes it: omp's layout may have changed. Logged once per run. |
+| `W_OMP_VERSION` | You were told about an omp version moraebot was not checked against (`detail` is the version). |
 
 ## Coming from 0.2.0
 
