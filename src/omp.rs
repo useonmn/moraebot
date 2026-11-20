@@ -165,11 +165,15 @@ impl TurnReport {
 }
 
 /// Result of one lead turn: the main row's report (with every file `send_file` queued
-/// during the turn) and, when a row was steered into it, that row's id and outcome.
+/// during the turn), when a row was steered into it, that row's id and outcome, and the
+/// turn's memory notes ([`TurnContext::memory_notes`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReport {
     pub main: TurnReport,
     pub steered: Option<(i64, Outcome)>,
+    /// Shown to the owner whatever the outcome: a `memory_write` to core or boundary is
+    /// committed even when the turn fails or is interrupted.
+    pub memory_notes: Vec<String>,
 }
 
 /// The lead turn that is running: its main row, conversation and the sender of the main
@@ -185,8 +189,9 @@ pub struct TurnContext {
     pub sender: Sender,
     pub steered_row_id: Option<i64>,
     pub outside_tools: bool,
-    /// Lines added under the turn's reply: owner sentences `memory_write` saved to `core` or
-    /// `boundary`, so the owner sees every standing rule the lead saved.
+    /// Owner sentences `memory_write` saved to `core` or `boundary`, one line each, so the
+    /// owner sees every standing rule the lead saved: dispatch posts them under the group's
+    /// reply, or after its failure notice when it did not reply ([`GroupReport::memory_notes`]).
     pub memory_notes: Vec<String>,
 }
 
@@ -226,21 +231,6 @@ fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event
     seen.store(true, Ordering::Relaxed);
     if let Some(turn) = lock(turn).as_mut() {
         turn.outside_tools = true;
-    }
-}
-
-/// The main outcome with the turn's memory notes under its reply. A turn that did not reply
-/// cannot carry them, so they are logged instead.
-fn with_memory_notes(key: &str, outcome: Outcome, notes: Vec<String>) -> Outcome {
-    if notes.is_empty() {
-        return outcome;
-    }
-    match outcome {
-        Outcome::Reply(text) => Outcome::Reply(format!("{text}\n\n{}", notes.join("\n"))),
-        other => {
-            tracing::warn!(conversation = %key, notes = notes.len(), code = other.code(), "turn did not reply; core memory notes not shown");
-            other
-        }
     }
 }
 
@@ -997,6 +987,7 @@ impl OmpManager {
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
                         steered: None,
+                        memory_notes: Vec::new(),
                     };
                 }
             }
@@ -1101,16 +1092,16 @@ impl OmpManager {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
         }
-        let notes = lock(&self.turn)
+        let memory_notes = lock(&self.turn)
             .take()
             .map(|turn| turn.memory_notes)
             .unwrap_or_default();
-        let main = with_memory_notes(key, main, notes);
         lock(&self.lead_watch).end();
         self.running.send_replace(None);
         GroupReport {
             main: report(key, main, files),
             steered,
+            memory_notes,
         }
     }
 

@@ -1719,17 +1719,85 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
         .expect("inference entry saved");
     assert_eq!(guess.entry.prov, Prov::Inference);
     assert!(guess.entry.expires.is_some());
-    // The owner sees the standing rule the lead saved, under the reply.
-    let Outcome::Reply(reply) = &report.main.outcome else {
-        panic!("reply: {report:?}");
-    };
-    let id = whole["id"].as_str().unwrap();
-    let note = format!(
-        "\n\n[memory] saved {id} to core/owner: \"릴리스는 금요일에 하자\" (say `forget {id}` if that was not meant)"
+    // The owner sees the standing rule the lead saved: dispatch posts the group's notes.
+    assert!(
+        matches!(&report.main.outcome, Outcome::Reply(reply) if !reply.contains("[memory]")),
+        "{report:?}"
     );
-    assert!(reply.ends_with(&note), "{reply}");
-    assert_eq!(reply.matches("[memory] saved").count(), 1, "{reply}");
+    let id = whole["id"].as_str().unwrap();
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(id, "릴리스는 금요일에 하자")]
+    );
     bounded(m.shutdown_all()).await;
+}
+
+fn core_owner_note(id: &str, text: &str) -> String {
+    format!(
+        "[memory] saved {id} to core/owner: \"{text}\" (say `forget {id}` if that was not meant)"
+    )
+}
+
+/// Runs one owner turn of KEY_A whose lead saves `RULE` to core with `memory_write` and then
+/// ends its turn as FAKE_OMP_TOOLS_END says; returns the report and the saved entry's id.
+async fn core_save_in_a_turn_that_ends(end: &str) -> (GroupReport, String) {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+    const RULE: &str = "릴리스는 금요일에 하자";
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let r = owner_row(&h, "m-end-1", &format!("run-tools. {RULE}"));
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": RULE, "bucket_hint": "core", "why": "qa"}
+    });
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([
+            ("FAKE_OMP_TOOL_CALLS", write.to_string()),
+            ("FAKE_OMP_TOOLS_END", end.to_owned()),
+        ])
+        .with_turn_timeout(Duration::from_secs(5))
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory);
+    let report = bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, &format!("run-tools. {RULE}")),
+    ))
+    .await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let saved: Value = serde_json::from_str(&results[0].1).expect("write json");
+    assert_eq!(saved["bucket"], "core/owner", "{saved}");
+    bounded(m.shutdown_all()).await;
+    (report, saved["id"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn a_core_save_is_reported_when_the_turn_fails() {
+    let (report, id) = core_save_in_a_turn_that_ends("error").await;
+    assert_eq!(report.main.outcome.code(), Some(omp::E_PROMPT_ERROR));
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(&id, "릴리스는 금요일에 하자")]
+    );
+}
+
+#[tokio::test]
+async fn a_core_save_is_reported_when_the_turn_needs_check() {
+    let (report, id) = core_save_in_a_turn_that_ends("hang").await;
+    assert!(
+        matches!(report.main.outcome, Outcome::NeedsCheck { .. }),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(&id, "릴리스는 금요일에 하자")]
+    );
 }
 
 #[tokio::test]
@@ -1919,3 +1987,4 @@ async fn conversation_memory_follows_the_body_once_until_it_changes() {
     assert!(messages[3].contains("keep PRs small"));
     bounded(manager.shutdown_all()).await;
 }
+

@@ -18,7 +18,8 @@
 //!
 //! `core` and `boundary` take only owner sentences; any other entry goes to the conversation.
 //! An owner sentence saved to `core` or `boundary` is also named to the owner under the
-//! turn's reply ([`TurnContext::memory_notes`]), so a wrong save is visible.
+//! turn's reply, or after its notice when the turn did not reply
+//! ([`TurnContext::memory_notes`]), so a wrong save is visible.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -291,7 +292,8 @@ pub fn plan_write(
     })
 }
 
-/// The line under the turn's reply that names an owner sentence saved to `core` or `boundary`.
+/// The line shown with the turn's outcome that names an owner sentence saved to `core` or
+/// `boundary`.
 fn core_note(id: &str, bucket: &str, text: &str) -> String {
     const SHOWN: usize = 80;
     let mut shown: String = text.chars().take(SHOWN).collect();

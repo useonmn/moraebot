@@ -41,6 +41,10 @@
 //! With FAKE_OMP_LANE_HOLD_AFTER_TOOLS set, a lane fake in mode `tools` writes nothing
 //! after the last scripted call's `host_tool_result` (no final reply), like `hang`.
 //!
+//! End of a lead tool turn: FAKE_OMP_TOOLS_END=error ends a lead fake's tool turn
+//! (after its last scripted call) with `agent_end` and an error `prompt_result`;
+//! `hang` writes nothing more, like `hang`. Unset or anything else: the echo reply.
+//!
 //! Touch on a refused call: FAKE_OMP_TOUCH_ON_TOOL_ERROR=<path> with
 //! FAKE_OMP_TOUCH_AFTER_ERRORS=<n> (default 1) creates `<path>` empty (parents
 //! are not created) when the n-th `host_tool_result` frame with
@@ -385,7 +389,17 @@ impl Fake {
                             completed(&turn.prompt_id, out);
                             completed(steer_id, out);
                         }
-                        None => finish_echo(&turn.prompt_id, &turn.message, out),
+                        None => {
+                            let end = std::env::var("FAKE_OMP_TOOLS_END").unwrap_or_default();
+                            match end.as_str() {
+                                "error" if !self.lane => {
+                                    send(out, &json!({"type": "agent_end", "messages": []}));
+                                    prompt_error(&turn.prompt_id, out);
+                                }
+                                "hang" if !self.lane => {}
+                                _ => finish_echo(&turn.prompt_id, &turn.message, out),
+                            }
+                        }
                     }
                     return None;
                 }

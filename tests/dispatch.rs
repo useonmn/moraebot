@@ -176,6 +176,18 @@ impl Harness {
         fail_threads: bool,
         extra_env: Vec<(&'static str, String)>,
     ) -> Self {
+        Self::with_lead(root, config, mode, fail_threads, extra_env, |omp| omp)
+    }
+
+    /// Like [`Self::with_config`]; `lead` finishes the lead's manager first.
+    fn with_lead(
+        root: &Path,
+        config: Config,
+        mode: &str,
+        fail_threads: bool,
+        extra_env: Vec<(&'static str, String)>,
+        lead: impl FnOnce(OmpManager) -> OmpManager,
+    ) -> Self {
         let home = config.home.clone();
         let store = Arc::new(Mutex::new(
             Store::open(&home.join("inbox.sqlite")).expect("store"),
@@ -188,7 +200,7 @@ impl Harness {
             ),
         ];
         env.extend(extra_env);
-        let omp = OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env(env);
+        let omp = lead(OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env(env));
         let chat = omp.chat();
         let adapter = Arc::new(FakeAdapter::new());
         let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
@@ -4236,4 +4248,109 @@ async fn memory_commands_never_use_an_onboarding_turn() {
         "memory commands and the forget answer are not onboarding turns"
     );
     h.close().await;
+}
+
+// --- Core saves of a turn that did not reply (#42 review) ---
+
+impl Harness {
+    /// The lead (fake-omp mode `tools`) has `memory_write` on a memory store under the test
+    /// home (fixed day) and a 5 s turn limit; it runs `script` as host tool calls, then ends
+    /// its turn as FAKE_OMP_TOOLS_END=`end` says.
+    fn open_lead_memory(root: &Path, script: String, end: &str) -> Self {
+        let config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+        let today = Day::from_ymd(2026, 11, 20).expect("day");
+        let store = MemoryStore::open(&config.home, Redactor::default(), Arc::new(move || today))
+            .expect("memory store");
+        let memory = MemoryHandle::spawn(store).expect("memory worker");
+        Self::with_lead(
+            root,
+            config,
+            "tools",
+            false,
+            vec![
+                ("FAKE_OMP_TOOL_CALLS", script),
+                ("FAKE_OMP_TOOLS_END", end.to_owned()),
+            ],
+            move |omp| {
+                omp.with_turn_timeout(Duration::from_secs(5))
+                    .with_memory_clock(Arc::new(move || today))
+                    .with_memory(memory)
+            },
+        )
+    }
+}
+
+/// An owner turn whose lead saves a standing rule to core and then ends as `end` says:
+/// the messages posted in the conversation.
+async fn core_save_then(end: &str) -> Vec<(String, String)> {
+    let dir = tempfile::tempdir().unwrap();
+    let rule = "릴리스는 금요일에 하자";
+    let write = json!({
+        "tool": moraebot::memory_tools::MEMORY_WRITE_TOOL,
+        "arguments": {"text": rule, "bucket_hint": "core", "why": "qa"}
+    });
+    let h = Harness::open_lead_memory(dir.path(), write.to_string(), end);
+    queued(
+        h.handle(event(
+            "4441",
+            OWNER,
+            Some("444"),
+            &format!("run-tools. {rule}"),
+        ))
+        .await,
+    );
+    assert!(h.step().await);
+    let sends = h.sends();
+    h.close().await;
+    sends
+}
+
+/// The saved-note line of `sends`, which must be the last line posted in thread 444.
+fn last_core_note(sends: &[(String, String)]) -> &str {
+    let (channel, text) = sends.last().expect("a message was posted");
+    assert_eq!(channel, "444");
+    let line = text.lines().last().unwrap_or_default();
+    assert!(
+        line.starts_with("[memory] saved m-")
+            && line.contains(" to core/owner: \"릴리스는 금요일에 하자\""),
+        "{sends:?}"
+    );
+    line
+}
+
+#[tokio::test]
+async fn a_core_save_in_a_failed_turn_is_posted_after_the_notice() {
+    let sends = core_save_then("error").await;
+    let note = last_core_note(&sends);
+    assert_eq!(sends.last().map(|(_, text)| text.as_str()), Some(note));
+    assert_eq!(
+        sends[..sends.len() - 1],
+        [("444".to_owned(), notice_text(N_FAILED).to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_core_save_in_an_interrupted_turn_is_posted_after_the_notice() {
+    let sends = core_save_then("hang").await;
+    let note = last_core_note(&sends);
+    assert_eq!(sends.last().map(|(_, text)| text.as_str()), Some(note));
+    assert_eq!(
+        sends[..sends.len() - 1],
+        [("444".to_owned(), notice_text(N_INTERRUPTED).to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_core_save_in_a_replied_turn_follows_the_reply() {
+    let sends = core_save_then("").await;
+    let note = last_core_note(&sends);
+    assert_eq!(sends.len(), 1, "one message: {sends:?}");
+    let reply = sends[0]
+        .1
+        .strip_suffix(note)
+        .expect("the note ends the reply");
+    assert!(
+        reply.starts_with("echo: ") && reply.ends_with("\n\n"),
+        "{reply:?}"
+    );
 }

@@ -1010,14 +1010,20 @@ impl Dispatcher {
 
     /// Stores the outcome of a lead turn and its steered row, if any: one reply on the
     /// main row (the steered row `done`), else every member `needs_check` with the
-    /// conversation's notice, else every member `failed` with one notice.
+    /// conversation's notice, else every member `failed` with one notice. The turn's memory
+    /// notes go under the reply, or right after the notice.
     async fn settle_group(
         &self,
         main_id: i64,
         target: &str,
         group: GroupReport,
     ) -> Result<(), StoreError> {
-        let GroupReport { main, steered } = group;
+        let GroupReport {
+            main,
+            steered,
+            memory_notes,
+        } = group;
+        let notes = memory_notes.join("\n");
         let steered_id = steered.as_ref().map(|(id, _)| *id);
         let mut ids = vec![main_id];
         ids.extend(steered_id);
@@ -1032,6 +1038,7 @@ impl Dispatcher {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn interrupted");
             self.store().interrupt_group(&ids, code)?;
             self.post_needs_check_notices().await?;
+            self.post_memory_notes(main_id, target, &notes).await;
             return Ok(());
         }
         if let Some(code) = outcomes.iter().find_map(|outcome| match outcome {
@@ -1046,10 +1053,16 @@ impl Dispatcher {
                 N_FAILED
             };
             self.notify(target, notice).await;
+            self.post_memory_notes(main_id, target, &notes).await;
             return Ok(());
         }
 
-        let reply = combine_replies(outcomes.iter().filter_map(|outcome| reply_text(outcome)));
+        let reply = combine_replies(
+            outcomes
+                .iter()
+                .filter_map(|outcome| reply_text(outcome))
+                .chain((!notes.is_empty()).then_some(notes.as_str())),
+        );
         let out_files = out_files_json(main.files);
         self.store()
             .finish_group(main_id, &reply, out_files.as_deref(), steered_id)?;
@@ -1423,6 +1436,20 @@ impl Dispatcher {
     /// Sends a fixed notice; returns whether the messenger accepted it.
     async fn notify(&self, channel: &str, code: &'static str) -> bool {
         send_notice(self.adapter.as_ref(), channel, code).await
+    }
+
+    /// Posts the memory notes of group `main_id`, a turn that did not reply, so the owner
+    /// sees a standing rule the lead saved before the turn failed. Best effort, like a notice.
+    async fn post_memory_notes(&self, main_id: i64, channel: &str, notes: &str) {
+        if notes.is_empty() {
+            return;
+        }
+        for chunk in reply_messages(notes, self.adapter.message_limit()) {
+            if let Err(err) = self.adapter.send(channel, &chunk).await {
+                tracing::warn!(row = main_id, code = err.code, "memory notes not sent");
+                return;
+            }
+        }
     }
 }
 
