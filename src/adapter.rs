@@ -112,13 +112,21 @@ impl Drop for TypingHandle {
 
 #[async_trait]
 pub trait MessengerAdapter: Send + Sync {
-    fn platform(&self) -> &'static str;
+    /// The conversation key prefix. A bridge adapter reads it from the bridge's hello, so
+    /// it borrows from the adapter.
+    fn platform(&self) -> &str;
 
     /// The longest message, in characters, this messenger accepts in one send.
     fn message_limit(&self) -> usize;
 
     /// Built-in formatting hints for omp about this messenger (overridable per home).
-    fn behavior_hints(&self) -> &'static str;
+    fn behavior_hints(&self) -> &str;
+
+    /// The send target for messages that belong to no conversation (the greeting fallback,
+    /// the omp version warning). `None`: the core uses the configured channel.
+    fn home_target(&self) -> Option<String> {
+        None
+    }
 
     async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError>;
 
@@ -188,6 +196,12 @@ pub trait MessengerAdapter: Send + Sync {
     fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         None
     }
+
+    /// Tells the messenger side that the inbound message `message_id` was handled: stored,
+    /// found a duplicate, dropped or answered with a notice. Never called when storing it
+    /// failed, so a spooling bridge delivers it again. Adapters without a spool keep this
+    /// default, which does nothing.
+    async fn ack_inbound(&self, _message_id: &str) {}
 
     /// Closes the messenger connection after the gateway stopped.
     async fn shutdown(&self) {}

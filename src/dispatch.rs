@@ -398,6 +398,7 @@ impl Dispatcher {
         store: Arc<Mutex<Store>>,
         omp: OmpManager,
     ) -> Self {
+        let channel_id = adapter.home_target().unwrap_or_else(|| config.channel_id());
         Self {
             owner_id: config.owner_id(),
             access: Policy::from_config(config),
@@ -409,7 +410,7 @@ impl Dispatcher {
             work_dir: std::path::absolute(&config.work_dir)
                 .unwrap_or_else(|_| config.work_dir.clone()),
             home: config.home.clone(),
-            channel_id: config.channel_id(),
+            channel_id,
             admission: tokio::sync::Mutex::new(()),
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
@@ -606,8 +607,12 @@ impl Dispatcher {
             tokio::select! {
                 event = inbound.recv() => match event {
                     Some(event) => {
-                        if let Err(err) = self.handle_event(event).await {
-                            tracing::error!(code = err.code(), error = %err, "inbound event not handled");
+                        let message_id = event.message_id.clone();
+                        match self.handle_event(event).await {
+                            // Every handled outcome is acked; a store error is not, so a
+                            // spooling bridge delivers the message again.
+                            Ok(_) => self.adapter.ack_inbound(&message_id).await,
+                            Err(err) => tracing::error!(code = err.code(), error = %err, "inbound event not handled"),
                         }
                     }
                     None => break None,
@@ -748,7 +753,8 @@ impl Dispatcher {
 
         let platform = self.adapter.platform();
         let (key, new_thread) = match (&event.thread_id, event.is_dm) {
-            (_, true) => (ConversationKey::dm(platform, &event.channel_id), false),
+            (Some(thread), true) => (ConversationKey::thread(platform, thread), false),
+            (None, true) => (ConversationKey::dm(platform, &event.channel_id), false),
             (Some(thread), false) => (ConversationKey::thread(platform, thread), false),
             (None, false) => (ConversationKey::thread(platform, &event.message_id), true),
         };
@@ -802,6 +808,12 @@ impl Dispatcher {
             (!event.attachments.is_empty()).then(|| declared_json(&event.attachments));
         let id = {
             let _gate = self.admission.lock().await;
+            // A DM thread already exists (a root DM is its own thread), so it is never opened.
+            if event.is_dm
+                && let Some(thread) = &event.thread_id
+            {
+                self.store().remember_thread(platform, thread)?;
+            }
             let admitted = self.store().admit_with_files(
                 platform,
                 &event.message_id,

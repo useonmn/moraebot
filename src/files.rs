@@ -84,6 +84,11 @@ impl Progress {
         }
     }
 
+    /// The byte limit set by [`Self::with_limit`]; `None` means no limit.
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+
     /// Records a received chunk of `n` bytes at the current instant.
     pub fn record(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
