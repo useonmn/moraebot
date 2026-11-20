@@ -434,7 +434,7 @@ moraebot은 자기 기억 장치를 두지 않습니다. 기억 코드는 `memor
 
 **저장소를 나누지 않는 까닭.** 저장소를 나누는 설정이 기억 방식마다 다릅니다. hindsight는 `hindsight.bankId`(환경변수 `HINDSIGHT_BANK_ID`), mnemopi는 설정 파일의 `mnemopi.bank`/`mnemopi.dbPath`뿐이고, local은 omp의 agent 폴더를 통째로 바꾸는 방법(로그인 정보까지 옮겨짐)밖에 없습니다. 하나로 모두 나눌 수 없고, 나누려면 moraebot이 주인의 기억 설정을 다시 건드려야 합니다. hindsight와 mnemopi는 기본이 "프로젝트별"이라, moraebot에서 생긴 기억은 작업 폴더 이름 아래에 모입니다.
 
-**0.2.0에서 올라올 때.** `~/.moraebot/memory/` 폴더, `~/.moraebot/omp/config-overlay.yml`, 데이터베이스의 기억 표는 지우지도 옮기지도 않고 쓰지 않습니다. 필요 없으면 손으로 지웁니다.
+**0.2.0에서 올라올 때.** 새 기억 저장소(#39, docs/memory.md)가 `~/.moraebot/memory/`를 씁니다. 옛 배치(`memory/system` 등, `omp/config-overlay.yml`)가 남아 있으면 moraebot은 시작을 거부하고 지울 경로와 `rm -rf` 명령을 한 줄로 알려 줍니다. 코드가 지우지는 않습니다. 데이터베이스의 옛 기억 표는 쓰지 않습니다.
 
 ### 3.11 레인 작업 폴더 (lanes L1)
 

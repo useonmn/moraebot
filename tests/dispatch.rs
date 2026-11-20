@@ -30,7 +30,7 @@ use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
 use moraebot::memory::{Bucket, Day, MemoryHandle, MemoryStore, Redactor};
-use moraebot::omp::{E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
+use moraebot::omp::{self, E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::store::{
     Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
@@ -3147,6 +3147,82 @@ async fn gateway_appends_lead_guidance_then_messenger_hints() {
 
     let empty = lead_system_prompt_flags(&dir.path().join("empty"), Some("")).await;
     assert_eq!(empty, [format!("{flag}{hints_text}")]);
+}
+
+/// The whole P1a path through `Gateway::open`: an owner "always remember" is answered by
+/// moraebot without starting the lead, lands in `<home>/memory/core/owner.md`, and the
+/// next lead turn carries it in the core block of the appended system prompt.
+#[tokio::test]
+async fn gateway_answers_memory_commands_and_appends_core_memory_to_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    let log = dir.path().join("fake-omp.log");
+    let adapter = Arc::new(FakeAdapter::new());
+    let as_dyn: Arc<dyn MessengerAdapter> = adapter.clone();
+    let vars = [
+        ("FAKE_OMP_MODE", "ok".to_owned()),
+        ("FAKE_OMP_LOG", log.to_string_lossy().into_owned()),
+    ];
+    let gateway = Gateway::open(&config, as_dyn)
+        .expect("open gateway")
+        .with_omp(|omp| omp.with_extra_env(vars));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(gateway.run(async {
+        let _ = stopped.await;
+    }));
+
+    adapter
+        .inject(dm(
+            "1300000000000000980",
+            DM_CHANNEL,
+            "항상 기억해: 답은 한국어로",
+        ))
+        .await;
+    bounded(adapter.wait_for_send(1)).await;
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "a memory command starts no lead"
+    );
+    adapter
+        .inject(dm("1300000000000000981", DM_CHANNEL, "hello"))
+        .await;
+    bounded(adapter.wait_for_send(2)).await;
+    let _ = stop.send(());
+    bounded(task).await.unwrap().expect("clean stop");
+
+    let sends: Vec<(String, String)> = adapter
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Send { channel, text } => Some((channel, text)),
+            _ => None,
+        })
+        .collect();
+    assert!(sends[0].1.starts_with("Remembered m-"), "{sends:?}");
+    let owner_md = config.home.join("memory/core/owner.md");
+    let saved = std::fs::read_to_string(&owner_md).expect("core/owner.md");
+    assert!(saved.contains("답은 한국어로"), "{saved}");
+
+    let log = std::fs::read_to_string(&log).expect("fake-omp log");
+    let argv = log
+        .lines()
+        .find_map(|l| l.strip_prefix("START pid="))
+        .and_then(|l| l.split_once(" argv="))
+        .map(|(_, argv)| serde_json::from_str::<Vec<String>>(argv).expect("argv JSON"))
+        .expect("one lead child");
+    let append = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--append-system-prompt="))
+        .expect("appended system prompt");
+    let block = append
+        .split_once(omp::CORE_MEMORY_OPEN)
+        .map(|(_, rest)| rest)
+        .expect("core memory block");
+    assert!(block.contains("답은 한국어로 (m-"), "{block}");
+    assert!(
+        block.trim_end().ends_with(omp::CORE_MEMORY_CLOSE),
+        "{block}"
+    );
 }
 
 fn onboarding_row(h: &Harness) -> Option<OnboardingRow> {

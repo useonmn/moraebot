@@ -20,6 +20,7 @@ use crate::config::{Config, ConfigError};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
+use crate::memory::{self, MemoryError, MemoryHandle, MemoryStore, Redactor};
 use crate::omp::{OmpManager, lock};
 use crate::onboarding;
 use crate::store::{Store, StoreError};
@@ -44,6 +45,8 @@ pub enum GatewayError {
     Adapter(#[from] AdapterError),
     #[error("{0}")]
     Config(#[from] ConfigError),
+    #[error("{0}")]
+    Memory(#[from] MemoryError),
     #[error("{E_GATEWAY_TASK}: dispatcher task failed: {0}")]
     Task(JoinError),
     #[error("{E_GATEWAY_TASK}: the {0} task stopped")]
@@ -60,6 +63,7 @@ impl GatewayError {
             Self::Store(err) => err.code(),
             Self::Adapter(err) => err.code,
             Self::Config(err) => err.code,
+            Self::Memory(err) => err.code,
             Self::Task(_) | Self::TaskEnded(_) => E_GATEWAY_TASK,
             Self::Signal(_) => E_GATEWAY_SIGNAL,
             Self::ShutdownTimeout => E_SHUTDOWN_TIMEOUT,
@@ -71,6 +75,7 @@ pub struct Gateway {
     config: Config,
     adapter: Arc<dyn MessengerAdapter>,
     store: Arc<Mutex<Store>>,
+    memory: MemoryHandle,
     omp: OmpManager,
 }
 
@@ -78,11 +83,18 @@ impl Gateway {
     /// Opens the inbox and builds the omp manager with the lead guidance followed by the
     /// adapter's behavior hints (each replaced by its override file in the home,
     /// `E_HINTS_FILE` when unusable). A second gateway on the same home fails here with
-    /// `E_ALREADY_RUNNING`. Nothing is started yet.
+    /// `E_ALREADY_RUNNING`. It also opens the memory store under `<home>/memory` (refusing an
+    /// old 0.2.0 layout with `E_MEMORY_OLD_LAYOUT`) and starts its writer thread, which
+    /// serves the owner's memory commands; nothing else is started yet.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
         let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
         let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
+        let memory = MemoryHandle::spawn(MemoryStore::open(
+            &config.home,
+            Redactor::from_config(config),
+            memory::system_clock(),
+        )?)?;
         let omp = OmpManager::new(config.clone(), Arc::clone(&store))
             .with_hints(lead::system_prompt(&guidance, &hints));
         let tools =
@@ -92,6 +104,7 @@ impl Gateway {
             config: config.clone(),
             adapter,
             store,
+            memory,
             omp,
         })
     }
@@ -114,10 +127,13 @@ impl Gateway {
             config,
             adapter,
             store,
+            memory,
             omp,
         } = self;
         let mut inbound = adapter.start().await?;
-        let dispatcher = Arc::new(Dispatcher::new(&config, adapter, Arc::clone(&store), omp));
+        let dispatcher = Arc::new(
+            Dispatcher::new(&config, adapter, Arc::clone(&store), omp).with_memory(memory),
+        );
         let (events, queue) = mpsc::channel(EVENT_QUEUE);
         let mut dispatch = tokio::spawn(dispatcher.run(queue));
         tracing::info!("gateway started");
