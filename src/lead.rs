@@ -108,6 +108,21 @@ pub fn lane_result(conversation_key: &str, lane_id: i64, result: &LaneResult) ->
     }
 }
 
+/// The lane's own words in a lane-result input: the body after the tag line, cut before the
+/// machine block moraebot appends (`[moraebot] Done checks passed:` or the failed claim).
+pub fn lane_result_text(input: &str) -> &str {
+    let body = input.split_once('\n').map_or("", |(_, body)| body);
+    let cut = [
+        "\n\n[moraebot] Done checks passed:",
+        "\n\n[moraebot] The lane's last lane_done claim failed:",
+    ]
+    .iter()
+    .filter_map(|marker| body.rfind(marker))
+    .min()
+    .unwrap_or(body.len());
+    body[..cut].trim()
+}
+
 /// The lead input for a lane that looks stalled: a tag line, a machine line, and one sentence.
 pub fn lane_stalled(conversation_key: &str, lane_id: i64, stalled: &Stalled) -> String {
     let tool: String = stalled
@@ -177,6 +192,45 @@ mod tests {
     use crate::hints;
     use crate::lane;
     use crate::onboarding;
+
+    #[test]
+    fn lane_result_text_is_only_the_lanes_words() {
+        let words =
+            |result: &LaneResult| lane_result_text(&lane_result("p:th:1", 3, result)).to_owned();
+        assert_eq!(
+            words(&LaneResult::Text("the fix is in\n\nsecond paragraph")),
+            "the fix is in\n\nsecond paragraph"
+        );
+        let done = LaneResult::Done {
+            text: "built it",
+            receipt: "evidence: e\n- file a -> ok",
+        };
+        assert_eq!(words(&done), "built it");
+        let unmet = LaneResult::Unmet {
+            text: "tried",
+            receipt: "- file a -> missing",
+        };
+        assert_eq!(words(&unmet), "tried");
+        assert_eq!(words(&LaneResult::Failed("E_TURN_TIMEOUT")), "");
+        assert_eq!(
+            words(&LaneResult::Stopped { reason: "qa stuck" }),
+            "[moraebot] Stopped by the lead: qa stuck"
+        );
+        let stalled = lane_stalled(
+            "p:th:1",
+            3,
+            &Stalled {
+                reason: N_LANE_QUIET,
+                quiet_minutes: 20,
+                idle_minutes: 20,
+                tool_calls: 1,
+                new_calls: 1,
+                last_tool: None,
+            },
+        );
+        assert!(lane_result_text(&stalled).starts_with(STALL_LINE));
+        assert_eq!(lane_result_text("no newline"), "");
+    }
 
     #[test]
     fn owner_input_tag_roundtrips() {
