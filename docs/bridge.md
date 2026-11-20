@@ -253,6 +253,7 @@ Link codes:
 |---|---|
 | `E_BRIDGE_PROTO` | The two sides speak different `proto` versions. |
 | `E_BRIDGE_BUSY` | Another core is connected. |
+| `E_BRIDGE_STOPPING` | Sent in `bye` by a bridge that is shutting down. The core reconnects with backoff. |
 | `E_BRIDGE_UNSUPPORTED` | Unknown frame type, or a capability the bridge lacks. |
 | `E_BRIDGE_BAD_REQUEST` | A missing or invalid field. |
 | `E_BRIDGE_PEER` | The peer uid differs. Logged only. |
@@ -264,3 +265,116 @@ Link codes:
 Every core call fails at once with the default code of its operation and `E_BRIDGE_DOWN` in the message. A request in flight when the link drops fails the same way. The reply row stays `reply_pending` and is sent again after the next `hello_ok`.
 
 Outbound delivery is therefore at least once. A send the messenger accepted just before the link dropped is sent again after the reconnect. This is the same class of duplicate as a core crash between posting a reply and marking it done.
+
+## The Slack bridge
+
+`moraebot-slack-bridge` is the bridge for Slack. It ships next to `moraebot` and runs as its own service.
+
+### What it reports
+
+- `platform` is `slack`, so the conversation keys and sessions of the in-core Slack adapter (before the bridge) carry over.
+- `message_limit` is 3900. `home` is the configured `channel_id`.
+- `caps`: `threads: "implicit"`, `dm`, `edit`, `files` and `status` true, `reactions` false, `agent_mode` true.
+- `dm` answers with the user id itself as the target: `chat.postMessage` to a user id posts into the app's DM with that user.
+- A `fetch` without `max_bytes` is capped at 1 GiB.
+- Slack messages with a subtype other than `file_share` and `thread_broadcast` are dropped, and the drop is logged at info level with the subtype.
+
+### Agent mode
+
+- Every DM is a thread. A root DM gets `thread_id` `<channel>:<ts>`, so the reply carries its `thread_ts`. A DM inside a thread gets `<channel>:<thread_ts>` and is answered in that thread.
+- `status start` on a DM thread target (`D...:<ts>`) calls `assistant.threads.setStatus` with a non-empty status and repeats it every 90 seconds, because Slack removes a status after two minutes without a message. `stop` sends an empty status. When several `start`s for one target are open (a lead turn and a lane), the status stays until the last `stop`. When the core disconnects, the bridge clears every status it set.
+- Every other target answers `ok` with no Slack call. Until a live check shows that `setStatus` works in channel threads, statuses are used in DM threads only.
+- A failed `setStatus` is logged by the bridge and still answers `ok`.
+- `setStatus` needs `chat:write`, or `assistant:write`. Some agent features need a paid Slack plan; threaded DM replies work on any plan.
+
+### Files and state
+
+| Path | Content |
+|---|---|
+| `<home>/slack-bridge.toml` | The bridge config (below). |
+| `<home>/slack-bridge/lock` | An exclusive lock. A second bridge on the same home exits with `E_BRIDGE_RUNNING`. |
+| `<home>/slack-bridge/spool/` | One file per inbound message not yet acked by a core (mode 0600, folder 0700). |
+| `<home>/logs/slack-bridge.log.*` | The bridge log, next to the core's. |
+
+`<home>` is the moraebot home (`~/.moraebot` unless `MORAEBOT_HOME` is set), the same folder the core uses.
+
+The spool holds raw Slack payloads, message text and file URLs included. An entry leaves it on the core's `ack`, when the message is not for the core (another channel, an unlisted sender), after 5 attempts, or when it is older than 7 days. At 10,000 entries a new message is dropped with an error log. A message that cannot be written to the spool is not acked to Slack, so Slack delivers it again.
+
+Bridge start errors:
+
+| Code | Meaning |
+|---|---|
+| `E_BRIDGE_RUNNING` | Another bridge holds the lock. |
+| `E_BRIDGE_STATE` | The state folder, the lock or the signal handlers cannot be set up. |
+| `E_BRIDGE_SOCKET` | The socket cannot be bound, or its path holds something that is not a socket. |
+| `E_BRIDGE_SPOOL` | The spool cannot be opened. |
+
+### Running the bridge by hand
+
+`slack-bridge.toml` names the socket, the channel the bridge reports as `home`, and the two token files:
+
+```toml
+socket = "/run/user/1000/moraebot/slack-bridge.sock"
+channel_id = "C222BBBB"
+bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
+app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+```
+
+- `socket` must be the same absolute path as `[bridge] socket` in the core's `config.toml`.
+- `channel_id` starts with `C` or `G`. The token files must be regular files with mode 0600.
+- The owner and the allow list are not here: the bridge gets them from the core in `hello_ok`.
+
+Commands:
+
+```sh
+moraebot-slack-bridge check-config [--config PATH]   # OK/FAIL lines for the config and both token files
+moraebot-slack-bridge run [--config PATH]            # runs until SIGTERM or SIGINT
+moraebot-slack-bridge --version
+```
+
+`--config` defaults to `<home>/slack-bridge.toml`. Start the bridge first, then `moraebot run`. Either can restart while the other runs: the core reconnects, and messages that arrive while no core is connected wait in the spool. On SIGTERM or SIGINT the bridge says `bye` with `E_BRIDGE_STOPPING`, removes the socket file and exits 0.
+
+### Moving a Slack config by hand
+
+A `config.toml` with a `[slack]` section or `messenger = "slack"` fails with `E_SLACK_MOVED`, because Slack no longer runs inside the core. To move it:
+
+1. In `config.toml`, set `messenger = "bridge"`.
+2. Rename `[slack]` to `[bridge]` and `[[slack.allow]]` to `[[bridge.allow]]`. Keep `owner_id`, `max_bot_replies` and the allow entries.
+3. Move `channel_id`, `bot_token_file` and `app_token_file` out of that section into a new `<home>/slack-bridge.toml` with mode 0600.
+4. Add the same `socket` line to both files. Use the default path for your OS from [Configuration](#configuration).
+5. Run `moraebot check-config` and `moraebot-slack-bridge check-config`, then start the bridge and the core.
+
+Before:
+
+```toml
+messenger = "slack"
+
+[slack]
+owner_id = "U111AAAA"
+channel_id = "C222BBBB"
+bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
+app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+```
+
+After, `config.toml`:
+
+```toml
+messenger = "bridge"
+
+[bridge]
+socket = "/run/user/1000/moraebot/slack-bridge.sock"
+owner_id = "U111AAAA"
+```
+
+and `slack-bridge.toml`:
+
+```toml
+socket = "/run/user/1000/moraebot/slack-bridge.sock"
+channel_id = "C222BBBB"
+bot_token_file = "/home/me/.moraebot/secrets/slack-bot.token"
+app_token_file = "/home/me/.moraebot/secrets/slack-app.token"
+```
+
+`moraebot setup slack` writes both files in this layout for a new setup.
+
+After the move, new DMs are threaded: each DM thread is its own conversation, with its own session and memory. An old `slack:dm:<channel>` conversation still gets its pending replies.
