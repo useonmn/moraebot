@@ -34,7 +34,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `m-1a2b3c 지워`, `forget m-1a2b3c` | Asks once; your next message there answers it (`응`/`yes` forgets, `아니`/`no` keeps). |
 | `m-1a2b3c 되살려`, `restore m-1a2b3c` | Brings a forgotten entry back. |
 
-A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when the lead saves a note for a conversation or project without a command (`memory_write` below); `뭐 기억해?` lists what this conversation got that way. When the lead saves one of your sentences as a core rule or a boundary, the reply ends with a line naming its id (`[memory] saved m-1a2b3c to core/owner: "..." (say \`forget m-1a2b3c\` if that was not meant)`), so a wrong save is visible.
+A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when the lead saves a note for a conversation or project without a command (`memory_write` below); `뭐 기억해?` lists what this conversation got that way. When the lead saves one of your sentences as a core rule or a boundary, moraebot posts a line naming its id (`[memory] saved m-1a2b3c to core/owner: "..." (say \`forget m-1a2b3c\` if that was not meant)`), so a wrong save is visible. The save stands however the turn ends. When the lead replies, the line goes under the reply, at its end. When the turn fails or is interrupted, the line is posted as its own message right after the failure or interrupted notice.
 
 The lead has no tool that corrects, forgets or restores an entry; only your commands above do that.
 
