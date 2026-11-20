@@ -298,7 +298,7 @@ Outbound delivery is therefore at least once. A send the messenger accepted just
 
 `<home>` is the moraebot home (`~/.moraebot` unless `MORAEBOT_HOME` is set), the same folder the core uses.
 
-The spool holds raw Slack payloads, message text and file URLs included. An entry leaves it on the core's `ack`, when the message is not for the core (another channel, an unlisted sender), after 5 attempts, or when it is older than 7 days. At 10,000 entries a new message is dropped with an error log. A message that cannot be written to the spool is not acked to Slack, so Slack delivers it again.
+The spool holds raw Slack payloads, message text and file URLs included. Only messages a core could take are written to it: a DM or a message in `channel_id`, not posted by the bot. Once a core has said `hello_ok`, the sender must also be its owner or a listed id; the bridge keeps that list in memory, so right after a bridge restart every sender is spooled until a core connects. A Slack event larger than one line (`MAX_LINE`) is refused by the WebSocket. A spooled message that would still encode longer than one line is removed with an error log instead of being sent. An entry leaves it on the core's `ack`, when the message is not for the core (another channel, an unlisted sender), after 5 attempts, or when it is older than 7 days. At 10,000 entries a new message is dropped with an error log. A message that cannot be written to the spool is not acked to Slack, so Slack delivers it again.
 
 Bridge start errors:
 
@@ -332,7 +332,7 @@ moraebot-slack-bridge run [--config PATH]            # runs until SIGTERM or SIG
 moraebot-slack-bridge --version
 ```
 
-`--config` defaults to `<home>/slack-bridge.toml`. Start the bridge first, then `moraebot run`. Either can restart while the other runs: the core reconnects, and messages that arrive while no core is connected wait in the spool. On SIGTERM or SIGINT the bridge says `bye` with `E_BRIDGE_STOPPING`, removes the socket file and exits 0.
+`--config` defaults to `<home>/slack-bridge.toml`. It moves only the config: the lock, the spool (`<home>/slack-bridge/`) and the log (`<home>/logs/`) always use the moraebot home (`MORAEBOT_HOME`, else `~/.moraebot`). To run a second bridge, give it its own `MORAEBOT_HOME`, not just another `--config`; with the same home it fails with `E_BRIDGE_RUNNING`. Start the bridge first, then `moraebot run`. Either can restart while the other runs: the core reconnects, and messages that arrive while no core is connected wait in the spool. On SIGTERM or SIGINT the bridge says `bye` with `E_BRIDGE_STOPPING`, removes the socket file and exits 0.
 
 ### Moving a Slack config by hand
 
