@@ -174,6 +174,7 @@ impl Rig {
                 app_token_file: home.join("secrets").join("slack-app.token"),
                 access: Default::default(),
             }),
+            bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };

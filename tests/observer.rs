@@ -63,6 +63,7 @@ fn test_config(root: &Path, omp_path: PathBuf, jev_url: &str) -> Config {
             access: Default::default(),
         }),
         slack: None,
+        bridge: None,
         omp: OmpConfig::default(),
         memory,
     }

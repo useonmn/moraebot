@@ -3,6 +3,9 @@ use crate::adapter::{
     AdapterError, E_ADAPTER_DM, E_ADAPTER_SEND, E_ADAPTER_UPLOAD_DENIED, InboundAttachment,
     InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
+use crate::bridge::client::{Connector, Link};
+use crate::bridge::proto::{Caps, Decoded, Frame, FrameReader, ThreadsCap, write_frame};
+use crate::bridge::{E_BRIDGE_UNSUPPORTED, PROTO_VERSION};
 use crate::files::{E_FILE_WRITE, Progress};
 use crate::slack::{
     E_SLACK_API, E_SLACK_AUTH, PostOutcome, SlackSocket, SlackTransport, SocketMessage,
@@ -1175,6 +1178,383 @@ async fn serve_jev(
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(payload.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// How long a [`FakeBridge`] helper waits for the core before it panics.
+const FAKE_BRIDGE_WAIT: Duration = Duration::from_secs(30);
+
+/// Scripted stand-in for a bridge process, for `BridgeAdapter` tests. It is the
+/// adapter's [`Connector`]: each connect hands the core one end of an in-memory stream
+/// and queues the other end for [`FakeBridge::accept`]. While it is down, connects fail.
+pub struct FakeBridge {
+    up: AtomicBool,
+    links: mpsc::UnboundedSender<tokio::io::DuplexStream>,
+    accepted: tokio::sync::Mutex<mpsc::UnboundedReceiver<tokio::io::DuplexStream>>,
+    attempts: watch::Sender<u64>,
+}
+
+impl FakeBridge {
+    /// A bridge that accepts connections.
+    pub fn new() -> Arc<Self> {
+        let (links, accepted) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            up: AtomicBool::new(true),
+            links,
+            accepted: tokio::sync::Mutex::new(accepted),
+            attempts: watch::channel(0).0,
+        })
+    }
+
+    /// `false`: every connect fails with "connection refused", as with no bridge running.
+    pub fn set_up(&self, up: bool) {
+        self.up.store(up, Ordering::SeqCst);
+    }
+
+    /// Counts connect attempts, failed ones included.
+    pub fn attempts(&self) -> watch::Receiver<u64> {
+        self.attempts.subscribe()
+    }
+
+    /// The bridge end of the next connection the core makes.
+    pub async fn accept(&self) -> FakeBridgeConn {
+        let link = tokio::time::timeout(FAKE_BRIDGE_WAIT, async {
+            self.accepted.lock().await.recv().await
+        })
+        .await
+        .expect("the core connected within the bound")
+        .expect("the fake bridge is alive");
+        let (read, writer) = tokio::io::split(link);
+        FakeBridgeConn {
+            frames: FrameReader::new(tokio::io::BufReader::new(read)),
+            writer,
+        }
+    }
+
+    /// A Slack-like hello: platform `slack`, limit 3900, home `C222`, every capability
+    /// on and implicit threads.
+    pub fn hello() -> Frame {
+        Self::hello_with(Caps {
+            threads: ThreadsCap::Implicit,
+            dm: true,
+            edit: true,
+            files: true,
+            status: true,
+            reactions: false,
+            agent_mode: true,
+        })
+    }
+
+    /// [`Self::hello`] with other capabilities.
+    pub fn hello_with(caps: Caps) -> Frame {
+        Frame::Hello {
+            proto: PROTO_VERSION,
+            bridge: "fake-bridge".to_owned(),
+            version: "0.0.0".to_owned(),
+            platform: "slack".to_owned(),
+            message_limit: 3900,
+            hints: "fake bridge hints".to_owned(),
+            home: Some("C222".to_owned()),
+            caps,
+            spooled: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl Connector for FakeBridge {
+    async fn connect(&self) -> std::io::Result<Box<dyn Link>> {
+        self.attempts.send_modify(|n| *n += 1);
+        if !self.up.load(Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::ConnectionRefused.into());
+        }
+        let (core, bridge) = tokio::io::duplex(256 * 1024);
+        self.links
+            .send(bridge)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))?;
+        Ok(Box::new(core))
+    }
+}
+
+/// The bridge end of one connection. Dropping it closes the link.
+pub struct FakeBridgeConn {
+    frames: FrameReader<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+}
+
+impl FakeBridgeConn {
+    pub async fn send(&mut self, frame: &Frame) {
+        write_frame(&mut self.writer, frame)
+            .await
+            .expect("the core end is open");
+    }
+
+    /// Writes `line` as it is, for malformed or unknown frames.
+    pub async fn send_raw(&mut self, line: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.writer.write_all(line).await.expect("write");
+        self.writer.flush().await.expect("flush");
+    }
+
+    /// The next frame the core wrote, pings included; `None` once the core closed the link.
+    pub async fn next_frame(&mut self) -> Option<Frame> {
+        let next = tokio::time::timeout(FAKE_BRIDGE_WAIT, self.frames.next())
+            .await
+            .expect("the core wrote within the bound");
+        match next {
+            Ok(Some(Decoded::Frame(frame))) => Some(frame),
+            Ok(None) | Err(crate::bridge::proto::ProtoError::Io(_)) => None,
+            other => panic!("the core wrote a bad frame: {other:?}"),
+        }
+    }
+
+    /// The next frame that is not a core ping; pings are answered on the way.
+    pub async fn recv(&mut self) -> Frame {
+        loop {
+            match self.next_frame().await {
+                Some(Frame::Ping { n }) => self.send(&Frame::Pong { n }).await,
+                Some(frame) => return frame,
+                None => panic!("the core closed the link"),
+            }
+        }
+    }
+
+    /// Sends `hello` and returns the core's `hello_ok`.
+    pub async fn handshake(&mut self, hello: &Frame) -> Frame {
+        self.send(hello).await;
+        let answer = self.recv().await;
+        assert!(
+            matches!(answer, Frame::HelloOk { .. }),
+            "expected hello_ok, got {}",
+            answer.kind()
+        );
+        answer
+    }
+
+    /// Asserts that the core wrote nothing but pings since the last read: pings the core
+    /// and expects its pong as the next frame.
+    pub async fn assert_quiet(&mut self) {
+        const MARK: u64 = u64::MAX;
+        self.send(&Frame::Ping { n: MARK }).await;
+        let next = self.recv().await;
+        assert_eq!(next, Frame::Pong { n: MARK }, "the core wrote a frame");
+    }
+
+    /// Waits until the core closes the link and returns the frames it wrote before,
+    /// pings left out.
+    pub async fn until_closed(&mut self) -> Vec<Frame> {
+        let mut seen = Vec::new();
+        while let Some(frame) = self.next_frame().await {
+            if !matches!(frame, Frame::Ping { .. }) {
+                seen.push(frame);
+            }
+        }
+        seen
+    }
+
+    /// Hands the connection to a task that answers every request with `ok` (see
+    /// [`AutoBridge`]).
+    pub fn auto(self) -> AutoBridge {
+        let record = Arc::new(Mutex::new(AutoRecord::default()));
+        let changed = Arc::new(watch::channel(0u64).0);
+        let (push, pushed) = mpsc::unbounded_channel();
+        let task = tokio::spawn(auto_serve(
+            self,
+            Arc::clone(&record),
+            Arc::clone(&changed),
+            pushed,
+        ));
+        AutoBridge {
+            record,
+            changed,
+            push,
+            task,
+        }
+    }
+}
+
+/// What an [`AutoBridge`] saw: every core request and every acked `seq`, in order.
+#[derive(Debug, Clone, Default)]
+pub struct AutoRecord {
+    pub requests: Vec<Frame>,
+    pub acks: Vec<u64>,
+}
+
+impl AutoRecord {
+    /// Every `send` as (target, text).
+    pub fn sends(&self) -> Vec<(String, String)> {
+        self.requests
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Send { target, text, .. } => Some((target.clone(), text.0.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// A connected fake bridge that answers on its own: `send` and `file` get a message
+/// id, `thread` gets `from_message_id`, `dm` gets the user id, `edit` and `status` get
+/// `ok`, `fetch` and `react` get `err`. Frames pushed with [`AutoBridge::push`] go to the
+/// core. Dropping it closes the link.
+pub struct AutoBridge {
+    record: Arc<Mutex<AutoRecord>>,
+    changed: Arc<watch::Sender<u64>>,
+    push: mpsc::UnboundedSender<Frame>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AutoBridge {
+    pub fn push(&self, frame: Frame) {
+        self.push.send(frame).expect("the auto bridge runs");
+    }
+
+    pub fn record(&self) -> AutoRecord {
+        self.record.lock().expect("auto bridge record").clone()
+    }
+
+    /// Waits until `done` holds for the record.
+    pub async fn wait_until(&self, done: impl Fn(&AutoRecord) -> bool) {
+        let mut changed = self.changed.subscribe();
+        tokio::time::timeout(FAKE_BRIDGE_WAIT, async {
+            loop {
+                if done(&self.record()) {
+                    return;
+                }
+                changed.changed().await.expect("the auto bridge runs");
+            }
+        })
+        .await
+        .expect("the auto bridge saw it within the bound");
+    }
+}
+
+impl Drop for AutoBridge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// An `ok` answer to request `re`; set its fields with the `bridge_ok_*` helpers.
+pub fn bridge_ok(re: u64) -> Frame {
+    bridge_ok_fields(re, None, None, None, None)
+}
+
+/// An `ok` answer to request `re` carrying `message_id`.
+pub fn bridge_ok_message(re: u64, message_id: impl Into<String>) -> Frame {
+    bridge_ok_fields(re, Some(message_id.into()), None, None, None)
+}
+
+/// An `ok` answer to request `re` carrying `thread_id`.
+pub fn bridge_ok_thread(re: u64, thread_id: impl Into<String>) -> Frame {
+    bridge_ok_fields(re, None, Some(thread_id.into()), None, None)
+}
+
+/// An `ok` answer to request `re` carrying `target`.
+pub fn bridge_ok_target(re: u64, target: impl Into<String>) -> Frame {
+    bridge_ok_fields(re, None, None, Some(target.into()), None)
+}
+
+/// An `ok` answer to request `re` carrying `bytes`.
+pub fn bridge_ok_bytes(re: u64, bytes: u64) -> Frame {
+    bridge_ok_fields(re, None, None, None, Some(bytes))
+}
+
+fn bridge_ok_fields(
+    re: u64,
+    message_id: Option<String>,
+    thread_id: Option<String>,
+    target: Option<String>,
+    bytes: Option<u64>,
+) -> Frame {
+    Frame::Ok {
+        re,
+        message_id,
+        thread_id,
+        target,
+        bytes,
+    }
+}
+
+/// Aborts the reader task of an [`AutoBridge`] with it, so the link closes.
+struct AbortReader(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortReader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn auto_serve(
+    conn: FakeBridgeConn,
+    record: Arc<Mutex<AutoRecord>>,
+    changed: Arc<watch::Sender<u64>>,
+    mut pushed: mpsc::UnboundedReceiver<Frame>,
+) {
+    let FakeBridgeConn {
+        mut frames,
+        mut writer,
+    } = conn;
+    // FrameReader::next is not cancel safe, so it runs on its own task.
+    let (read_tx, mut read) = mpsc::unbounded_channel();
+    let _reader = AbortReader(tokio::spawn(async move {
+        while let Ok(Some(Decoded::Frame(frame))) = frames.next().await {
+            if read_tx.send(frame).is_err() {
+                return;
+            }
+        }
+    }));
+    let note = |change: &dyn Fn(&mut AutoRecord)| {
+        change(&mut record.lock().expect("auto bridge record"));
+        changed.send_modify(|n| *n += 1);
+    };
+    loop {
+        let frame = tokio::select! {
+            frame = read.recv() => match frame {
+                Some(frame) => frame,
+                None => return,
+            },
+            Some(frame) = pushed.recv() => {
+                if write_frame(&mut writer, &frame).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let answer = match &frame {
+            Frame::Ping { n } => Some(Frame::Pong { n: *n }),
+            Frame::Ack { seq } => {
+                let seq = *seq;
+                note(&|r| r.acks.push(seq));
+                None
+            }
+            Frame::Send { id, target, .. } => {
+                Some(bridge_ok_message(*id, format!("{target}:auto-{id}")))
+            }
+            Frame::File { id, .. } => Some(bridge_ok_message(*id, format!("F{id}"))),
+            Frame::Thread {
+                id,
+                from_message_id,
+                ..
+            } => Some(bridge_ok_thread(*id, from_message_id.clone())),
+            Frame::Dm { id, user_id } => Some(bridge_ok_target(*id, user_id.clone())),
+            Frame::Edit { id, .. } | Frame::Status { id, .. } => Some(bridge_ok(*id)),
+            Frame::Fetch { id, .. } | Frame::React { id, .. } => Some(Frame::Err {
+                re: *id,
+                code: E_BRIDGE_UNSUPPORTED.to_owned(),
+                message: "the auto bridge serves no downloads or reactions".to_owned(),
+            }),
+            _ => None,
+        };
+        if frame.request_id().is_some() {
+            let seen = frame.clone();
+            note(&|r| r.requests.push(seen.clone()));
+        }
+        if let Some(answer) = answer
+            && write_frame(&mut writer, &answer).await.is_err()
+        {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]

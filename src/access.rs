@@ -72,6 +72,7 @@ impl Policy {
                     .collect()
             }),
             Platform::Slack => config.slack.as_ref().map(|s| s.access.allow.clone()),
+            Platform::Bridge => config.bridge.as_ref().map(|b| b.access.allow.clone()),
         };
         Self::new(config.owner_id(), allow.unwrap_or_default())
     }
@@ -120,6 +121,10 @@ impl BotReplies {
                 .as_ref()
                 .and_then(|d| d.access.max_bot_replies),
             Platform::Slack => config.slack.as_ref().and_then(|s| s.access.max_bot_replies),
+            Platform::Bridge => config
+                .bridge
+                .as_ref()
+                .and_then(|b| b.access.max_bot_replies),
         };
         Self::new(max)
     }
@@ -281,6 +286,35 @@ mod tests {
             replies.take("a", later),
             "the window slid past both replies"
         );
+    }
+
+    #[test]
+    fn bridge_config_feeds_the_policy_and_the_bot_limit() {
+        let env = crate::config::Env {
+            home_dir: Some("/h/u".into()),
+            ..Default::default()
+        };
+        let config = Config::from_toml(
+            "messenger = \"bridge\"\naccess_mode = \"allowlist\"\nomp_path = \"/bin/omp\"\n\
+             [bridge]\nsocket = \"/run/b.sock\"\nowner_id = \"U111\"\nmax_bot_replies = 2\n\
+             [[bridge.allow]]\nid = \"B444\"\nkind = \"bot\"\n",
+            &env,
+        )
+        .expect("loads");
+        let policy = Policy::from_config(&config);
+        assert_eq!(
+            policy,
+            Policy::new("U111", vec![entry("B444", SenderKind::Bot)])
+        );
+        assert_eq!(
+            policy.allow(&event("U111", false)),
+            Decision::Allow(Sender::Owner)
+        );
+        assert_eq!(
+            policy.allow(&event("B444", true)),
+            Decision::Allow(Sender::Listed(Role::Chat))
+        );
+        assert_eq!(BotReplies::from_config(&config).max, Some(2));
     }
 
     #[test]

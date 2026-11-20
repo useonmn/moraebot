@@ -183,6 +183,7 @@ impl Rig {
                 access: Default::default(),
             }),
             slack: None,
+            bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };

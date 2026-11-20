@@ -63,28 +63,46 @@ const BAD_BOT_TOKEN: &str =
 const BAD_APP_TOKEN: &str =
     "E_SLACK_TOKEN_KIND: a Slack app token starts with xapp-. Please enter it again.";
 
+/// A messenger that `init`, `setup` and `guide` can configure. The bridge is not one:
+/// its section is written by hand or by the bridge's own setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupTarget {
+    Discord,
+    Slack,
+}
+
+impl SetupTarget {
+    /// The `messenger` value this target writes.
+    pub fn platform(self) -> Platform {
+        match self {
+            SetupTarget::Discord => Platform::Discord,
+            SetupTarget::Slack => Platform::Slack,
+        }
+    }
+}
+
 pub struct Messenger {
     pub name: &'static str,
     /// `None` while the messenger is not implemented yet.
-    pub platform: Option<Platform>,
+    pub target: Option<SetupTarget>,
 }
 
 pub const MESSENGERS: [Messenger; 4] = [
     Messenger {
         name: "Discord",
-        platform: Some(Platform::Discord),
+        target: Some(SetupTarget::Discord),
     },
     Messenger {
         name: "Slack",
-        platform: Some(Platform::Slack),
+        target: Some(SetupTarget::Slack),
     },
     Messenger {
         name: "Telegram",
-        platform: None,
+        target: None,
     },
     Messenger {
         name: "WhatsApp",
-        platform: None,
+        target: None,
     },
 ];
 
@@ -164,6 +182,7 @@ fn assemble(
         messenger,
         discord,
         slack,
+        bridge: None,
         work_dir: env.expand_tilde(Path::new(work_dir))?,
         omp_path: env.expand_tilde(Path::new(omp_path))?,
         home: env.default_home()?,
@@ -174,10 +193,10 @@ fn assemble(
 }
 
 /// `moraebot guide <messenger>`: the same text as `docs/guides/<messenger>.md`.
-pub fn guide(messenger: Platform) -> &'static str {
+pub fn guide(messenger: SetupTarget) -> &'static str {
     match messenger {
-        Platform::Discord => DISCORD_GUIDE,
-        Platform::Slack => SLACK_GUIDE,
+        SetupTarget::Discord => DISCORD_GUIDE,
+        SetupTarget::Slack => SLACK_GUIDE,
     }
 }
 
@@ -447,10 +466,10 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         Ok(InitOutcome::Written { checks_ok })
     }
 
-    fn choose_messenger(&mut self) -> Result<Platform, ConfigError> {
+    fn choose_messenger(&mut self) -> Result<SetupTarget, ConfigError> {
         writeln!(self.out, "Choose a messenger:")?;
         for (index, messenger) in MESSENGERS.iter().enumerate() {
-            let suffix = if messenger.platform.is_some() {
+            let suffix = if messenger.target.is_some() {
                 ""
             } else {
                 " (coming later)"
@@ -466,9 +485,9 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             };
             match choice.and_then(|n| MESSENGERS.get(n.wrapping_sub(1))) {
                 Some(Messenger {
-                    platform: Some(platform),
+                    target: Some(target),
                     ..
-                }) => Ok(*platform),
+                }) => Ok(*target),
                 Some(_) => Err("That messenger is coming later. Please choose an available one."),
                 None => Err("Please enter one of the listed numbers."),
             }
@@ -500,11 +519,11 @@ pub fn run<R: BufRead, W: Write>(
     let messenger = prompter.choose_messenger()?;
     let home = env.default_home()?;
     let (discord, slack, tokens) = match messenger {
-        Platform::Discord => {
+        SetupTarget::Discord => {
             let (section, tokens) = prompter.ask_discord(None, &home)?;
             (Some(section), None, tokens)
         }
-        Platform::Slack => {
+        SetupTarget::Slack => {
             prompter.print_slack_link()?;
             let (section, tokens) = prompter.ask_slack(None, &home)?;
             (None, Some(section), tokens)
@@ -534,7 +553,7 @@ pub fn run<R: BufRead, W: Write>(
 
     let config = assemble(
         env,
-        messenger,
+        messenger.platform(),
         discord,
         slack,
         &omp_path.to_string_lossy(),
@@ -553,7 +572,7 @@ pub fn run<R: BufRead, W: Write>(
 /// other config value and makes the messenger the active one.
 pub fn setup<R: BufRead, W: Write>(
     env: &Env,
-    messenger: Platform,
+    messenger: SetupTarget,
     input: R,
     out: W,
     is_tty: bool,
@@ -571,24 +590,24 @@ pub fn setup<R: BufRead, W: Write>(
     }
     let mut config = Config::load(&config_path, env)?;
     let tokens = match messenger {
-        Platform::Discord => {
+        SetupTarget::Discord => {
             let (section, tokens) = prompter.ask_discord(config.discord.as_ref(), &config.home)?;
             config.discord = Some(section);
             tokens
         }
-        Platform::Slack => {
+        SetupTarget::Slack => {
             prompter.print_slack_link()?;
             let (section, tokens) = prompter.ask_slack(config.slack.as_ref(), &config.home)?;
             config.slack = Some(section);
             tokens
         }
     };
-    config.messenger = messenger;
+    config.messenger = messenger.platform();
     let outcome = prompter.finish(&config, &config_path, env, tokens)?;
     writeln!(
         prompter.out,
         "{} is now the active messenger. Restart moraebot to use it.",
-        messenger.as_str()
+        config.messenger.as_str()
     )?;
     Ok(outcome)
 }
@@ -955,7 +974,7 @@ mod tests {
     impl Fixture {
         fn setup(
             &self,
-            messenger: Platform,
+            messenger: SetupTarget,
             input: &str,
         ) -> (Result<InitOutcome, ConfigError>, String) {
             let mut out = Vec::new();
@@ -1017,7 +1036,7 @@ mod tests {
             typed_work.display()
         );
         assert!(fx.run(&input).0.is_ok());
-        let (result, out) = fx.setup(Platform::Slack, &fx.slack_input());
+        let (result, out) = fx.setup(SetupTarget::Slack, &fx.slack_input());
         assert_eq!(
             result.expect("setup runs"),
             InitOutcome::Written { checks_ok: true }
@@ -1048,7 +1067,7 @@ mod tests {
             fx.omp.display().to_string()
         );
         fs::write(fx.config_path(), legacy).expect("legacy config");
-        let (result, _) = fx.setup(Platform::Discord, "\n\n\n");
+        let (result, _) = fx.setup(SetupTarget::Discord, "\n\n\n");
         assert_eq!(
             result.expect("setup runs"),
             InitOutcome::Written { checks_ok: true }
@@ -1070,7 +1089,7 @@ mod tests {
     fn setup_keeps_saved_tokens_on_enter() {
         let fx = Fixture::new();
         assert!(fx.setup_after_init_slack().is_ok());
-        let (result, out) = fx.setup(Platform::Slack, "U222\n\n\n\n");
+        let (result, out) = fx.setup(SetupTarget::Slack, "U222\n\n\n\n");
         assert!(result.is_ok());
         assert!(out.contains("Enter keeps the saved token"));
         assert_eq!(
@@ -1093,13 +1112,13 @@ mod tests {
     fn setup_keeps_the_allowlist() {
         let cases = [
             (
-                Platform::Discord,
+                SetupTarget::Discord,
                 "1\n111\n222\nTOKEN_SENTINEL_9f3a\n".to_string(),
                 "\n\n\n",
                 "max_bot_replies = 5\n[[discord.allow]]\nid = 333\nkind = \"bot\"\n",
             ),
             (
-                Platform::Slack,
+                SetupTarget::Slack,
                 format!("2\nU111\nC222\n{BOT}\n{APP}\n"),
                 "\n\n\n\n",
                 "max_bot_replies = 5\n[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
@@ -1122,12 +1141,12 @@ mod tests {
             let after = Config::load(&fx.config_path(), &fx.env).expect("reloads");
             assert_eq!(after.access_mode, AccessMode::Allowlist, "{platform:?}");
             match platform {
-                Platform::Discord => {
+                SetupTarget::Discord => {
                     let access = &after.discord.as_ref().expect("discord").access;
                     assert_eq!(access, &before.discord.as_ref().expect("discord").access);
                     assert_eq!(access.allow.len(), 1);
                 }
-                Platform::Slack => {
+                SetupTarget::Slack => {
                     let access = &after.slack.as_ref().expect("slack").access;
                     assert_eq!(access, &before.slack.as_ref().expect("slack").access);
                     assert_eq!(access.allow.len(), 1);
@@ -1149,7 +1168,7 @@ mod tests {
         assert!(fx.setup_after_init_slack().is_ok());
         let request = crate::onboarding::request_file(&fx.dir.path().join("mhome"));
         fs::remove_file(&request).expect("init left a request");
-        let (result, out) = fx.setup(Platform::Slack, "U222\n\n\n\n");
+        let (result, out) = fx.setup(SetupTarget::Slack, "U222\n\n\n\n");
         assert_eq!(
             result.expect("setup runs"),
             InitOutcome::Written { checks_ok: true }
@@ -1163,7 +1182,7 @@ mod tests {
         let fx = Fixture::new();
         assert!(fx.run(&fx.happy_input()).0.is_ok());
         let input = format!("U111\nC222\n{APP}\n{BOT}\n{APP}\n");
-        let (result, out) = fx.setup(Platform::Slack, &input);
+        let (result, out) = fx.setup(SetupTarget::Slack, &input);
         assert!(result.is_ok());
         assert!(out.contains(E_SLACK_TOKEN_KIND));
         assert_eq!(
@@ -1177,7 +1196,7 @@ mod tests {
         let fx = Fixture::new();
         assert!(fx.run(&fx.happy_input()).0.is_ok());
         let before = fs::read(fx.config_path()).expect("config");
-        let (result, _) = fx.setup(Platform::Slack, &format!("U111\nC222\n{APP}\n"));
+        let (result, _) = fx.setup(SetupTarget::Slack, &format!("U111\nC222\n{APP}\n"));
         assert_eq!(code(result), E_INIT_EOF);
         assert_eq!(fs::read(fx.config_path()).expect("config"), before);
         assert!(!fx.secret("slack-bot.token").exists());
@@ -1186,7 +1205,7 @@ mod tests {
     #[test]
     fn setup_without_config_is_setup_no_config() {
         let fx = Fixture::new();
-        let (result, _) = fx.setup(Platform::Slack, &fx.slack_input());
+        let (result, _) = fx.setup(SetupTarget::Slack, &fx.slack_input());
         assert_eq!(code(result), E_SETUP_NO_CONFIG);
     }
 

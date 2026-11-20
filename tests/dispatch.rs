@@ -81,6 +81,7 @@ fn test_config(root: &Path, omp_path: PathBuf) -> Config {
             access: Default::default(),
         }),
         slack: None,
+        bridge: None,
         omp: OmpConfig::default(),
         memory: moraebot::config::MemoryConfig::default(),
     }
@@ -196,6 +197,25 @@ impl Harness {
         extra_env: Vec<(&'static str, String)>,
         lead: impl FnOnce(OmpManager) -> OmpManager,
     ) -> Self {
+        Self::assemble(root, config, mode, extra_env, lead, |adapter| {
+            if fail_threads {
+                Arc::new(ThreadFailAdapter(adapter))
+            } else {
+                adapter
+            }
+        })
+    }
+
+    /// Like [`Self::with_lead`]; `wrap` turns the recording [`FakeAdapter`] into the adapter
+    /// the dispatcher gets.
+    fn assemble(
+        root: &Path,
+        config: Config,
+        mode: &str,
+        extra_env: Vec<(&'static str, String)>,
+        lead: impl FnOnce(OmpManager) -> OmpManager,
+        wrap: impl FnOnce(Arc<FakeAdapter>) -> Arc<dyn MessengerAdapter>,
+    ) -> Self {
         let home = config.home.clone();
         let store = Arc::new(Mutex::new(
             Store::open(&home.join("inbox.sqlite")).expect("store"),
@@ -211,11 +231,7 @@ impl Harness {
         let omp = lead(OmpManager::new(config.clone(), Arc::clone(&store)).with_extra_env(env));
         let chat = omp.chat();
         let adapter = Arc::new(FakeAdapter::new());
-        let as_dyn: Arc<dyn MessengerAdapter> = if fail_threads {
-            Arc::new(ThreadFailAdapter(Arc::clone(&adapter)))
-        } else {
-            adapter.clone()
-        };
+        let as_dyn = wrap(Arc::clone(&adapter));
         let dispatcher = Arc::new(Dispatcher::new(&config, as_dyn, Arc::clone(&store), omp));
         Self {
             root: root.to_owned(),
@@ -396,7 +412,7 @@ struct ThreadFailAdapter(Arc<FakeAdapter>);
 
 #[async_trait]
 impl MessengerAdapter for ThreadFailAdapter {
-    fn platform(&self) -> &'static str {
+    fn platform(&self) -> &str {
         self.0.platform()
     }
 
@@ -404,7 +420,7 @@ impl MessengerAdapter for ThreadFailAdapter {
         self.0.message_limit()
     }
 
-    fn behavior_hints(&self) -> &'static str {
+    fn behavior_hints(&self) -> &str {
         self.0.behavior_hints()
     }
 
@@ -3150,7 +3166,8 @@ async fn lead_system_prompt(root: &Path, lead_override: Option<&str>) -> String 
 #[tokio::test]
 async fn gateway_appends_lead_guidance_then_messenger_hints() {
     let dir = tempfile::tempdir().unwrap();
-    let hints_text = FakeAdapter::new().behavior_hints();
+    let fake = FakeAdapter::new();
+    let hints_text = fake.behavior_hints();
 
     let first_line = lead::DEFAULT_GUIDANCE.lines().next().unwrap();
     let built_in = lead_system_prompt(&dir.path().join("built-in"), None).await;
@@ -4930,4 +4947,246 @@ async fn the_core_save_of_a_failed_turn_is_posted_once_after_a_restart() {
     let h = Harness::open(dir.path(), "ok");
     bounded(h.dispatcher.startup()).await.unwrap();
     assert!(h.sends().is_empty(), "the notes are posted exactly once");
+}
+
+/// A [`FakeAdapter`] as a bridge adapter looks to the dispatcher: an optional home target
+/// from the hello, and every `ack_inbound` recorded.
+struct BridgeLikeAdapter {
+    inner: Arc<FakeAdapter>,
+    home: Option<String>,
+    acks: Mutex<Vec<String>>,
+    ack_count: watch::Sender<usize>,
+}
+
+impl BridgeLikeAdapter {
+    fn new(inner: Arc<FakeAdapter>, home: Option<&str>) -> Self {
+        Self {
+            inner,
+            home: home.map(str::to_owned),
+            acks: Mutex::default(),
+            ack_count: watch::channel(0).0,
+        }
+    }
+
+    fn acks(&self) -> Vec<String> {
+        self.acks.lock().unwrap().clone()
+    }
+
+    async fn wait_for_acks(&self, n: usize) {
+        let mut rx = self.ack_count.subscribe();
+        rx.wait_for(|count| *count >= n).await.expect("ack counter");
+    }
+}
+
+#[async_trait]
+impl MessengerAdapter for BridgeLikeAdapter {
+    fn platform(&self) -> &str {
+        self.inner.platform()
+    }
+
+    fn message_limit(&self) -> usize {
+        self.inner.message_limit()
+    }
+
+    fn behavior_hints(&self) -> &str {
+        self.inner.behavior_hints()
+    }
+
+    fn home_target(&self) -> Option<String> {
+        self.home.clone()
+    }
+
+    async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
+        self.inner.start().await
+    }
+
+    async fn send(&self, channel: &str, text: &str) -> Result<SendResult, AdapterError> {
+        self.inner.send(channel, text).await
+    }
+
+    async fn create_thread(
+        &self,
+        channel_id: &str,
+        from_message_id: &str,
+        name: &str,
+    ) -> Result<String, AdapterError> {
+        self.inner
+            .create_thread(channel_id, from_message_id, name)
+            .await
+    }
+
+    async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError> {
+        self.inner.start_typing(channel).await
+    }
+
+    async fn open_dm(&self, user_id: &str) -> Result<String, AdapterError> {
+        self.inner.open_dm(user_id).await
+    }
+
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        self.inner.reconnects()
+    }
+
+    async fn ack_inbound(&self, message_id: &str) {
+        self.acks.lock().unwrap().push(message_id.to_owned());
+        self.ack_count.send_modify(|count| *count += 1);
+    }
+}
+
+/// A harness whose dispatcher talks to a [`BridgeLikeAdapter`] with `home`.
+fn open_bridge_like(root: &Path, home: Option<&str>) -> (Harness, Arc<BridgeLikeAdapter>) {
+    let config = test_config(root, PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    bridge_like_harness(root, config, home)
+}
+
+fn bridge_like_harness(
+    root: &Path,
+    config: Config,
+    home: Option<&str>,
+) -> (Harness, Arc<BridgeLikeAdapter>) {
+    let mut bridge = None;
+    let h = Harness::assemble(
+        root,
+        config,
+        "ok",
+        Vec::new(),
+        |omp| omp,
+        |fake| {
+            let adapter = Arc::new(BridgeLikeAdapter::new(fake, home));
+            bridge = Some(Arc::clone(&adapter));
+            adapter
+        },
+    );
+    (h, bridge.expect("adapter built"))
+}
+
+/// An owner DM in channel `444`, inside `thread_id` when given.
+fn owner_dm(message_id: &str, thread_id: Option<&str>, text: &str) -> InboundEvent {
+    let mut ev = event(message_id, OWNER, thread_id, text);
+    ev.is_dm = true;
+    ev.channel_id = "444".into();
+    ev
+}
+
+#[tokio::test]
+async fn a_dm_in_a_thread_is_keyed_and_answered_in_that_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(
+        h.handle(owner_dm("444:101", Some("444:100"), "in the thread"))
+            .await,
+    );
+    let plain = queued(h.handle(owner_dm("444:102", None, "plain dm")).await);
+    h.drain().await;
+
+    assert_eq!(h.row(id).conversation_key, "fake:th:444:100");
+    assert_eq!(h.row(plain).conversation_key, "fake:dm:444");
+    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(
+        h.sends(),
+        vec![
+            ("444:100".to_owned(), "echo: in the thread".to_owned()),
+            ("444".to_owned(), "echo: plain dm".to_owned()),
+        ]
+    );
+    assert_eq!(h.threads_created(), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn a_root_dm_runs_without_opening_a_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(h.handle(owner_dm("444:200", Some("444:200"), "root")).await);
+    // A restart before the turn: startup opens missing threads of thread starters.
+    bounded(h.dispatcher.startup()).await.unwrap();
+    h.drain().await;
+
+    assert_eq!(h.row(id).conversation_key, "fake:th:444:200");
+    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(
+        h.sends(),
+        vec![("444:200".to_owned(), "echo: root".to_owned())]
+    );
+    assert_eq!(h.threads_created(), 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn the_greeting_fallback_goes_to_the_adapter_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _bridge) = open_bridge_like(dir.path(), Some("home-999"));
+    onboarding::request(&h.config.home, GreetTarget::Channel).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+
+    assert_eq!(
+        h.sends(),
+        vec![(
+            "home-999".to_owned(),
+            notice_text(N_ONBOARDING_HELLO).to_owned()
+        )]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn every_handled_event_is_acked_and_a_store_error_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    // The store holds its file exclusively, so the failure is planted before it opens:
+    // storing a message with the text "lost" fails.
+    let store_file = config.home.join("inbox.sqlite");
+    drop(Store::open(&store_file).unwrap());
+    rusqlite::Connection::open(&store_file)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER lost_fails BEFORE INSERT ON inbox WHEN NEW.text = 'lost'
+             BEGIN SELECT RAISE(ABORT, 'injected store failure'); END;",
+        )
+        .unwrap();
+    let (h, bridge) = bridge_like_harness(dir.path(), config, None);
+    let inbound = h.adapter.start().await.unwrap();
+    let runner = tokio::spawn(Arc::clone(&h.dispatcher).run(inbound));
+
+    // Queued, then answered.
+    h.adapter
+        .inject(channel_msg("1300000000000000401", "stored"))
+        .await;
+    bounded(bridge.wait_for_acks(1)).await;
+    bounded(h.adapter.wait_for_send(1)).await;
+    // Dropped, notice, duplicate.
+    h.adapter
+        .inject(event("1300000000000000402", STRANGER, None, "hi"))
+        .await;
+    h.adapter
+        .inject(channel_msg("1300000000000000403", "/help"))
+        .await;
+    h.adapter
+        .inject(channel_msg("1300000000000000401", "stored"))
+        .await;
+    bounded(bridge.wait_for_acks(4)).await;
+
+    // Storing the next owner message fails; a dropped message after it shows the loop
+    // went on without acking it.
+    h.adapter
+        .inject(channel_msg("1300000000000000404", "lost"))
+        .await;
+    h.adapter
+        .inject(event("1300000000000000405", STRANGER, None, "after"))
+        .await;
+    bounded(bridge.wait_for_acks(5)).await;
+
+    assert_eq!(
+        bridge.acks(),
+        [
+            "1300000000000000401",
+            "1300000000000000402",
+            "1300000000000000403",
+            "1300000000000000401",
+            "1300000000000000405",
+        ]
+    );
+    runner.abort();
+    let _ = runner.await;
+    h.close().await;
 }

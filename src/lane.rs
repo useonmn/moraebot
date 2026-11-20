@@ -1916,6 +1916,7 @@ mod tests {
                 access: Default::default(),
             }),
             slack: None,
+            bridge: None,
             omp: OmpConfig::default(),
             memory: crate::config::MemoryConfig::default(),
         };
@@ -2050,6 +2051,7 @@ mod tests {
                 access: Default::default(),
             }),
             slack: None,
+            bridge: None,
             omp: OmpConfig::default(),
             memory: crate::config::MemoryConfig::default(),
         };

@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
+use moraebot::bridge::client::BridgeAdapter;
 use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
 use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
-use moraebot::init::{self, InitOutcome};
+use moraebot::init::{self, InitOutcome, SetupTarget};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
 use moraebot::memory;
@@ -52,10 +53,10 @@ enum Command {
     },
     Init,
     Setup {
-        messenger: Platform,
+        messenger: SetupTarget,
     },
     Guide {
-        messenger: Platform,
+        messenger: SetupTarget,
     },
     Run {
         config: Option<PathBuf>,
@@ -118,10 +119,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 }
 
-fn parse_messenger(command: &str, args: &[String]) -> Result<Platform, String> {
+fn parse_messenger(command: &str, args: &[String]) -> Result<SetupTarget, String> {
     match args {
-        [name] if name == "discord" => Ok(Platform::Discord),
-        [name] if name == "slack" => Ok(Platform::Slack),
+        [name] if name == "discord" => Ok(SetupTarget::Discord),
+        [name] if name == "slack" => Ok(SetupTarget::Slack),
         [name] => Err(format!("unknown messenger '{name}'; use discord or slack")),
         _ => Err(format!("{command} needs one messenger: discord or slack")),
     }
@@ -254,7 +255,7 @@ fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
     })
 }
 
-fn run_setup(env: &Env, messenger: Platform) -> Result<ExitCode, ConfigError> {
+fn run_setup(env: &Env, messenger: SetupTarget) -> Result<ExitCode, ConfigError> {
     let stdin = io::stdin();
     let is_tty = stdin.is_terminal();
     let outcome = init::setup(env, messenger, stdin.lock(), io::stdout().lock(), is_tty)?;
@@ -381,6 +382,8 @@ async fn serve(config: Config, overlay: OverlayCheck) -> Result<(), GatewayError
     let adapter: Arc<dyn MessengerAdapter> = match config.messenger {
         Platform::Discord => Arc::new(DiscordAdapter::from_config(&config)?),
         Platform::Slack => Arc::new(SlackAdapter::from_config(&config)?),
+        // Waits up to 10 s for the bridge's hello, else starts from the cached one.
+        Platform::Bridge => Arc::new(BridgeAdapter::open(&config).await?),
     };
     tracing::info!(platform = adapter.platform(), "starting messenger");
     let gateway = Gateway::open(&config, Arc::clone(&adapter))?.with_omp_check(&overlay);
@@ -523,13 +526,13 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["setup", "slack"])),
             Ok(Command::Setup {
-                messenger: Platform::Slack
+                messenger: SetupTarget::Slack
             })
         );
         assert_eq!(
             parse_args(&args(&["guide", "discord"])),
             Ok(Command::Guide {
-                messenger: Platform::Discord
+                messenger: SetupTarget::Discord
             })
         );
         assert_eq!(
@@ -622,6 +625,8 @@ mod tests {
             &["init", "extra"],
             &["setup"],
             &["setup", "telegram"],
+            &["setup", "bridge"],
+            &["guide", "bridge"],
             &["guide", "slack", "extra"],
             &["check-config", "--config"],
             &["check-config", "--nope"],
