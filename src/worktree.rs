@@ -3,6 +3,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::done::{self, Check, Ran, RunOpts, Stopped};
@@ -44,6 +45,11 @@ pub fn branch(lane_id: i64) -> String {
 /// Empty file written into a lane worktree's own git dir only after a complete `worktree add`:
 /// the stored fact that the folder is a finished worktree made by moraebot.
 const READY_MARKER: &str = "moraebot-ready";
+
+/// Held while moraebot runs a git command that adds or removes an entry under a checkout's
+/// `.git/worktrees/`: `git worktree add` reads every other entry there and fails with
+/// `failed to read .git/worktrees/<other>/commondir` when it meets one still being written.
+static WORKTREE_ADMIN: Mutex<()> = Mutex::new(());
 
 /// Why a lane's worktree is not ready.
 #[derive(Debug)]
@@ -190,23 +196,26 @@ pub(crate) fn ensure(
 
     // 5. The worktree on the lane's own branch, from the checkout's HEAD.
     let branch = branch(lane_id);
-    let ran = done::run_command(
-        git,
-        &args(&[
-            OsStr::new("-C"),
-            top.as_os_str(),
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("-b"),
-            OsStr::new(&branch),
-            folder.as_os_str(),
-            OsStr::new("HEAD"),
-        ]),
-        &top,
-        &opts,
-        &mut started,
-        &mut ended,
-    )
+    let ran = {
+        let _admin = omp::lock(&WORKTREE_ADMIN);
+        done::run_command(
+            git,
+            &args(&[
+                OsStr::new("-C"),
+                top.as_os_str(),
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new(&branch),
+                folder.as_os_str(),
+                OsStr::new("HEAD"),
+            ]),
+            &top,
+            &opts,
+            &mut started,
+            &mut ended,
+        )
+    }
     .map_err(stopped)?;
     match ran {
         Ran::Spawn(_) | Ran::Timeout => return Err(failed(E_LANE_GIT, git_detail(&ran, &opts))),
@@ -481,20 +490,23 @@ pub(crate) fn remove(
         env: &env,
         timeout: opts.timeout,
     };
-    let ran = done::run_command(
-        OsStr::new("git"),
-        &args(&[
-            OsStr::new("-C"),
-            repo.as_os_str(),
-            OsStr::new("worktree"),
-            OsStr::new("remove"),
-            folder.as_os_str(),
-        ]),
-        repo,
-        &opts,
-        &mut started,
-        &mut ended,
-    )?;
+    let ran = {
+        let _admin = omp::lock(&WORKTREE_ADMIN);
+        done::run_command(
+            OsStr::new("git"),
+            &args(&[
+                OsStr::new("-C"),
+                repo.as_os_str(),
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                folder.as_os_str(),
+            ]),
+            repo,
+            &opts,
+            &mut started,
+            &mut ended,
+        )
+    }?;
     if matches!(ran, Ran::Exited(0)) {
         Ok(Cleanup::Removed)
     } else {
@@ -691,6 +703,41 @@ mod tests {
         ensure_counted(dir, &repo, 1, &real_path(), &mut counts).unwrap();
         assert_eq!(worktrees(&repo).len(), 2);
         assert_eq!(counts, (7, 7));
+    }
+
+    #[test]
+    fn ensure_creates_concurrent_worktrees_of_one_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let repo = qa_repo(dir, "qa-repo");
+        let ids: Vec<i64> = (1..=16).collect();
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let repo = &repo;
+                    scope.spawn(move || {
+                        let out = dir.join("qa-mbhome").join(format!("git-{id}"));
+                        omp::private_dir(&out).unwrap();
+                        let env = env(dir, &real_path());
+                        ensure(
+                            repo,
+                            &lane_folder(dir, id),
+                            id,
+                            &opts(&out, &env, GIT_TIMEOUT),
+                            |_| true,
+                            |_| {},
+                        )
+                    })
+                })
+                .collect();
+            for (id, run) in ids.iter().zip(runs) {
+                if let Err(error) = run.join().unwrap() {
+                    panic!("lane {id}: {error:?}");
+                }
+            }
+        });
+        assert_eq!(worktrees(&repo).len(), ids.len() + 1);
     }
 
     #[test]
