@@ -631,6 +631,14 @@ struct OpenTurn {
     steer: Option<Steer>,
 }
 
+impl OpenTurn {
+    /// The turn takes a steer from `sender` in conversation `key`: same conversation and
+    /// sender, the lead reported `agent_start`, and no steer yet.
+    fn accepts(&self, key: &str, sender: Sender) -> bool {
+        self.key == key && self.sender == sender && self.started && self.steer.is_none()
+    }
+}
+
 /// What a lead child was given ([`GivenState`]). Kept per lead child, so a new child gets
 /// every block again.
 type Given = Arc<Mutex<GivenState>>;
@@ -1159,6 +1167,11 @@ impl OmpManager {
     /// holds no steer yet; then `claim` gets the turn's main row id and must claim the row in the store
     /// (false: nothing is sent). Like in `prompt`, an owner row's input gets its changed memory
     /// sections appended. Returns whether the row was steered.
+    ///
+    /// The memory block reads files and runs git, so it is built with the gate released (the
+    /// lead's event callback takes the gate for every event): the turn is checked and copied
+    /// first, then checked again, claimed and sent under the gate. A block built for a turn
+    /// that ended meanwhile is dropped.
     pub fn try_steer(
         &self,
         key: &str,
@@ -1167,13 +1180,28 @@ impl OmpManager {
         text: &str,
         claim: impl FnOnce(i64) -> bool,
     ) -> bool {
+        let (main_row_id, view, epoch) = {
+            let gate = lock(&self.gate);
+            let Some(turn) = gate.as_ref().filter(|turn| turn.accepts(key, sender)) else {
+                return false;
+            };
+            let (view, epoch) = given_view(&turn.given, &turn.main_fresh);
+            (turn.main_row_id, view, epoch)
+        };
+        let (text, fresh) = thread_memory(
+            &self.config.memory_dir(),
+            (self.memory_clock)(),
+            text,
+            &view,
+        );
+
         let mut gate = lock(&self.gate);
-        let Some(turn) = gate.as_mut() else {
+        let Some(turn) = gate
+            .as_mut()
+            .filter(|turn| turn.main_row_id == main_row_id && turn.accepts(key, sender))
+        else {
             return false;
         };
-        if turn.key != key || turn.sender != sender || !turn.started || turn.steer.is_some() {
-            return false;
-        }
         if !claim(turn.main_row_id) {
             return false;
         }
@@ -1181,9 +1209,6 @@ impl OmpManager {
         if let Some(context) = lock(&self.turn).as_mut() {
             context.steered_row_id = Some(row_id);
         }
-        let (view, epoch) = given_view(&turn.given, &turn.main_fresh);
-        let (text, fresh) =
-            thread_memory(&self.config.memory_dir(), (self.memory_clock)(), text, &view);
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text,
