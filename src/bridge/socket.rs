@@ -137,25 +137,22 @@ mod tests {
     #[test]
     fn linux_uses_the_runtime_dir_when_absolute() {
         assert_eq!(
-            default_path(&env("/home/u"), "linux", Some(Path::new("/run/user/1000"))).unwrap(),
+            default_path(&env("/h/u"), "linux", Some(Path::new("/run/user/1000"))).unwrap(),
             PathBuf::from("/run/user/1000/moraebot/slack-bridge.sock")
         );
     }
 
     #[test]
     fn linux_without_a_runtime_dir_uses_the_moraebot_home() {
-        let fallback = PathBuf::from("/home/u/.moraebot/run/slack-bridge.sock");
+        let fallback = PathBuf::from("/h/u/.moraebot/run/slack-bridge.sock");
+        assert_eq!(default_path(&env("/h/u"), "linux", None).unwrap(), fallback);
         assert_eq!(
-            default_path(&env("/home/u"), "linux", None).unwrap(),
-            fallback
-        );
-        assert_eq!(
-            default_path(&env("/home/u"), "linux", Some(Path::new("run/user"))).unwrap(),
+            default_path(&env("/h/u"), "linux", Some(Path::new("run/user"))).unwrap(),
             fallback
         );
         let custom = Env {
             moraebot_home: Some(PathBuf::from("/srv/mb")),
-            ..env("/home/u")
+            ..env("/h/u")
         };
         assert_eq!(
             default_path(&custom, "linux", None).unwrap(),
@@ -168,8 +165,8 @@ mod tests {
     #[test]
     fn macos_uses_application_support_and_ignores_the_runtime_dir() {
         assert_eq!(
-            default_path(&env("/Users/u"), "macos", Some(Path::new("/tmp/xdg"))).unwrap(),
-            PathBuf::from("/Users/u/Library/Application Support/moraebot/slack-bridge.sock")
+            default_path(&env("/m/u"), "macos", Some(Path::new("/tmp/xdg"))).unwrap(),
+            PathBuf::from("/m/u/Library/Application Support/moraebot/slack-bridge.sock")
         );
         let err = default_path(&Env::default(), "macos", None).unwrap_err();
         assert_eq!(err.code, E_HOME_UNKNOWN);

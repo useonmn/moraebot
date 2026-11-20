@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn bridge_config_feeds_the_policy_and_the_bot_limit() {
         let env = crate::config::Env {
-            home_dir: Some("/home/u".into()),
+            home_dir: Some("/h/u".into()),
             ..Default::default()
         };
         let config = Config::from_toml(
