@@ -642,6 +642,56 @@ async fn observer_processing_a_job_twice_adds_nothing() {
     assert!(detail.contains("saved=0 skipped=1"), "{detail}");
 }
 
+/// A failed lead turn keeps the line of its own core save on its main row (#43), and its
+/// partial job still reaches the observer. When jev picks the sentence the lead already
+/// saved, the observer adds no entry and no notice: the line is shown once, after the
+/// failure notice, and the next reply carries nothing more.
+#[tokio::test]
+async fn observer_adds_no_second_line_for_a_core_save_of_a_failed_lead_turn() {
+    let fx = Fixture::new().await;
+    let text = "앞으로 답은 항상 한국어로 해줘.";
+    let row = fx.admit("m1", text);
+    // The lead's `memory_write` of the owner's sentence, saved before the turn failed.
+    let lead_save = NewEntry {
+        text: text.into(),
+        prov: Prov::Owner,
+        bucket: Bucket::Owner,
+        src: Source::row_sentence(row, 0),
+        expires: None,
+        why: Some("qa".into()),
+    };
+    fx.memory
+        .apply_batch(vec![Op::Add(lead_save)])
+        .await
+        .unwrap()
+        .into_iter()
+        .for_each(|r| assert!(r.is_ok()));
+    let id = fx.entries(&Bucket::Owner)[0].id.clone();
+    let note = moraebot::memory_tools::core_note(&id, &Bucket::Owner.label(), text);
+    fx.store()
+        .fail_group(&[row], "E_TEST", &note, &trace(false, false))
+        .unwrap();
+
+    fx.jev.answer(save("core", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.jev.requests().len(), 1, "the partial job was judged");
+    assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
+    assert!(
+        fx.store().pending_memory_notices(KEY).unwrap().is_empty(),
+        "no observer notice for the lead's own save"
+    );
+    let failed = fx.store().get(row).unwrap().unwrap();
+    assert_eq!(failed.reply.as_deref(), Some(note.as_str()));
+    assert!(!failed.text_sent, "the stored line is still owed, once");
+
+    let next = fx.admit("m2", "다음 질문");
+    fx.reply(next, None, "답이에요", &trace(false, true));
+    assert_eq!(
+        fx.store().get(next).unwrap().unwrap().reply.as_deref(),
+        Some("답이에요")
+    );
+}
+
 #[tokio::test]
 async fn observer_keeps_every_entry_of_a_lead_group_and_three_lanes() {
     let fx = Fixture::new().await;

@@ -980,6 +980,42 @@ async fn shutdown_during_a_check_kills_it_and_writes_no_result() {
     assert_eq!(lane.error.as_deref(), Some(E_LANE_INTERRUPTED));
 }
 
+/// A `lane_done` call refused because moraebot is stopping can reach a lane that is still
+/// alive (`stop_accepting` runs before the kills); the reply that ends that turn is still a
+/// cut turn, left `running` for `recover_on_start`.
+#[tokio::test]
+async fn a_claim_refused_for_the_shutdown_leaves_the_turn_for_recovery() {
+    let h = Harness::new();
+    let release = h.config.work_dir.join("release");
+    let argv = [
+        "/bin/sh",
+        "-c",
+        "echo CHECK pid=$$ >> \"$FAKE_OMP_LOG\"; while [ ! -e release ]; do sleep 0.05; done",
+    ];
+    let omp = h.done_manager(
+        &format!("command {}", serde_json::to_string(&argv).unwrap()),
+        1,
+    );
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+    let mut pids = omp.lanes().running_pids();
+    bounded(pids.wait_for(|p| p.len() == 2))
+        .await
+        .expect("pid channel open");
+
+    omp.lanes().stop_accepting();
+    std::fs::write(&release, "").unwrap();
+    bounded(pids.wait_for(|p| p.is_empty()))
+        .await
+        .expect("pid channel open");
+
+    let results = h.lane_tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_refused(&results[0], E_LANE_STOPPING);
+    assert_eq!(h.store.lock().unwrap().count().unwrap(), 0, "no result row");
+    assert_eq!(h.lane(1).state, LaneState::Running);
+    bounded(omp.shutdown_all()).await;
+}
+
 /// Time-limit exception: the 3 s turn timeout is the behavior under test.
 #[tokio::test]
 async fn turn_timeout_during_a_check_kills_the_check() {

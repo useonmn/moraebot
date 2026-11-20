@@ -105,6 +105,8 @@ pub struct InboxRow {
     pub author_id: String,
     pub text: String,
     pub state: State,
+    /// The reply text; on the main row of a turn group that did not reply (`failed` or
+    /// `needs_check`), the turn's memory notes, posted after its notice.
     pub reply: Option<String>,
     pub notice_sent: bool,
     pub error: Option<String>,
@@ -789,6 +791,23 @@ fn skip_interrupted(out_files: &str) -> Option<String> {
     changed.then(|| files.to_string())
 }
 
+/// Stores a turn group's memory `notes` on its main row (the first of `ids`) in the reply
+/// column, still to be delivered (`text_sent` unset), so they survive a failed send and a
+/// restart like a reply. Empty notes store nothing.
+fn store_notes(conn: &Connection, ids: &[i64], notes: &str) -> Result<(), StoreError> {
+    let Some(&main) = ids.first() else {
+        return Ok(());
+    };
+    if notes.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("UPDATE inbox SET reply = ?2, text_sent = 0, updated_at = {NOW} WHERE id = ?1"),
+        params![main, notes],
+    )?;
+    Ok(())
+}
+
 /// Holds the queued owner rows of the conversations selected by the appended subquery:
 /// they become `needs_check` / [`E_DISPATCH_HELD`] with their notice still to be posted.
 /// Lane-result rows are never held: they answer no owner message.
@@ -1420,12 +1439,14 @@ impl Store {
 
     /// Marks every row of an interrupted group `needs_check` with `code` and, in the same
     /// transaction, holds the queued owner rows of their conversations, so the hold survives
-    /// a restart.
-    /// The group's `partial` memory job is stored in the same transaction.
+    /// a restart, and stores the turn's memory `notes` (if any) on the main row, the first
+    /// of `ids` ([`store_notes`]). The group's `partial` memory job is stored in the same
+    /// transaction.
     pub fn interrupt_group(
         &mut self,
         ids: &[i64],
         code: &str,
+        notes: &str,
         trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
@@ -1440,6 +1461,7 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
+        store_notes(&tx, ids, notes)?;
         for &id in ids {
             tx.execute(
                 &hold_queued_sql("SELECT conversation_key FROM inbox WHERE id = ?1"),
@@ -1557,12 +1579,14 @@ impl Store {
         Ok(texts)
     }
 
-    /// Marks every row of a turn group `failed` with `code`, in one transaction that also
-    /// stores the group's `partial` memory job.
+    /// Marks every row of a turn group `failed` with `code` and stores the turn's memory
+    /// `notes` (if any) on the main row, the first of `ids` ([`store_notes`]), in one
+    /// transaction that also stores the group's `partial` memory job.
     pub fn fail_group(
         &mut self,
         ids: &[i64],
         code: &str,
+        notes: &str,
         trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
@@ -1579,6 +1603,7 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
+        store_notes(&tx, ids, notes)?;
         let inserted = enqueue_group(&tx, ids, true, Some(trace))?;
         tx.commit()?;
         self.wake_after(inserted);
@@ -1707,6 +1732,17 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLS} FROM inbox
              WHERE state = 'failed' AND notice_sent = 0 AND error LIKE 'E\\_FILE\\_%' ESCAPE '\\'
+             ORDER BY id"
+        ))?;
+        Ok(stmt.query_map([], map_row)?.collect::<Result<_, _>>()?)
+    }
+
+    /// Main rows of turn groups that did not reply (`failed` or `needs_check`) whose stored
+    /// memory notes were not delivered yet (`text_sent` unset).
+    pub fn unsent_notes(&self) -> Result<Vec<InboxRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM inbox
+             WHERE state IN ('failed', 'needs_check') AND reply IS NOT NULL AND text_sent = 0
              ORDER BY id"
         ))?;
         Ok(stmt.query_map([], map_row)?.collect::<Result<_, _>>()?)
@@ -2200,7 +2236,7 @@ mod tests {
         let d = new_id(admit(&mut s, "m4", "k2"));
         let e = new_id(admit(&mut s, "m5", "k3"));
         s.mark(a, State::Processing, None).unwrap();
-        s.interrupt_group(&[a], "E_TEST", &TurnTrace::default())
+        s.interrupt_group(&[a], "E_TEST", "", &TurnTrace::default())
             .unwrap();
         s.mark(c, State::Processing, None).unwrap();
         drop(s);
@@ -2524,7 +2560,7 @@ mod tests {
         let a = new_id(admit(&mut s, "m1", "k1"));
         let b = admit_files(&mut s, "m2", "k1");
         s.mark(a, State::Processing, None).unwrap();
-        s.interrupt_group(&[a], "E_TEST", &TurnTrace::default())
+        s.interrupt_group(&[a], "E_TEST", "", &TurnTrace::default())
             .unwrap();
         assert!(!s.files_failed(b, crate::files::E_FILE_FETCH).unwrap());
         let row = s.get(b).unwrap().unwrap();
@@ -2538,7 +2574,7 @@ mod tests {
         let a = new_id(admit(&mut s, "m1", "k1"));
         let b = admit_files(&mut s, "m2", "k1");
         s.mark(a, State::Processing, None).unwrap();
-        s.interrupt_group(&[a], "E_TEST", &TurnTrace::default())
+        s.interrupt_group(&[a], "E_TEST", "", &TurnTrace::default())
             .unwrap();
         let before = s.get(b).unwrap().unwrap();
         assert!(!s.files_saved(b, "[]").unwrap());
@@ -3097,7 +3133,7 @@ mod tests {
         let st = new_id(admit(&mut s, "m2", K1));
         assert!(s.steer_into(st, m).unwrap());
         let other = new_id(admit(&mut s, "m3", K2));
-        s.fail_group(&[m, st], "E_TEST", &TurnTrace::default())
+        s.fail_group(&[m, st], "E_TEST", "", &TurnTrace::default())
             .unwrap();
         for id in [m, st] {
             assert_eq!(
@@ -3109,6 +3145,49 @@ mod tests {
     }
 
     #[test]
+    fn a_group_that_did_not_reply_keeps_its_notes_on_the_main_row_until_sent() {
+        let (_d, _p, mut s) = open_tmp();
+        let failed = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, failed).unwrap());
+        s.fail_group(
+            &[failed, st],
+            "E_TEST",
+            "[memory] saved m-1",
+            &TurnTrace::default(),
+        )
+        .unwrap();
+        let cut = claimed(&mut s, "m3", K2);
+        s.interrupt_group(
+            &[cut],
+            "E_CHILD_LOST",
+            "[memory] saved m-2",
+            &TurnTrace::default(),
+        )
+        .unwrap();
+        let quiet = claimed(&mut s, "m4", K2);
+        s.fail_group(&[quiet], "E_TEST", "", &TurnTrace::default())
+            .unwrap();
+
+        let unsent: Vec<(i64, Option<String>)> = s
+            .unsent_notes()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.reply))
+            .collect();
+        assert_eq!(
+            unsent,
+            [
+                (failed, Some("[memory] saved m-1".into())),
+                (cut, Some("[memory] saved m-2".into())),
+            ]
+        );
+        assert_eq!(s.get(st).unwrap().unwrap().reply, None);
+        s.mark_text_sent(failed).unwrap();
+        assert_eq!(s.unsent_notes().unwrap().len(), 1);
+    }
+
+    #[test]
     fn interrupt_group_holds_queued_rows_of_each_conversation() {
         let (_d, _p, mut s) = open_tmp();
         let m = claimed(&mut s, "m1", K1);
@@ -3116,7 +3195,7 @@ mod tests {
         assert!(s.steer_into(st, m).unwrap());
         let same = new_id(admit(&mut s, "m3", K1));
         let other = new_id(admit(&mut s, "m4", K2));
-        s.interrupt_group(&[m, st], "E_CHILD_LOST", &TurnTrace::default())
+        s.interrupt_group(&[m, st], "E_CHILD_LOST", "", &TurnTrace::default())
             .unwrap();
         for id in [m, st] {
             assert_eq!(
@@ -3144,7 +3223,7 @@ mod tests {
                 s.recover_on_start().unwrap();
                 "interrupted"
             } else {
-                s.interrupt_group(&[m], "E_CHILD_LOST", &TurnTrace::default())
+                s.interrupt_group(&[m], "E_CHILD_LOST", "", &TurnTrace::default())
                     .unwrap();
                 "E_CHILD_LOST"
             };
@@ -3670,8 +3749,8 @@ mod tests {
         let b = new_id(admit(&mut s, "m2", "k2"));
         assert!(s.claim(a).unwrap());
         assert!(s.claim(b).unwrap());
-        s.fail_group(&[a], "E_TEST", &sample_trace()).unwrap();
-        s.interrupt_group(&[b], "E_CHILD_LOST", &TurnTrace::default())
+        s.fail_group(&[a], "E_TEST", "", &sample_trace()).unwrap();
+        s.interrupt_group(&[b], "E_CHILD_LOST", "", &TurnTrace::default())
             .unwrap();
         let jobs = pending_jobs(&s, JobKind::Group);
         assert_eq!(jobs.len(), 2);
@@ -3707,7 +3786,10 @@ mod tests {
         assert_eq!(row.state, State::Processing);
         assert_eq!(row.reply, None);
         assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
-        assert!(s.fail_group(&[m, 9999], "E_TEST", &sample_trace()).is_err());
+        assert!(
+            s.fail_group(&[m, 9999], "E_TEST", "", &sample_trace())
+                .is_err()
+        );
         assert_eq!(s.get(m).unwrap().unwrap().state, State::Processing);
         assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
         assert_eq!(wakes(&wake), 0);
@@ -3902,7 +3984,8 @@ mod tests {
         }
         let m = new_id(admit(&mut s, "m1", "k1"));
         assert!(s.claim(m).unwrap());
-        s.fail_group(&[m], "E_TEST", &TurnTrace::default()).unwrap();
+        s.fail_group(&[m], "E_TEST", "", &TurnTrace::default())
+            .unwrap();
         let ids: Vec<i64> = s
             .pending_memory_jobs(100)
             .unwrap()

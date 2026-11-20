@@ -759,6 +759,9 @@ struct OpenTurn {
     /// What the main input gave its conversation, not recorded until the turn ends: the steer
     /// counts it as given, since the main prompt was accepted before any steer can join.
     main_fresh: Fresh,
+    /// The compaction epoch the main input was built in ([`GivenState::epoch`]): after a
+    /// compaction the steer no longer counts `main_fresh` as given.
+    main_epoch: u64,
     steer: Option<Steer>,
 }
 
@@ -1212,6 +1215,7 @@ impl OmpManager {
                 requests: current.requests.clone(),
                 given: Arc::clone(&current.given),
                 main_fresh: fresh.clone(),
+                main_epoch: epoch,
                 steer: None,
             });
             current.requests.send(request).is_ok()
@@ -1326,7 +1330,7 @@ impl OmpManager {
             let Some(turn) = gate.as_ref().filter(|turn| turn.accepts(key, sender)) else {
                 return false;
             };
-            let (view, epoch) = given_view(&turn.given, &turn.main_fresh);
+            let (view, epoch) = given_view(&turn.given, &turn.main_fresh, turn.main_epoch);
             (turn.main_row_id, view, epoch)
         };
         let (text, fresh) = thread_memory(
@@ -1701,11 +1705,19 @@ fn record_given(given: &Given, fresh: Fresh, epoch: u64) {
 }
 
 /// What the steer's input counts as given: the child's sections with the open turn's main
-/// input (`main_fresh`, accepted but not recorded yet) on top, and the compaction epoch.
-fn given_view(given: &Given, main_fresh: &Fresh) -> (HashMap<String, HashMap<String, u64>>, u64) {
+/// input (`main_fresh`, accepted but not recorded yet, built in `main_epoch`) on top, and the
+/// compaction epoch. After a compaction since the main input was built, its block may have
+/// been summarised away, so it is not counted and the steer carries it again.
+fn given_view(
+    given: &Given,
+    main_fresh: &Fresh,
+    main_epoch: u64,
+) -> (HashMap<String, HashMap<String, u64>>, u64) {
     let given = lock(given);
     let mut view = given.sections.clone();
-    if let Some((key, sections)) = main_fresh {
+    if given.epoch == main_epoch
+        && let Some((key, sections)) = main_fresh
+    {
         view.entry(key.clone())
             .or_default()
             .extend(sections.iter().cloned());

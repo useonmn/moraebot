@@ -55,7 +55,10 @@
 //! Interrupted work (`needs_check`) is never re-prompted; its conversation gets one
 //! notice, also across restarts (`notice_sent`), and its older queued rows are held: they
 //! are marked `needs_check` / [`E_DISPATCH_HELD`] in the same store transaction as the
-//! interruption, so the hold survives a restart.
+//! interruption, so the hold survives a restart. The memory notes of a turn that did not
+//! reply are stored on its main row with the failure or interruption and posted after its
+//! notice; like a reply, notes whose send failed are retried after a reconnect and at
+//! startup (`text_sent` records the delivery).
 //!
 //! Files the agent queued with `send_file` are stored with the reply and uploaded after
 //! its text, each marked sent or skipped on its own, so a resend sends only what is
@@ -448,13 +451,18 @@ impl Dispatcher {
     /// reply whose file upload was cut gets one file notice (the file is skipped), stored
     /// replies are re-sent. A row cut off by a crash and one marked by a graceful shutdown
     /// are treated the same. A lane a restart interrupted gets one notice in its
-    /// conversation. Then an onboarding request gets its one greeting, and last an omp version
-    /// warning is sent once per version ([`N_OMP_VERSION`]).
+    /// conversation. The memory notes of a turn that did not reply and were not delivered
+    /// yet are posted. Then an onboarding request gets its one greeting, and last an omp
+    /// version warning is sent once per version ([`N_OMP_VERSION`]).
     pub async fn startup(&self) -> Result<(), StoreError> {
         let recovered = self.store().recover_on_start()?;
         self.post_needs_check_notices().await?;
         self.post_lane_notices().await?;
         self.post_failed_file_notices().await?;
+        let unsent_notes = self.store().unsent_notes()?;
+        for row in unsent_notes {
+            self.send_notes(row.id).await?;
+        }
         for id in recovered.interrupted_uploads {
             let Some(row) = self.store().get(id)? else {
                 continue;
@@ -1103,7 +1111,8 @@ impl Dispatcher {
     /// Stores the outcome of a lead turn and its steered row, if any: one reply on the
     /// main row (the steered row `done`), else every member `needs_check` with the
     /// conversation's notice, else every member `failed` with one notice. The turn's memory
-    /// notes go under the reply, or right after the notice.
+    /// notes go under the reply, or are stored on the main row and posted right after the
+    /// notice ([`Self::send_notes`]).
     async fn settle_group(
         &self,
         main_id: i64,
@@ -1129,9 +1138,9 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn interrupted");
-            self.store().interrupt_group(&ids, code, &trace)?;
+            self.store().interrupt_group(&ids, code, &notes, &trace)?;
             self.post_needs_check_notices().await?;
-            self.post_memory_notes(main_id, target, &notes).await;
+            self.send_notes(main_id).await?;
             return Ok(());
         }
         if let Some(code) = outcomes.iter().find_map(|outcome| match outcome {
@@ -1139,14 +1148,14 @@ impl Dispatcher {
             _ => None,
         }) {
             tracing::warn!(row = main_id, steered = ?steered_id, code, "turn failed");
-            self.store().fail_group(&ids, code, &trace)?;
+            self.store().fail_group(&ids, code, &notes, &trace)?;
             let notice = if code == E_COST_CAP {
                 N_COST_CAP
             } else {
                 N_FAILED
             };
             self.notify(target, notice).await;
-            self.post_memory_notes(main_id, target, &notes).await;
+            self.send_notes(main_id).await?;
             return Ok(());
         }
 
@@ -1199,8 +1208,9 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Re-sends replies whose earlier send failed (call after a reconnect).
-    /// Returns how many were delivered.
+    /// Re-sends replies and memory notes whose earlier send failed (call after a reconnect);
+    /// the interrupted notice that notes wait for is posted first. Returns how many were
+    /// delivered.
     pub async fn resend_pending(&self) -> Result<usize, StoreError> {
         let ids = std::mem::take(&mut *lock(&self.pending));
         let mut delivered = 0;
@@ -1208,10 +1218,17 @@ impl Dispatcher {
             let Some(row) = self.store().get(id)? else {
                 continue;
             };
-            if row.state != State::ReplyPending {
-                continue;
-            }
-            if self.send_reply(row.id).await? {
+            let sent = match row.state {
+                State::ReplyPending => self.send_reply(row.id).await?,
+                State::NeedsCheck | State::Failed => {
+                    if row.state == State::NeedsCheck && !row.notice_sent {
+                        self.post_needs_check_notices().await?;
+                    }
+                    self.send_notes(row.id).await?
+                }
+                _ => false,
+            };
+            if sent {
                 delivered += 1;
             }
         }
@@ -1531,18 +1548,40 @@ impl Dispatcher {
         send_notice(self.adapter.as_ref(), channel, code).await
     }
 
-    /// Posts the memory notes of group `main_id`, a turn that did not reply, so the owner
-    /// sees a standing rule the lead saved before the turn failed. Best effort, like a notice.
-    async fn post_memory_notes(&self, main_id: i64, channel: &str, notes: &str) {
-        if notes.is_empty() {
-            return;
+    /// Posts the memory notes stored on `id`, the main row of a turn that did not reply
+    /// ([`Store::fail_group`], [`Store::interrupt_group`]), so the owner sees a standing rule
+    /// the lead saved before the turn failed. They follow the row's notice: a `needs_check`
+    /// row waits until its interrupted notice was posted (`notice_sent`). Delivered notes are
+    /// marked `text_sent`; a failed send, or a notice still missing, remembers the row for
+    /// [`Self::resend_pending`]. Returns whether notes were delivered now.
+    async fn send_notes(&self, id: i64) -> Result<bool, StoreError> {
+        let Some(row) = self.store().get(id)? else {
+            return Ok(false);
+        };
+        let notes = row.reply.as_deref().unwrap_or_default();
+        if row.text_sent || notes.is_empty() {
+            return Ok(false);
+        }
+        let Some(target) = reply_target(&row.conversation_key) else {
+            return Ok(false);
+        };
+        if row.state == State::NeedsCheck && !row.notice_sent {
+            self.remember_pending(id);
+            return Ok(false);
         }
         for chunk in reply_messages(notes, self.adapter.message_limit()) {
-            if let Err(err) = self.adapter.send(channel, &chunk).await {
-                tracing::warn!(row = main_id, code = err.code, "memory notes not sent");
-                return;
+            if let Err(err) = self.adapter.send(target, &chunk).await {
+                tracing::warn!(
+                    row = id,
+                    code = err.code,
+                    "memory notes send failed, kept for a resend"
+                );
+                self.remember_pending(id);
+                return Ok(false);
             }
         }
+        self.store().mark_text_sent(id)?;
+        Ok(true)
     }
 }
 

@@ -341,8 +341,9 @@ fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
         .map(|sentence| (sentence, Source::lane(lane, seq)))
 }
 
-/// The line shown to the owner that names an owner sentence saved to `core` or `boundary`
-/// (by `memory_write`, or by the observer under the next reply).
+/// The line shown to the owner that names an owner sentence saved to `core` or `boundary`:
+/// with the turn's outcome for a `memory_write` save, or under the next reply for an observer
+/// save.
 pub fn core_note(id: &str, bucket: &str, text: &str) -> String {
     const SHOWN: usize = 80;
     let mut shown: String = text.chars().take(SHOWN).collect();

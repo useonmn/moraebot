@@ -20,8 +20,10 @@
 //! taken last and nothing is locked while it is held.
 //!
 //! Shutdown kills every lane child first, then every running check, then waits until
-//! each killed check was reaped: a check's refusal never reaches a live lane, so a turn
-//! cut during a check is always left for `recover_on_start`.
+//! each killed check was reaped. `stopping` is set before those kills, so a `lane_done`
+//! call refused for the shutdown can still reach a live lane, which may then end its turn
+//! with a reply; that refusal marks the job's claim `Cut`, so a turn cut during a check is
+//! always left for `recover_on_start`.
 //!
 //! A lane started with `repo` works in its own git worktree,
 //! `<work dir>/.moraebot-lanes/lane-<id>` on branch `moraebot/lane-<id>`, created before
@@ -297,8 +299,14 @@ struct CheckDirs {
 /// What the lane's `lane_done` calls of one job established; the last call decides.
 enum Claim {
     None,
-    Failed { receipt: String },
-    Accepted { receipt: String },
+    Failed {
+        receipt: String,
+    },
+    Accepted {
+        receipt: String,
+    },
+    /// A call was refused because moraebot is stopping: the turn is cut, whatever it replies.
+    Cut,
 }
 
 /// A lane prompt that ran, with its claim state applied.
@@ -1369,42 +1377,14 @@ impl LaneManager {
             .and_then(Value::as_str)
             .filter(|evidence| !evidence.trim().is_empty())
             .ok_or_else(|| refused(E_LANE_ARGS, "evidence must be a non-empty string"))?;
-        let stopping = || refused(E_LANE_STOPPING, "the gateway is stopping");
         let mut claim = lock(claim);
-        if lock(&self.inner).stopping {
-            return Err(stopping());
-        }
-        let env = omp::check_env(&self.extra_env);
-        let mut checks = Vec::new();
-        if dirs.git {
-            let opts = done::RunOpts {
-                out_dir: &dirs.out,
-                env: &env,
-                timeout: worktree::GIT_TIMEOUT,
-            };
-            match worktree::git_checks(
-                &dirs.work,
-                &opts,
-                |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
-                |pid| self.untrack(pid),
-            ) {
-                Ok(git) => checks = git,
-                Err(done::Stopped) => return Err(stopping()),
+        let Ok(checks) = self.claim_checks((id, seq), ctx, line, dirs) else {
+            // `stopping` never resets, so `write_result` leaves this job for recovery.
+            if lock(&self.inner).stopping {
+                *claim = Claim::Cut;
             }
-        }
-        let signals = done::run(
-            line,
-            &dirs.work,
-            &dirs.out,
-            &env,
-            self.check_timeout,
-            |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
-            |pid| self.untrack(pid),
-        );
-        match signals {
-            Ok(signals) if !lock(&self.inner).stopping => checks.extend(signals),
-            _ => return Err(stopping()),
-        }
+            return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
+        };
         let receipt = done::receipt(evidence, &checks);
         if done::all_passed(&checks) {
             tracing::info!(
@@ -1431,6 +1411,48 @@ impl LaneManager {
         );
         *claim = Claim::Failed { receipt };
         Err(refused(done::E_DONE_UNMET, &done::not_done(&checks)))
+    }
+
+    /// Runs one `lane_done` call's git checks (worktree lanes), then its Done checks;
+    /// `Stopped` when moraebot is stopping, the call was cancelled or the job was stopped.
+    fn claim_checks(
+        &self,
+        (id, seq): (i64, i64),
+        ctx: &HostToolContext,
+        line: &DoneLine,
+        dirs: &CheckDirs,
+    ) -> Result<Vec<done::Check>, done::Stopped> {
+        if lock(&self.inner).stopping {
+            return Err(done::Stopped);
+        }
+        let env = omp::check_env(&self.extra_env);
+        let mut checks = Vec::new();
+        if dirs.git {
+            let opts = done::RunOpts {
+                out_dir: &dirs.out,
+                env: &env,
+                timeout: worktree::GIT_TIMEOUT,
+            };
+            checks = worktree::git_checks(
+                &dirs.work,
+                &opts,
+                |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
+                |pid| self.untrack(pid),
+            )?;
+        }
+        checks.extend(done::run(
+            line,
+            &dirs.work,
+            &dirs.out,
+            &env,
+            self.check_timeout,
+            |pid| self.track(pid, (id, seq), ctx.is_cancelled()),
+            |pid| self.untrack(pid),
+        )?);
+        if lock(&self.inner).stopping {
+            return Err(done::Stopped);
+        }
+        Ok(checks)
     }
 
     /// The `lane_report` tool of one job: its handler records the job's newest report.
@@ -1615,6 +1637,10 @@ impl LaneManager {
                     text,
                     receipt: receipt.clone(),
                 },
+                Claim::Cut => LaneOutcome::Plain(Outcome::NeedsCheck {
+                    code: E_LANE_STOPPING,
+                    detail: "a lane_done call was refused for the shutdown".to_owned(),
+                }),
             },
         };
         omp::close(&name, client);
