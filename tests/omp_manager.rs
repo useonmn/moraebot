@@ -1619,3 +1619,73 @@ async fn turn_timeout_with_steer_kills_lead_before_waiting() {
     assert!(!alive(pids[0]), "the lead child is gone");
     assert_eq!(manager.child_pid().await, None);
 }
+
+fn qa_memory_store(h: &Harness) -> moraebot::memory::MemoryStore {
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    moraebot::memory::MemoryStore::open(
+        &h.config.home,
+        moraebot::memory::Redactor::default(),
+        Arc::new(move || today),
+    )
+    .expect("memory store")
+}
+
+fn qa_note(text: &str, bucket: moraebot::memory::Bucket) -> moraebot::memory::NewEntry {
+    moraebot::memory::NewEntry {
+        text: text.into(),
+        prov: moraebot::memory::Prov::Owner,
+        bucket,
+        src: moraebot::memory::Source::row(1),
+        expires: None,
+    }
+}
+
+#[tokio::test]
+async fn conversation_memory_follows_the_body_once_until_it_changes() {
+    let h = Harness::new();
+    let mut store = qa_memory_store(&h);
+    let thread = moraebot::memory::Bucket::Thread(KEY_A.into());
+    store
+        .add(qa_note("reply in Korean", thread.clone()))
+        .expect("add");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h.manager("ok").with_memory_clock(Arc::new(move || today));
+    let inputs = [
+        lead::owner_input(KEY_A, 1, "first"),
+        lead::owner_input(KEY_A, 2, "second"),
+        lead::owner_input(KEY_B, 3, "other conversation"),
+    ];
+    for (n, input) in inputs.iter().enumerate() {
+        bounded(manager.prompt(
+            if n == 2 { KEY_B } else { KEY_A },
+            n as i64 + 1,
+            Sender::Owner,
+            input,
+        ))
+        .await;
+    }
+    store
+        .add(qa_note("keep PRs small", thread.clone()))
+        .expect("add");
+    let last = lead::owner_input(KEY_A, 4, "third");
+    bounded(manager.prompt(KEY_A, 4, Sender::Owner, &last)).await;
+
+    let messages: Vec<String> = h
+        .frames("prompt")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(messages.len(), 4);
+    let open = omp::thread_memory_open(KEY_A);
+    let (body, block) = messages[0].split_once("\n\n").expect("memory block");
+    assert_eq!(body, inputs[0], "the owner body comes first");
+    assert!(
+        block.starts_with(&open) && block.contains("reply in Korean"),
+        "{block}"
+    );
+    assert_eq!(messages[1], inputs[1], "unchanged memory is not sent again");
+    assert_eq!(messages[2], inputs[2], "KEY_B has no memory");
+    assert!(messages[3].starts_with(&format!("{last}\n\n{open}")));
+    assert!(messages[3].contains("keep PRs small"));
+    bounded(manager.shutdown_all()).await;
+}

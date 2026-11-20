@@ -68,6 +68,7 @@ use crate::access::{E_ACCESS_NOT_OWNER, Sender};
 use crate::config::Config;
 use crate::done::{self, DoneLine};
 use crate::lead::{self, LaneResult, Stalled};
+use crate::memory;
 use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
@@ -336,6 +337,8 @@ pub struct LaneManager {
     /// The time of the last watchdog tick; the dispatcher posts lane news after each.
     ticks: watch::Sender<Option<Instant>>,
     pub(crate) extra_env: Vec<(OsString, OsString)>,
+    /// Today's date for a job's memory block (expired entries are left out).
+    pub(crate) memory_clock: memory::Clock,
 }
 
 fn refused(code: &str, reason: &str) -> HostToolError {
@@ -416,6 +419,7 @@ impl LaneManager {
             reports: watch::channel(0).0,
             ticks: watch::channel(None).0,
             extra_env: Vec::new(),
+            memory_clock: memory::system_clock(),
         }
     }
 
@@ -1476,7 +1480,8 @@ impl LaneManager {
         Ok(json!({"recorded": true}).to_string().into())
     }
 
-    /// `Err` is a failure before the prompt was sent (the child did not open).
+    /// `Err` is a failure before the prompt was sent (the child did not open). The child's
+    /// system prompt gets the job's memory block ([`memory::lane_block`]), read now.
     fn run_prompt(
         self: &Arc<Self>,
         job: &Job,
@@ -1486,11 +1491,16 @@ impl LaneManager {
         let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
         let session_dir = omp::lane_session_dir(&self.config, job.id);
+        let memory = memory::lane_block(
+            &self.config.memory_dir(),
+            job.repo.as_deref(),
+            (self.memory_clock)(),
+        );
         let command = omp::private_dir(&session_dir)
             .and_then(|()| {
                 omp::child_command(
                     &self.config,
-                    omp::omp_args(&self.config, &cwd, &session_dir, ""),
+                    omp::omp_args(&self.config, &cwd, &session_dir, &memory),
                     &omp::stderr_log_path(&self.config, &name),
                     &self.extra_env,
                 )

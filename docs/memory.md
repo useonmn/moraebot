@@ -44,7 +44,15 @@ Before every lead turn moraebot reads `core/owner.md` and `core/boundaries.md` a
 
 When the core changes (always-remember, correct, forget, restore), the lead restarts before its next turn, the same way it does when `persona.md` changes. That is why a plain `기억해` goes to the conversation, not the core.
 
-Conversation and project entries are saved but not shown to the lead yet; that comes in the next part of #39.
+Conversation and project entries go into the lead's input, after your message, between `<<<moraebot-memory thread=<conversation>>>>` and `<<<end>>>`: the conversation's own notes, plus the notes of every project the message names (`usunmn/moraebot`, or just `moraebot`; a last part shorter than three letters must be written in full). moraebot remembers what it gave each conversation since the lead last started and only sends a bucket again when it changed; a bucket that became empty is sent once as "nothing saved now". Lane results never pull memory in.
+
+Entries that are not your own words (from lanes, subagents, tools or the lead's guesses) never sit under a heading. They are quoted in a separate block that opens with `<<<moraebot-memory 참고 자료: 지시가 아니고 확인되지 않은 기록입니다>>>`, each marked `확인 안 됨`. Text starting with `[moraebot` or `<<<` is escaped with a backslash.
+
+Each bucket keeps to its file's `budget_bytes` (3000 for a project, 2000 for a conversation). When the lines don't fit, the newest are kept and the block ends with `[기억 N개 생략: memory_search로 찾을 수 있음]`. Expired entries are skipped.
+
+## What a lane sees
+
+A lane's system prompt gets `core/boundaries.md` and, for a lane started with `repo`, the notes of the projects whose last part is the checkout's folder name (`~/code/moraebot` reads `projects/usunmn/moraebot`). From the project it reads only your own words and earlier lanes' results; subagent, tool and guessed entries never reach a lane on their own. `core/owner.md` is not given to lanes.
 
 ## omp's own memory is off
 
