@@ -299,7 +299,7 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
 }
 
 #[tokio::test]
-async fn owner_dm_is_answered_in_the_dm_without_thread_ts() {
+async fn owner_dm_is_answered_in_its_own_thread() {
     let mut rig = Rig::new();
     let (running, session) = rig.start("ok").await;
 
@@ -307,9 +307,9 @@ async fn owner_dm_is_answered_in_the_dm_without_thread_ts() {
     rig.wait_for_posts(1).await;
     let post = rig.fake.record().posts[0].clone();
     assert_eq!(post["channel"], DM);
-    assert!(
-        post.get("thread_ts").is_none(),
-        "DM replies are not threaded"
+    assert_eq!(
+        post["thread_ts"], "5.5",
+        "a root DM is answered in its thread"
     );
     assert!(post["text"].as_str().unwrap().contains("echo: hi there"));
 
@@ -337,7 +337,7 @@ async fn slack_greeting_goes_to_the_owner_dm_and_the_reply_is_turn_1() {
     rig.wait_for_posts(2).await;
     let reply = rig.fake.record().posts[1].clone();
     assert_eq!(reply["channel"], DM);
-    assert!(reply.get("thread_ts").is_none());
+    assert_eq!(reply["thread_ts"], "5.5");
 
     rig.tap.wait_for_prompts(1).await;
     running.stop().await;

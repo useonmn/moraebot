@@ -6,7 +6,8 @@
 //! `slack_bridge::testing::FakeSlackTransport` for offline tests.
 //!
 //! Id encoding: a Slack `ts` is unique only per channel, so message ids are
-//! `<channel>:<ts>` and thread ids are `<channel>:<thread_ts>`.
+//! `<channel>:<ts>` and thread ids are `<channel>:<thread_ts>`. Every DM is threaded
+//! (agent mode): a root DM is its own thread, `<channel>:<ts>`.
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -45,6 +46,12 @@ pub const E_SLACK_PROTOCOL: &str = "E_SLACK_PROTOCOL";
 /// A file upload step failed in a way that may work next time (network, 5xx, 429, or a
 /// transient Slack error).
 pub const E_SLACK_UPLOAD: &str = "E_SLACK_UPLOAD";
+
+/// The working status shown under a DM thread while a turn runs.
+pub const STATUS_TEXT: &str = "is working on it...";
+/// Slack removes a status after two minutes without a message, so it is set again this
+/// often while the turn runs.
+pub const STATUS_REFRESH: Duration = Duration::from_secs(90);
 
 /// The only host Slack serves file downloads and upload URLs from.
 pub const FILE_HOST: &str = "files.slack.com";
@@ -194,7 +201,9 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         if user != scope.owner_id && !listed {
             return None;
         }
-        None
+        // Agent mode: every DM is answered in a thread. A root DM opens its own thread.
+        let thread_ts = event.get("thread_ts").and_then(Value::as_str).unwrap_or(ts);
+        Some(format!("{channel}:{thread_ts}"))
     } else {
         if channel != scope.channel_id {
             return None;
@@ -263,6 +272,20 @@ pub fn post_body(channel: &str, thread_ts: Option<&str>, text: &str) -> Value {
     body
 }
 
+/// The DM channel and thread `ts` of a target that names a DM thread (`D...:<ts>`), the
+/// only kind of target that gets a working status.
+pub fn status_thread(target: &str) -> Option<(String, String)> {
+    match parse_target(target) {
+        Ok((channel, Some(ts))) if channel.starts_with('D') => Some((channel, ts)),
+        _ => None,
+    }
+}
+
+/// The `assistant.threads.setStatus` body; an empty `status` clears it.
+pub fn status_body(channel_id: &str, thread_ts: &str, status: &str) -> Value {
+    json!({ "channel_id": channel_id, "thread_ts": thread_ts, "status": status })
+}
+
 /// The `chat.update` body for the message `ts` in `channel`.
 pub fn update_body(channel: &str, ts: &str, text: &str) -> Value {
     json!({ "channel": channel, "ts": ts, "text": text })
@@ -295,6 +318,21 @@ pub fn parse_open_response(json: &Value) -> Result<String, AdapterError> {
 /// `auth.test` response -> the bot's user id.
 pub fn parse_auth_response(json: &Value) -> Result<String, AdapterError> {
     ok_field(json, "user_id", E_SLACK_AUTH)
+}
+
+/// A response that carries nothing but `ok` (`assistant.threads.setStatus`).
+pub fn parse_ok_response(json: &Value) -> Result<(), AdapterError> {
+    if json.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let reason = json
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Err(AdapterError {
+        code: E_SLACK_API,
+        message: reason.to_string(),
+    })
 }
 
 /// `chat.postMessage` response -> the new message's `ts`.
@@ -374,6 +412,7 @@ const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
 const UPDATE_MESSAGE_URL: &str = "https://slack.com/api/chat.update";
 const UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
 const COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
+const SET_STATUS_URL: &str = "https://slack.com/api/assistant.threads.setStatus";
 
 const INBOUND_BUFFER: usize = 64;
 const BACKOFF_START: Duration = Duration::from_secs(5);
@@ -447,6 +486,13 @@ pub trait SlackTransport: Send + Sync {
         title: &str,
         channel_id: &str,
         thread_ts: Option<&str>,
+    ) -> Result<(), AdapterError>;
+    /// `assistant.threads.setStatus` on a DM thread; an empty `status` clears it.
+    async fn set_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
     ) -> Result<(), AdapterError>;
 }
 
@@ -736,6 +782,27 @@ impl SlackTransport for HttpTransport {
         {
             Ok(json) => upload_ok(&json),
             Err(_) => Err(upload_rate_limited("files.completeUploadExternal")),
+        }
+    }
+
+    async fn set_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
+    ) -> Result<(), AdapterError> {
+        let body = status_body(channel_id, thread_ts, status);
+        match self
+            .call(
+                SET_STATUS_URL,
+                &self.bot_token,
+                ApiBody::Json(&body),
+                E_SLACK_API,
+            )
+            .await?
+        {
+            Ok(json) => parse_ok_response(&json),
+            Err(_) => Err(rate_limited("assistant.threads.setStatus")),
         }
     }
 }
@@ -1124,6 +1191,48 @@ impl SlackLink {
         }));
         Ok(bot_rx)
     }
+
+    /// Shows [`STATUS_TEXT`] under a DM thread target (`D...:<ts>`) and sets it again
+    /// every [`STATUS_REFRESH`] until the returned keeper is dropped, which clears it.
+    /// Other targets get `None` and no Slack call: until a live check shows otherwise,
+    /// agent mode statuses are used in DM threads only. A failed call is logged and
+    /// never reaches the turn.
+    pub fn keep_status(&self, target: &str) -> Option<StatusKeeper> {
+        let (channel, thread_ts) = status_thread(target)?;
+        let transport = self.transport.clone();
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let set = |status: &'static str| {
+                let transport = transport.clone();
+                let (channel, thread_ts) = (channel.clone(), thread_ts.clone());
+                async move {
+                    if let Err(err) = transport.set_status(&channel, &thread_ts, status).await {
+                        tracing::warn!(
+                            code = err.code,
+                            reason = %err.message,
+                            clear = status.is_empty(),
+                            "slack setStatus failed"
+                        );
+                    }
+                }
+            };
+            loop {
+                set(STATUS_TEXT).await;
+                tokio::select! {
+                    () = tokio::time::sleep(STATUS_REFRESH) => {}
+                    // A send or a dropped keeper both end the status.
+                    _ = &mut stopped => break,
+                }
+            }
+            set("").await;
+        });
+        Some(StatusKeeper { _stop: stop })
+    }
+}
+
+/// Keeps a DM thread's working status up; dropping it clears the status.
+pub struct StatusKeeper {
+    _stop: oneshot::Sender<()>,
 }
 
 /// `auth.test` until it passes, with the socket backoff between tries; `None` on stop.
@@ -1467,8 +1576,46 @@ mod tests {
         m["channel_type"] = json!("im");
         let event = map_event(&payload(m), &scope()).unwrap();
         assert!(event.is_dm);
-        assert_eq!(event.thread_id, None);
+        // A root DM is its own thread.
+        assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
         assert_eq!(event.channel_id, "D333");
+    }
+
+    #[test]
+    fn dm_inside_a_thread_maps_to_that_thread() {
+        let mut m = msg("U111", "D333", "4.4");
+        m["channel_type"] = json!("im");
+        m["thread_ts"] = json!("3.3");
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
+        assert_eq!(event.message_id, "D333:4.4");
+    }
+
+    #[test]
+    fn only_a_dm_thread_target_gets_a_status() {
+        assert_eq!(
+            status_thread("D333:3.3"),
+            Some(("D333".to_string(), "3.3".to_string()))
+        );
+        assert_eq!(status_thread("D333"), None);
+        assert_eq!(status_thread("C222:1.1"), None);
+        assert_eq!(status_thread("U111"), None);
+        assert_eq!(status_thread(""), None);
+    }
+
+    #[test]
+    fn status_body_and_ok_response() {
+        assert_eq!(
+            status_body("D333", "3.3", ""),
+            json!({ "channel_id": "D333", "thread_ts": "3.3", "status": "" })
+        );
+        assert!(parse_ok_response(&json!({ "ok": true })).is_ok());
+        let err = parse_ok_response(
+            &json!({ "ok": false, "error": "method_not_supported_for_channel_type" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_SLACK_API);
+        assert_eq!(err.message, "method_not_supported_for_channel_type");
     }
 
     #[test]

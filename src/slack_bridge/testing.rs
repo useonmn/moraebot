@@ -114,6 +114,17 @@ pub struct SlackRecord {
     pub closed_sockets: usize,
     /// Every file call (downloads and the three upload steps), failed ones included.
     pub file_calls: Vec<SlackFileCall>,
+    /// Every `assistant.threads.setStatus` call, failed ones included.
+    pub statuses: Vec<StatusCall>,
+}
+
+/// One `assistant.threads.setStatus` call seen by `FakeSlackTransport`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusCall {
+    pub channel_id: String,
+    pub thread_ts: String,
+    /// Empty when the call cleared the status.
+    pub status: String,
 }
 
 /// One file call seen by `FakeSlackTransport`.
@@ -165,6 +176,7 @@ struct FakeSlackState {
     step_failures: VecDeque<(UploadStep, String)>,
     bytes_status_failures: VecDeque<u16>,
     upload_url: Option<String>,
+    status_failures: VecDeque<String>,
 }
 
 impl FakeSlackState {
@@ -274,6 +286,13 @@ impl FakeSlackTransport {
     pub fn fail_next_upload_bytes_status(&self, status: u16) {
         self.shared
             .update(|state| state.bytes_status_failures.push_back(status));
+    }
+
+    /// The next `set_status` records itself, then answers `ok:false` with `slack_error`.
+    /// Calls queue up.
+    pub fn fail_next_status(&self, slack_error: &str) {
+        self.shared
+            .update(|state| state.status_failures.push_back(slack_error.to_owned()));
     }
 
     /// The upload URL later `upload_url` calls return (default `FAKE_UPLOAD_URL`).
@@ -533,6 +552,28 @@ impl SlackTransport for FakeSlackTransport {
                 thread_ts: thread_ts.map(str::to_owned),
             });
             state.step_failure(UploadStep::CompleteUpload)
+        })
+    }
+
+    async fn set_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
+    ) -> Result<(), AdapterError> {
+        self.shared.update(|state| {
+            state.record.statuses.push(StatusCall {
+                channel_id: channel_id.to_owned(),
+                thread_ts: thread_ts.to_owned(),
+                status: status.to_owned(),
+            });
+            match state.status_failures.pop_front() {
+                Some(slack_error) => Err(AdapterError {
+                    code: E_SLACK_API,
+                    message: slack_error,
+                }),
+                None => Ok(()),
+            }
         })
     }
 }

@@ -6,8 +6,10 @@
 //! scope of this connection (the core's owner and allow list, the configured channel,
 //! the bot user id), so a message the core would not take is deleted here and never
 //! sent. Every request runs on its own task and is answered by its `id`, so a download
-//! never holds a send. When the session ends, its requests are stopped and their part
-//! files removed; unacked messages stay in the spool for the next core.
+//! never holds a send. A `status` is not a task: the session keeps one Slack status per
+//! DM thread target until the matching `stop`. When the session ends, its requests are
+//! stopped, their part files removed and its statuses cleared; unacked messages stay in
+//! the spool for the next core.
 //!
 //! Frames are never logged; logs carry `t`, `id`, `re` and `seq` only.
 
@@ -27,7 +29,7 @@ use tokio::time::Instant;
 use super::{BRIDGE_NAME, BridgeError, E_BRIDGE_STOPPING};
 use crate::adapter::{AdapterError, AttachmentRef, InboundAttachment, MessengerAdapter};
 use crate::bridge::proto::{
-    Caps, Decoded, Frame, FrameReader, ProtoError, Redacted, RequestKind, ThreadsCap,
+    Caps, Decoded, Frame, FrameReader, ProtoError, Redacted, RequestKind, StatusState, ThreadsCap,
     WireAttachment, map_error, write_frame,
 };
 use crate::bridge::spool::{Attempt, Spool};
@@ -37,7 +39,7 @@ use crate::bridge::{
 };
 use crate::files::{self, Progress};
 use crate::slack_bridge::slack::{
-    DEFAULT_HINTS, MESSAGE_LIMIT, PLATFORM, Scope, SlackLink, map_event, unix_now,
+    DEFAULT_HINTS, MESSAGE_LIMIT, PLATFORM, Scope, SlackLink, StatusKeeper, map_event, unix_now,
 };
 
 /// A link with no frame from the core for this long is closed (the core pings every 15 s).
@@ -246,7 +248,7 @@ fn hello(ctx: &Ctx) -> Frame {
             files: true,
             status: true,
             reactions: false,
-            agent_mode: false,
+            agent_mode: true,
         },
         spooled: ctx.spool.len() as u64,
     }
@@ -401,6 +403,9 @@ struct Session {
     /// The highest spool seq this connection has considered.
     cursor: u64,
     running: HashMap<u64, Running>,
+    /// The Slack status per DM thread target, with the number of `start`s not stopped
+    /// yet (a lead turn and a lane can work in one thread at once).
+    statuses: HashMap<String, (StatusKeeper, usize)>,
     finished_tx: mpsc::UnboundedSender<u64>,
     finished: mpsc::UnboundedReceiver<u64>,
 }
@@ -417,6 +422,7 @@ impl Session {
             unacked: BTreeSet::new(),
             cursor: 0,
             running: HashMap::new(),
+            statuses: HashMap::new(),
             finished_tx,
             finished,
         }
@@ -523,6 +529,7 @@ impl Session {
                 return false;
             }
             Frame::Cancel { id } => self.cancel(id),
+            Frame::Status { id, target, state } => self.status(id, target, state),
             Frame::React { id, .. } => {
                 self.answer_err(
                     id,
@@ -534,7 +541,6 @@ impl Session {
             | Frame::Edit { .. }
             | Frame::Thread { .. }
             | Frame::Dm { .. }
-            | Frame::Status { .. }
             | Frame::File { .. }
             | Frame::Fetch { .. }) => self.start(request),
             other => {
@@ -692,10 +698,42 @@ impl Session {
         }
     }
 
+    /// Starts or stops the Slack status of `target` and answers `ok` at once: a status
+    /// never fails a turn. Targets other than DM threads get no Slack call.
+    fn status(&mut self, id: u64, target: String, state: StatusState) {
+        match state {
+            StatusState::Start => {
+                if let Some((_, count)) = self.statuses.get_mut(&target) {
+                    *count += 1;
+                } else if let Some(keeper) = self.ctx.link.keep_status(&target) {
+                    self.statuses.insert(target, (keeper, 1));
+                }
+            }
+            StatusState::Stop => {
+                if let Some((_, count)) = self.statuses.get_mut(&target) {
+                    *count -= 1;
+                    if *count == 0 {
+                        // Dropping the keeper clears the status.
+                        self.statuses.remove(&target);
+                    }
+                }
+            }
+        }
+        let _ = self.out.send(Frame::Ok {
+            re: id,
+            message_id: None,
+            thread_id: None,
+            target: None,
+            bytes: None,
+        });
+    }
+
     fn close(&mut self) {
         for (_, running) in self.running.drain() {
             stop_request(running);
         }
+        // A core that went away cannot stop its statuses; clear them here.
+        self.statuses.clear();
     }
 }
 
@@ -766,9 +804,6 @@ async fn run_request(
                 ..Answer::default()
             }),
         ),
-        // Slack shows no working indicator through this link yet; the request is answered
-        // so the core's bookkeeping stays simple. The core never waits on it.
-        Frame::Status { id, .. } => (id, RequestKind::Status, Ok(Answer::default())),
         Frame::File {
             id,
             target,

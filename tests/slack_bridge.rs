@@ -12,11 +12,14 @@ use moraebot::adapter::{
     MessengerAdapter,
 };
 use moraebot::bridge::peer::own_uid;
-use moraebot::bridge::proto::{Decoded, Frame, FrameReader, ThreadsCap, write_frame};
+use moraebot::bridge::proto::{Decoded, Frame, FrameReader, StatusState, ThreadsCap, write_frame};
 use moraebot::bridge::{E_BRIDGE_BAD_REQUEST, E_BRIDGE_BUSY, E_BRIDGE_UNSUPPORTED, PROTO_VERSION};
 use moraebot::files::{E_FILE_TOO_LARGE, Progress};
-use moraebot::slack_bridge::slack::{DEFAULT_HINTS, E_SLACK_UPLOAD, MESSAGE_LIMIT};
-use moraebot::slack_bridge::testing::{FakeSlackTransport, TEST_CHANNEL, TestBridge, UploadStep};
+use moraebot::slack_bridge::slack::{DEFAULT_HINTS, E_SLACK_UPLOAD, MESSAGE_LIMIT, STATUS_TEXT};
+use moraebot::slack_bridge::testing::{
+    FakeSlackTransport, SlackFileCall, SlackRecord, StatusCall, TEST_CHANNEL, TestBridge,
+    UploadStep,
+};
 use moraebot::slack_bridge::{BRIDGE_NAME, E_BRIDGE_RUNNING, E_BRIDGE_STOPPING};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -216,6 +219,7 @@ async fn the_hello_describes_slack_and_the_adapter_reports_it() {
     assert_eq!(home.as_deref(), Some(TEST_CHANNEL));
     assert_eq!(caps.threads, ThreadsCap::Implicit);
     assert!(caps.dm && caps.edit && caps.files && caps.status && !caps.reactions);
+    assert!(caps.agent_mode);
     assert_eq!(spooled, 0);
     drop(_core);
 
@@ -601,4 +605,198 @@ async fn shutdown_says_bye_and_removes_the_socket() {
     }
     assert!(core.try_next().await.is_none());
     assert!(!socket.exists());
+}
+
+/// A DM in `D333`; `thread_ts` places it inside an existing thread.
+fn dm(envelope_id: &str, ts: &str, thread_ts: Option<&str>) -> Value {
+    let mut frame = message(envelope_id, OWNER, "D333", ts);
+    if let Some(thread_ts) = thread_ts {
+        frame["payload"]["event"]["thread_ts"] = json!(thread_ts);
+    }
+    frame
+}
+
+fn status_calls(record: &SlackRecord) -> Vec<(String, String, String)> {
+    record
+        .statuses
+        .iter()
+        .map(
+            |StatusCall {
+                 channel_id,
+                 thread_ts,
+                 status,
+             }| { (channel_id.clone(), thread_ts.clone(), status.clone()) },
+        )
+        .collect()
+}
+
+fn set(thread_ts: &str) -> (String, String, String) {
+    (
+        "D333".to_owned(),
+        thread_ts.to_owned(),
+        STATUS_TEXT.to_owned(),
+    )
+}
+
+fn cleared(thread_ts: &str) -> (String, String, String) {
+    ("D333".to_owned(), thread_ts.to_owned(), String::new())
+}
+
+#[tokio::test]
+async fn a_root_dm_is_its_own_thread_and_the_reply_goes_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let adapter = bridge.connect(OWNER, &[]).await;
+    let mut inbound = adapter.start().await.unwrap();
+    from_slack(&bridge, &[dm("e1", "3.3", None)], 1).await;
+
+    let event = within(inbound.recv()).await.expect("the DM arrives");
+    assert!(event.is_dm);
+    assert_eq!(event.message_id, "D333:3.3");
+    assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
+
+    adapter
+        .send(event.thread_id.as_deref().unwrap(), "answer")
+        .await
+        .unwrap();
+    let post = &bridge.fake.record().posts[0];
+    assert_eq!(post["channel"], "D333");
+    assert_eq!(
+        post["thread_ts"], "3.3",
+        "the reply is threaded under the DM"
+    );
+    adapter.shutdown().await;
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dm_inside_a_thread_is_answered_in_that_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let adapter = bridge.connect(OWNER, &[]).await;
+    let mut inbound = adapter.start().await.unwrap();
+    from_slack(&bridge, &[dm("e1", "4.4", Some("3.3"))], 1).await;
+
+    let event = within(inbound.recv()).await.expect("the DM arrives");
+    assert_eq!(event.message_id, "D333:4.4");
+    assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
+
+    adapter
+        .send(event.thread_id.as_deref().unwrap(), "answer")
+        .await
+        .unwrap();
+    let post = &bridge.fake.record().posts[0];
+    assert_eq!(post["channel"], "D333");
+    assert_eq!(post["thread_ts"], "3.3");
+    adapter.shutdown().await;
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dm_turn_sets_the_slack_status_and_its_end_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let adapter = bridge.connect(OWNER, &[]).await;
+
+    let typing = adapter.start_typing("D333:3.3").await.unwrap();
+    within(bridge.fake.wait_until(|r| !r.statuses.is_empty())).await;
+    assert_eq!(status_calls(&bridge.fake.record()), [set("3.3")]);
+    assert!(!STATUS_TEXT.is_empty());
+
+    drop(typing);
+    within(bridge.fake.wait_until(|r| r.statuses.len() == 2)).await;
+    assert_eq!(
+        status_calls(&bridge.fake.record()),
+        [set("3.3"), cleared("3.3")]
+    );
+    adapter.shutdown().await;
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_status_error_still_answers_ok_and_other_targets_call_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let mut core = RawCore::accept(bridge.socket(), &[], 32).await;
+    bridge
+        .fake
+        .fail_next_status("method_not_supported_for_channel_type");
+
+    let start = |id, target: &str| Frame::Status {
+        id,
+        target: target.to_owned(),
+        state: StatusState::Start,
+    };
+    for (id, target) in [(1, "D333:3.3"), (2, "C222:1.1"), (3, "D333"), (4, OWNER)] {
+        core.send(&start(id, target)).await;
+        match core.next().await {
+            Frame::Ok { re, .. } => assert_eq!(re, id),
+            other => panic!("expected ok for {target}, got {other:?}"),
+        }
+    }
+    within(bridge.fake.wait_until(|r| !r.statuses.is_empty())).await;
+    assert!(core.sync().await.is_empty());
+    // The failed call was the only one: a channel thread, a bare DM channel and a user
+    // id get no status.
+    assert_eq!(status_calls(&bridge.fake.record()), [set("3.3")]);
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn overlapping_turns_share_one_status_and_a_lost_core_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let mut core = RawCore::accept(bridge.socket(), &[], 32).await;
+    let status = |id, state| Frame::Status {
+        id,
+        target: "D333:3.3".to_owned(),
+        state,
+    };
+
+    core.send(&status(1, StatusState::Start)).await;
+    core.send(&status(2, StatusState::Start)).await;
+    core.send(&status(3, StatusState::Stop)).await;
+    let answers = core.sync().await;
+    assert_eq!(answers.len(), 3, "{answers:?}");
+    within(bridge.fake.wait_until(|r| !r.statuses.is_empty())).await;
+    // One start is still open, so the status stays.
+    assert_eq!(status_calls(&bridge.fake.record()), [set("3.3")]);
+
+    drop(core);
+    within(bridge.fake.wait_until(|r| r.statuses.len() == 2)).await;
+    assert_eq!(
+        status_calls(&bridge.fake.record()),
+        [set("3.3"), cleared("3.3")]
+    );
+    bridge.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_into_a_dm_thread_completes_with_the_thread_ts() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = bridge(dir.path()).await;
+    let adapter = bridge.connect(OWNER, &[]).await;
+    let file = dir.path().join("report.txt");
+    std::fs::write(&file, b"report").unwrap();
+    adapter
+        .send_file("D333:3.3", &file, "report.txt")
+        .await
+        .unwrap();
+    let complete = bridge
+        .fake
+        .record()
+        .file_calls
+        .into_iter()
+        .find_map(|call| match call {
+            SlackFileCall::CompleteUpload {
+                channel_id,
+                thread_ts,
+                ..
+            } => Some((channel_id, thread_ts)),
+            _ => None,
+        })
+        .expect("the upload completed");
+    assert_eq!(complete, ("D333".to_owned(), Some("3.3".to_owned())));
+    adapter.shutdown().await;
+    bridge.shutdown().await;
 }

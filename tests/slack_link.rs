@@ -16,7 +16,7 @@ use moraebot::adapter::{
 use moraebot::files::{E_FILE_HOST, E_FILE_REMOTE, E_FILE_WRITE, Progress};
 use moraebot::slack_bridge::slack::E_SLACK_ID;
 use moraebot::slack_bridge::slack::{
-    E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, SlackLink, SlackTransport,
+    E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, STATUS_TEXT, SlackLink, SlackTransport,
 };
 use moraebot::slack_bridge::testing::{
     FAKE_FILE_ID, FakeSlackTransport, SlackFileCall, UploadStep,
@@ -646,4 +646,38 @@ async fn shutdown_stops_socket_task() {
     assert_eq!(fake.record().closed_sockets, 1);
     assert!(within(WAIT, rx.recv()).await.is_none());
     assert_eq!(fake.record().opens, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_thread_status_is_set_again_before_slack_drops_it_and_cleared_on_drop() {
+    let (fake, link) = setup();
+    assert!(
+        link.keep_status("C222:1.1").is_none(),
+        "channel threads get no status"
+    );
+    let keeper = link
+        .keep_status("D333:3.3")
+        .expect("a DM thread gets a status");
+    within(PAUSED_WAIT, fake.wait_until(|r| r.statuses.len() == 1)).await;
+    // A failed call is only logged; the refresh still comes.
+    fake.fail_next_status("ratelimited");
+    let first = Instant::now();
+    within(PAUSED_WAIT, fake.wait_until(|r| r.statuses.len() == 2)).await;
+    // Slack drops a status after two minutes without a message.
+    assert!(first.elapsed() < Duration::from_secs(120));
+    let second = Instant::now();
+    within(PAUSED_WAIT, fake.wait_until(|r| r.statuses.len() == 3)).await;
+    assert!(second.elapsed() < Duration::from_secs(120));
+    assert!(
+        fake.record()
+            .statuses
+            .iter()
+            .all(|call| call.channel_id == "D333"
+                && call.thread_ts == "3.3"
+                && call.status == STATUS_TEXT)
+    );
+
+    drop(keeper);
+    within(PAUSED_WAIT, fake.wait_until(|r| r.statuses.len() == 4)).await;
+    assert_eq!(fake.record().statuses[3].status, "");
 }
