@@ -335,7 +335,7 @@ Files involved:
 
 ## Memory
 
-moraebot keeps what you ask it to remember in `~/.moraebot/memory/`, a small git repository. Tell it in plain words (`기억해: ...`, `항상 기억해: ...`, `뭐 기억해?`, `m-1a2b3c 지워`); moraebot answers these itself, so they never reach the lead. Your core rules are added to the lead's system prompt before each turn. See [docs/memory.md](docs/memory.md) for the commands, the folder layout and how to remove something from the history for good.
+moraebot keeps what you ask it to remember in `~/.moraebot/memory/`, a small git repository. Tell it in plain words (`기억해: ...`, `항상 기억해: ...`, `뭐 기억해?`, `m-1a2b3c 지워`); moraebot answers these itself, so they never reach the lead. Your core rules are added to the lead's system prompt before each turn, the notes of the conversation and of the projects you name follow your message, and the lead and lanes can look things up with `memory_search` (only the lead can save, with `memory_write`, and moraebot decides whose words a saved line is). See [docs/memory.md](docs/memory.md) for the commands, the folder layout and how to remove something from the history for good.
 
 The lead and the lanes are ordinary omp processes that read your own omp settings, except for omp's own memory: moraebot runs them with `--config ~/.moraebot/omp-overlay.yml`, which turns `memory.backend` and `autolearn` off, so nothing they do lands in your terminal omp's memory. If a newer omp no longer knows those keys, `moraebot run` refuses to start (`E_OMP_OVERLAY`). See [docs/memory.md](docs/memory.md#omps-own-memory-is-off).
 

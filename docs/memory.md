@@ -1,6 +1,6 @@
 # Memory
 
-moraebot keeps a small memory of what you, the owner, asked it to remember. This page covers what the first part of it (issue #39, P1a) does: the store, the commands you type in plain words, and how the lead sees your core rules.
+moraebot keeps a small memory of what you, the owner, asked it to remember. This page covers what the first part of it (issue #39, P1) does: the store, the commands you type in plain words, the two memory tools, what the lead and the lanes see, and how omp's own memory is kept out.
 
 ## Where it lives
 
@@ -34,7 +34,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `m-1a2b3c 지워`, `forget m-1a2b3c` | Asks once; your next message there answers it (`응`/`yes` forgets, `아니`/`no` keeps). |
 | `m-1a2b3c 되살려`, `restore m-1a2b3c` | Brings a forgotten entry back. |
 
-A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when it saves something on its own (nothing does yet in P1a).
+A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when something is saved without a command (the lead's `memory_write` below); `뭐 기억해?` lists what this conversation got that way.
 
 The lead has no tool that corrects, forgets or restores an entry; only your commands above do that.
 
