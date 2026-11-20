@@ -25,6 +25,17 @@ fn fake_executable(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// A temp folder short enough for the default bridge socket under it: on macOS the
+/// default is `~/Library/Application Support/moraebot/slack-bridge.sock`, and a home under
+/// the per-user temp folder (`/var/folders/..`) pushes it past the 103 bytes
+/// `sockaddr_un` allows there.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mb")
+        .tempdir_in("/tmp")
+        .expect("tempdir")
+}
+
 fn run_init(home: &Path, input: &str) -> std::process::Output {
     let mut child = moraebot(home)
         .arg("init")
@@ -312,7 +323,7 @@ fn percent_decode(text: &str) -> String {
 
 #[test]
 fn init_then_setup_slack_writes_both_configs_and_activates_the_bridge() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -368,7 +379,7 @@ fn init_then_setup_slack_writes_both_configs_and_activates_the_bridge() {
 
 #[test]
 fn setup_prints_manifest_link_that_decodes_to_manifest() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -400,7 +411,7 @@ fn setup_prints_manifest_link_that_decodes_to_manifest() {
 
 #[test]
 fn failed_setup_leaves_config_byte_identical() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -411,6 +422,32 @@ fn failed_setup_leaves_config_byte_identical() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("E_SLACK_TOKEN_KIND"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("E_INIT_EOF"));
+    assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
+}
+
+#[test]
+fn a_socket_path_too_long_only_stops_the_slack_setup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("h".repeat(100));
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    let output = run_init(&home, &input);
+    assert!(
+        output.status.success(),
+        "a Discord init needs no socket: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = fs::read(home.join("config.toml")).expect("config");
+
+    let output = run_with_input(
+        &home,
+        &["setup", "slack"],
+        &format!("U111\nC222\n{BOT}\n{APP}\n"),
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("E_BRIDGE_SOCKET"), "{stderr}");
+    assert!(stderr.contains("this OS allows at most"), "{stderr}");
     assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
 }
 

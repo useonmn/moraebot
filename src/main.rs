@@ -254,8 +254,13 @@ fn default_socket(env: &Env) -> Result<PathBuf, ConfigError> {
 fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
     let stdin = io::stdin();
     let is_tty = stdin.is_terminal();
-    let socket = default_socket(env)?;
-    let outcome = init::run(env, &socket, stdin.lock(), io::stdout().lock(), is_tty)?;
+    let outcome = init::run(
+        env,
+        || default_socket(env),
+        stdin.lock(),
+        io::stdout().lock(),
+        is_tty,
+    )?;
     Ok(match outcome {
         InitOutcome::Written { checks_ok: false } => ExitCode::FAILURE,
         InitOutcome::Written { checks_ok: true } | InitOutcome::Kept => ExitCode::SUCCESS,
@@ -265,11 +270,10 @@ fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
 fn run_setup(env: &Env, messenger: SetupTarget) -> Result<ExitCode, ConfigError> {
     let stdin = io::stdin();
     let is_tty = stdin.is_terminal();
-    let socket = default_socket(env)?;
     let outcome = init::setup(
         env,
         messenger,
-        &socket,
+        || default_socket(env),
         stdin.lock(),
         io::stdout().lock(),
         is_tty,

@@ -528,10 +528,11 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
     }
 }
 
-/// `moraebot init`. `socket` is the bridge socket path written for a Slack setup.
+/// `moraebot init`. `socket` yields the bridge socket path written for a Slack setup; it
+/// is called only when Slack is chosen, so a Discord setup never depends on it.
 pub fn run<R: BufRead, W: Write>(
     env: &Env,
-    socket: &Path,
+    socket: impl FnOnce() -> Result<PathBuf, ConfigError>,
     input: R,
     out: W,
     is_tty: bool,
@@ -559,8 +560,9 @@ pub fn run<R: BufRead, W: Write>(
             (Some(section), None, tokens)
         }
         SetupTarget::Slack => {
+            let socket = socket()?;
             prompter.print_slack_link()?;
-            let (setup, tokens) = prompter.ask_slack(None, None, socket, &home)?;
+            let (setup, tokens) = prompter.ask_slack(None, None, &socket, &home)?;
             (None, Some(setup), tokens)
         }
     };
@@ -605,12 +607,12 @@ pub fn run<R: BufRead, W: Write>(
 }
 
 /// `moraebot setup <messenger>`: asks only that messenger's required fields, keeps every
-/// other config value and makes the messenger the active one. `socket` is the bridge
-/// socket path for a Slack setup when the config names none yet.
+/// other config value and makes the messenger the active one. `socket` yields the bridge
+/// socket path for a Slack setup when the config names none yet; it is called only then.
 pub fn setup<R: BufRead, W: Write>(
     env: &Env,
     messenger: SetupTarget,
-    socket: &Path,
+    socket: impl FnOnce() -> Result<PathBuf, ConfigError>,
     input: R,
     out: W,
     is_tty: bool,
@@ -639,12 +641,15 @@ pub fn setup<R: BufRead, W: Write>(
             let existing =
                 SlackBridgeConfig::load(&config.home.join(slack_bridge_config::FILE_NAME), env)
                     .ok();
-            let socket = config
+            let named = config
                 .bridge
                 .as_ref()
                 .map(|b| b.socket.clone())
-                .or_else(|| existing.as_ref().map(|e| e.socket.clone()))
-                .unwrap_or_else(|| socket.to_path_buf());
+                .or_else(|| existing.as_ref().map(|e| e.socket.clone()));
+            let socket = match named {
+                Some(socket) => socket,
+                None => socket()?,
+            };
             let (setup, tokens) = prompter.ask_slack(
                 config.bridge.as_ref(),
                 existing.as_ref(),
@@ -736,7 +741,13 @@ mod tests {
 
         fn run(&self, input: &str) -> (Result<InitOutcome, ConfigError>, String) {
             let mut out = Vec::new();
-            let result = run(&self.env, &self.socket(), input.as_bytes(), &mut out, false);
+            let result = run(
+                &self.env,
+                || Ok(self.socket()),
+                input.as_bytes(),
+                &mut out,
+                false,
+            );
             (result, String::from_utf8(out).expect("utf-8 output"))
         }
 
@@ -991,7 +1002,7 @@ mod tests {
         };
         let mut out = Vec::new();
         let input = "1\n111\n222\nTOKEN_SENTINEL_9f3a\n";
-        let result = run(&env, &fx.socket(), input.as_bytes(), &mut out, false);
+        let result = run(&env, || Ok(fx.socket()), input.as_bytes(), &mut out, false);
         assert_eq!(
             result.expect("init runs"),
             InitOutcome::Written { checks_ok: true }
@@ -1047,7 +1058,7 @@ mod tests {
             let result = setup(
                 &self.env,
                 messenger,
-                &self.socket(),
+                || Ok(self.socket()),
                 input.as_bytes(),
                 &mut out,
                 false,
