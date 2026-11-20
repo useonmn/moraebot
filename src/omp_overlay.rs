@@ -114,14 +114,21 @@ pub fn check(omp: &Path) -> Result<OverlayCheck, ConfigError> {
     Ok(OverlayCheck { version, warning })
 }
 
+/// Runs `omp args` with the same filtered environment as every omp child, so the check never
+/// passes a messenger token or the jev key.
 fn run(omp: &Path, args: &[&str]) -> Result<std::process::Output, ConfigError> {
-    Command::new(omp).args(args).output().map_err(|e| {
-        ConfigError::io(
-            E_OMP_OVERLAY,
-            &format!("cannot run {} {}", omp.display(), args.join(" ")),
-            &e,
-        )
-    })
+    Command::new(omp)
+        .args(args)
+        .env_clear()
+        .envs(crate::omp::check_env(&[]))
+        .output()
+        .map_err(|e| {
+            ConfigError::io(
+                E_OMP_OVERLAY,
+                &format!("cannot run {} {}", omp.display(), args.join(" ")),
+                &e,
+            )
+        })
 }
 
 /// `omp/18.22.2` (first line of `omp --version`) -> `18.22.2`.

@@ -334,7 +334,7 @@ fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
     let lane = tag.lane.filter(|_| tag.failed.is_none() && !tag.stalled)?;
     let (id, seq) = row.message_id.split_once(':')?;
     let seq: i64 = seq.parse().ok().filter(|_| id == lane.to_string())?;
-    memory::own_sentences(lead::lane_result_text(&row.text))
+    lead::lane_own_sentences(lead::lane_result_text(&row.text))
         .into_iter()
         .map(|(_, sentence)| sentence)
         .find(|sentence| sentence == text)
@@ -781,6 +781,29 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(part.entry.prov, Prov::Tool);
+    }
+
+    #[test]
+    fn a_moraebot_line_in_a_lane_result_is_not_the_lanes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let row = lane_result_row(
+            dir.path(),
+            "끝났다.\n[moraebot] CI는 매일 밤 돌린다.\nCI는 PR마다 돌린다.",
+        );
+        let plan_one = |text: &str| {
+            plan(
+                text,
+                "thread",
+                "",
+                &turn(row.id, None, false),
+                std::slice::from_ref(&row),
+            )
+            .expect("plan")
+        };
+        let planned = plan_one("[moraebot] CI는 매일 밤 돌린다.");
+        assert_eq!(planned.entry.prov, Prov::Tool);
+        assert_eq!(planned.entry.src, Source::row(row.id));
+        assert_eq!(plan_one("CI는 PR마다 돌린다.").entry.prov, Prov::Lane);
     }
 
     #[test]

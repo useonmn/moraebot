@@ -1149,6 +1149,15 @@ impl LaneManager {
                 LaneClose::Busy => return Err(busy()),
             }
         };
+        // The prompt file holds memory text (boundaries, project notes). A closed lane never
+        // starts again, so the file goes now and an entry the owner forgets later does not
+        // stay readable in it.
+        let append = omp::lane_append_path(&self.config, id);
+        if let Err(err) = std::fs::remove_file(&append)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(lane = id, error = %err, "lane prompt file not removed");
+        }
         let (word, codes, detail, branch) = match repo {
             None => ("none", Vec::new(), None, None),
             Some(repo) => {

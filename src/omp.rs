@@ -475,12 +475,16 @@ static APPEND_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Writes a child's appended system prompt `text` to `path` (mode `0o600`, parent `0o700`)
 /// through a temp file that is synced and renamed over it, and returns the absolute path for
-/// [`omp_args`]. Empty `text` writes nothing and returns `None` (no argument). A path with a
+/// [`omp_args`]. Empty `text` removes an earlier file (it may hold memory text the owner has
+/// since forgotten) and returns `None` (no argument). A path with a
 /// line break is refused: omp reads such a value as literal text, not as a file. Written
 /// before every start; a running child never reads it again.
 pub fn write_append_file(path: &Path, text: &str) -> std::io::Result<Option<PathBuf>> {
     if text.is_empty() {
-        return Ok(None);
+        return match std::fs::remove_file(path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(None),
+        };
     }
     let path = std::path::absolute(path)?;
     if path
@@ -2267,16 +2271,36 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_prompt_removes_the_earlier_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lanes").join("1").join("append.md");
+        assert_eq!(
+            write_append_file(&path, "never force-push").expect("write"),
+            Some(path.clone())
+        );
+        assert!(path.exists());
+        assert_eq!(write_append_file(&path, "").expect("empty"), None);
+        assert!(
+            !path.exists(),
+            "a forgotten entry does not stay in the file"
+        );
+        assert_eq!(write_append_file(&path, "").expect("again"), None);
+    }
+
+    #[test]
     fn check_env_drops_messenger_names() {
-        let names: Vec<String> =
-            check_env(&[("SLACK_X".into(), "1".into()), ("OTHER".into(), "1".into())])
-                .into_iter()
-                .map(|(k, _)| k.to_string_lossy().into_owned())
-                .collect();
+        let names: Vec<String> = check_env(&[
+            ("SLACK_X".into(), "1".into()),
+            ("TYPESAFE_API_KEY".into(), "1".into()),
+            ("OTHER".into(), "1".into()),
+        ])
+        .into_iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
         assert!(names.iter().any(|name| name == "OTHER"));
         assert!(!names.iter().any(|name| {
             let name = name.to_ascii_uppercase();
-            name.contains("SLACK") || name.contains("DISCORD")
+            name.contains("SLACK") || name.contains("DISCORD") || name.contains("TYPESAFE")
         }));
     }
 

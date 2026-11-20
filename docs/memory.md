@@ -116,7 +116,7 @@ It never sends the lead's reply, a tool's output, row ids, conversation keys or 
 
 ### Turning it on and off
 
-jev is on when moraebot finds a key: the `TYPESAFE_API_KEY` environment variable of `moraebot run`, or else the file named by `api_key_file`. The key is never written to `config.toml`, never passed to the lead, lanes, chat children or Done checks (every variable with `TYPESAFE` in its name is dropped from their environment) and is saved only as a `[redacted]` marker if it ever turns up in text moraebot writes to the memory store. To turn the observer's jev calls off even with a key:
+jev is on when moraebot finds a key: the `TYPESAFE_API_KEY` environment variable of `moraebot run`, or else the file named by `api_key_file`. The key is never written to `config.toml`, never passed to the lead, lanes, chat children, Done checks, the `omp --version` check or the `git remote get-url` moraebot runs in a lane's checkout (every variable with `TYPESAFE` in its name is dropped from their environment) and is saved only as a `[redacted]` marker if it ever turns up in text moraebot writes to the memory store. Lanes run as the same Unix user as moraebot, so a lane can read any file moraebot can read, `api_key_file` included; keeping the key out of the environment hides it from a lane, a file does not. Prefer the environment variable, or accept that a lane could read the file. To turn the observer's jev calls off even with a key:
 
 ```toml
 [memory.jev]
@@ -149,7 +149,7 @@ Every key is optional.
 | `memory.filter.credentials` | built in (`토큰`, `비밀번호`, `token`, `password`, `secret`, `api key`, ...) | Same. |
 | `memory.filter.commands` | built in (`$ `, `./`, `\| sh`, `&&`, `rm -rf`, `sudo`, `curl`, ...) | Same. |
 
-Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored.
+Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Full-width letters and look-alikes of `.`, `/`, `|` and `:` are matched as their plain forms, and a lane or subagent sentence that holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents) is dropped, so such characters cannot hide a listed word.
 
 ### When jev fails
 

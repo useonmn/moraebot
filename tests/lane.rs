@@ -2179,4 +2179,13 @@ async fn lane_prompt_is_passed_as_a_private_file() {
     assert!(text.starts_with("<<<moraebot-memory lane>>>"), "{text}");
     assert!(text.contains("never force-push"), "{text}");
     assert_eq!(appended(start), text, "omp read the file at start");
+
+    // A closed lane never starts again: its prompt file, and the memory text in it, go.
+    let m2 = h
+        .manager("ok", &[lane_close(1, "finished")])
+        .with_extra_env(GIT_ENV);
+    bounded(m2.prompt(KEY, 2, Sender::Owner, "run-tools go")).await;
+    bounded(m2.shutdown_all()).await;
+    assert!(h.lane(1).closed);
+    assert!(!path.exists(), "a closed lane keeps no memory text");
 }

@@ -123,6 +123,18 @@ pub fn lane_result_text(input: &str) -> &str {
     body[..cut].trim()
 }
 
+/// The numbered sentences ([`crate::memory::own_sentences`]) of a lane's or subagent's own
+/// text, after dropping every line that starts with `[moraebot`: such a line looks like a
+/// moraebot tag or machine line, and a lane must not be able to save one as its words.
+pub fn lane_own_sentences(text: &str) -> Vec<(u32, String)> {
+    let own: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("[moraebot"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::memory::own_sentences(&own)
+}
+
 /// The lead input for a lane that looks stalled: a tag line, a machine line, and one sentence.
 pub fn lane_stalled(conversation_key: &str, lane_id: i64, stalled: &Stalled) -> String {
     let tool: String = stalled

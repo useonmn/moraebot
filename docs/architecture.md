@@ -457,7 +457,7 @@ This subsection is in English (#39 P2); docs/memory.md has the owner-facing deta
 
 **omp version notice.** `Gateway::with_omp_check` hands the start check to the observer (the omp version logged with every job) and to the dispatcher. At the end of `startup`, a warning with no `W_OMP_VERSION` log row for that version sends `N_OMP_VERSION` to the owner's DM, or to the configured channel when the DM fails, and then writes the row. Rows are pruned after 30 days.
 
-**Secrets.** The jev key comes from `TYPESAFE_API_KEY` or `memory.jev.api_key_file`, never from `config.toml`. `child_env` drops every variable whose name holds `TYPESAFE` for every omp child, and the memory store's redactor (`Redactor::with_own`) hides the key.
+**Secrets.** The jev key comes from `TYPESAFE_API_KEY` or `memory.jev.api_key_file`, never from `config.toml`. `child_env` drops every variable whose name holds `TYPESAFE` for every omp child, Done check, the `omp --version` check and the `git remote get-url` run in a lane checkout, and the memory store's redactor (`Redactor::with_own`) hides the key. `api_key_file` is not hidden from lanes: they run as the same Unix user and can read it.
 
 ### 3.11 레인 작업 폴더 (lanes L1)
 
