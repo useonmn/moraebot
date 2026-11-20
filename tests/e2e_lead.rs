@@ -1,6 +1,6 @@
 //! Offline end-to-end tests of the lead and its lanes through the library-level gateway:
-//! `FakeAdapter` or the real `SlackLink` over `FakeSlackTransport`, with `fake-omp` as
-//! the lead and as every lane. Nothing leaves the machine.
+//! `FakeAdapter`, or the core's `BridgeAdapter` linked to an in-process Slack bridge over
+//! `FakeSlackTransport`, with `fake-omp` as the lead and as every lane. Nothing leaves the machine.
 
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -23,8 +23,7 @@ use moraebot::lead;
 use moraebot::omp::key_slug;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::persona;
-use moraebot::slack_bridge::slack::SlackLink;
-use moraebot::slack_bridge::testing::FakeSlackTransport;
+use moraebot::slack_bridge::testing::{FakeSlackTransport, TestBridge};
 use moraebot::store::{LaneState, OnboardingRow, OnboardingState, State, Store};
 use moraebot::testing::{Call, FakeAdapter, appended};
 use serde_json::{Value, json};
@@ -274,7 +273,7 @@ impl Rig {
                 Platform::Bridge,
                 None,
                 Some(BridgeConfig {
-                    socket: home.join("run").join("slack-bridge.sock"),
+                    socket: TestBridge::socket_in(home),
                     owner_id: SLACK_OWNER.into(),
                     access: Default::default(),
                 }),
@@ -510,13 +509,10 @@ fn slack_message(envelope_id: &str, ts: &str, thread_ts: Option<&str>, text: &st
 async fn slack_follow_up_in_the_same_thread_is_steered_into_one_reply() {
     let mut rig = Rig::slack();
     let fake = Arc::new(FakeSlackTransport::new());
-    let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackLink::with_transport(
-        fake.clone(),
-        SLACK_OWNER.into(),
-        SLACK_CHANNEL.into(),
-    ));
+    let bridge = TestBridge::start(&rig.config.home, fake.clone()).await;
+    let answered = bridge.connect_answered(SLACK_OWNER, &[]).await;
     let gateway = rig.gateway(
-        adapter,
+        answered.clone(),
         &[
             ("FAKE_OMP_MODE", "steer"),
             ("FAKE_OMP_STEER_CASE", "merged"),
@@ -534,7 +530,10 @@ async fn slack_follow_up_in_the_same_thread_is_steered_into_one_reply() {
     assert_eq!(key.as_deref(), Some("slack:th:C222:1.1"));
     session.frame(slack_message("e2", "2.2", Some("1.1"), "again"));
     bounded(fake.wait_until(|record| !record.posts.is_empty())).await;
+    // The post is recorded before its answer reaches the core.
+    bounded(answered.wait_answered(1)).await;
     running.stop().await;
+    bridge.shutdown().await;
 
     let posts = fake.record().posts;
     assert_eq!(posts.len(), 1, "one post answers both messages");

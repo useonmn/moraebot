@@ -1118,7 +1118,8 @@ struct Runtime {
 /// The bridge's connection to Slack: Socket Mode in, Web API out. The bridge server
 /// starts it with [`SlackLink::start_spooling`] and drives the Web API side through its
 /// [`MessengerAdapter`] methods. [`MessengerAdapter::start`] (map and deliver at once,
-/// with a fixed scope) remains for the tests that run a gateway on the link directly.
+/// with a fixed scope) remains for `tests/slack_link.rs`, which drives the link alone;
+/// the gateway tests run through the bridge.
 pub struct SlackLink {
     transport: Arc<dyn SlackTransport>,
     owner_id: String,

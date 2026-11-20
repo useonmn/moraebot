@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::adapter::AdapterError;
+use crate::adapter::{
+    AdapterError, InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
+};
 use crate::bridge::client::{BridgeAdapter, BridgeOptions, HELLO_CACHE, UnixConnector};
 use crate::bridge::peer::own_uid;
 use crate::bridge::socket::SOCKET_NAME;
@@ -92,8 +94,127 @@ impl TestBridge {
         .expect("the core connects to the test bridge")
     }
 
+    /// Like [`Self::connect`], wrapped in an [`AnsweredAdapter`] for gateway tests.
+    pub async fn connect_answered(&self, owner_id: &str, allow: &[&str]) -> Arc<AnsweredAdapter> {
+        Arc::new(AnsweredAdapter {
+            inner: self.connect(owner_id, allow).await,
+            answered: watch::channel(0).0,
+        })
+    }
+
     pub async fn shutdown(self) {
         self.bridge.shutdown().await;
+    }
+}
+
+/// The core's [`BridgeAdapter`] with a count of the `send` and `send_file` calls that got
+/// their answer from the bridge, failed ones included. A Slack call is recorded by the
+/// fake before its answer crosses the socket, so a recorded post does not mean the core
+/// knows about it yet. The dispatcher marks a reply sent or done right after the answer,
+/// with no await in between, so on the current-thread test runtime a test that waited
+/// for the count reads the row's final state.
+pub struct AnsweredAdapter {
+    inner: BridgeAdapter,
+    answered: watch::Sender<u64>,
+}
+
+impl AnsweredAdapter {
+    /// Resolves once `n` sends and uploads have been answered. Wrap it in a timeout.
+    pub async fn wait_answered(&self, n: u64) {
+        self.answered
+            .subscribe()
+            .wait_for(|count| *count >= n)
+            .await
+            .expect("the adapter owns the sender");
+    }
+
+    fn answered<T>(&self, result: T) -> T {
+        self.answered.send_modify(|count| *count += 1);
+        result
+    }
+}
+
+#[async_trait]
+impl MessengerAdapter for AnsweredAdapter {
+    fn platform(&self) -> &str {
+        self.inner.platform()
+    }
+
+    fn message_limit(&self) -> usize {
+        self.inner.message_limit()
+    }
+
+    fn behavior_hints(&self) -> &str {
+        self.inner.behavior_hints()
+    }
+
+    fn home_target(&self) -> Option<String> {
+        self.inner.home_target()
+    }
+
+    async fn start(&self) -> Result<mpsc::Receiver<InboundEvent>, AdapterError> {
+        self.inner.start().await
+    }
+
+    async fn send(&self, channel: &str, text: &str) -> Result<SendResult, AdapterError> {
+        let result = self.inner.send(channel, text).await;
+        self.answered(result)
+    }
+
+    async fn create_thread(
+        &self,
+        channel_id: &str,
+        from_message_id: &str,
+        name: &str,
+    ) -> Result<String, AdapterError> {
+        self.inner
+            .create_thread(channel_id, from_message_id, name)
+            .await
+    }
+
+    async fn start_typing(&self, channel: &str) -> Result<TypingHandle, AdapterError> {
+        self.inner.start_typing(channel).await
+    }
+
+    async fn open_dm(&self, user_id: &str) -> Result<String, AdapterError> {
+        self.inner.open_dm(user_id).await
+    }
+
+    async fn fetch_attachment(
+        &self,
+        attachment: &InboundAttachment,
+        dest: &Path,
+        progress: &Progress,
+    ) -> Result<u64, AdapterError> {
+        self.inner
+            .fetch_attachment(attachment, dest, progress)
+            .await
+    }
+
+    async fn send_file(
+        &self,
+        target: &str,
+        path: &Path,
+        name: &str,
+    ) -> Result<SendResult, AdapterError> {
+        let result = self.inner.send_file(target, path, name).await;
+        self.answered(result)
+    }
+
+    async fn edit(&self, target: &str, message_id: &str, text: &str) -> Result<(), AdapterError> {
+        self.inner.edit(target, message_id, text).await
+    }
+
+    fn reconnects(&self) -> Option<watch::Receiver<u64>> {
+        self.inner.reconnects()
+    }
+
+    async fn ack_inbound(&self, message_id: &str) {
+        self.inner.ack_inbound(message_id).await;
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 }
 

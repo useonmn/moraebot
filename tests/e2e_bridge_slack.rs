@@ -1,5 +1,6 @@
-//! Offline end-to-end tests for Slack: the library-level gateway with the real
-//! `SlackLink` over `FakeSlackTransport` and `fake-omp`. Nothing reaches the network.
+//! Offline end-to-end tests for Slack: the library-level gateway on the core's
+//! `BridgeAdapter`, linked over a real unix socket to an in-process Slack bridge on
+//! `FakeSlackTransport`, with `fake-omp`. Nothing reaches the network.
 
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -15,8 +16,10 @@ use moraebot::dispatch::{N_ONBOARDING_HELLO, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lead;
 use moraebot::onboarding::{self, GreetTarget};
-use moraebot::slack_bridge::slack::{DEFAULT_HINTS, SlackLink, escape_text};
-use moraebot::slack_bridge::testing::{FakeSlackSession, FakeSlackTransport};
+use moraebot::slack_bridge::slack::{DEFAULT_HINTS, STATUS_TEXT, escape_text};
+use moraebot::slack_bridge::testing::{
+    AnsweredAdapter, FakeSlackSession, FakeSlackTransport, TestBridge,
+};
 use moraebot::store::{State, Store};
 use moraebot::testing::appended;
 use serde_json::{Value, json};
@@ -141,15 +144,31 @@ struct Rig {
 struct Running {
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<(), GatewayError>>,
+    bridge: TestBridge,
+    adapter: Arc<AnsweredAdapter>,
 }
 
 impl Running {
+    /// Waits until Slack recorded `n` posts and the core got the answer for each, so the
+    /// rows' states are final.
+    async fn wait_for_posts(&self, n: usize) {
+        bounded(
+            self.bridge
+                .fake
+                .wait_until(|record| record.posts.len() >= n),
+        )
+        .await;
+        bounded(self.adapter.wait_answered(n as u64)).await;
+    }
+
+    /// Stops the gateway, then the bridge.
     async fn stop(self) {
         let _ = self.stop.send(());
         bounded(self.task)
             .await
             .expect("gateway task joined")
             .expect("clean stop");
+        self.bridge.shutdown().await;
     }
 }
 
@@ -169,7 +188,7 @@ impl Rig {
             access_mode: AccessMode::OwnerOnly,
             discord: None,
             bridge: Some(BridgeConfig {
-                socket: home.join("run").join("slack-bridge.sock"),
+                socket: TestBridge::socket_in(&home),
                 owner_id: OWNER.into(),
                 access: Default::default(),
             }),
@@ -186,14 +205,13 @@ impl Rig {
         }
     }
 
-    /// Starts the gateway on a `SlackLink` over the fake transport and returns the
-    /// first socket session once the adapter has connected it.
+    /// Starts a Slack bridge on the fake transport in the core's home, then the gateway
+    /// on a `BridgeAdapter` connected to it, and returns the first Slack socket session
+    /// once the bridge has connected it.
     async fn start(&self, mode: &str) -> (Running, FakeSlackSession) {
-        let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackLink::with_transport(
-            self.fake.clone(),
-            OWNER.into(),
-            CHANNEL.into(),
-        ));
+        let bridge = TestBridge::start(&self.config.home, self.fake.clone()).await;
+        let answered = bridge.connect_answered(OWNER, &[]).await;
+        let adapter: Arc<dyn MessengerAdapter> = answered.clone();
         let vars = [
             ("FAKE_OMP_MODE", mode.to_owned()),
             (
@@ -212,11 +230,15 @@ impl Rig {
             let _ = stopped.await;
         }));
         let session = bounded(self.fake.session(1)).await;
-        (Running { stop, task }, session)
-    }
-
-    async fn wait_for_posts(&self, n: usize) {
-        bounded(self.fake.wait_until(|record| record.posts.len() >= n)).await;
+        (
+            Running {
+                stop,
+                task,
+                bridge,
+                adapter: answered,
+            },
+            session,
+        )
     }
 
     fn row_state(&self, id: i64) -> State {
@@ -272,14 +294,14 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
     let (running, session) = rig.start("ok").await;
 
     session.frame(message_frame("e1", OWNER, CHANNEL, "1.1", "hello"));
-    rig.wait_for_posts(1).await;
+    running.wait_for_posts(1).await;
     let first = rig.fake.record().posts[0].clone();
     assert_eq!(first["channel"], CHANNEL);
     assert_eq!(first["thread_ts"], "1.1");
     assert!(first["text"].as_str().unwrap().contains("echo: hello"));
 
     session.frame(thread_reply_frame("e2", "2.2", "1.1", "again"));
-    rig.wait_for_posts(2).await;
+    running.wait_for_posts(2).await;
     let second = rig.fake.record().posts[1].clone();
     assert_eq!(second["channel"], CHANNEL);
     assert_eq!(second["thread_ts"], "1.1", "same thread, no new one");
@@ -299,23 +321,53 @@ async fn channel_message_gets_a_thread_reply_and_the_thread_continues() {
 }
 
 #[tokio::test]
-async fn owner_dm_is_answered_in_its_own_thread() {
+async fn owner_dm_is_answered_in_its_thread_with_a_working_status() {
     let mut rig = Rig::new();
     let (running, session) = rig.start("ok").await;
 
     session.frame(message_frame("e1", OWNER, DM, "5.5", "hi there"));
-    rig.wait_for_posts(1).await;
+    running.wait_for_posts(1).await;
     let post = rig.fake.record().posts[0].clone();
     assert_eq!(post["channel"], DM);
     assert_eq!(
         post["thread_ts"], "5.5",
-        "a root DM is answered in its thread"
+        "a root DM is answered in its own thread"
     );
     assert!(post["text"].as_str().unwrap().contains("echo: hi there"));
 
+    // The turn set the agent status on the DM thread and cleared it when it ended.
+    bounded(
+        rig.fake
+            .wait_until(|record| record.statuses.iter().any(|call| call.status.is_empty())),
+    )
+    .await;
+    let statuses = rig.fake.record().statuses;
+    assert_eq!(statuses[0].channel_id, DM);
+    assert_eq!(statuses[0].thread_ts, "5.5");
+    assert_eq!(statuses[0].status, STATUS_TEXT);
+    assert!(statuses.iter().all(|call| call.thread_ts == "5.5"));
+
+    let mut follow_up = message_frame("e2", OWNER, DM, "6.6", "and more");
+    follow_up["payload"]["event"]["thread_ts"] = json!("5.5");
+    session.frame(follow_up);
+    running.wait_for_posts(2).await;
+    let second = rig.fake.record().posts[1].clone();
+    assert_eq!(second["channel"], DM);
+    assert_eq!(
+        second["thread_ts"], "5.5",
+        "a threaded DM stays in its thread"
+    );
+    assert!(second["text"].as_str().unwrap().contains("echo: and more"));
+
     running.stop().await;
     assert_eq!(rig.row_state(1), State::Done);
-    rig.tap.wait_for_prompts(1).await;
+    assert_eq!(rig.row_state(2), State::Done);
+    rig.tap.wait_for_prompts(2).await;
+    assert_eq!(
+        rig.tap.pids().len(),
+        1,
+        "one omp child serves the DM thread"
+    );
     rig.assert_no_child_left();
 }
 
@@ -324,7 +376,7 @@ async fn slack_greeting_goes_to_the_owner_dm_and_the_reply_is_turn_1() {
     let mut rig = Rig::new();
     onboarding::request(&rig.config.home, GreetTarget::Dm).unwrap();
     let (running, session) = rig.start("ok").await;
-    rig.wait_for_posts(1).await;
+    running.wait_for_posts(1).await;
     let greeting = rig.fake.record().posts[0].clone();
     assert_eq!(greeting["channel"], OWNER);
     assert!(greeting.get("thread_ts").is_none());
@@ -334,7 +386,7 @@ async fn slack_greeting_goes_to_the_owner_dm_and_the_reply_is_turn_1() {
     );
 
     session.frame(message_frame("e1", OWNER, DM, "5.5", "Mina"));
-    rig.wait_for_posts(2).await;
+    running.wait_for_posts(2).await;
     let reply = rig.fake.record().posts[1].clone();
     assert_eq!(reply["channel"], DM);
     assert_eq!(reply["thread_ts"], "5.5");
@@ -362,7 +414,7 @@ async fn other_users_and_bots_never_reach_the_store_or_omp() {
     session.frame(message_frame("e4", OWNER, "C777", "4.4", "other channel"));
     // Frames are handled in order, so the owner's reply proves the four above were seen.
     session.frame(message_frame("e5", OWNER, CHANNEL, "5.5", "marker"));
-    rig.wait_for_posts(1).await;
+    running.wait_for_posts(1).await;
 
     running.stop().await;
     assert_eq!(rig.row_count(), 1, "only the owner's message was stored");
@@ -379,7 +431,7 @@ async fn a_redelivered_event_is_prompted_once() {
     session.frame(message_frame("e1", OWNER, CHANNEL, "1.1", "once"));
     session.frame(message_frame("e1-retry", OWNER, CHANNEL, "1.1", "once"));
     session.frame(message_frame("e2", OWNER, CHANNEL, "2.2", "marker"));
-    rig.wait_for_posts(2).await;
+    running.wait_for_posts(2).await;
 
     running.stop().await;
     assert_eq!(rig.row_count(), 2);
@@ -402,12 +454,12 @@ async fn a_failed_post_is_re_sent_once_after_a_reconnect() {
 
     rig.fake.fail_next_post();
     session.frame(message_frame("e1", OWNER, CHANNEL, "1.1", "hello"));
-    rig.wait_for_posts(1).await;
+    running.wait_for_posts(1).await;
 
     session.frame(json!({ "type": "disconnect", "reason": "refresh_requested" }));
     let reconnected = bounded(rig.fake.session(2)).await;
     reconnected.frame(json!({ "type": "hello", "num_connections": 1 }));
-    rig.wait_for_posts(2).await;
+    running.wait_for_posts(2).await;
 
     running.stop().await;
     assert_eq!(rig.fake.record().posts.len(), 2, "re-sent exactly once");
