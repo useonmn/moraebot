@@ -9,10 +9,15 @@
 //!
 //! The link is multiplexed: every request carries a fresh `id`, and its `ok`, `err` and
 //! `progress` frames are matched by `re`, never by line order. A reader task and a writer
-//! task keep the socket moving on their own, and inbound messages go into an unbounded
-//! internal queue, so a request waiting for its `ok` never blocks inbound delivery (and
-//! a slow dispatcher never stops the reader from seeing that `ok`). The bridge bounds the
-//! queue: it keeps at most [`WINDOW`] messages unacked per connection.
+//! task keep the socket moving on their own, and inbound messages go into an internal
+//! queue, so a request waiting for its `ok` never blocks inbound delivery (and a slow
+//! dispatcher never stops the reader from seeing that `ok`). The window bounds the
+//! queue: the bridge keeps at most [`WINDOW`] messages unacked per connection, and the
+//! core closes a connection whose bridge sends more.
+//!
+//! Message requests (`send`, `edit`, `thread`, `dm`) wait at most [`REQUEST_DEADLINE`]
+//! for their answer, so a bridge that keeps answering pings but never answers one
+//! request cannot hang the dispatcher. `status` is not waited for at all.
 //!
 //! Frames are never logged; logs carry `t`, `id`, `re` and `seq` only.
 
@@ -32,13 +37,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use super::peer::PeerError;
 use super::proto::{
     Caps, Decoded, Frame, FrameReader, ProtoError, Redacted, RequestKind, StatusState, ThreadsCap,
     WireAttachment, map_error, write_frame,
 };
 use super::{
-    E_BRIDGE_BAD_REQUEST, E_BRIDGE_DOWN, E_BRIDGE_PLATFORM, E_BRIDGE_PROTO, E_BRIDGE_UNSUPPORTED,
-    PROTO_VERSION, check_peer,
+    E_BRIDGE_BAD_REQUEST, E_BRIDGE_DOWN, E_BRIDGE_PEER, E_BRIDGE_PLATFORM, E_BRIDGE_PROTO,
+    E_BRIDGE_UNSUPPORTED, PROTO_VERSION, check_peer,
 };
 use crate::adapter::{
     AdapterError, AttachmentRef, E_ADAPTER_DM, E_ADAPTER_EDIT, E_ADAPTER_FILES, E_ADAPTER_START,
@@ -62,6 +68,12 @@ pub const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 pub const BACKOFF_START: Duration = Duration::from_millis(500);
 /// Longest reconnect delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// How long a message request (`send`, `edit`, `thread`, `dm`) waits for its answer.
+/// `fetch` and `file` have no deadline here: the dispatcher's stall watchdog and upload
+/// time limit bound them.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// The smallest `message_limit` a hello may carry.
+pub const MIN_MESSAGE_LIMIT: usize = 100;
 /// Capacity of the receiver `start` returns.
 const INBOUND_CAPACITY: usize = 64;
 
@@ -92,10 +104,19 @@ impl UnixConnector {
 impl Connector for UnixConnector {
     async fn connect(&self) -> io::Result<Box<dyn Link>> {
         let stream = UnixStream::connect(&self.path).await?;
-        check_peer(&stream)
-            .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err.to_string()))?;
+        check_peer(&stream).map_err(peer_refused)?;
         Ok(Box::new(stream))
     }
+}
+
+/// The connect error for a peer that failed the uid check; [`is_peer_refusal`] spots it.
+fn peer_refused(err: PeerError) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, err)
+}
+
+/// Whether a connect error is a failed peer uid check, which is always logged.
+fn is_peer_refusal(err: &io::Error) -> bool {
+    err.get_ref().is_some_and(|inner| inner.is::<PeerError>())
 }
 
 /// What the adapter tells the bridge, and where it keeps the last hello.
@@ -139,6 +160,21 @@ struct HelloInfo {
 }
 
 impl HelloInfo {
+    /// Refuses values the core cannot work with: an empty `platform` would make keys
+    /// like `:th:...`, and a tiny `message_limit` would split replies into crumbs.
+    fn check(&self) -> Result<(), String> {
+        if self.platform.trim().is_empty() {
+            return Err("the hello has an empty `platform`".to_owned());
+        }
+        if self.message_limit < MIN_MESSAGE_LIMIT {
+            return Err(format!(
+                "the hello's `message_limit` {} is below {MIN_MESSAGE_LIMIT}",
+                self.message_limit
+            ));
+        }
+        Ok(())
+    }
+
     fn from_frame(frame: &Frame) -> Option<Self> {
         match frame {
             Frame::Hello {
@@ -393,34 +429,50 @@ impl Shared {
         })
     }
 
+    /// Sends a message request and waits up to [`REQUEST_DEADLINE`] for its answer.
     async fn request(
         &self,
         kind: RequestKind,
         build: impl FnOnce(u64) -> Frame,
     ) -> Result<Answer, AdapterError> {
-        self.begin(kind, None, build)?.wait().await
+        let call = self.begin(kind, None, build)?;
+        match tokio::time::timeout(REQUEST_DEADLINE, call.wait()).await {
+            Ok(answer) => answer,
+            // The timed-out future dropped the `InFlight`, which sent `cancel`.
+            Err(_) => Err(AdapterError {
+                code: kind.default_code(),
+                message: format!(
+                    "the bridge gave no answer within {}s",
+                    REQUEST_DEADLINE.as_secs()
+                ),
+            }),
+        }
     }
 
-    fn deliver(&self, generation: u64, seq: u64, event: InboundEvent) {
+    /// Queues an inbound message for the dispatcher. `false` when the bridge overran
+    /// the window, a contract violation that closes the connection; the message is left
+    /// to the bridge's spool.
+    fn deliver(&self, generation: u64, seq: u64, event: InboundEvent) -> bool {
         {
             let mut live = self.live();
-            live.unacked
-                .entry(event.message_id.clone())
-                .or_default()
-                .push((generation, seq));
             let open = live
                 .unacked
                 .values()
                 .flatten()
                 .filter(|(g, _)| *g == generation)
                 .count();
-            if open > WINDOW as usize {
-                tracing::warn!(
+            if open >= WINDOW as usize {
+                tracing::error!(
                     seq,
                     open,
-                    "the bridge sent more unacked messages than the window"
+                    "the bridge sent more unacked messages than the window, closing the link"
                 );
+                return false;
             }
+            live.unacked
+                .entry(event.message_id.clone())
+                .or_default()
+                .push((generation, seq));
         }
         let inbound = self.inbound.lock().unwrap_or_else(|e| e.into_inner());
         match inbound.as_ref() {
@@ -429,6 +481,7 @@ impl Shared {
             }
             None => tracing::debug!(seq, "inbound closed, message left to the bridge spool"),
         }
+        true
     }
 
     fn save_hello(&self, hello: &Frame) {
@@ -448,13 +501,28 @@ impl Shared {
             }
         };
         let line = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-        match super::proto::decode_line(line) {
-            Ok(Decoded::Frame(frame)) => HelloInfo::from_frame(&frame),
+        let frame = match super::proto::decode_line(line) {
+            Ok(Decoded::Frame(frame @ Frame::Hello { .. })) => frame,
             _ => {
                 tracing::warn!("the cached bridge hello is not a hello frame, ignored");
-                None
+                return None;
             }
+        };
+        if let Frame::Hello { proto, .. } = &frame
+            && *proto != PROTO_VERSION
+        {
+            tracing::warn!(
+                proto,
+                "the cached bridge hello speaks another proto, ignored"
+            );
+            return None;
         }
+        let info = HelloInfo::from_frame(&frame)?;
+        if let Err(why) = info.check() {
+            tracing::warn!(reason = %why, "the cached bridge hello is unusable, ignored");
+            return None;
+        }
+        Some(info)
     }
 }
 
@@ -472,12 +540,52 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// Why a connection did not get to serving. Repeats of the same `cause` are logged at
+/// debug only, so a version skew does not fill the log every ten seconds.
+struct Failure {
+    cause: &'static str,
+    detail: String,
+    /// Logged at error rather than warn the first time.
+    error: bool,
+}
+
+impl Failure {
+    fn warn(cause: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            cause,
+            detail: detail.into(),
+            error: false,
+        }
+    }
+
+    fn error(cause: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            cause,
+            detail: detail.into(),
+            error: true,
+        }
+    }
+
+    /// Logs this failure; `last` is the cause of the previous one since the last served
+    /// connection.
+    fn report(self, last: &mut Option<&'static str>) {
+        if *last == Some(self.cause) {
+            tracing::debug!(detail = %self.detail, "{}", self.cause);
+        } else if self.error {
+            tracing::error!(detail = %self.detail, "{}", self.cause);
+        } else {
+            tracing::warn!(detail = %self.detail, "{}", self.cause);
+        }
+        *last = Some(self.cause);
+    }
+}
+
 /// How a session ended.
 enum Ended {
     /// The link served (or got as far as the handshake) and dropped; reconnect soon.
     Served,
     /// The handshake failed; reconnect with backoff.
-    Failed,
+    Failed(Failure),
     /// The adapter stops: shutdown, or the bridge changed platform.
     Stop,
 }
@@ -676,13 +784,17 @@ impl MessengerAdapter for BridgeAdapter {
         if !self.caps().status {
             return Ok(TypingHandle::new(|| {}));
         }
-        self.shared
-            .request(RequestKind::Status, |id| Frame::Status {
-                id,
-                target: channel.to_owned(),
-                state: StatusState::Start,
-            })
-            .await?;
+        // Fire and forget: the turn must not wait on the messenger's status call, and a
+        // failed status is only cosmetic.
+        let session = self
+            .shared
+            .session()
+            .ok_or_else(|| link_down(RequestKind::Status, "the bridge is not connected"))?;
+        session.fire(|id| Frame::Status {
+            id,
+            target: channel.to_owned(),
+            state: StatusState::Start,
+        });
         let shared = Arc::clone(&self.shared);
         let target = channel.to_owned();
         Ok(TypingHandle::new(move || {
@@ -749,7 +861,14 @@ impl MessengerAdapter for BridgeAdapter {
                 answer = &mut call.reply => {
                     call.done = true;
                     let answer = flatten(call.kind, answer)?;
-                    return Ok(answer.bytes.unwrap_or(seen));
+                    // The final total counts like a progress frame: a bridge that
+                    // answers past the limit without progress is still refused.
+                    let total = answer.bytes.unwrap_or(seen);
+                    progress.check_limit(total)?;
+                    if total > seen {
+                        progress.record(total - seen);
+                    }
+                    return Ok(total);
                 }
             }
         }
@@ -833,7 +952,7 @@ impl MessengerAdapter for BridgeAdapter {
 async fn connect_loop(shared: Arc<Shared>, connector: Arc<dyn Connector>) {
     let mut stop = shared.stop.subscribe();
     let mut delay = BACKOFF_START;
-    let mut quiet = false;
+    let mut last_failure = None;
     loop {
         let attempt = tokio::select! {
             attempt = connector.connect() => attempt,
@@ -843,16 +962,21 @@ async fn connect_loop(shared: Arc<Shared>, connector: Arc<dyn Connector>) {
             Ok(link) => match run_session(&shared, link, &mut stop).await {
                 Ended::Served => {
                     delay = BACKOFF_START;
-                    quiet = false;
+                    last_failure = None;
                 }
-                Ended::Failed => {}
+                Ended::Failed(failure) => failure.report(&mut last_failure),
                 Ended::Stop => return,
             },
-            Err(err) if !quiet => {
-                tracing::warn!(error = %err, "cannot reach the bridge, retrying");
-                quiet = true;
+            // The one security-relevant link event: logged every time.
+            Err(err) if is_peer_refusal(&err) => tracing::error!(
+                code = E_BRIDGE_PEER,
+                error = %err,
+                "the bridge socket is served by another user, refused"
+            ),
+            Err(err) => {
+                Failure::warn("cannot reach the bridge, retrying", err.to_string())
+                    .report(&mut last_failure);
             }
-            Err(err) => tracing::debug!(error = %err, "cannot reach the bridge"),
         }
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
@@ -929,43 +1053,54 @@ async fn run_session(
     let hello = match first {
         Ok(Some(Ok(Decoded::Frame(hello @ Frame::Hello { .. })))) => hello,
         Ok(Some(Ok(Decoded::Frame(Frame::Bye { code, .. })))) => {
-            tracing::warn!(code = %code, "the bridge refused the connection");
-            return Ended::Failed;
+            return Ended::Failed(Failure::warn("the bridge refused the connection", code));
         }
         Ok(Some(Ok(other))) => {
-            tracing::warn!(frame = ?kind_of(&other), "the bridge did not start with hello");
-            return Ended::Failed;
+            return Ended::Failed(Failure::warn(
+                "the bridge did not start with hello",
+                kind_of(&other),
+            ));
         }
         Ok(Some(Err(err))) => {
-            tracing::warn!(error = %err, "unreadable hello from the bridge");
-            return Ended::Failed;
+            return Ended::Failed(Failure::warn(
+                "unreadable hello from the bridge",
+                err.to_string(),
+            ));
         }
         Ok(None) => {
-            tracing::warn!("the bridge closed the link before hello");
-            return Ended::Failed;
+            return Ended::Failed(Failure::warn("the bridge closed the link before hello", ""));
         }
         Err(_) => {
-            tracing::warn!("the bridge sent no hello in time");
-            return Ended::Failed;
+            return Ended::Failed(Failure::warn("the bridge sent no hello in time", ""));
         }
     };
     let Frame::Hello { proto, .. } = &hello else {
         unreachable!("matched above");
     };
     if *proto != PROTO_VERSION {
-        tracing::error!(
-            code = E_BRIDGE_PROTO,
-            proto,
-            "the bridge speaks another proto"
-        );
+        let message = format!("the core speaks proto {PROTO_VERSION}, the bridge sent {proto}");
         let bye = Frame::Bye {
             code: E_BRIDGE_PROTO.to_owned(),
-            message: format!("the core speaks proto {PROTO_VERSION}, the bridge sent {proto}"),
+            message: message.clone(),
         };
         let _ = write_frame(&mut write, &bye).await;
-        return Ended::Failed;
+        return Ended::Failed(Failure::error(
+            "E_BRIDGE_PROTO: the bridge speaks another proto",
+            message,
+        ));
     }
     let info = HelloInfo::from_frame(&hello).expect("a hello frame");
+    if let Err(why) = info.check() {
+        let bye = Frame::Bye {
+            code: E_BRIDGE_BAD_REQUEST.to_owned(),
+            message: why.clone(),
+        };
+        let _ = write_frame(&mut write, &bye).await;
+        return Ended::Failed(Failure::error(
+            "E_BRIDGE_BAD_REQUEST: the bridge sent an unusable hello",
+            why,
+        ));
+    }
     let fixed = shared.fixed.get_or_init(|| Fixed {
         platform: info.platform.clone(),
         hints: info.hints.clone(),
@@ -1002,8 +1137,10 @@ async fn run_session(
         window: WINDOW,
     };
     if let Err(err) = write_frame(&mut write, &hello_ok).await {
-        tracing::warn!(error = %err, "could not answer the bridge hello");
-        return Ended::Failed;
+        return Ended::Failed(Failure::warn(
+            "could not answer the bridge hello",
+            err.to_string(),
+        ));
     }
 
     let (out, out_rx) = mpsc::unbounded_channel();
@@ -1163,7 +1300,9 @@ fn handle_frame(shared: &Shared, session: &Session, decoded: Decoded) -> bool {
                     })
                     .collect(),
             };
-            shared.deliver(session.generation, seq, event);
+            if !shared.deliver(session.generation, seq, event) {
+                return false;
+            }
         }
         Frame::Ok {
             re,
@@ -1212,4 +1351,40 @@ fn handle_frame(shared: &Shared, session: &Session, decoded: Decoded) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_peer_check_is_told_apart_from_other_connect_errors() {
+        assert!(is_peer_refusal(&peer_refused(PeerError::Mismatch {
+            peer: 1001,
+            own: 1000
+        })));
+        assert!(!is_peer_refusal(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_peer_refusal(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket mode"
+        )));
+    }
+
+    #[test]
+    fn a_hello_needs_a_platform_and_a_usable_message_limit() {
+        let info = |platform: &str, message_limit| HelloInfo {
+            platform: platform.to_owned(),
+            hints: String::new(),
+            home: None,
+            message_limit,
+            caps: Caps::default(),
+        };
+        assert!(info("slack", MIN_MESSAGE_LIMIT).check().is_ok());
+        assert!(info("", 3900).check().is_err());
+        assert!(info(" ", 3900).check().is_err());
+        assert!(info("slack", 0).check().is_err());
+        assert!(info("slack", MIN_MESSAGE_LIMIT - 1).check().is_err());
+    }
 }

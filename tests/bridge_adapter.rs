@@ -12,7 +12,8 @@ use moraebot::adapter::{
     E_ADAPTER_THREAD, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
 };
 use moraebot::bridge::client::{
-    BridgeAdapter, BridgeOptions, HELLO_CACHE, SILENCE_LIMIT, UnixConnector, WINDOW,
+    BridgeAdapter, BridgeOptions, HELLO_CACHE, MIN_MESSAGE_LIMIT, REQUEST_DEADLINE, SILENCE_LIMIT,
+    UnixConnector, WINDOW,
 };
 use moraebot::bridge::proto::{Caps, Frame, FrameReader, Redacted, ThreadsCap};
 use moraebot::bridge::{
@@ -554,6 +555,191 @@ async fn progress_past_the_limit_cancels_the_download() {
     let err = bounded(fetch).await.unwrap().unwrap_err();
     assert_eq!(err.code, moraebot::files::E_FILE_TOO_LARGE);
     assert_eq!(conn.recv().await, Frame::Cancel { id });
+}
+
+#[tokio::test]
+async fn a_final_ok_past_the_limit_is_refused_without_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_bridge, adapter, mut conn) = connected(dir.path(), FakeBridge::hello()).await;
+    let adapter = Arc::new(adapter);
+    let progress = Arc::new(Progress::with_limit(10));
+    let fetch = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        let progress = Arc::clone(&progress);
+        let dest = dir.path().join("big.bin");
+        async move {
+            let attachment = InboundAttachment {
+                name: "big.bin".into(),
+                size: 10,
+                mime: None,
+                reference: AttachmentRef("ref".into()),
+            };
+            adapter
+                .fetch_attachment(&attachment, &dest, &progress)
+                .await
+        }
+    });
+    let Frame::Fetch { id, .. } = conn.recv().await else {
+        panic!("fetch frame");
+    };
+    conn.send(&bridge_ok_bytes(id, 11)).await;
+    let err = bounded(fetch).await.unwrap().unwrap_err();
+    assert_eq!(err.code, moraebot::files::E_FILE_TOO_LARGE);
+    // The bridge already answered, so there is nothing to cancel.
+    conn.assert_quiet().await;
+
+    // Within the limit, the final total is recorded like a progress frame.
+    let progress = Arc::new(Progress::with_limit(100));
+    let fetch = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        let progress = Arc::clone(&progress);
+        let dest = dir.path().join("small.bin");
+        async move {
+            let attachment = InboundAttachment {
+                name: "small.bin".into(),
+                size: 40,
+                mime: None,
+                reference: AttachmentRef("ref".into()),
+            };
+            adapter
+                .fetch_attachment(&attachment, &dest, &progress)
+                .await
+        }
+    });
+    let Frame::Fetch { id, .. } = conn.recv().await else {
+        panic!("fetch frame");
+    };
+    conn.send(&Frame::Progress { re: id, bytes: 15 }).await;
+    conn.send(&bridge_ok_bytes(id, 40)).await;
+    assert_eq!(bounded(fetch).await.unwrap().unwrap(), 40);
+    assert_eq!(progress.bytes(), 40);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_request_fails_after_its_deadline_and_typing_never_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_bridge, adapter, mut conn) = connected(dir.path(), FakeBridge::hello()).await;
+    let adapter = Arc::new(adapter);
+
+    // `status start` is fire and forget: the handle comes back before any answer.
+    let started = Instant::now();
+    let typing = bounded(adapter.start_typing("D111:1.0"))
+        .await
+        .expect("typing");
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    let Frame::Status { state, .. } = conn.recv().await else {
+        panic!("status frame");
+    };
+    assert_eq!(state, moraebot::bridge::proto::StatusState::Start);
+    drop(typing);
+    let Frame::Status { state, .. } = conn.recv().await else {
+        panic!("status stop frame");
+    };
+    assert_eq!(state, moraebot::bridge::proto::StatusState::Stop);
+
+    // The fake answers pings (inside `recv`) but never the send.
+    let send = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        async move {
+            let started = Instant::now();
+            (adapter.send("D111:1.0", "reply").await, started.elapsed())
+        }
+    });
+    let Frame::Send { id, .. } = conn.recv().await else {
+        panic!("send frame");
+    };
+    assert_eq!(conn.recv().await, Frame::Cancel { id });
+    let (result, elapsed) = tokio::time::timeout(REQUEST_DEADLINE * 2, send)
+        .await
+        .expect("the send ended")
+        .unwrap();
+    let err = result.unwrap_err();
+    assert_eq!(err.code, E_ADAPTER_SEND);
+    assert!(err.message.contains("no answer"), "{}", err.message);
+    assert_eq!(elapsed, REQUEST_DEADLINE);
+}
+
+#[tokio::test]
+async fn a_bridge_that_overruns_the_window_is_disconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, adapter, mut conn) = connected(dir.path(), FakeBridge::hello()).await;
+    let mut inbound = adapter.start().await.unwrap();
+    let before = *bridge.attempts().borrow();
+    for seq in 1..=u64::from(WINDOW) + 1 {
+        conn.send(&dm(seq, &format!("{seq}.0"), "burst")).await;
+    }
+    let written = conn.until_closed().await;
+    assert!(written.is_empty(), "{written:?}");
+    wait_for_attempt(&bridge, before).await;
+    // The window's worth was delivered; the extra one stays in the bridge's spool.
+    for seq in 1..=u64::from(WINDOW) {
+        let event = bounded(inbound.recv()).await.expect("event");
+        assert_eq!(event.message_id, format!("{DM}:{seq}.0"));
+    }
+    assert!(
+        inbound.try_recv().is_err(),
+        "the overrun message was not delivered"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_hello_gets_bye_and_an_unusable_cache_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, adapter, conn) = connected(dir.path(), FakeBridge::hello()).await;
+    let mut reconnects = adapter.reconnects().unwrap();
+    drop(conn);
+
+    let breaks: [fn(&mut Frame); 3] = [
+        |hello: &mut Frame| {
+            if let Frame::Hello { message_limit, .. } = hello {
+                *message_limit = 0;
+            }
+        },
+        |hello: &mut Frame| {
+            if let Frame::Hello { message_limit, .. } = hello {
+                *message_limit = MIN_MESSAGE_LIMIT - 1;
+            }
+        },
+        |hello: &mut Frame| {
+            if let Frame::Hello { platform, .. } = hello {
+                platform.clear();
+            }
+        },
+    ];
+    for broken in breaks {
+        let mut conn = bridge.accept().await;
+        let mut hello = FakeBridge::hello();
+        broken(&mut hello);
+        conn.send(&hello).await;
+        let Some(Frame::Bye { code, .. }) = conn.next_frame().await else {
+            panic!("bye");
+        };
+        assert_eq!(code, E_BRIDGE_BAD_REQUEST);
+    }
+    let mut conn = bridge.accept().await;
+    conn.handshake(&FakeBridge::hello()).await;
+    bounded(reconnects.wait_for(|n| *n == 2)).await.unwrap();
+    assert_eq!(adapter.message_limit(), 3900);
+    drop(conn);
+    drop(adapter);
+
+    // A cached hello of another proto is not a start point.
+    let cached = tempfile::tempdir().unwrap();
+    let mut hello = FakeBridge::hello();
+    if let Frame::Hello { proto, .. } = &mut hello {
+        *proto = 2;
+    }
+    std::fs::write(cached.path().join(HELLO_CACHE), hello.encode()).unwrap();
+    let bridge = FakeBridge::new();
+    bridge.set_up(false);
+    let options = BridgeOptions {
+        first_hello_wait: Duration::from_millis(100),
+        ..options(cached.path())
+    };
+    let Err(err) = BridgeAdapter::open_with(options, bridge).await else {
+        panic!("open must fail");
+    };
+    assert_eq!(err.code, E_ADAPTER_START);
 }
 
 #[tokio::test(start_paused = true)]

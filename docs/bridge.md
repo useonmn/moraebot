@@ -45,7 +45,7 @@ Setup writes the same absolute path into both files. Neither process works the p
 
 - A unix stream socket. The bridge listens and the core connects. One core at a time.
 - The socket file has mode 0600 and sits in a folder with mode 0700.
-- Each side checks that the peer uid equals its own (`SO_PEERCRED` on Linux, `getpeereid` on macOS, both through tokio's `UnixStream::peer_cred()`). A mismatch closes the connection and is logged as `E_BRIDGE_PEER`.
+- Each side checks that the peer uid equals its own (`SO_PEERCRED` on Linux, `getpeereid` on macOS, both through tokio's `UnixStream::peer_cred()`). A mismatch closes the connection and is logged as `E_BRIDGE_PEER` at error level on every attempt.
 - Either side can restart while the other keeps running. The core reconnects after 0.5 seconds, doubling up to 10 seconds.
 
 ## Framing
@@ -96,6 +96,8 @@ The core keeps the last `hello` in `<home>/bridge-hello.json` (mode 0600). When 
 
 `platform`, `hints` and `home` come from the hello used at start. `message_limit` and `caps` follow the latest hello. A later hello with another `platform` is refused with `E_BRIDGE_PLATFORM` and the core stops, so the service manager starts it again with the new hello. Changed `hints` or `home` are logged and apply at the next start.
 
+A `hello` with an empty `platform` or a `message_limit` below 100 gets `bye` with `E_BRIDGE_BAD_REQUEST`, and the core retries with backoff. A cached copy that fails the same check, or that carries another `proto`, is ignored. A handshake that keeps failing for the same cause is logged once, then at debug level until a connection is served again.
+
 A side that can't go on sends `bye` and closes:
 
 ```json
@@ -133,9 +135,9 @@ Delivery is at least once:
 
 1. The bridge writes a message to its spool before it acks its messenger, and deletes it only on `ack`.
 2. After every `hello_ok` the bridge sends every unacked message again in `seq` order, then new ones as they arrive. `redelivery` is true when the message was already sent on an earlier connection.
-3. The bridge keeps at most `window` messages unacked on a connection.
-4. The core sends `ack` after it handled the message, whatever the outcome: a stored row, a duplicate, a drop by the access check, a notice, or rejected files. It doesn't ack when the store failed, so the message comes again.
-5. The bridge stops redelivering a message after a fixed number of attempts, logs the drop and moves on, so one bad message can't block the spool.
+3. The bridge keeps at most `window` messages unacked on a connection. A bridge that sends more breaks the contract: the core closes the connection without delivering the extra message.
+4. The core sends `ack` after it handled the message, whatever the outcome: a stored row, a duplicate, a drop by the access check, a notice, or rejected files. It doesn't ack when the store failed. That message keeps its window slot and is sent again only on the next connection, which is when its attempt count moves.
+5. The bridge stops redelivering a message after a fixed number of attempts (counted per connection), logs the drop and moves on, so one bad message can't block the spool.
 6. The core dedupes on `(platform, message_id)`.
 7. The bridge keeps spooling inbound while a download or any other request is in flight. The core handles events one at a time, and a slow event (a download) holds its window slot until its ack.
 
@@ -170,6 +172,8 @@ The core sends a request with a fresh `id`, an integer above zero that grows per
 {"t":"err","re":15,"code":"E_BRIDGE_UNSUPPORTED","message":"reactions are not supported"}
 ```
 
+- `send`, `edit`, `thread` and `dm` must be answered within 30 seconds. Past that the core gives up: it sends `cancel` and the call fails with the operation's default code. `fetch` and `file` have no such deadline; the core's stall watchdog and upload time limit bound them.
+- The core does not wait for the answer to `status`, so a slow or failing status call never delays a turn. A failed `status` is logged by the bridge only.
 - `status start` shows a working indicator for `target` until `stop` or until the connection closes. Keeping it alive (Slack drops a status after two minutes) is the bridge's job.
 - `file`: the bridge reads `path` whole and uploads it. The core has already checked the path.
 - `react` is reserved. Version 1 cores don't send it.
@@ -185,7 +189,8 @@ The core sends a request with a fresh `id`, an integer above zero that grows per
 
 - `dest` is absolute. Its folder exists; the core creates it with mode 0700.
 - The bridge writes through `<dest>.part` (mode 0600, created new) and renames it to `dest` on success. It never follows redirects.
-- `max_bytes` is an integer, or `null` for no limit. Past the limit the bridge stops, removes the part file and answers `E_FILE_TOO_LARGE`.
+- `max_bytes` is an integer, or `null` when the core sets no limit. Past the limit the bridge stops, removes the part file and answers `E_FILE_TOO_LARGE`. Inbox downloads of inbound attachments are sent with `null` today, so the bridge must apply its own size cap when `max_bytes` is `null`.
+- The core checks the `bytes` of the final `ok` against `max_bytes` too, so a bridge that skips `progress` cannot pass the limit.
 - Each `progress` frame carries the `re` of its `fetch`. `bytes` is the running total written. While bytes flow the bridge sends one at least every second.
 - The bridge has its own stall guard: 120 seconds without a byte ends the download with `E_FILE_FETCH`.
 - The core feeds each `progress` into its own stall watchdog, so a bridge that stops reporting is caught there too.
@@ -228,17 +233,17 @@ The core sends `ping` every 15 seconds and the bridge answers with the same `n`.
   - `E_FILE_DENIED`: the user gets the "not allowed" notice.
   - `E_FILE_TOO_LARGE`: the user gets the size notice.
 - Every other code is a plain failure of that call.
-- The core knows the `E_ADAPTER_*` and `E_FILE_*` codes. An unknown code becomes the default code of the operation, with the original code kept in the message:
+- Each operation passes only the codes of its own family. Any other code, link codes and the core-made `E_BRIDGE_DOWN` and `E_BRIDGE_PLATFORM` included, becomes the default code of the operation, with the original code kept at the front of the message. A bridge can't trigger the upload or file branches from the wrong operation.
 
-| Request | Default code |
-|---|---|
-| `send` | `E_ADAPTER_SEND` |
-| `edit` | `E_ADAPTER_EDIT` |
-| `thread` | `E_ADAPTER_THREAD` |
-| `dm` | `E_ADAPTER_DM` |
-| `status` | `E_ADAPTER_TYPING` |
-| `fetch` | `E_FILE_FETCH` |
-| `file` | `E_ADAPTER_UPLOAD` |
+| Request | Default code | Codes that pass |
+|---|---|---|
+| `send` | `E_ADAPTER_SEND` | `E_ADAPTER_SEND` |
+| `edit` | `E_ADAPTER_EDIT` | `E_ADAPTER_EDIT` |
+| `thread` | `E_ADAPTER_THREAD` | `E_ADAPTER_THREAD` |
+| `dm` | `E_ADAPTER_DM` | `E_ADAPTER_DM` |
+| `status` | `E_ADAPTER_TYPING` | `E_ADAPTER_TYPING` |
+| `fetch` | `E_FILE_FETCH` | `E_ADAPTER_FILES`, `E_FILE_FETCH`, `E_FILE_HOST`, `E_FILE_REMOTE`, `E_FILE_WRITE`, `E_FILE_PATH`, `E_FILE_INCOMPLETE`, `E_FILE_DENIED`, `E_FILE_TOO_LARGE` |
+| `file` | `E_ADAPTER_UPLOAD` | `E_ADAPTER_UPLOAD`, `E_ADAPTER_UPLOAD_DENIED`, `E_ADAPTER_FILES` |
 
 Link codes:
 
