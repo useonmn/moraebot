@@ -36,7 +36,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 
 A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual, unless jev reads it as a memory request (next section). moraebot sends no notice when the lead or the observer saves a note for a conversation or project (`memory_write` below, and [The observer](#the-observer)); `뭐 기억해?` lists what this conversation got that way. When one of your sentences is saved as a core rule or a boundary without a command, by the lead or by the observer, you see a line naming its id (`[memory] saved m-1a2b3c to core/owner: "..." (say \`forget m-1a2b3c\` if that was not meant)`), so a wrong save is visible. The lead's save stands however the turn ends. When the lead replies, the line goes under the reply, at its end. When the turn fails or is interrupted, the line is posted as its own message right after the failure or interrupted notice. A line that could not be sent is sent again after the messenger reconnects or moraebot restarts, like a reply. An observer save is shown under the next reply in that conversation (the observer runs after the reply has gone out); the observer shows no line for a sentence the lead already saved to the same place, so one save is never shown twice.
 
-`뭐 기억해?` starts with one line about the observer: `Observer: jev ok, 0 waiting`, `Observer: jev off, 3 waiting`, `Observer: jev busy, retrying, 12 waiting` or `Observer: paused (E_JEV_AUTH), 12 waiting`, where the number counts the turns, lane results and subagent files still waiting to be read.
+`뭐 기억해?` starts with one line about the observer: `Observer: jev ok, 0 waiting`, `Observer: jev off, 3 waiting`, `Observer: jev busy, retrying, 12 waiting`, `Observer: paused (E_JEV_AUTH), 12 waiting` or, after the observer crashed outside a job, `Observer: down (E_OBSERVER_PANIC), retrying, 12 waiting` (until a later pass ends normally), where the number counts the turns, lane results and subagent files still waiting to be read.
 
 ### The same requests in your own words
 
@@ -48,7 +48,7 @@ When jev is on, a message the rules above don't match is asked of jev if it hold
 | forget | Asks about the one id in the message (and acts on your answer, as above). Without exactly one id, the message goes to the lead. |
 | restore | Restores the one id in the message; otherwise the lead gets it. |
 | correct | Replaces the one id in the message with the message's other sentences (the ones without the id); otherwise the lead gets it. |
-| remember | Saves the sentence jev picked, word for word, for this conversation. It goes to the core only when the message says "always" (`항상` or `always` anywhere), and to the boundaries when that sentence also says not to do something. |
+| remember | Saves the sentence jev picked, word for word, for this conversation. It goes to the core only when the message states a standing rule: `항상` anywhere, or `always`, `앞으로` or `앞으로는` as a whole word, or the phrase "from now on". It goes to the boundaries when that sentence also says not to do something. |
 
 Only your own messages without attachments are asked, and only when they arrive; lane results and chat senders never are. jev is asked once, with a 1.5 second limit (`classify_timeout_ms`) and no retry. When jev is off, paused, backing off, slow or unsure (below `classify_threshold`), the message simply goes to the lead, and the rules above keep working the same.
 
@@ -94,10 +94,17 @@ After a turn, a lane result or a subagent's report, moraebot queues a job in `in
 
 | Read from | Saved as | May go to |
 | --- | --- | --- |
-| Your message (a turn's own row or one steered into it) | your words (`owner`), the whole sentence as you wrote it, source `row=<id> s=<n>` | this conversation, the one project the message names, or (when you said "always", "from now on" or "never") the core rules or the boundaries |
+| Your message (a turn's own row or one steered into it) | your words (`owner`), the whole sentence as you wrote it, source `row=<id> s=<n>` | this conversation, the one project the message names, or the core rules or the boundaries (see below) |
 | A lane's result | a `lane` reference line, source `lane=<id> seq=<n>` | the lane's project, or this conversation |
 | A lane's subagent report | a `subagent` reference line | the lane's project, or this conversation |
 | The lead's subagent report | a `subagent` reference line | `projects/_general.md` |
+
+jev's `core` or `boundary` answer alone never puts a sentence in the core; the code checks the sentence itself:
+
+- `core/owner.md` takes it only when it states a standing rule: `항상` anywhere, or `always`, `앞으로` or `앞으로는` as a whole word, or the phrase "from now on" ("From now on, reply in English.").
+- `core/boundaries.md` takes it only when it holds `always`, `never`, `항상`, `절대` or `절대로` as a whole word. A word is a run of letters and digits, so "Push to main: never." counts and "Whenever you're unsure, ask me." does not. A plain "don't" or "하지 마" is not enough ("Don't add emoji in this PR." is often meant for one task only).
+
+Otherwise the sentence is saved for this conversation instead.
 
 Only your sentences become rules; lane and subagent lines stay reference lines, never sit in the core and expire after 30 days. A lane result is judged once, by its own job, not again by the lead turn that reads it. Subagent reports are found by scanning the session folders of the lead and the lanes for omp 18.22.2's `<task>.md` output files (at most 256 KiB, no symlinks), after a turn and at start; a file whose size and modification time are unchanged is not read again, and each content is judged once.
 
@@ -116,11 +123,11 @@ It never sends the lead's reply, a tool's output, row ids, conversation keys or 
 
 ### Turning it on and off
 
-jev is on when moraebot finds a key: the `TYPESAFE_API_KEY` environment variable of `moraebot run`, or else the file named by `api_key_file`. The key is never written to `config.toml`, never passed to the lead, lanes, chat children, Done checks, the `omp --version` check or the `git remote get-url` moraebot runs in a lane's checkout (every variable with `TYPESAFE` in its name is dropped from their environment) and is saved only as a `[redacted]` marker if it ever turns up in text moraebot writes to the memory store. Lanes run as the same Unix user as moraebot, so a lane can read any file moraebot can read, `api_key_file` included; keeping the key out of the environment hides it from a lane, a file does not. Prefer the environment variable, or accept that a lane could read the file. To turn the observer's jev calls off even with a key:
+jev is off unless you turn it on. It runs only when `memory.jev.enabled = true` and moraebot finds a key: the `TYPESAFE_API_KEY` environment variable of `moraebot run`, or else the file named by `api_key_file`. A key alone turns nothing on; moraebot then logs one line at start saying jev is off, and `check-config` says so too. The key is never written to `config.toml`, never passed to the lead, lanes, chat children, Done checks, the `omp --version` check or the `git remote get-url` moraebot runs in a lane's checkout (every variable with `TYPESAFE` in its name is dropped from their environment) and is saved only as a `[redacted]` marker if it ever turns up in text moraebot writes to the memory store. Lanes run as the same Unix user as moraebot, so a lane can read any file moraebot can read, `api_key_file` included; keeping the key out of the environment hides it from a lane, a file does not. Prefer the environment variable, or accept that a lane could read the file. To turn jev on:
 
 ```toml
 [memory.jev]
-enabled = false
+enabled = true
 ```
 
 With jev off, jobs are settled without a request (`M_JEV_OFF`), so turning it on later does not replay old history, and the rule commands work as before. `enabled = true` without a key pauses jev with `E_JEV_AUTH`.
@@ -131,9 +138,9 @@ Every key is optional.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `memory.jev.enabled` | on when a key is found | `false` turns jev off. |
+| `memory.jev.enabled` | `false` | `true` turns jev on; it also needs a key. |
 | `memory.jev.api_key_file` | none | A file holding the key; `TYPESAFE_API_KEY` wins over it. |
-| `memory.jev.base_url` | `https://api.typesafe.ai` | Must be `https://` (or `http://127.0.0.1` / `http://localhost` for tests). |
+| `memory.jev.base_url` | `https://api.typesafe.ai` | Must be `https://` (or `http://` to the host `127.0.0.1`, `localhost` or `[::1]`, for tests), without a user name or password. |
 | `memory.jev.model` | `jev-latest` | The model; the version that answered is logged with every job. |
 | `memory.jev.timeout_seconds` | 10 | Limit of one observer request. |
 | `memory.jev.classify_timeout_ms` | 1500 | Limit of the plain-language memory request check. |
@@ -149,11 +156,11 @@ Every key is optional.
 | `memory.filter.credentials` | built in (`토큰`, `비밀번호`, `token`, `password`, `secret`, `api key`, ...) | Same. |
 | `memory.filter.commands` | built in (`$ `, `./`, `\| sh`, `&&`, `rm -rf`, `sudo`, `curl`, ...) | Same. |
 
-Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Full-width letters and look-alikes of `.`, `/`, `|` and `:` are matched as their plain forms, and a lane or subagent sentence that holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents) is dropped, so such characters cannot hide a listed word.
+Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Sentences are NFKC-normalized first, so full-width and mathematical letters and other compatibility forms are matched as their plain letters, and look-alikes of `.`, `/`, `|` and `:` as those characters. A lane or subagent sentence is dropped when it holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents), a word that mixes Latin with Cyrillic or Greek letters (a Cyrillic `о` in "owner"), or Hangul typed as conjoining jamo, so none of these can hide a listed word.
 
 ### When jev fails
 
-Nothing is lost: pending jobs wait in `inbox.sqlite`. A busy (408, 429, 5xx) or network error waits 2, 4, 8, 16 seconds, then after five failures in a row tries once every 5 minutes; a `Retry-After` header is honored. A refused key (401, 403) or a request jev rejects (another 4xx) pauses jev until the next restart, so a wrong key or model name never marks your turns as failed. Lane, subagent and scan jobs that wait more than 7 days are dropped; jobs of your own turns never expire. A job that fails three times for another reason (an unreadable row or file) is marked failed and the next one goes on; a queued job that can no longer be decoded is marked failed at once.
+Nothing is lost: pending jobs wait in `inbox.sqlite`. A busy (408, 429, 5xx) or network error waits 2, 4, 8, 16 seconds, then after five failures in a row tries once every 5 minutes; a `Retry-After` header is honored. A refused key (401, 403) pauses jev until the next restart and never marks a job as failed. A request jev rejects (another 4xx) also pauses jev until the next restart, and counts one attempt of the job it was sent for, since it may be that job's own request (too long, say). An answer that does not fit counts one attempt too, and waits like a busy error. A job reaches three attempts at most, whatever their reason: then it is marked failed, jev is no longer paused or backing off because of it, and the next job goes on, so one bad job never holds the queue. A wrong model name therefore costs the oldest job one attempt per restart, and fails it on the third. Lane, subagent and scan jobs that wait more than 7 days are dropped; jobs of your own turns never expire. A job that cannot be read (an unreadable row or file) also counts one attempt; a queued job that can no longer be decoded is marked failed at once. When the store cannot settle jobs (a full disk, say), the pass stops and the observer tries again when new work arrives or a minute later, not at once, so jev is not asked about the same jobs over and over; a core rule it already saved still gets its line under the next reply when the job settles.
 
 ### Codes in the memory log
 
@@ -166,13 +173,12 @@ The `memory_log` table of `inbox.sqlite` keeps one row per settled job and per p
 | `M_JOB_EXPIRED` | A lane, subagent or scan job waited more than 7 days. |
 | `M_ARTIFACT_CHANGED` | A subagent file changed before its job ran; the new content has its own job. |
 | `E_JEV_AUTH` | No key, or the key was refused. jev is paused until restart. |
-| `E_JEV_REQUEST` | jev rejected the request (bad model, URL or shape). Paused until restart. |
+| `E_JEV_REQUEST` | jev rejected the request (bad model, URL or shape). Paused until restart; counts one attempt of the job (`detail` `attempts=3` when it failed). |
 | `W_JEV_BUSY` | jev was busy (408, 429, 5xx); retried later. |
 | `W_JEV_NETWORK` | jev could not be reached; retried later. |
-| `E_JEV_RESPONSE` | jev's answer could not be read; retried later. |
+| `E_JEV_RESPONSE` | jev's answer could not be read; retried later, counting one attempt of the job. |
 | `E_OBSERVER_JOB` | A job could not be read (one attempt of three), or could not be decoded at all (`detail` is `unreadable`; failed at once). |
-| `E_OBSERVER_PANIC` | Reading a job crashed (one attempt of three). |
-| `E_OBSERVER_VERBATIM` | A sentence did not match your message when it was saved; it was kept as a guess, not as your words. |
+| `E_OBSERVER_PANIC` | Reading a job crashed (one attempt of three), or a pass crashed outside a job (`detail` is `pass`; the observer shows as down and tries again later). |
 | `W_MEMORY_WRITE` | One entry could not be written (too long, unusable bucket name). |
 | `W_MEMORY_BACKLOG` | More than 10,000 jobs are waiting. |
 | `W_SUBAGENT_SKIPPED` | A subagent file was skipped (symlink, too large, outside its folder, bad name). |
