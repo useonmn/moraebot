@@ -278,6 +278,7 @@ CREATE TABLE IF NOT EXISTS inbox(
     text_sent INTEGER NOT NULL DEFAULT 0,
     origin TEXT NOT NULL DEFAULT 'owner',
     steered_into INTEGER,
+    memory_answered INTEGER NOT NULL DEFAULT 0,
     UNIQUE(platform, message_id)
 );
 CREATE TABLE IF NOT EXISTS conversations(
@@ -326,13 +327,14 @@ CREATE TABLE IF NOT EXISTS onboarding(
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
     ("inbox", "text_sent", "INTEGER NOT NULL DEFAULT 0"),
     ("inbox", "origin", "TEXT NOT NULL DEFAULT 'owner'"),
     ("inbox", "steered_into", "INTEGER"),
+    ("inbox", "memory_answered", "INTEGER NOT NULL DEFAULT 0"),
     ("lanes", "done", "TEXT"),
     ("lanes", "repo", "TEXT"),
     ("lanes", "closed_at", "TEXT"),
@@ -813,6 +815,22 @@ impl Store {
         Ok(())
     }
 
+    /// Stores the memory store's answer to an owner memory command on `id`
+    /// (`reply_pending`, as [`Store::save_reply`]) and marks the row `memory_answered`, so
+    /// it is never counted as an onboarding turn.
+    pub fn finish_memory(&self, id: i64, reply: &str) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            &format!(
+                "UPDATE inbox SET reply = ?2, out_files = NULL, state = 'reply_pending', error = NULL, memory_answered = 1, updated_at = {NOW} WHERE id = ?1"
+            ),
+            params![id, reply],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Invalid("no such inbox row"));
+        }
+        Ok(())
+    }
+
     /// Marks every row of a turn group `failed` with `code`, in one transaction.
     pub fn fail_group(&mut self, ids: &[i64], code: &str) -> Result<(), StoreError> {
         let tx = self
@@ -1275,14 +1293,16 @@ impl Store {
     }
 
     /// The owner turn number of `turn_row` in a running onboarding: owner rows after its
-    /// start up to and including `turn_row` that were neither steered into another row nor
-    /// left queued or failed. `None` unless an onboarding is running.
+    /// start up to and including `turn_row` that were neither steered into another row,
+    /// answered by the memory store, nor left queued or failed. `None` unless an
+    /// onboarding is running.
     pub fn onboarding_turn(&self, turn_row: i64) -> Result<Option<i64>, StoreError> {
         Ok(self
             .conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM inbox
                          WHERE origin = 'owner' AND steered_into IS NULL
+                           AND memory_answered = 0
                            AND state NOT IN ('queued', 'failed')
                            AND id > onboarding.after_row AND id <= ?1)
                  FROM onboarding WHERE id = 1 AND state = 'active'",

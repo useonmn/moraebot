@@ -28,7 +28,7 @@ The bot only runs while you're logged in to macOS and the Mac is awake. On Linux
 
 ## Install
 
-You'll need Apple Silicon macOS or Linux (x86_64 or aarch64), a Discord or Slack account, and omp already installed and working in your terminal.
+You'll need Apple Silicon macOS or Linux (x86_64 or aarch64), a Discord or Slack account, git, and omp already installed and working in your terminal.
 
 ### 1. Install moraebot
 

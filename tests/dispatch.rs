@@ -4138,7 +4138,7 @@ async fn forget_asks_once_and_acts_only_on_the_owners_answer() {
         in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
     };
 
-    let saved = memory_row(h.handle(say("회의는 3시 기억해")).await);
+    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
     let bucket = Bucket::Thread(h.row(saved).conversation_key);
     let id = memory.entries(&bucket).unwrap()[0].id.clone();
     let reply = |row: i64| h.row(row).reply.expect("reply");
@@ -4182,6 +4182,42 @@ async fn forget_asks_once_and_acts_only_on_the_owners_answer() {
         bodies,
         ["오늘 뭐해", "응"],
         "only the plain messages reached omp"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn memory_commands_never_use_an_onboarding_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
+    onboarding::request(&h.config.home, GreetTarget::Dm).unwrap();
+    bounded(h.dispatcher.startup()).await.unwrap();
+    let mut n = 9300;
+    let mut say = |text: &str| {
+        n += 1;
+        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
+    };
+
+    queued(h.handle(say("hi")).await);
+    h.drain().await;
+    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
+    memory_row(h.handle(say("뭐 기억해?")).await);
+    let bucket = Bucket::Thread(h.row(saved).conversation_key);
+    let id = memory.entries(&bucket).unwrap()[0].id.clone();
+    memory_row(h.handle(say(&format!("{id} 지워"))).await);
+    memory_row(h.handle(say("응")).await);
+    assert!(memory.entries(&bucket).unwrap().is_empty());
+    queued(h.handle(say("more")).await);
+    h.drain().await;
+
+    let messages: Vec<Value> = h.prompts().iter().map(|p| p["message"].clone()).collect();
+    assert_eq!(
+        messages,
+        [
+            format!("{}\nhi", onboarding::notice_line(1)),
+            format!("{}\nmore", onboarding::notice_line(2)),
+        ],
+        "memory commands and the forget answer are not onboarding turns"
     );
     h.close().await;
 }

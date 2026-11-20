@@ -1003,7 +1003,7 @@ impl Dispatcher {
             }
         };
         tracing::info!(row = id, conversation = key, "memory command answered");
-        self.store().finish_group(id, &reply, None, None)?;
+        self.store().finish_memory(id, &reply)?;
         self.send_reply(id).await?;
         Ok(Some(Handled::Memory(id)))
     }

@@ -80,16 +80,15 @@ const SHOW_PHRASES: [&str; 16] = [
     "list memories",
 ];
 
-/// Suffix forms: `<text> 기억해`. The longest first, so `기억해 줘` is not cut at `기억해`.
-const KO_SUFFIXES: [&str; 8] = [
-    "기억해 두어",
+/// Suffix forms: `<text> 기억해줘`. Only the explicit imperatives: a bare `<text> 기억해` is
+/// often a question asked without `?` ("어제 한 얘기 기억해"), so it goes to the lead.
+const KO_SUFFIXES: [&str; 6] = [
     "기억해 줘",
     "기억해 둬",
     "기억해 놔",
     "기억해줘",
     "기억해둬",
     "기억해놔",
-    "기억해",
 ];
 
 /// Prefix forms, each followed by `:` (or `(<repo>):`).
@@ -296,7 +295,7 @@ fn parse_remember(text: &str) -> Option<Command> {
     if let Some((repo, body)) = prefixed(rest) {
         return remember(body, always, repo);
     }
-    // Suffix form: `<text> (항상) 기억해(줘)`.
+    // Suffix form: `<text> (항상) 기억해줘` (or 둬 / 놔).
     let trimmed = text.trim_end_matches(|c: char| "!.~ ".contains(c) || c.is_whitespace());
     let suffix = KO_SUFFIXES.iter().find(|s| trimmed.ends_with(*s))?;
     let body = trimmed[..trimmed.len() - suffix.len()].trim_end();
@@ -582,7 +581,7 @@ mod tests {
     fn remember_defaults_to_the_conversation() {
         for text in [
             "기억해: 회의는 3시",
-            "회의는 3시 기억해",
+            "회의는 3시 기억해놔",
             "회의는 3시, 기억해줘!",
             "회의는 3시 기억해 둬",
             "remember: 회의는 3시",
@@ -594,6 +593,10 @@ mod tests {
                 "{text}"
             );
         }
+        assert_eq!(
+            remember_in("이거 기억해줘"),
+            Some(("이거".into(), Target::Conversation))
+        );
     }
 
     #[test]
@@ -603,7 +606,7 @@ mod tests {
             Some(("존댓말로 답해".into(), Target::Core))
         );
         assert_eq!(
-            remember_in("존댓말로 답해 항상 기억해"),
+            remember_in("존댓말로 답해 항상 기억해줘"),
             Some(("존댓말로 답해".into(), Target::Core))
         );
         assert_eq!(
@@ -628,6 +631,9 @@ mod tests {
         for text in [
             "그거 기억해?",
             "어제 한 얘기 기억해?",
+            "어제 한 얘기 기억해",
+            "그거 기억해",
+            "회의는 3시 기억해 두어",
             "이거 기억해서 나중에 PR 열어줘",
             "remember to open the PR",
             "m-1f3a2b 지워진 이유가 뭐야",
@@ -702,7 +708,7 @@ mod tests {
         let key = "discord:th:111";
         let run_text = |text: &str| parse(text).expect("a command");
 
-        let saved = run(&memory, key, 7, run_text("회의는 3시 기억해")).await;
+        let saved = run(&memory, key, 7, run_text("회의는 3시 기억해줘")).await;
         assert!(saved.reply.starts_with("Remembered m-"), "{}", saved.reply);
         let id = memory
             .entries(&Bucket::Thread(key.into()))

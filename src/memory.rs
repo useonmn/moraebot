@@ -1430,7 +1430,13 @@ impl MemoryStore {
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_OBJECT_DIRECTORY")
             .output()
-            .map_err(|e| MemoryError::io("git", &e))?;
+            .map_err(|e| match e.kind() {
+                ErrorKind::NotFound => MemoryError::new(
+                    E_MEMORY_IO,
+                    "git not found: install git, the memory store needs it",
+                ),
+                _ => MemoryError::io("git", &e),
+            })?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {

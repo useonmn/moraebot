@@ -4,7 +4,7 @@ moraebot keeps a small memory of what you, the owner, asked it to remember. This
 
 ## Where it lives
 
-Everything is under `~/.moraebot/memory/` (the moraebot home's `memory/` folder, mode 0700). It is a git repository, so every change is one commit you can read with `git log`.
+Everything is under `~/.moraebot/memory/` (the moraebot home's `memory/` folder, mode 0700). It is a git repository, so every change is one commit you can read with `git log`; moraebot needs `git` installed and refuses to start without it (`E_GIT_MISSING`).
 
 ```
 core/owner.md          rules, preferences and facts you said to always keep
@@ -34,7 +34,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `m-1a2b3c 지워`, `forget m-1a2b3c` | Asks once; your next message there answers it (`응`/`yes` forgets, `아니`/`no` keeps). |
 | `m-1a2b3c 되살려`, `restore m-1a2b3c` | Brings a forgotten entry back. |
 
-A sentence that only mentions an id, or a question such as `기억해?`, goes to the lead as usual. moraebot sends no notice when it saves something on its own (nothing does yet in P1a).
+A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when it saves something on its own (nothing does yet in P1a).
 
 The lead has no tool that changes memory.
 
