@@ -835,10 +835,15 @@ impl Observer {
             let Some(row) = row.filter(|row| row.origin == "owner") else {
                 continue;
             };
+            // As for the owner's other sentences (#63): secrets are taken out first, and a
+            // sentence that was nothing but a secret is no candidate.
             let found = memory::own_sentences(&row.text)
                 .into_iter()
+                .map(|(n, s)| (n, self.redactor.redact(&s).0))
                 .filter(|(_, s)| {
-                    self.candidate(s) && says_correction(s, &settings.correction_patterns)
+                    self.candidate(s)
+                        && self.candidate(&without_markers(s))
+                        && says_correction(s, &settings.correction_patterns)
                 })
                 .take(OWNER_WINDOWS);
             for (n, sentence) in found {
@@ -914,8 +919,9 @@ impl Observer {
                 }
             }
         }
-        let (ops, dropped) =
-            consolidate::plan(&offer, groups, today, |text| self.check_summary(text));
+        let (ops, dropped) = consolidate::plan(&offer, groups, today, |text| {
+            self.check_summary(text, Prov::Owner)
+        });
         for reason in dropped {
             self.log(row(
                 LogLevel::Warn,

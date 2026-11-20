@@ -1634,17 +1634,19 @@ pub fn core_memory_block(root: &Path, today: memory::Day) -> String {
 }
 
 /// The bot's self readings under `root` as of `today` (`self/self.md`), between
-/// [`SELF_MEMORY_OPEN`] and [`CORE_MEMORY_CLOSE`] lines, at most [`memory::SELF_CAP_BYTES`] in
+/// [`SELF_MEMORY_OPEN`] and [`CORE_MEMORY_CLOSE`] lines, opened by [`memory::MEMORY_GUARD`] like
+/// every memory block the lead reads, at most [`memory::SELF_CAP_BYTES`] in
 /// all, newest readings first to stay. Entry text is escaped like the core block's. Empty
 /// when there is no reading. It follows the core block, so a change restarts the lead between
 /// turns the same way.
 pub fn self_memory_block(root: &Path, today: memory::Day) -> String {
-    let frame = SELF_MEMORY_OPEN.len() + CORE_MEMORY_CLOSE.len() + 2;
+    let guard = memory::MEMORY_GUARD;
+    let frame = SELF_MEMORY_OPEN.len() + guard.len() + CORE_MEMORY_CLOSE.len() + 3;
     let block = memory::self_block(root, today, memory::SELF_CAP_BYTES.saturating_sub(frame));
     if block.is_empty() {
         return block;
     }
-    format!("{SELF_MEMORY_OPEN}\n{block}\n{CORE_MEMORY_CLOSE}")
+    format!("{SELF_MEMORY_OPEN}\n{guard}\n{block}\n{CORE_MEMORY_CLOSE}")
 }
 
 /// The first line of conversation `key`'s memory block in a lead input.
@@ -2123,7 +2125,8 @@ mod tests {
         assert_ne!(after, before);
         let core = core_memory_block(store.root(), qa_day("2026-11-20"));
         let own = format!(
-            "{SELF_MEMORY_OPEN}\n{}\n- [2026-11-20] I reply at length ››› short is wanted ({})\n{CORE_MEMORY_CLOSE}",
+            "{SELF_MEMORY_OPEN}\n{}\n{}\n- [2026-11-20] I reply at length ››› short is wanted ({})\n{CORE_MEMORY_CLOSE}",
+            memory::MEMORY_GUARD,
             memory::SELF_HEADER,
             reading.id
         );

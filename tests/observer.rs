@@ -2155,7 +2155,7 @@ async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
     let b = seed_observation(&fx, 2, "I answered in English again").await;
     let c = seed_observation(&fx, 3, "I pushed to main").await;
     let reply = format!(
-        "{{\"groups\":[{{\"obs\":[\"{a}\",\"{b}\"],\"text\":\"I answer in English; wanted instead: Korean\",\"reconfirms\":null}},{{\"obs\":[\"{c}\"],\"text\":\"I push to main\"}}]}}"
+        "{{\"groups\":[{{\"obs\":[\"{a}\",\"{b}\"],\"text\":\"I answer in English; the owner wants Korean\",\"reconfirms\":null}},{{\"obs\":[\"{c}\"],\"text\":\"I push to main\"}}]}}"
     );
     let fx = fx.with_summarizer(&[("FAKE_OMP_REPLY", reply.as_str())]);
 
@@ -2169,7 +2169,7 @@ async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
     assert_eq!(readings.len(), 1, "{readings:?}");
     assert_eq!(
         readings[0].text,
-        "I answer in English; wanted instead: Korean"
+        "I answer in English; the owner wants Korean"
     );
     assert_eq!(
         readings[0].src.as_deref(),

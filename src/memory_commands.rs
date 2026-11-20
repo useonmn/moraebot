@@ -878,7 +878,7 @@ fn show_self(memory: &MemoryHandle) -> String {
         out.push("No readings about myself yet.".to_owned());
     } else {
         out.push("How I look from outside (readings to test, not rules):".to_owned());
-        out.extend(readings.into_iter().map(entry_line));
+        out.extend(readings.iter().map(entry_line));
     }
     out.push(format!("Corrections waiting for consolidation: {pending}."));
     out.push(
