@@ -735,6 +735,12 @@ impl ExcerptFilter {
         )
     }
 
+    /// Whether `text` claims an approval or permission (the `approval` list, matched like in
+    /// [`Self::allows`]). Text that hides or disguises characters counts as a claim.
+    pub fn claims_approval(&self, text: &str) -> bool {
+        matches_folded(&self.approval, text)
+    }
+
     /// `Ok` when `sentence` may be saved, else the first reason it may not.
     pub fn allows(&self, sentence: &str, redactor: &Redactor) -> Result<(), ExcerptDrop> {
         let folded = fold_for_match(sentence)?;
@@ -841,6 +847,15 @@ fn hidden(c: char) -> bool {
             | 0x20D0..=0x20FF
             | 0xFE20..=0xFE2F
     ) || (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+}
+
+/// Whether any of the lower-case `patterns` is in `text` once it is folded ([`fold_for_match`])
+/// and lower-cased; text the fold refuses (hidden or look-alike characters) counts as a match.
+pub(crate) fn matches_folded(patterns: &[String], text: &str) -> bool {
+    match fold_for_match(text) {
+        Ok(folded) => matches_any(patterns, &folded.to_lowercase()),
+        Err(_) => true,
+    }
 }
 
 /// Whether any of `patterns` is in `lower`. A pattern of only ASCII letters, digits and `_`

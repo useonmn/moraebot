@@ -294,14 +294,18 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// The recall advisor's mode: `memory.recall.mode` when set, else `shadow` with jev
-    /// turned on and `off` without it.
+    /// The recall advisor's mode: `memory.recall.mode` when set, else `shadow` only with jev
+    /// turned on and `memory.recall.model` set, and `off` otherwise. So an upgraded install never
+    /// starts an advisor child on the lead's (default) model unasked (moraedang on #66); an
+    /// explicit `mode = "shadow"` without a model still runs on omp's default model.
     pub fn recall_mode(&self) -> RecallMode {
-        self.recall.mode.unwrap_or(if self.jev.enabled {
-            RecallMode::Shadow
-        } else {
-            RecallMode::Off
-        })
+        self.recall
+            .mode
+            .unwrap_or(if self.jev.enabled && self.recall_model().is_some() {
+                RecallMode::Shadow
+            } else {
+                RecallMode::Off
+            })
     }
 
     /// `memory.recall.model`, or `None` when it is empty (omp's default model then).
@@ -357,7 +361,8 @@ impl RecallMode {
 /// consolidation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallConfig {
-    /// `None`: `shadow` when jev is on, `off` otherwise ([`MemoryConfig::recall_mode`]).
+    /// `None`: `shadow` when jev is on and `model` is set, `off` otherwise
+    /// ([`MemoryConfig::recall_mode`]).
     pub mode: Option<RecallMode>,
     /// The omp model of the advisor and of self consolidation (`--model`); empty is omp's
     /// default model.
@@ -1134,10 +1139,16 @@ impl MemoryConfig {
     }
 
     /// The `check-config` line for the recall advisor. Advisory: a missing model only means
-    /// the advisor runs on omp's default model.
+    /// an explicit shadow mode runs on omp's default model. With jev on and neither a mode nor a
+    /// model set, it says how to turn the advisor on.
     fn recall_check(&self) -> Check {
         let mode = self.recall_mode();
         let result = match (mode, self.recall_model()) {
+            (RecallMode::Off, None) if self.jev.enabled && self.recall.mode.is_none() => Ok(
+                "off (set memory.recall.model to a small fast model to run the advisor in shadow \
+                 mode)"
+                    .to_owned(),
+            ),
             (RecallMode::Off, _) => Ok("off".to_owned()),
             (RecallMode::Shadow, Some(model)) => Ok(format!("shadow, model {model}")),
             (RecallMode::Shadow, None) => Err(ConfigError::new(
@@ -2240,18 +2251,44 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_is_shadow_with_jev_on_off_without_and_refuses_on() {
+    fn memory_recall_is_shadow_only_with_jev_and_a_model_or_when_asked_and_refuses_on() {
         let fx = Fixture::new();
+        let mode = |extra: &str| {
+            let cfg = fx
+                .load(&format!("{}{extra}", fx.valid_toml()))
+                .expect("loads");
+            cfg.memory.recall_mode()
+        };
         let plain = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(plain.memory.recall, RecallConfig::default());
-        assert_eq!(plain.memory.recall_mode(), RecallMode::Off);
         assert_eq!(plain.memory.recall_model(), None);
-        let jev = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
-        let jev = fx.load(&jev).expect("loads");
-        assert_eq!(jev.memory.recall_mode(), RecallMode::Shadow);
+        let jev = "[memory.jev]\nenabled = true\n";
+        let model = "[memory.recall]\nmodel = \"qa-small\"\n";
+        // moraedang on #66: an upgraded jev install without a model starts no advisor.
+        for (extra, want) in [
+            (String::new(), RecallMode::Off),
+            (jev.to_owned(), RecallMode::Off),
+            (model.to_owned(), RecallMode::Off),
+            (format!("{jev}{model}"), RecallMode::Shadow),
+            (format!("{jev}{model}mode = \"off\"\n"), RecallMode::Off),
+            (
+                "[memory.recall]\nmode = \"shadow\"\n".to_owned(),
+                RecallMode::Shadow,
+            ),
+            (
+                format!("{jev}[memory.recall]\nmode = \"shadow\"\n"),
+                RecallMode::Shadow,
+            ),
+        ] {
+            assert_eq!(mode(&extra), want, "{extra}");
+        }
+        let jev = fx
+            .load(&format!("{}{jev}{model}", fx.valid_toml()))
+            .expect("loads");
+        let written = jev.to_toml().unwrap();
         assert!(
-            !jev.to_toml().unwrap().contains("[memory.recall]"),
-            "the default stays implicit"
+            !written.lines().any(|line| line.starts_with("mode =")),
+            "the default stays implicit: {written}"
         );
 
         let text = format!(
@@ -2293,7 +2330,23 @@ mod tests {
         };
         assert_eq!(check(&fx.valid_toml()), Ok("off".to_owned()));
         let jev = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
-        assert_eq!(check(&jev), Err(E_CONFIG_VALUE));
+        assert_eq!(
+            check(&jev),
+            Ok(
+                "off (set memory.recall.model to a small fast model to run the advisor in \
+                 shadow mode)"
+                    .to_owned()
+            ),
+            "one hint line on how to turn it on"
+        );
+        let off = format!("{jev}[memory.recall]\nmode = \"off\"\n");
+        assert_eq!(check(&off), Ok("off".to_owned()), "turned off on purpose");
+        let asked = format!("{jev}[memory.recall]\nmode = \"shadow\"\n");
+        assert_eq!(
+            check(&asked),
+            Err(E_CONFIG_VALUE),
+            "shadow on the default model"
+        );
         let model = format!("{jev}[memory.recall]\nmodel = \"qa-small\"\n");
         assert_eq!(check(&model), Ok("shadow, model qa-small".to_owned()));
     }

@@ -1092,8 +1092,6 @@ impl OmpManager {
         self
     }
 
-    /// The running turn's main row and conversation, for host-tool handlers; `None`
-    /// between turns.
     /// Wakes `advisor` beside every lead turn an owner input starts (shadow mode: it never
     /// changes the input).
     pub fn with_recall(mut self, advisor: Arc<Advisor>) -> Self {
@@ -1106,6 +1104,8 @@ impl OmpManager {
         self.recall.is_some()
     }
 
+    /// The running turn's main row and conversation, for host-tool handlers; `None`
+    /// between turns.
     pub fn turn_context(&self) -> Arc<Mutex<Option<TurnContext>>> {
         Arc::clone(&self.turn)
     }

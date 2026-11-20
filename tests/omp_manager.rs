@@ -2262,8 +2262,18 @@ fn advisor_log(h: &Harness) -> PathBuf {
 
 /// An advisor on the fake omp with model `qa-small`, its own log, scripted by `vars`.
 fn qa_advisor(h: &Harness, vars: &[(&str, &str)]) -> Arc<moraebot::recall::Advisor> {
+    qa_advisor_with(h, vars, |_| {})
+}
+
+/// [`qa_advisor`] with `adjust` applied to its config.
+fn qa_advisor_with(
+    h: &Harness,
+    vars: &[(&str, &str)],
+    adjust: impl FnOnce(&mut Config),
+) -> Arc<moraebot::recall::Advisor> {
     let mut config = h.config.clone();
     config.memory.recall.model = "qa-small".into();
+    adjust(&mut config);
     let mut env: Vec<(String, String)> = vars
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -2386,7 +2396,7 @@ async fn shadow_recall_logs_its_picks_and_never_changes_the_lead_input() {
     assert!(logged(
         &h,
         moraebot::recall::I_RECALL_PICK,
-        &format!("gen=1 epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=1")
+        &format!("gen=1 epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=1 blocked=0")
     ));
     assert_eq!(ledger_rows(&h, 1), [(id, "shadow".to_owned())]);
     m.shutdown_all().await;
@@ -2422,8 +2432,9 @@ async fn a_shadow_pick_is_offered_again_only_to_a_new_lead_generation() {
     assert_eq!(asked.len(), 2, "the new lead child never saw the pick");
     assert!(asked[1].contains(&id), "{}", asked[1]);
     for generation in [1, 2] {
-        let detail =
-            format!("gen={generation} epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=0");
+        let detail = format!(
+            "gen={generation} epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=0 blocked=0"
+        );
         assert!(
             logged(&h, moraebot::recall::I_RECALL_PICK, &detail),
             "{detail}"
@@ -2507,4 +2518,57 @@ async fn lane_results_and_untagged_inputs_never_wake_the_advisor() {
     m.shutdown_all().await;
     assert_eq!(*progress.borrow(), 0);
     assert!(advisor_lines(&h).is_empty());
+}
+
+/// A turn with an advisor that fails is the same turn as without one; the failure is logged.
+async fn turn_with_failing_advisor(h: &Harness, advisor: Arc<moraebot::recall::Advisor>) {
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "hello");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hello".into()));
+    wakes_done(&mut progress, 1).await;
+    let lead_prompts = h.frames("prompt");
+    assert_eq!(lead_prompts.len(), 1);
+    assert_eq!(lead_prompts[0]["message"], input.as_str());
+    assert!(ledger_rows(h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_advisor_past_its_time_limit_is_logged_and_the_turn_is_unaffected() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor_with(&h, &[("FAKE_OMP_MODE", "hang")], |c| {
+        c.memory.recall.timeout_seconds = 1;
+    });
+    turn_with_failing_advisor(&h, advisor).await;
+    assert_eq!(advisor_prompts(&h).len(), 1, "the advisor was asked");
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_TIMEOUT,
+        "gen=1 epoch=0 row=1"
+    ));
+}
+
+#[tokio::test]
+async fn an_advisor_answer_without_json_is_logged_and_the_turn_is_unaffected() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY", "I would pick the first entry.")]);
+    turn_with_failing_advisor(&h, advisor).await;
+    assert_eq!(advisor_prompts(&h).len(), 1, "the advisor was asked");
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_OUTPUT,
+        "gen=1 epoch=0 row=1"
+    ));
+    assert!(!logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        "gen=1 epoch=0 row=1 offered=1 picks= rejected=0 unoffered=0 blocked=0"
+    ));
 }
