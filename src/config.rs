@@ -535,6 +535,11 @@ impl Config {
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
     }
 
+    /// The memory store folder, `<home>/memory`.
+    pub fn memory_dir(&self) -> PathBuf {
+        crate::memory::memory_dir(&self.home)
+    }
+
     /// The active messenger's owner id as text.
     pub fn owner_id(&self) -> String {
         match self.messenger {

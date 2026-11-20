@@ -11,6 +11,7 @@ use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
 use moraebot::init::{self, InitOutcome};
 use moraebot::launchd::{self, DEFAULT_LABEL};
 use moraebot::logging;
+use moraebot::memory;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
@@ -329,6 +330,7 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     };
     let config = Config::load(&path, env)?;
     config.validate()?;
+    memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

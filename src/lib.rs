@@ -15,6 +15,7 @@ pub mod lane;
 pub mod launchd;
 pub mod lead;
 pub mod logging;
+pub mod memory;
 pub mod omp;
 pub mod onboarding;
 pub mod persona;
