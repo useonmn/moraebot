@@ -97,7 +97,6 @@ fn bridge_config(root: &Path, socket: PathBuf, omp_path: PathBuf) -> Config {
     Config {
         messenger: Platform::Bridge,
         discord: None,
-        slack: None,
         bridge: Some(BridgeConfig {
             socket,
             owner_id: OWNER.to_owned(),

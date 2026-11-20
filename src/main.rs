@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
 use moraebot::bridge::client::BridgeAdapter;
+use moraebot::bridge::socket;
 use moraebot::config::{Config, ConfigError, Env, Platform, report_checks};
 use moraebot::discord::DiscordAdapter;
 use moraebot::gateway::{E_SHUTDOWN_TIMEOUT, Gateway, GatewayError};
@@ -15,7 +16,6 @@ use moraebot::logging;
 use moraebot::memory;
 use moraebot::omp_overlay::{self, OverlayCheck};
 use moraebot::onboarding::{self, GreetTarget};
-use moraebot::slack::SlackAdapter;
 use moraebot::systemd;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -245,10 +245,17 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
     })
 }
 
+/// The bridge socket path `init` and `setup slack` write into both configs.
+fn default_socket(env: &Env) -> Result<PathBuf, ConfigError> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    socket::default_path(env, std::env::consts::OS, runtime_dir.as_deref())
+}
+
 fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
     let stdin = io::stdin();
     let is_tty = stdin.is_terminal();
-    let outcome = init::run(env, stdin.lock(), io::stdout().lock(), is_tty)?;
+    let socket = default_socket(env)?;
+    let outcome = init::run(env, &socket, stdin.lock(), io::stdout().lock(), is_tty)?;
     Ok(match outcome {
         InitOutcome::Written { checks_ok: false } => ExitCode::FAILURE,
         InitOutcome::Written { checks_ok: true } | InitOutcome::Kept => ExitCode::SUCCESS,
@@ -258,7 +265,15 @@ fn run_init(env: &Env) -> Result<ExitCode, ConfigError> {
 fn run_setup(env: &Env, messenger: SetupTarget) -> Result<ExitCode, ConfigError> {
     let stdin = io::stdin();
     let is_tty = stdin.is_terminal();
-    let outcome = init::setup(env, messenger, stdin.lock(), io::stdout().lock(), is_tty)?;
+    let socket = default_socket(env)?;
+    let outcome = init::setup(
+        env,
+        messenger,
+        &socket,
+        stdin.lock(),
+        io::stdout().lock(),
+        is_tty,
+    )?;
     Ok(match outcome {
         InitOutcome::Written { checks_ok: false } => ExitCode::FAILURE,
         InitOutcome::Written { checks_ok: true } | InitOutcome::Kept => ExitCode::SUCCESS,
@@ -381,7 +396,6 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
 async fn serve(config: Config, overlay: OverlayCheck) -> Result<(), GatewayError> {
     let adapter: Arc<dyn MessengerAdapter> = match config.messenger {
         Platform::Discord => Arc::new(DiscordAdapter::from_config(&config)?),
-        Platform::Slack => Arc::new(SlackAdapter::from_config(&config)?),
         // Waits up to 10 s for the bridge's hello, else starts from the cached one.
         Platform::Bridge => Arc::new(BridgeAdapter::open(&config).await?),
     };

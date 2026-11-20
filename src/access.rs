@@ -71,7 +71,6 @@ impl Policy {
                     })
                     .collect()
             }),
-            Platform::Slack => config.slack.as_ref().map(|s| s.access.allow.clone()),
             Platform::Bridge => config.bridge.as_ref().map(|b| b.access.allow.clone()),
         };
         Self::new(config.owner_id(), allow.unwrap_or_default())
@@ -120,7 +119,6 @@ impl BotReplies {
                 .discord
                 .as_ref()
                 .and_then(|d| d.access.max_bot_replies),
-            Platform::Slack => config.slack.as_ref().and_then(|s| s.access.max_bot_replies),
             Platform::Bridge => config
                 .bridge
                 .as_ref()

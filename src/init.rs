@@ -7,10 +7,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    AccessMode, Config, ConfigError, DiscordConfig, E_CHANNEL_MISSING, E_IO, E_OMP_MISSING,
-    E_OWNER_MISSING, Env, OmpConfig, Platform, SlackConfig, report_checks,
+    AccessMode, BridgeConfig, Config, ConfigError, DiscordConfig, E_CHANNEL_MISSING, E_IO,
+    E_OMP_MISSING, E_OWNER_MISSING, Env, OmpConfig, Platform, report_checks,
 };
 use crate::onboarding::{E_ONBOARDING_REQUEST, GreetTarget, request};
+use crate::slack_bridge::config::{self as slack_bridge_config, SlackBridgeConfig, check_slack_id};
 
 pub const E_INIT_EOF: &str = "E_INIT_EOF";
 pub const E_SETUP_NO_CONFIG: &str = "E_SETUP_NO_CONFIG";
@@ -63,8 +64,9 @@ const BAD_BOT_TOKEN: &str =
 const BAD_APP_TOKEN: &str =
     "E_SLACK_TOKEN_KIND: a Slack app token starts with xapp-. Please enter it again.";
 
-/// A messenger that `init`, `setup` and `guide` can configure. The bridge is not one:
-/// its section is written by hand or by the bridge's own setup.
+/// A messenger that `init`, `setup` and `guide` can configure. Slack runs behind the
+/// bridge: its setup writes `[bridge]` into `config.toml` and the Slack side into
+/// `slack-bridge.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupTarget {
     Discord,
@@ -76,7 +78,14 @@ impl SetupTarget {
     pub fn platform(self) -> Platform {
         match self {
             SetupTarget::Discord => Platform::Discord,
-            SetupTarget::Slack => Platform::Slack,
+            SetupTarget::Slack => Platform::Bridge,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SetupTarget::Discord => "discord",
+            SetupTarget::Slack => "slack",
         }
     }
 }
@@ -108,6 +117,12 @@ pub const MESSENGERS: [Messenger; 4] = [
 
 /// A token typed by the owner and the file it is saved to once every question is answered.
 type PendingToken = (PathBuf, Option<String>);
+
+/// The Slack answers: the core's `[bridge]` section and the bridge's own config.
+struct SlackSetup {
+    bridge: BridgeConfig,
+    slack_bridge: SlackBridgeConfig,
+}
 
 /// Raw answers for the Discord messenger. The bot token is deliberately not part of this.
 #[derive(Debug, Clone)]
@@ -163,7 +178,7 @@ fn assemble(
     env: &Env,
     messenger: Platform,
     discord: Option<DiscordConfig>,
-    slack: Option<SlackConfig>,
+    bridge: Option<BridgeConfig>,
     omp_path: &str,
     work_dir: &str,
 ) -> Result<Config, ConfigError> {
@@ -181,8 +196,7 @@ fn assemble(
     Ok(Config {
         messenger,
         discord,
-        slack,
-        bridge: None,
+        bridge,
         work_dir: env.expand_tilde(Path::new(work_dir))?,
         omp_path: env.expand_tilde(Path::new(omp_path))?,
         home: env.default_home()?,
@@ -225,11 +239,7 @@ fn percent_encode(text: &str) -> String {
 
 /// Slack ids are capital letters and digits; the first letter tells the kind.
 fn valid_slack_id(id: &str, first: &[char]) -> bool {
-    id.len() >= 2
-        && id.starts_with(first)
-        && id
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    check_slack_id("id", id, first).is_ok()
 }
 
 pub fn is_executable_file(path: &Path) -> bool {
@@ -389,14 +399,19 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         Ok((section, vec![token]))
     }
 
+    /// Asks the Slack questions. `bridge` is the current `[bridge]` section and
+    /// `existing` the current `slack-bridge.toml`; their values are the defaults. Both
+    /// configs get the same `socket`.
     fn ask_slack(
         &mut self,
-        existing: Option<&SlackConfig>,
+        bridge: Option<&BridgeConfig>,
+        existing: Option<&SlackBridgeConfig>,
+        socket: &Path,
         home: &Path,
-    ) -> Result<(SlackConfig, Vec<PendingToken>), ConfigError> {
+    ) -> Result<(SlackSetup, Vec<PendingToken>), ConfigError> {
         let owner_id = self.ask_id(
             "Slack owner member id (starts with U)",
-            existing.map(|s| s.owner_id.clone()),
+            bridge.map(|b| b.owner_id.clone()),
             |id| valid_slack_id(id, &['U', 'W']),
             BAD_SLACK_OWNER,
         )?;
@@ -424,14 +439,20 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
             &app_token_file,
             Some(("xapp-", BAD_APP_TOKEN)),
         )?;
-        let section = SlackConfig {
-            owner_id,
-            channel_id,
-            bot_token_file,
-            app_token_file,
-            access: existing.map(|s| s.access.clone()).unwrap_or_default(),
+        let setup = SlackSetup {
+            bridge: BridgeConfig {
+                socket: socket.to_path_buf(),
+                owner_id,
+                access: bridge.map(|b| b.access.clone()).unwrap_or_default(),
+            },
+            slack_bridge: SlackBridgeConfig {
+                socket: socket.to_path_buf(),
+                channel_id,
+                bot_token_file,
+                app_token_file,
+            },
         };
-        Ok((section, vec![bot, app]))
+        Ok((setup, vec![bot, app]))
     }
 
     fn print_slack_link(&mut self) -> Result<(), ConfigError> {
@@ -443,17 +464,24 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         Ok(())
     }
 
-    /// Writes the config and the typed tokens, then runs the checks on what was written.
+    /// Writes the config, the Slack bridge config when there is one and the typed
+    /// tokens, then runs the checks on what was written.
     fn finish(
         &mut self,
         config: &Config,
         config_path: &Path,
         env: &Env,
+        slack_bridge: Option<&SlackBridgeConfig>,
         tokens: Vec<PendingToken>,
     ) -> Result<InitOutcome, ConfigError> {
         config.ensure_home_layout()?;
         write_private_file(config_path, config.to_toml()?.as_bytes())?;
         writeln!(self.out, "Wrote {}", config_path.display())?;
+        let bridge_path = config.home.join(slack_bridge_config::FILE_NAME);
+        if let Some(slack_bridge) = slack_bridge {
+            write_private_file(&bridge_path, slack_bridge.to_toml()?.as_bytes())?;
+            writeln!(self.out, "Wrote {}", bridge_path.display())?;
+        }
         for (file, token) in tokens {
             if let Some(token) = token {
                 write_private_file(&file, token.as_bytes())?;
@@ -462,7 +490,12 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         }
         writeln!(self.out, "Checking the new config:")?;
         let loaded = Config::load(config_path, env)?;
-        let checks_ok = report_checks(&loaded.checks(), &mut self.out)?;
+        let mut checks_ok = report_checks(&loaded.checks(), &mut self.out)?;
+        if slack_bridge.is_some() {
+            writeln!(self.out, "Checking {}:", bridge_path.display())?;
+            let loaded = SlackBridgeConfig::load(&bridge_path, env)?;
+            checks_ok &= report_checks(&loaded.checks(), &mut self.out)?;
+        }
         Ok(InitOutcome::Written { checks_ok })
     }
 
@@ -495,8 +528,10 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
     }
 }
 
+/// `moraebot init`. `socket` is the bridge socket path written for a Slack setup.
 pub fn run<R: BufRead, W: Write>(
     env: &Env,
+    socket: &Path,
     input: R,
     out: W,
     is_tty: bool,
@@ -525,8 +560,8 @@ pub fn run<R: BufRead, W: Write>(
         }
         SetupTarget::Slack => {
             prompter.print_slack_link()?;
-            let (section, tokens) = prompter.ask_slack(None, &home)?;
-            (None, Some(section), tokens)
+            let (setup, tokens) = prompter.ask_slack(None, None, socket, &home)?;
+            (None, Some(setup), tokens)
         }
     };
 
@@ -555,11 +590,12 @@ pub fn run<R: BufRead, W: Write>(
         env,
         messenger.platform(),
         discord,
-        slack,
+        slack.as_ref().map(|s| s.bridge.clone()),
         &omp_path.to_string_lossy(),
         &work_dir,
     )?;
-    let outcome = prompter.finish(&config, &config_path, env, tokens)?;
+    let slack_bridge = slack.as_ref().map(|s| &s.slack_bridge);
+    let outcome = prompter.finish(&config, &config_path, env, slack_bridge, tokens)?;
     request(&config.home, GreetTarget::Dm)
         .map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
     if outcome == (InitOutcome::Written { checks_ok: true }) {
@@ -569,10 +605,12 @@ pub fn run<R: BufRead, W: Write>(
 }
 
 /// `moraebot setup <messenger>`: asks only that messenger's required fields, keeps every
-/// other config value and makes the messenger the active one.
+/// other config value and makes the messenger the active one. `socket` is the bridge
+/// socket path for a Slack setup when the config names none yet.
 pub fn setup<R: BufRead, W: Write>(
     env: &Env,
     messenger: SetupTarget,
+    socket: &Path,
     input: R,
     out: W,
     is_tty: bool,
@@ -589,25 +627,40 @@ pub fn setup<R: BufRead, W: Write>(
         ));
     }
     let mut config = Config::load(&config_path, env)?;
-    let tokens = match messenger {
+    let (slack_bridge, tokens) = match messenger {
         SetupTarget::Discord => {
             let (section, tokens) = prompter.ask_discord(config.discord.as_ref(), &config.home)?;
             config.discord = Some(section);
-            tokens
+            (None, tokens)
         }
         SetupTarget::Slack => {
             prompter.print_slack_link()?;
-            let (section, tokens) = prompter.ask_slack(config.slack.as_ref(), &config.home)?;
-            config.slack = Some(section);
-            tokens
+            // A broken bridge config only loses its defaults: every value is asked again.
+            let existing =
+                SlackBridgeConfig::load(&config.home.join(slack_bridge_config::FILE_NAME), env)
+                    .ok();
+            let socket = config
+                .bridge
+                .as_ref()
+                .map(|b| b.socket.clone())
+                .or_else(|| existing.as_ref().map(|e| e.socket.clone()))
+                .unwrap_or_else(|| socket.to_path_buf());
+            let (setup, tokens) = prompter.ask_slack(
+                config.bridge.as_ref(),
+                existing.as_ref(),
+                &socket,
+                &config.home,
+            )?;
+            config.bridge = Some(setup.bridge);
+            (Some(setup.slack_bridge), tokens)
         }
     };
     config.messenger = messenger.platform();
-    let outcome = prompter.finish(&config, &config_path, env, tokens)?;
+    let outcome = prompter.finish(&config, &config_path, env, slack_bridge.as_ref(), tokens)?;
     writeln!(
         prompter.out,
         "{} is now the active messenger. Restart moraebot to use it.",
-        config.messenger.as_str()
+        messenger.as_str()
     )?;
     Ok(outcome)
 }
@@ -668,9 +721,22 @@ mod tests {
             self.env.default_config_path().expect("config path")
         }
 
+        fn socket(&self) -> PathBuf {
+            self.dir.path().join("mhome/run/slack-bridge.sock")
+        }
+
+        fn slack_bridge(&self) -> SlackBridgeConfig {
+            let path = self
+                .dir
+                .path()
+                .join("mhome")
+                .join(slack_bridge_config::FILE_NAME);
+            SlackBridgeConfig::load(&path, &self.env).expect("slack-bridge.toml loads")
+        }
+
         fn run(&self, input: &str) -> (Result<InitOutcome, ConfigError>, String) {
             let mut out = Vec::new();
-            let result = run(&self.env, input.as_bytes(), &mut out, false);
+            let result = run(&self.env, &self.socket(), input.as_bytes(), &mut out, false);
             (result, String::from_utf8(out).expect("utf-8 output"))
         }
 
@@ -925,7 +991,7 @@ mod tests {
         };
         let mut out = Vec::new();
         let input = "1\n111\n222\nTOKEN_SENTINEL_9f3a\n";
-        let result = run(&env, input.as_bytes(), &mut out, false);
+        let result = run(&env, &fx.socket(), input.as_bytes(), &mut out, false);
         assert_eq!(
             result.expect("init runs"),
             InitOutcome::Written { checks_ok: true }
@@ -978,7 +1044,14 @@ mod tests {
             input: &str,
         ) -> (Result<InitOutcome, ConfigError>, String) {
             let mut out = Vec::new();
-            let result = setup(&self.env, messenger, input.as_bytes(), &mut out, false);
+            let result = setup(
+                &self.env,
+                messenger,
+                &self.socket(),
+                input.as_bytes(),
+                &mut out,
+                false,
+            );
             (result, String::from_utf8(out).expect("utf-8 output"))
         }
 
@@ -992,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn init_slack_writes_slack_section_and_two_private_tokens() {
+    fn init_slack_writes_both_configs_and_two_private_tokens() {
         let fx = Fixture::new();
         let input = format!("2\nU111\nC222\n{BOT}\n{APP}\n{}\n\n", fx.omp.display());
         let (result, out) = fx.run(&input);
@@ -1017,13 +1090,29 @@ mod tests {
             APP
         );
         let config_text = fs::read_to_string(fx.config_path()).expect("config");
-        assert!(config_text.contains("messenger = \"slack\""));
-        for text in [&config_text, &out] {
+        assert!(config_text.contains("messenger = \"bridge\""));
+        assert!(!config_text.contains("[slack]") && !config_text.contains("token_file"));
+        let bridge_path = fx.dir.path().join("mhome/slack-bridge.toml");
+        let bridge_text = fs::read_to_string(&bridge_path).expect("bridge config");
+        assert_eq!(mode_of(&bridge_path), 0o600);
+        for text in [&config_text, &bridge_text, &out] {
             assert!(!text.contains("SENTINEL"));
         }
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
-        assert_eq!(loaded.messenger, Platform::Slack);
+        assert_eq!(loaded.messenger, Platform::Bridge);
         assert!(loaded.discord.is_none());
+        let bridge = loaded.bridge.as_ref().expect("bridge section");
+        assert_eq!(bridge.owner_id, "U111");
+        let slack_bridge = fx.slack_bridge();
+        assert_eq!(bridge.socket, fx.socket());
+        assert_eq!(
+            slack_bridge.socket,
+            fx.socket(),
+            "both sides name one socket"
+        );
+        assert_eq!(slack_bridge.channel_id, "C222");
+        assert_eq!(slack_bridge.bot_token_file, fx.secret("slack-bot.token"));
+        assert_eq!(slack_bridge.app_token_file, fx.secret("slack-app.token"));
     }
 
     #[test]
@@ -1043,11 +1132,12 @@ mod tests {
         );
         assert!(out.contains("slack is now the active messenger"));
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
-        assert_eq!(loaded.messenger, Platform::Slack);
+        assert_eq!(loaded.messenger, Platform::Bridge);
         assert_eq!(loaded.work_dir, typed_work);
         let discord = loaded.discord.as_ref().expect("discord kept");
         assert_eq!((discord.owner_id, discord.channel_id), (111, 222));
-        assert_eq!(loaded.slack.as_ref().expect("slack").owner_id, "U111");
+        assert_eq!(loaded.bridge.as_ref().expect("bridge").owner_id, "U111");
+        assert_eq!(fx.slack_bridge().channel_id, "C222");
         assert_eq!(
             fs::read_to_string(fx.secret("discord.token")).expect("discord token"),
             "TOKEN_SENTINEL_9f3a"
@@ -1101,11 +1191,8 @@ mod tests {
             APP
         );
         let loaded = Config::load(&fx.config_path(), &fx.env).expect("loads");
-        let slack = loaded.slack.as_ref().expect("slack");
-        assert_eq!(
-            (slack.owner_id.as_str(), slack.channel_id.as_str()),
-            ("U222", "C222")
-        );
+        assert_eq!(loaded.bridge.as_ref().expect("bridge").owner_id, "U222");
+        assert_eq!(fx.slack_bridge().channel_id, "C222");
     }
 
     #[test]
@@ -1121,7 +1208,7 @@ mod tests {
                 SetupTarget::Slack,
                 format!("2\nU111\nC222\n{BOT}\n{APP}\n"),
                 "\n\n\n\n",
-                "max_bot_replies = 5\n[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
+                "max_bot_replies = 5\n[[bridge.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
             ),
         ];
         for (platform, init, setup, allow) in cases {
@@ -1147,8 +1234,8 @@ mod tests {
                     assert_eq!(access.allow.len(), 1);
                 }
                 SetupTarget::Slack => {
-                    let access = &after.slack.as_ref().expect("slack").access;
-                    assert_eq!(access, &before.slack.as_ref().expect("slack").access);
+                    let access = &after.bridge.as_ref().expect("bridge").access;
+                    assert_eq!(access, &before.bridge.as_ref().expect("bridge").access);
                     assert_eq!(access.allow.len(), 1);
                 }
             }
@@ -1200,6 +1287,7 @@ mod tests {
         assert_eq!(code(result), E_INIT_EOF);
         assert_eq!(fs::read(fx.config_path()).expect("config"), before);
         assert!(!fx.secret("slack-bot.token").exists());
+        assert!(!fx.dir.path().join("mhome/slack-bridge.toml").exists());
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Slack adapter (Socket Mode).
+//! The bridge's Slack link (Socket Mode and the Web API).
 //!
 //! The protocol core (frame parsing, event mapping, id encoding, text escaping and Web
 //! API response parsing) is pure. All I/O goes through the `SlackTransport` seam: the
 //! real `HttpTransport` (HTTPS Web API + outbound WebSocket, no listening socket) and
-//! `testing::FakeSlackTransport` for offline tests.
+//! `slack_bridge::testing::FakeSlackTransport` for offline tests.
 //!
 //! Id encoding: a Slack `ts` is unique only per channel, so message ids are
 //! `<channel>:<ts>` and thread ids are `<channel>:<thread_ts>`.
@@ -28,8 +28,8 @@ use crate::adapter::{
     E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
     SendResult, TypingHandle, next_backoff,
 };
-use crate::config::{Config, E_MESSENGER_MISSING};
 use crate::files::{self, E_FILE_REMOTE, Progress};
+use crate::slack_bridge::config::SlackBridgeConfig;
 
 pub const PLATFORM: &str = "slack";
 /// Slack advises keeping `text` under 4,000 characters.
@@ -966,7 +966,9 @@ struct Runtime {
     task: Option<JoinHandle<()>>,
 }
 
-pub struct SlackAdapter {
+/// The bridge's connection to Slack: Socket Mode in, Web API out. It still implements
+/// [`MessengerAdapter`] so the bridge server can drive it through that one interface.
+pub struct SlackLink {
     transport: Arc<dyn SlackTransport>,
     owner_id: String,
     channel_id: String,
@@ -976,19 +978,16 @@ pub struct SlackAdapter {
     runtime: Mutex<Runtime>,
 }
 
-impl SlackAdapter {
-    pub fn from_config(config: &Config) -> Result<Self, AdapterError> {
-        let slack = config.slack.as_ref().ok_or_else(|| AdapterError {
-            code: E_MESSENGER_MISSING,
-            message: "the [slack] config section is missing".into(),
-        })?;
-        let transport = HttpTransport::new(&slack.bot_token_file, &slack.app_token_file)?;
+impl SlackLink {
+    /// The link for `config`. The owner comes from the core (its `hello_ok`), not
+    /// from the bridge config.
+    pub fn from_config(config: &SlackBridgeConfig, owner_id: String) -> Result<Self, AdapterError> {
+        let transport = HttpTransport::new(&config.bot_token_file, &config.app_token_file)?;
         Ok(Self::with_transport(
             Arc::new(transport),
-            slack.owner_id.clone(),
-            slack.channel_id.clone(),
-        )
-        .with_allowed(slack.access.allow.iter().map(|e| e.id.clone()).collect()))
+            owner_id,
+            config.channel_id.clone(),
+        ))
     }
 
     /// The listed user ids that pass the adapter's filter besides the owner.
@@ -1036,7 +1035,7 @@ fn edit_error(err: &AdapterError) -> AdapterError {
 }
 
 #[async_trait]
-impl MessengerAdapter for SlackAdapter {
+impl MessengerAdapter for SlackLink {
     fn platform(&self) -> &'static str {
         PLATFORM
     }
@@ -1053,7 +1052,7 @@ impl MessengerAdapter for SlackAdapter {
         {
             let mut runtime = self.runtime.lock().expect("runtime lock");
             if runtime.started {
-                return Err(start_error("the slack adapter was already started".into()));
+                return Err(start_error("the slack link was already started".into()));
             }
             runtime.started = true;
         }

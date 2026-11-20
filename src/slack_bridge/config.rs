@@ -7,7 +7,6 @@
 //! [`SlackBridgeConfig`].
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::socket;
 use crate::config::{
     Check, ConfigError, E_CHANNEL_MISSING, E_CONFIG_PARSE, E_CONFIG_READ, E_CONFIG_VALUE,
-    E_TOKEN_MISSING, E_TOKEN_MODE, E_TOKEN_NOT_FILE, Env,
+    E_TOKEN_MISSING, Env, check_token_file,
 };
 
 /// File name of the bridge config inside the moraebot home.
@@ -146,38 +145,12 @@ pub fn check_slack_id(name: &str, id: &str, prefixes: &[char]) -> Result<(), Con
     ))
 }
 
-fn check_token_file(path: &Path) -> Result<String, ConfigError> {
-    let meta = fs::metadata(path).map_err(|e| {
-        ConfigError::io(
-            E_TOKEN_MISSING,
-            &format!("cannot read token file {}", path.display()),
-            &e,
-        )
-    })?;
-    if !meta.is_file() {
-        return Err(ConfigError::new(
-            E_TOKEN_NOT_FILE,
-            format!("token file {} is not a regular file", path.display()),
-        ));
-    }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(ConfigError::new(
-            E_TOKEN_MODE,
-            format!(
-                "token file {} has mode {mode:03o}; only the owner may access it, run: chmod 600 {}",
-                path.display(),
-                path.display()
-            ),
-        ));
-    }
-    Ok(format!("{} (mode {mode:03o})", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge::E_BRIDGE_SOCKET;
+    use crate::config::{E_TOKEN_MODE, E_TOKEN_NOT_FILE};
+    use std::os::unix::fs::PermissionsExt;
 
     struct Fixture {
         tmp: tempfile::TempDir,

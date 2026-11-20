@@ -8,7 +8,9 @@ const SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
 
 fn moraebot(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_moraebot"));
-    cmd.env("MORAEBOT_HOME", home).env("HOME", home);
+    cmd.env("MORAEBOT_HOME", home)
+        .env("HOME", home)
+        .env_remove("XDG_RUNTIME_DIR");
     cmd
 }
 
@@ -309,7 +311,7 @@ fn percent_decode(text: &str) -> String {
 }
 
 #[test]
-fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
+fn init_then_setup_slack_writes_both_configs_and_activates_the_bridge() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
@@ -333,9 +335,23 @@ fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
         assert_eq!(mode, 0o600, "{name}");
     }
     let config_text = fs::read_to_string(home.join("config.toml")).expect("config.toml");
-    assert!(config_text.contains("messenger = \"slack\""));
-    assert!(config_text.contains("[discord]") && config_text.contains("[slack]"));
-    for text in [stdout.as_ref(), config_text.as_str()] {
+    let bridge_text = fs::read_to_string(home.join("slack-bridge.toml")).expect("bridge config");
+    let config: toml::Table = toml::from_str(&config_text).expect("config TOML");
+    let bridge_file: toml::Table = toml::from_str(&bridge_text).expect("bridge TOML");
+    assert_eq!(config["messenger"].as_str(), Some("bridge"));
+    assert!(config.contains_key("discord") && !config.contains_key("slack"));
+    let socket = config["bridge"]["socket"].as_str().expect("bridge.socket");
+    assert_eq!(
+        bridge_file["socket"].as_str(),
+        Some(socket),
+        "one socket path"
+    );
+    assert_eq!(
+        socket,
+        home.join("run/slack-bridge.sock").to_str().expect("utf-8")
+    );
+    assert_eq!(bridge_file["channel_id"].as_str(), Some("C222"));
+    for text in [stdout.as_ref(), config_text.as_str(), bridge_text.as_str()] {
         assert!(!text.contains("SENTINEL"), "token leaked");
     }
 

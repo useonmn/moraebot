@@ -1,5 +1,5 @@
 //! Offline end-to-end tests for Slack: the library-level gateway with the real
-//! `SlackAdapter` over `FakeSlackTransport` and `fake-omp`. Nothing reaches the network.
+//! `SlackLink` over `FakeSlackTransport` and `fake-omp`. Nothing reaches the network.
 
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -10,14 +10,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::MessengerAdapter;
-use moraebot::config::{AccessMode, Config, OmpConfig, Platform, SlackConfig};
+use moraebot::config::{AccessMode, BridgeConfig, Config, OmpConfig, Platform};
 use moraebot::dispatch::{N_ONBOARDING_HELLO, notice_text};
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lead;
 use moraebot::onboarding::{self, GreetTarget};
-use moraebot::slack::{DEFAULT_HINTS, SlackAdapter, escape_text};
+use moraebot::slack_bridge::slack::{DEFAULT_HINTS, SlackLink, escape_text};
+use moraebot::slack_bridge::testing::{FakeSlackSession, FakeSlackTransport};
 use moraebot::store::{State, Store};
-use moraebot::testing::{FakeSlackSession, FakeSlackTransport, appended};
+use moraebot::testing::appended;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -161,20 +162,17 @@ impl Rig {
         std::fs::create_dir_all(home.join("secrets")).expect("home");
         std::fs::create_dir_all(&work_dir).expect("work dir");
         let config = Config {
-            messenger: Platform::Slack,
+            messenger: Platform::Bridge,
             work_dir,
             omp_path: PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
             home: home.clone(),
             access_mode: AccessMode::OwnerOnly,
             discord: None,
-            slack: Some(SlackConfig {
+            bridge: Some(BridgeConfig {
+                socket: home.join("run").join("slack-bridge.sock"),
                 owner_id: OWNER.into(),
-                channel_id: CHANNEL.into(),
-                bot_token_file: home.join("secrets").join("slack-bot.token"),
-                app_token_file: home.join("secrets").join("slack-app.token"),
                 access: Default::default(),
             }),
-            bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
@@ -188,10 +186,10 @@ impl Rig {
         }
     }
 
-    /// Starts the gateway on a `SlackAdapter` over the fake transport and returns the
+    /// Starts the gateway on a `SlackLink` over the fake transport and returns the
     /// first socket session once the adapter has connected it.
     async fn start(&self, mode: &str) -> (Running, FakeSlackSession) {
-        let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackAdapter::with_transport(
+        let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackLink::with_transport(
             self.fake.clone(),
             OWNER.into(),
             CHANNEL.into(),

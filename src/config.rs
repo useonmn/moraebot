@@ -29,6 +29,8 @@ pub const E_HOME_LAYOUT: &str = "E_HOME_LAYOUT";
 pub const E_CONFIG_READ: &str = "E_CONFIG_READ";
 pub const E_CONFIG_PARSE: &str = "E_CONFIG_PARSE";
 pub const E_CONFIG_VALUE: &str = "E_CONFIG_VALUE";
+/// The config still names Slack directly; Slack now runs in `moraebot-slack-bridge`.
+pub const E_SLACK_MOVED: &str = "E_SLACK_MOVED";
 pub const E_IO: &str = "E_IO";
 /// Advisory only: someone besides the owner is listed and may talk to moraebot.
 pub const W_ALLOWLIST: &str = "W_ALLOWLIST";
@@ -202,7 +204,6 @@ impl<Id> Default for Access<Id> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Discord,
-    Slack,
     /// A separate bridge process on a unix socket (see `docs/bridge.md`). The bridge
     /// names the real platform in its hello.
     Bridge,
@@ -212,7 +213,6 @@ impl Platform {
     pub fn as_str(self) -> &'static str {
         match self {
             Platform::Discord => "discord",
-            Platform::Slack => "slack",
             Platform::Bridge => "bridge",
         }
     }
@@ -224,15 +224,6 @@ pub struct DiscordConfig {
     pub channel_id: u64,
     pub token_file: PathBuf,
     pub access: Access<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SlackConfig {
-    pub owner_id: String,
-    pub channel_id: String,
-    pub bot_token_file: PathBuf,
-    pub app_token_file: PathBuf,
-    pub access: Access<String>,
 }
 
 /// `[bridge]`: where the bridge listens and who may talk to moraebot. Ids are opaque
@@ -491,7 +482,6 @@ impl Default for FilterConfig {
 pub struct Config {
     pub messenger: Platform,
     pub discord: Option<DiscordConfig>,
-    pub slack: Option<SlackConfig>,
     pub bridge: Option<BridgeConfig>,
     pub work_dir: PathBuf,
     pub omp_path: PathBuf,
@@ -506,7 +496,6 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("messenger", &self.messenger)
             .field("discord", &self.discord)
-            .field("slack", &self.slack)
             .field("bridge", &self.bridge)
             .field("work_dir", &self.work_dir)
             .field("omp_path", &self.omp_path)
@@ -539,8 +528,9 @@ struct ConfigFile {
     access_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     discord: Option<DiscordSection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    slack: Option<SlackSection>,
+    /// Read only to report [`E_SLACK_MOVED`]; never written.
+    #[serde(skip_serializing)]
+    slack: Option<toml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridge: Option<BridgeSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -562,23 +552,6 @@ struct DiscordSection {
     max_bot_replies: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allow: Option<Vec<AllowSection<u64>>>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SlackSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    owner_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bot_token_file: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    app_token_file: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_bot_replies: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allow: Option<Vec<AllowSection<String>>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1013,16 +986,21 @@ impl Config {
                 ));
             }
         };
+        if file.slack.is_some() || file.messenger.as_deref() == Some("slack") {
+            return Err(ConfigError::new(
+                E_SLACK_MOVED,
+                "Slack now runs in the separate moraebot-slack-bridge process; move the [slack] \
+                 section by hand as docs/bridge.md, section \"Moving a Slack config by hand\", \
+                 describes",
+            ));
+        }
         let messenger = match file.messenger.as_deref() {
             None | Some("discord") => Platform::Discord,
-            Some("slack") => Platform::Slack,
             Some("bridge") => Platform::Bridge,
             Some(other) => {
                 return Err(ConfigError::new(
                     E_MESSENGER,
-                    format!(
-                        "messenger '{other}' is not available; use 'discord', 'slack' or 'bridge'"
-                    ),
+                    format!("messenger '{other}' is not available; use 'discord' or 'bridge'"),
                 ));
             }
         };
@@ -1033,11 +1011,9 @@ impl Config {
             access_mode,
             env,
         )?;
-        let slack = slack_config(file.slack, access_mode, env)?;
         let bridge = bridge_config(file.bridge, access_mode, env)?;
         let missing = match messenger {
             Platform::Discord => discord.is_none().then_some("[discord]"),
-            Platform::Slack => slack.is_none().then_some("[slack]"),
             Platform::Bridge => bridge.is_none().then_some("[bridge]"),
         };
         if let Some(section) = missing {
@@ -1091,7 +1067,6 @@ impl Config {
         Ok(Config {
             messenger,
             discord,
-            slack,
             bridge,
             work_dir,
             omp_path: env.expand_tilde(&omp_path)?,
@@ -1126,14 +1101,7 @@ impl Config {
                 max_bot_replies: d.access.max_bot_replies,
                 allow: allow_sections(&d.access),
             }),
-            slack: self.slack.as_ref().map(|s| SlackSection {
-                owner_id: Some(s.owner_id.clone()),
-                channel_id: Some(s.channel_id.clone()),
-                bot_token_file: Some(s.bot_token_file.clone()),
-                app_token_file: Some(s.app_token_file.clone()),
-                max_bot_replies: s.access.max_bot_replies,
-                allow: allow_sections(&s.access),
-            }),
+            slack: None,
             bridge: self.bridge.as_ref().map(|b| BridgeSection {
                 socket: Some(b.socket.clone()),
                 owner_id: Some(b.owner_id.clone()),
@@ -1159,7 +1127,6 @@ impl Config {
     pub fn owner_id(&self) -> String {
         match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.owner_id.to_string()),
-            Platform::Slack => self.slack.as_ref().map(|s| s.owner_id.clone()),
             Platform::Bridge => self.bridge.as_ref().map(|b| b.owner_id.clone()),
         }
         .unwrap_or_default()
@@ -1170,7 +1137,6 @@ impl Config {
     pub fn channel_id(&self) -> String {
         match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.channel_id.to_string()),
-            Platform::Slack => self.slack.as_ref().map(|s| s.channel_id.clone()),
             Platform::Bridge => None,
         }
         .unwrap_or_default()
@@ -1187,7 +1153,6 @@ impl Config {
         }];
         let channel_name = match active {
             Platform::Discord => Some("discord.channel_id"),
-            Platform::Slack => Some("slack.channel_id"),
             Platform::Bridge => None,
         };
         if let Some(name) = channel_name {
@@ -1208,15 +1173,6 @@ impl Config {
                         ));
                     }
                 }
-                Platform::Slack => {
-                    if let Some(slack) = &self.slack {
-                        checks.extend(access_checks(
-                            "slack.allow",
-                            "slack.max_bot_replies",
-                            &slack.access,
-                        ));
-                    }
-                }
                 Platform::Bridge => {
                     if let Some(bridge) = &self.bridge {
                         checks.extend(access_checks(
@@ -1233,19 +1189,6 @@ impl Config {
                 name: "discord token_file",
                 result: check_token_file(&discord.token_file),
                 advisory: active != Platform::Discord,
-            });
-        }
-        if let Some(slack) = &self.slack {
-            let advisory = active != Platform::Slack;
-            checks.push(Check {
-                name: "slack bot_token_file",
-                result: check_token_file(&slack.bot_token_file),
-                advisory,
-            });
-            checks.push(Check {
-                name: "slack app_token_file",
-                result: check_token_file(&slack.app_token_file),
-                advisory,
             });
         }
         if let Some(bridge) = &self.bridge {
@@ -1327,7 +1270,6 @@ impl Config {
     fn check_channel(&self) -> Result<String, ConfigError> {
         let channel = match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.channel_id.to_string()),
-            Platform::Slack => self.slack.as_ref().map(|s| s.channel_id.clone()),
             Platform::Bridge => None,
         }
         .unwrap_or_default();
@@ -1420,7 +1362,9 @@ fn check_git(git: &Path) -> Result<String, ConfigError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn check_token_file(path: &Path) -> Result<String, ConfigError> {
+/// A token file must exist, be a regular file and be private to the owner (no group or
+/// other bits).
+pub(crate) fn check_token_file(path: &Path) -> Result<String, ConfigError> {
     let meta = fs::metadata(path).map_err(|e| {
         ConfigError::io(
             E_TOKEN_MISSING,
@@ -1649,50 +1593,6 @@ fn discord_config(
     }))
 }
 
-fn slack_config(
-    section: Option<SlackSection>,
-    mode: AccessMode,
-    env: &Env,
-) -> Result<Option<SlackConfig>, ConfigError> {
-    let Some(section) = section else {
-        return Ok(None);
-    };
-    let owner_id = section
-        .owner_id
-        .ok_or_else(|| ConfigError::new(E_OWNER_MISSING, "slack.owner_id is required"))?;
-    let channel_id = section
-        .channel_id
-        .ok_or_else(|| ConfigError::new(E_CHANNEL_MISSING, "slack.channel_id is required"))?;
-    let bot_token_file = section
-        .bot_token_file
-        .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "slack.bot_token_file is required"))?;
-    let app_token_file = section
-        .app_token_file
-        .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "slack.app_token_file is required"))?;
-    check_slack_id("slack.owner_id", &owner_id, &['U', 'W'])?;
-    check_slack_id("slack.channel_id", &channel_id, &['C', 'G'])?;
-    let access = access_config(
-        "slack",
-        mode,
-        &owner_id,
-        section.allow,
-        section.max_bot_replies,
-        // A Slack bot is matched by its user id or by the `bot_id` (`B...`) the adapter
-        // sees on bot messages, some of which carry no user id at all.
-        |name, id, kind| match kind {
-            SenderKind::User => check_slack_id(name, id, &['U', 'W']),
-            SenderKind::Bot => check_slack_id(name, id, &['U', 'W', 'B']),
-        },
-    )?;
-    Ok(Some(SlackConfig {
-        owner_id,
-        channel_id,
-        bot_token_file: env.expand_tilde(&bot_token_file)?,
-        app_token_file: env.expand_tilde(&app_token_file)?,
-        access,
-    }))
-}
-
 /// The core does not know the id format of the messenger behind the bridge, so an id
 /// only has to be non-empty text without whitespace.
 fn bridge_config(
@@ -1733,26 +1633,6 @@ fn check_bridge_id(name: &str, id: &str) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
-}
-
-/// A Slack id is an uppercase letter or digit string with a kind prefix.
-fn check_slack_id(name: &str, id: &str, prefixes: &[char]) -> Result<(), ConfigError> {
-    let mut chars = id.chars();
-    let well_formed = chars.next().is_some_and(|c| prefixes.contains(&c))
-        && id.len() > 1
-        && id
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-    if well_formed {
-        return Ok(());
-    }
-    Err(ConfigError::new(
-        E_CONFIG_VALUE,
-        format!(
-            "{name} must start with {} followed by uppercase letters or digits",
-            prefixes.iter().collect::<String>()
-        ),
-    ))
 }
 
 fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -2095,16 +1975,12 @@ mod tests {
         let fx = Fixture::new();
         let mut cfg = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(cfg.channel_id(), "222");
-        cfg.messenger = Platform::Slack;
-        assert_eq!(cfg.channel_id(), "");
-        cfg.slack = Some(SlackConfig {
-            owner_id: "U111".to_string(),
-            channel_id: "C222".to_string(),
-            bot_token_file: fx.token.clone(),
-            app_token_file: fx.token.clone(),
-            access: Default::default(),
-        });
-        assert_eq!(cfg.channel_id(), "C222");
+        cfg.messenger = Platform::Bridge;
+        assert_eq!(
+            cfg.channel_id(),
+            "",
+            "the bridge reports its channel in the hello"
+        );
     }
 
     #[test]
@@ -2205,8 +2081,8 @@ mod tests {
         let discord = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(discord.access_mode, AccessMode::OwnerOnly);
         assert_eq!(discord.discord.expect("discord").access, Access::default());
-        let slack = fx.load(&slack_toml(&fx)).expect("loads");
-        assert_eq!(slack.slack.expect("slack").access, Access::default());
+        let bridge = fx.load(&bridge_toml(&fx, "/run/b.sock")).expect("loads");
+        assert_eq!(bridge.bridge.expect("bridge").access, Access::default());
     }
 
     #[test]
@@ -2241,43 +2117,6 @@ mod tests {
         assert_eq!(cfg.discord.expect("discord").access.max_bot_replies, None);
         let zero = allowlist_toml(&fx, &DISCORD_ALLOW.replace("= 30", "= 0"));
         assert_eq!(code(fx.load(&zero)), E_CONFIG_VALUE);
-    }
-
-    #[test]
-    fn slack_allowlist_is_parsed() {
-        let fx = Fixture::new();
-        let text = format!(
-            "access_mode = \"allowlist\"\n{}[[slack.allow]]\nid = \"U0BOT\"\nkind = \"bot\"\nrole = \"chat\"\n",
-            slack_toml(&fx)
-        );
-        let access = fx.load(&text).expect("loads").slack.expect("slack").access;
-        assert_eq!(
-            access.allow,
-            vec![AllowEntry {
-                id: "U0BOT".to_string(),
-                kind: SenderKind::Bot,
-                role: Role::Chat
-            }]
-        );
-        assert_eq!(access.max_bot_replies, None);
-        for bad in ["C0BOT", "u0bot", ""] {
-            let text = text.replace("U0BOT", bad);
-            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "id {bad:?}");
-        }
-    }
-
-    #[test]
-    fn slack_bot_entries_accept_a_bot_id() {
-        let fx = Fixture::new();
-        let text = format!(
-            "access_mode = \"allowlist\"\n{}[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
-            slack_toml(&fx)
-        );
-        let access = fx.load(&text).expect("loads").slack.expect("slack").access;
-        assert_eq!(access.allow[0].id, "B0BOT");
-        assert_eq!(access.allow[0].kind, SenderKind::Bot);
-        let user = text.replace("\"bot\"", "\"user\"");
-        assert_eq!(code(fx.load(&user)), E_CONFIG_VALUE);
     }
 
     #[test]
@@ -2544,16 +2383,6 @@ mod tests {
         assert_eq!(again.omp.stall_after_minutes, Some(9));
     }
 
-    fn slack_toml(fx: &Fixture) -> String {
-        format!(
-            "messenger = \"slack\"\nomp_path = {}\n[slack]\nowner_id = \"U111\"\nchannel_id = \"C222\"\n\
-             bot_token_file = {}\napp_token_file = {}\n",
-            quoted(&fx.omp),
-            quoted(&fx.token),
-            quoted(&fx.token)
-        )
-    }
-
     #[test]
     fn legacy_discord_file_loads() {
         let fx = Fixture::new();
@@ -2563,7 +2392,7 @@ mod tests {
         assert_eq!(discord.owner_id, 111);
         assert_eq!(discord.channel_id, 222);
         assert_eq!(discord.token_file, fx.token);
-        assert!(cfg.slack.is_none());
+        assert!(cfg.bridge.is_none());
     }
 
     #[test]
@@ -2581,25 +2410,21 @@ mod tests {
     }
 
     #[test]
-    fn slack_section_loads() {
+    fn a_slack_section_or_messenger_is_slack_moved() {
         let fx = Fixture::new();
-        let cfg = fx.load(&slack_toml(&fx)).expect("loads");
-        assert_eq!(cfg.messenger, Platform::Slack);
-        assert_eq!(cfg.owner_id(), "U111");
-        let slack = cfg.slack.expect("slack section");
-        assert_eq!(slack.channel_id, "C222");
-        assert_eq!(slack.bot_token_file, fx.token);
-        assert_eq!(slack.app_token_file, fx.token);
-        assert!(cfg.discord.is_none());
-    }
-
-    #[test]
-    fn slack_active_without_section_is_messenger_missing() {
-        let fx = Fixture::new();
-        let text = format!("messenger = \"slack\"\nomp_path = {}\n", quoted(&fx.omp));
-        assert_eq!(code(fx.load(&text)), E_MESSENGER_MISSING);
-        let discord_only = format!("messenger = \"slack\"\n{}", fx.valid_toml());
-        assert_eq!(code(fx.load(&discord_only)), E_MESSENGER_MISSING);
+        let section = "[slack]\nowner_id = \"U111\"\nchannel_id = \"C222\"\n";
+        let cases = [
+            format!("{}{section}", fx.valid_toml()),
+            format!("messenger = \"slack\"\n{}", fx.valid_toml()),
+            format!("messenger = \"slack\"\n{}{section}", fx.valid_toml()),
+            format!(
+                "messenger = \"slack\"\nomp_path = {}\n{section}",
+                quoted(&fx.omp)
+            ),
+        ];
+        for text in cases {
+            assert_eq!(code(fx.load(&text)), E_SLACK_MOVED, "{text}");
+        }
     }
 
     #[test]
@@ -2607,23 +2432,6 @@ mod tests {
         let fx = Fixture::new();
         let text = format!("messenger = \"telegram\"\n{}", fx.valid_toml());
         assert_eq!(code(fx.load(&text)), E_MESSENGER);
-    }
-
-    #[test]
-    fn slack_owner_id_format_rejected() {
-        let fx = Fixture::new();
-        for owner in ["111", "u111", "U", "UAB-1", "C111"] {
-            let text = slack_toml(&fx).replace("U111", owner);
-            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "owner {owner:?}");
-        }
-        for channel in ["222", "D222", "c222"] {
-            let text = slack_toml(&fx).replace("C222", channel);
-            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "channel {channel:?}");
-        }
-        let workspace_user = slack_toml(&fx)
-            .replace("U111", "W111")
-            .replace("C222", "G222");
-        assert!(fx.load(&workspace_user).is_ok());
     }
 
     #[test]
@@ -2645,47 +2453,51 @@ mod tests {
             (b.owner_id, b.channel_id, b.token_file)
         );
 
-        let slack = fx.load(&slack_toml(&fx)).expect("loads");
-        let again = fx
-            .load(&slack.to_toml().expect("serializes"))
-            .expect("reloads");
-        assert_eq!(again.messenger, Platform::Slack);
-        assert_eq!(again.owner_id(), "U111");
+        // Nothing Slack-specific is ever written: no [slack] table, no token file key
+        // besides Discord's.
+        let both = format!(
+            "{}[bridge]\nsocket = \"/run/b.sock\"\nowner_id = \"U111\"\n",
+            fx.valid_toml()
+        );
+        let text = fx
+            .load(&both)
+            .expect("loads")
+            .to_toml()
+            .expect("serializes");
+        let table: toml::Table = toml::from_str(&text).expect("valid TOML");
+        assert!(!table.contains_key("slack"), "{text}");
+        assert!(!text.contains("bot_token_file") && !text.contains("app_token_file"));
+        let bridge = table["bridge"].as_table().expect("bridge table");
+        assert!(bridge.keys().all(|key| !key.contains("token")), "{text}");
     }
 
     #[test]
     fn checks_cover_both_messengers() {
         let fx = Fixture::new();
-        let other = fx.dir.path().join("other.token");
-        fs::write(&other, "x").expect("write");
-        fs::set_permissions(&other, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let socket = fx.dir.path().join("b.sock");
         let both = format!(
-            "{}[slack]\nowner_id = \"U111\"\nchannel_id = \"C222\"\nbot_token_file = {}\napp_token_file = {}\n",
+            "{}[bridge]\nsocket = {}\nowner_id = \"U111\"\n",
             fx.valid_toml(),
-            quoted(&other),
-            quoted(&fx.token)
+            quoted(&socket)
         );
         let cfg = fx.load(&both).expect("loads");
         let names: Vec<_> = cfg.checks().iter().map(|c| c.name).collect();
-        for name in [
-            "discord token_file",
-            "slack bot_token_file",
-            "slack app_token_file",
-        ] {
+        for name in ["discord token_file", "bridge socket"] {
             assert!(names.contains(&name), "{name}");
         }
-        // The inactive messenger's bad token file is advisory, so validation still passes.
-        cfg.validate().expect("active messenger is fine");
+        // With the bridge active, a bad Discord token file is advisory only.
+        fs::set_permissions(&fx.token, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let bridge_active = format!("messenger = \"bridge\"\n{both}");
+        let cfg = fx.load(&bridge_active).expect("loads");
+        cfg.validate().expect("the active bridge is fine");
         let mut out = Vec::new();
-        let all_ok = report_checks(&cfg.checks(), &mut out).expect("report");
-        assert!(all_ok);
+        assert!(report_checks(&cfg.checks(), &mut out).expect("report"));
         let report = String::from_utf8(out).expect("utf-8");
-        assert!(report.contains("WARN slack bot_token_file"));
+        assert!(report.contains("WARN discord token_file"), "{report}");
         assert!(report.contains(E_TOKEN_MODE));
 
-        // Make Slack the active messenger: the same bad file now fails validation.
-        let slack_active = format!("messenger = \"slack\"\n{both}");
-        let cfg = fx.load(&slack_active).expect("loads");
+        // Discord active: the same bad file now fails validation.
+        let cfg = fx.load(&both).expect("loads");
         assert_eq!(code(cfg.validate()), E_TOKEN_MODE);
     }
 

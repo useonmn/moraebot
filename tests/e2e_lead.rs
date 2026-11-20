@@ -1,5 +1,5 @@
 //! Offline end-to-end tests of the lead and its lanes through the library-level gateway:
-//! `FakeAdapter` or the real `SlackAdapter` over `FakeSlackTransport`, with `fake-omp` as
+//! `FakeAdapter` or the real `SlackLink` over `FakeSlackTransport`, with `fake-omp` as
 //! the lead and as every lane. Nothing leaves the machine.
 
 use std::fs::OpenOptions;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, SlackConfig};
+use moraebot::config::{AccessMode, BridgeConfig, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{
     N_LANE_INTERRUPTED, N_ONBOARDING_HELLO, N_UNSUPPORTED_INPUT, notice_text,
 };
@@ -23,9 +23,10 @@ use moraebot::lead;
 use moraebot::omp::key_slug;
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::persona;
-use moraebot::slack::SlackAdapter;
+use moraebot::slack_bridge::slack::SlackLink;
+use moraebot::slack_bridge::testing::FakeSlackTransport;
 use moraebot::store::{LaneState, OnboardingRow, OnboardingState, State, Store};
-use moraebot::testing::{Call, FakeAdapter, FakeSlackTransport, appended};
+use moraebot::testing::{Call, FakeAdapter, appended};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -270,13 +271,11 @@ impl Rig {
     fn slack() -> Self {
         Self::new(|home| {
             (
-                Platform::Slack,
+                Platform::Bridge,
                 None,
-                Some(SlackConfig {
+                Some(BridgeConfig {
+                    socket: home.join("run").join("slack-bridge.sock"),
                     owner_id: SLACK_OWNER.into(),
-                    channel_id: SLACK_CHANNEL.into(),
-                    bot_token_file: home.join("secrets").join("slack-bot.token"),
-                    app_token_file: home.join("secrets").join("slack-app.token"),
                     access: Default::default(),
                 }),
             )
@@ -284,7 +283,7 @@ impl Rig {
     }
 
     fn new(
-        messenger: impl FnOnce(&Path) -> (Platform, Option<DiscordConfig>, Option<SlackConfig>),
+        messenger: impl FnOnce(&Path) -> (Platform, Option<DiscordConfig>, Option<BridgeConfig>),
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_owned();
@@ -292,7 +291,7 @@ impl Rig {
         let work_dir = root.join("work");
         std::fs::create_dir_all(home.join("secrets")).expect("home");
         std::fs::create_dir_all(&work_dir).expect("work dir");
-        let (platform, discord, slack) = messenger(&home);
+        let (platform, discord, bridge) = messenger(&home);
         let config = Config {
             messenger: platform,
             work_dir,
@@ -300,8 +299,7 @@ impl Rig {
             home,
             access_mode: AccessMode::OwnerOnly,
             discord,
-            slack,
-            bridge: None,
+            bridge,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
@@ -512,7 +510,7 @@ fn slack_message(envelope_id: &str, ts: &str, thread_ts: Option<&str>, text: &st
 async fn slack_follow_up_in_the_same_thread_is_steered_into_one_reply() {
     let mut rig = Rig::slack();
     let fake = Arc::new(FakeSlackTransport::new());
-    let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackAdapter::with_transport(
+    let adapter: Arc<dyn MessengerAdapter> = Arc::new(SlackLink::with_transport(
         fake.clone(),
         SLACK_OWNER.into(),
         SLACK_CHANNEL.into(),

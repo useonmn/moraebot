@@ -1,4 +1,4 @@
-//! Slack adapter over `FakeSlackTransport`: Socket Mode loop, acks, reconnects and sends.
+//! The bridge's `SlackLink` over `FakeSlackTransport`: Socket Mode loop, acks, reconnects and sends.
 //! Offline only. Waiting is on recorded state with a timeout; paused time is used only
 //! where time is the behavior (backoff, silence, Retry-After).
 
@@ -14,11 +14,13 @@ use moraebot::adapter::{
     InboundAttachment, MessengerAdapter,
 };
 use moraebot::files::{E_FILE_HOST, E_FILE_REMOTE, E_FILE_WRITE, Progress};
-use moraebot::slack::E_SLACK_ID;
-use moraebot::slack::{
-    E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, SlackAdapter, SlackTransport,
+use moraebot::slack_bridge::slack::E_SLACK_ID;
+use moraebot::slack_bridge::slack::{
+    E_SLACK_API, E_SLACK_AUTH, E_SLACK_RATE, E_SLACK_UPLOAD, SlackLink, SlackTransport,
 };
-use moraebot::testing::{FAKE_FILE_ID, FakeSlackTransport, SlackFileCall, UploadStep};
+use moraebot::slack_bridge::testing::{
+    FAKE_FILE_ID, FakeSlackTransport, SlackFileCall, UploadStep,
+};
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
 
@@ -30,9 +32,9 @@ async fn within<T>(bound: Duration, future: impl Future<Output = T>) -> T {
     timeout(bound, future).await.expect("timed out")
 }
 
-fn setup() -> (Arc<FakeSlackTransport>, SlackAdapter) {
+fn setup() -> (Arc<FakeSlackTransport>, SlackLink) {
     let fake = Arc::new(FakeSlackTransport::new());
-    let adapter = SlackAdapter::with_transport(fake.clone(), "U111".into(), "C222".into());
+    let adapter = SlackLink::with_transport(fake.clone(), "U111".into(), "C222".into());
     (fake, adapter)
 }
 

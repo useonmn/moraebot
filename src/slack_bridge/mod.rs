@@ -2,3 +2,5 @@
 //! side, the bridge socket to the core on the other (see `docs/bridge.md`).
 
 pub mod config;
+pub mod slack;
+pub mod testing;

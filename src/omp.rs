@@ -1914,7 +1914,6 @@ mod tests {
                 token_file: home.join("discord.token"),
                 access: Default::default(),
             }),
-            slack: None,
             bridge: None,
             omp: OmpConfig {
                 turn_timeout_minutes,
