@@ -18,11 +18,8 @@
 //! ends normally again. It never sleeps between retries either: when jev refuses a call the pass stops, every later job stays
 //! pending, and [`Observer::run`] calls [`Observer::run_once`] again later. Entries go to the
 //! memory writer as one batch per pass ([`MemoryHandle::apply_batch`], one git commit) as
-//! [`Op::AddUnique`], so a job processed twice adds nothing.
-//!
-//! An owner sentence the observer saves to `core/owner.md` or `core/boundaries.md` is named to
-//! the owner under the next reply in that conversation (owner decision on #39): the notice is
-//! stored with the settled job ([`Store::settle_memory_jobs`]) and survives a restart.
+//! [`Op::AddUnique`], so a job processed twice adds nothing. Saves are never posted in a
+//! conversation (#56): the memory writer logs each one, and the owner lists them on request.
 
 use std::collections::HashSet;
 use std::fs;
@@ -46,11 +43,10 @@ use crate::memory::{
     Outcome, Prov, Redactor, Source,
 };
 use crate::memory_commands::{says_always, says_boundary};
-use crate::memory_tools::core_note;
 use crate::omp;
 use crate::store::{
-    GroupJob, JobEnd, JobKind, LaneJob, LogLevel, LogRow, MemoryJob, MemoryNotice, Settled, Store,
-    StoreError, SubagentJob, ToolUse,
+    GroupJob, JobEnd, JobKind, LaneJob, LogLevel, LogRow, MemoryJob, Settled, Store, StoreError,
+    SubagentJob, ToolUse,
 };
 
 /// A job settled after it was processed (`detail` holds the counts).
@@ -139,18 +135,11 @@ impl Kind {
     }
 }
 
-/// One entry a job wants written, and the conversation to tell when it lands in `core/`.
-#[derive(Debug, Clone)]
-struct Planned {
-    entry: NewEntry,
-    notice: Option<String>,
-}
-
 /// What processing one job produced.
 #[derive(Debug)]
 struct Work {
     code: &'static str,
-    entries: Vec<Planned>,
+    entries: Vec<NewEntry>,
     requests: u32,
     tokens: u64,
     model: Option<String>,
@@ -434,7 +423,7 @@ impl Observer {
             })
             .collect();
         tracing::warn!(jobs = ?ids, "unreadable memory jobs failed");
-        match lock(&self.store).settle_memory_jobs(&settled, &[], now) {
+        match lock(&self.store).settle_memory_jobs(&settled, now) {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!(error = %err, "unreadable memory jobs not settled");
@@ -537,18 +526,16 @@ impl Observer {
         }
     }
 
-    /// Writes every entry of `finished` in one batch, then settles the jobs with their log rows
-    /// and the owner's core notices. False when the memory writer has stopped or the jobs could
-    /// not be settled: the pass then waits, so jev is not asked about the same jobs again at
-    /// once. A core entry that already exists from such an earlier pass (same source and text,
-    /// so the same id) still gets its notice, unless that notice is already stored.
+    /// Writes every entry of `finished` in one batch, then settles the jobs with their log
+    /// rows. False when the memory writer has stopped or the jobs could not be settled: the
+    /// pass then waits, so jev is not asked about the same jobs again at once.
     async fn write(&self, finished: Vec<(MemoryJob, Work)>, now: i64) -> bool {
         let mut ops = Vec::new();
-        let mut owners = Vec::new();
+        let mut job_of = Vec::new();
         for (index, (_, work)) in finished.iter().enumerate() {
-            for planned in &work.entries {
-                ops.push(Op::AddUnique(planned.entry.clone()));
-                owners.push((index, planned));
+            for entry in &work.entries {
+                ops.push(Op::AddUnique(entry.clone()));
+                job_of.push(index);
             }
         }
         let results = if ops.is_empty() {
@@ -565,33 +552,9 @@ impl Observer {
         };
         let mut saved = vec![0usize; finished.len()];
         let mut skipped = vec![0usize; finished.len()];
-        let mut notices = Vec::new();
-        for ((index, planned), result) in owners.into_iter().zip(results) {
+        for (index, result) in job_of.into_iter().zip(results) {
             match result {
-                Ok(Outcome::Added(added)) => {
-                    if added.created {
-                        saved[index] += 1;
-                    } else {
-                        skipped[index] += 1;
-                    }
-                    let Some(key) = &planned.notice else {
-                        continue;
-                    };
-                    if !added.bucket.is_core() {
-                        continue;
-                    }
-                    let text = core_note(&added.id, &added.bucket.label(), &planned.entry.text);
-                    // An entry this observer committed before its settle failed has no notice
-                    // yet; one the lead saved has its line in a reply already.
-                    let owed = added.created
-                        || !lock(&self.store).memory_notice_known(&text).unwrap_or(true);
-                    if owed {
-                        notices.push(MemoryNotice {
-                            conversation_key: key.clone(),
-                            text,
-                        });
-                    }
-                }
+                Ok(Outcome::Added(added)) if added.created => saved[index] += 1,
                 Ok(_) => skipped[index] += 1,
                 Err(err) => {
                     skipped[index] += 1;
@@ -629,7 +592,7 @@ impl Observer {
                 )),
             })
             .collect();
-        let result = lock(&self.store).settle_memory_jobs(&settled, &notices, now);
+        let result = lock(&self.store).settle_memory_jobs(&settled, now);
         if let Err(err) = result {
             tracing::warn!(error = %err, "memory jobs not settled; they run again later");
             return false;
@@ -731,15 +694,12 @@ impl Observer {
                 };
                 // `pick` is a sentence of this window, cut from `row.text` above: the entry
                 // is the owner's own sentence, verbatim.
-                work.entries.push(Planned {
-                    notice: bucket.is_core().then(|| row.conversation_key.clone()),
-                    entry: entry(
-                        pick.sentence,
-                        Prov::Owner,
-                        bucket,
-                        Source::row_sentence(row.id, pick.n),
-                    ),
-                });
+                work.entries.push(entry(
+                    pick.sentence,
+                    Prov::Owner,
+                    bucket,
+                    Source::row_sentence(row.id, pick.n),
+                ));
             }
         }
         Ok(())
@@ -898,10 +858,8 @@ impl Observer {
             } else {
                 place.project.clone()
             };
-            work.entries.push(Planned {
-                notice: None,
-                entry: entry(pick.sentence, prov, bucket, src.clone()),
-            });
+            work.entries
+                .push(entry(pick.sentence, prov, bucket, src.clone()));
         }
         Ok(())
     }

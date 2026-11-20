@@ -331,49 +331,23 @@ async fn observer_saves_an_owner_sentence_word_for_word() {
     assert_eq!(fx.backlog(), Backlog::default());
 }
 
-/// Owner decision on #39: a core or boundary save by the observer is named under the next
-/// reply in that conversation, and the pending note survives a restart.
+/// #56: a core or boundary save by the observer stays internal; the next reply in that
+/// conversation carries only the lead's text.
 #[tokio::test]
-async fn observer_core_save_is_shown_under_the_next_reply_even_after_a_restart() {
+async fn observer_core_save_never_reaches_the_next_reply() {
     let fx = Fixture::new().await;
     let row = fx.admit("m1", "앞으로 PR은 항상 영어로 올려.");
     fx.reply(row, None, "네", &trace(false, true));
     fx.jev.answer(save("boundary", "s0"));
-    fx.observer.run_once().await;
-    let id = fx.entries(&Bucket::Boundaries)[0].id.clone();
-    let expected = format!(
-        "[memory] saved {id} to core/boundaries: \"앞으로 PR은 항상 영어로 올려.\" (say `forget {id}` if that was not meant)"
-    );
-    assert_eq!(
-        fx.store().pending_memory_notices(KEY).unwrap(),
-        std::slice::from_ref(&expected)
-    );
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.entries(&Bucket::Boundaries).len(), 1);
 
-    // A restart: the observer and the store go away, the database stays.
-    let path = fx.config.home.join(STORE_FILE);
-    let Fixture {
-        root: _root,
-        store,
-        observer,
-        ..
-    } = fx;
-    drop(observer);
-    drop(store);
-    let mut store = Store::open(&path).unwrap();
-    let Admitted::New(next) = store
-        .admit("discord", "m2", KEY, CHANNEL, OWNER, "다음 질문")
-        .unwrap()
-    else {
-        panic!("new row");
-    };
-    store
-        .finish_group(next, "답이에요", None, None, &TurnTrace::default())
-        .unwrap();
+    let next = fx.admit("m2", "다음 질문");
+    fx.reply(next, None, "답이에요", &trace(false, true));
     assert_eq!(
-        store.get(next).unwrap().unwrap().reply.unwrap(),
-        format!("답이에요\n\n{expected}")
+        fx.store().get(next).unwrap().unwrap().reply.as_deref(),
+        Some("답이에요")
     );
-    assert!(store.pending_memory_notices(KEY).unwrap().is_empty());
 }
 
 /// Owner decision 5: jev's `core` or `boundary` answer alone does not put a sentence in core;
@@ -393,7 +367,6 @@ async fn observer_keeps_a_sentence_without_always_out_of_core() {
     let thread = fx.entries(&Bucket::Thread(KEY.into()));
     assert_eq!(thread.len(), 1, "{thread:?}");
     assert_eq!(thread[0].text, "릴리스는 금요일에 하자.");
-    assert!(fx.store().pending_memory_notices(KEY).unwrap().is_empty());
 
     // A "never" sentence may be a boundary.
     let next = fx.admit("m2", "Never force-push to main.");
@@ -420,7 +393,6 @@ async fn observer_never_makes_a_lane_sentence_the_owners() {
         Some(format!("lane={lane} seq=1").as_str())
     );
     assert_eq!(fx.bodies()[0]["state"]["kind"], "lane_result");
-    assert!(fx.store().pending_memory_notices(KEY).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -664,17 +636,6 @@ async fn observer_processing_a_job_twice_adds_nothing() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
     assert_eq!(fx.commits(), commits, "nothing new to commit");
-    // The cut pass never stored its notice (it is stored with the settle), so this one does,
-    // once (moraedang on #46).
-    let id = fx.entries(&Bucket::Owner)[0].id.clone();
-    assert_eq!(
-        fx.store().pending_memory_notices(KEY).unwrap(),
-        [moraebot::memory_tools::core_note(
-            &id,
-            &Bucket::Owner.label(),
-            "앞으로 답은 항상 한국어로 해줘."
-        )]
-    );
     let (_root, db) = fx.into_db();
     let detail: String = db
         .query_row(
@@ -686,12 +647,11 @@ async fn observer_processing_a_job_twice_adds_nothing() {
     assert!(detail.contains("saved=0 skipped=1"), "{detail}");
 }
 
-/// A failed lead turn keeps the line of its own core save on its main row (#43), and its
-/// partial job still reaches the observer. When jev picks the sentence the lead already
-/// saved, the observer adds no entry and no notice: the line is shown once, after the
-/// failure notice, and the next reply carries nothing more.
+/// A failed lead turn's partial job still reaches the observer. When jev picks the sentence
+/// the lead already saved, the observer adds no entry, and nothing about either save is
+/// stored for the conversation (#56).
 #[tokio::test]
-async fn observer_adds_no_second_line_for_a_core_save_of_a_failed_lead_turn() {
+async fn observer_adds_no_second_entry_for_a_core_save_of_a_failed_lead_turn() {
     let fx = Fixture::new().await;
     let text = "앞으로 답은 항상 한국어로 해줘.";
     let row = fx.admit("m1", text);
@@ -710,23 +670,15 @@ async fn observer_adds_no_second_line_for_a_core_save_of_a_failed_lead_turn() {
         .unwrap()
         .into_iter()
         .for_each(|r| assert!(r.is_ok()));
-    let id = fx.entries(&Bucket::Owner)[0].id.clone();
-    let note = moraebot::memory_tools::core_note(&id, &Bucket::Owner.label(), text);
     fx.store()
-        .fail_group(&[row], "E_TEST", &note, &trace(false, false))
+        .fail_group(&[row], "E_TEST", &trace(false, false))
         .unwrap();
 
     fx.jev.answer(save("core", "s0"));
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert_eq!(fx.jev.requests().len(), 1, "the partial job was judged");
     assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
-    assert!(
-        fx.store().pending_memory_notices(KEY).unwrap().is_empty(),
-        "no observer notice for the lead's own save"
-    );
-    let failed = fx.store().get(row).unwrap().unwrap();
-    assert_eq!(failed.reply.as_deref(), Some(note.as_str()));
-    assert!(!failed.text_sent, "the stored line is still owed, once");
+    assert_eq!(fx.store().get(row).unwrap().unwrap().reply, None);
 
     let next = fx.admit("m2", "다음 질문");
     fx.reply(next, None, "답이에요", &trace(false, true));
@@ -1302,10 +1254,9 @@ async fn observer_waits_when_an_unreadable_job_cannot_be_settled() {
 }
 
 /// moraedang on #46: when settling fails after the entries were written, the pass backs off
-/// instead of asking jev again, and the core entry it committed still gets its note when the
-/// job runs again.
+/// instead of asking jev again, and the job settles when it runs again.
 #[tokio::test]
-async fn observer_backs_off_when_settling_fails_and_keeps_the_core_note() {
+async fn observer_backs_off_when_settling_fails() {
     let fx = Fixture::new().await;
     let text = "앞으로 답은 항상 한국어로 해줘.";
     owner_turn(&fx, "m1", text);
@@ -1317,14 +1268,11 @@ async fn observer_backs_off_when_settling_fails_and_keeps_the_core_note() {
     assert_eq!(pass, Pass::Waiting { until: None });
     assert_eq!(fx.jev.requests().len(), 1, "jev is not asked again");
     assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
-    assert!(fx.store().pending_memory_notices(KEY).unwrap().is_empty());
 
     fx.with_store_closed("DROP TRIGGER fail_settle");
     fx.jev.answer(save("core", "s0"));
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
-    let id = fx.entries(&Bucket::Owner)[0].id.clone();
-    let note = moraebot::memory_tools::core_note(&id, &Bucket::Owner.label(), text);
-    assert_eq!(fx.store().pending_memory_notices(KEY).unwrap(), [note]);
+    assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
     assert_eq!(fx.backlog(), Backlog::default());
 }
 
@@ -1525,7 +1473,7 @@ async fn gateway_observes_a_reply_end_to_end() {
         "{owner_md}"
     );
 
-    // The owner sees the observer's core save under the next reply.
+    // The observer's core save stays internal: the next reply names nothing (#56).
     adapter.inject(dm("1300000000000000002", "고마워")).await;
     tokio::time::timeout(BOUND, adapter.wait_for_send(2))
         .await
@@ -1544,9 +1492,9 @@ async fn gateway_observes_a_reply_end_to_end() {
             _ => None,
         })
         .collect();
-    assert!(!sends[0].contains("[memory] saved"), "{sends:?}");
+    assert_eq!(sends.len(), 2, "{sends:?}");
     assert!(
-        sends[1].contains("[memory] saved m-") && sends[1].contains("to core/owner"),
+        sends.iter().all(|text| !text.contains("[memory]")),
         "{sends:?}"
     );
 }

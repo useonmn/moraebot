@@ -4659,54 +4659,42 @@ async fn core_save_turn(root: &Path, end: &str, before: impl FnOnce(&Harness)) -
     (h, id)
 }
 
-/// The saved-note line of `sends`, which must be the last line posted in thread 444.
-fn last_core_note(sends: &[(String, String)]) -> &str {
-    let (channel, text) = sends.last().expect("a message was posted");
-    assert_eq!(channel, "444");
-    let line = text.lines().last().unwrap_or_default();
+/// No message in `sends` names a memory save.
+fn assert_no_memory_note(sends: &[(String, String)]) {
     assert!(
-        line.starts_with("[memory] saved m-")
-            && line.contains(" to core/owner: \"릴리스는 금요일에 하자\""),
+        sends.iter().all(|(_, text)| !text.contains("[memory]")),
         "{sends:?}"
     );
-    line
 }
 
 #[tokio::test]
-async fn a_core_save_in_a_failed_turn_is_posted_after_the_notice() {
+async fn a_core_save_in_a_failed_turn_posts_only_the_notice() {
     let sends = core_save_then("error").await;
-    let note = last_core_note(&sends);
-    assert_eq!(sends.last().map(|(_, text)| text.as_str()), Some(note));
+    assert_no_memory_note(&sends);
     assert_eq!(
-        sends[..sends.len() - 1],
+        sends,
         [("444".to_owned(), notice_text(N_FAILED).to_owned())]
     );
 }
 
 #[tokio::test]
-async fn a_core_save_in_an_interrupted_turn_is_posted_after_the_notice() {
+async fn a_core_save_in_an_interrupted_turn_posts_only_the_notice() {
     let sends = core_save_then("hang").await;
-    let note = last_core_note(&sends);
-    assert_eq!(sends.last().map(|(_, text)| text.as_str()), Some(note));
+    assert_no_memory_note(&sends);
     assert_eq!(
-        sends[..sends.len() - 1],
+        sends,
         [("444".to_owned(), notice_text(N_INTERRUPTED).to_owned())]
     );
 }
 
 #[tokio::test]
-async fn a_core_save_in_a_replied_turn_follows_the_reply() {
+async fn a_core_save_in_a_replied_turn_leaves_the_reply_alone() {
     let sends = core_save_then("").await;
-    let note = last_core_note(&sends);
+    assert_no_memory_note(&sends);
     assert_eq!(sends.len(), 1, "one message: {sends:?}");
-    let reply = sends[0]
-        .1
-        .strip_suffix(note)
-        .expect("the note ends the reply");
-    assert!(
-        reply.starts_with("echo: ") && reply.ends_with("\n\n"),
-        "{reply:?}"
-    );
+    let reply = &sends[0].1;
+    assert!(reply.starts_with("echo: "), "{reply:?}");
+    assert!(!reply.ends_with('\n'), "nothing is appended: {reply:?}");
 }
 
 // --- Memory jobs (P2 stage 1) ---
@@ -4778,31 +4766,6 @@ async fn memory_job_exists_after_a_failed_turn() {
 }
 
 #[tokio::test]
-async fn the_core_save_of_a_failed_turn_is_resent_when_its_send_failed() {
-    let dir = tempfile::tempdir().unwrap();
-    let (h, id) = core_save_turn(dir.path(), "error", |h| {
-        h.adapter.fail_next_send_containing("[memory] saved m-")
-    })
-    .await;
-    assert_eq!(h.row(id).state, State::Failed);
-    assert!(!h.row(id).text_sent, "the notes are still owed");
-
-    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 1);
-    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
-    assert!(h.row(id).text_sent);
-    let sends = h.sends();
-    let note = last_core_note(&sends).to_owned();
-    let failed = ("444".to_owned(), notice_text(N_FAILED).to_owned());
-    let noted = ("444".to_owned(), note);
-    assert_eq!(
-        sends,
-        [failed, noted.clone(), noted],
-        "the notice, the failed notes send, then the notes once"
-    );
-    h.close().await;
-}
-
-#[tokio::test]
 async fn memory_job_exists_after_a_timed_out_turn() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
@@ -4822,27 +4785,6 @@ async fn memory_job_exists_after_a_timed_out_turn() {
     assert!(
         group_trace(&jobs[0]).is_some(),
         "a timed-out turn keeps its trace"
-    );
-    h.close().await;
-}
-
-#[tokio::test]
-async fn the_core_save_of_an_interrupted_turn_waits_for_its_notice_and_is_resent() {
-    let dir = tempfile::tempdir().unwrap();
-    // The interrupted notice is the first send; it fails, so the notes wait for it.
-    let (h, id) = core_save_turn(dir.path(), "hang", |h| h.adapter.fail_next_send()).await;
-    let interrupted = ("444".to_owned(), notice_text(N_INTERRUPTED).to_owned());
-    assert_eq!(h.sends(), std::slice::from_ref(&interrupted));
-
-    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 1);
-    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
-    let row = h.row(id);
-    assert!(row.notice_sent && row.text_sent, "{row:?}");
-    let sends = h.sends();
-    let note = last_core_note(&sends).to_owned();
-    assert_eq!(
-        sends,
-        [interrupted.clone(), interrupted, ("444".to_owned(), note)]
     );
     h.close().await;
 }
@@ -4928,25 +4870,17 @@ async fn memory_job_of_a_lane_result_turn_lists_the_steered_owner_row() {
 }
 
 #[tokio::test]
-async fn the_core_save_of_a_failed_turn_is_posted_once_after_a_restart() {
+async fn a_core_save_of_a_failed_turn_is_not_posted_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let (h, id) = core_save_turn(dir.path(), "error", |h| {
-        h.adapter.fail_next_send_containing("[memory] saved m-")
-    })
-    .await;
+    let (h, id) = core_save_turn(dir.path(), "error", |h| h.adapter.fail_next_send()).await;
+    assert_eq!(h.row(id).state, State::Failed);
+    assert_eq!(h.row(id).reply, None, "nothing is stored to post later");
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
     h.close().await;
 
     let h = Harness::open(dir.path(), "ok");
     bounded(h.dispatcher.startup()).await.unwrap();
-    let sends = h.sends();
-    last_core_note(&sends);
-    assert_eq!(sends.len(), 1, "only the notes: {sends:?}");
-    assert!(h.row(id).text_sent);
-    drop(h);
-
-    let h = Harness::open(dir.path(), "ok");
-    bounded(h.dispatcher.startup()).await.unwrap();
-    assert!(h.sends().is_empty(), "the notes are posted exactly once");
+    assert!(h.sends().is_empty(), "{:?}", h.sends());
 }
 
 /// A [`FakeAdapter`] as a bridge adapter looks to the dispatcher: an optional home target

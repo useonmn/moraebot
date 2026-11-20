@@ -167,14 +167,11 @@ impl TurnReport {
 
 /// Result of one lead turn: the main row's report (with every file `send_file` queued
 /// during the turn), when a row was steered into it, that row's id and outcome, and the
-/// turn's memory notes ([`TurnContext::memory_notes`]) and its content-free trace.
+/// turn's content-free trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReport {
     pub main: TurnReport,
     pub steered: Option<(i64, Outcome)>,
-    /// Shown to the owner whatever the outcome: a `memory_write` to core or boundary is
-    /// committed even when the turn fails or is interrupted.
-    pub memory_notes: Vec<String>,
     /// The tools the group started and whether its session settled, for the memory job;
     /// also present for a failed or timed-out turn.
     pub trace: TurnTrace,
@@ -193,10 +190,6 @@ pub struct TurnContext {
     pub sender: Sender,
     pub steered_row_id: Option<i64>,
     pub outside_tools: bool,
-    /// Owner sentences `memory_write` saved to `core` or `boundary`, one line each, so the
-    /// owner sees every standing rule the lead saved: dispatch posts them under the group's
-    /// reply, or after its failure notice when it did not reply ([`GroupReport::memory_notes`]).
-    pub memory_notes: Vec<String>,
     /// Distinct tools the lead started in this group (names and sources only), first seen
     /// first, at most [`MAX_TRACE_TOOLS`]; they become the group's [`TurnTrace`].
     pub tools: Vec<ToolUse>,
@@ -213,7 +206,6 @@ impl TurnContext {
             sender,
             steered_row_id: None,
             outside_tools: false,
-            memory_notes: Vec::new(),
             tools: Vec::new(),
             task: false,
         }
@@ -1169,7 +1161,6 @@ impl OmpManager {
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
                         steered: None,
-                        memory_notes: Vec::new(),
                         trace: TurnTrace::default(),
                     };
                 }
@@ -1288,16 +1279,15 @@ impl OmpManager {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
         }
-        let (memory_notes, tools, task) = lock(&self.turn)
+        let (tools, task) = lock(&self.turn)
             .take()
-            .map(|turn| (turn.memory_notes, turn.tools, turn.task))
+            .map(|turn| (turn.tools, turn.task))
             .unwrap_or_default();
         lock(&self.lead_watch).end();
         self.running.send_replace(None);
         GroupReport {
             main: report(key, main, files),
             steered,
-            memory_notes,
             trace: TurnTrace {
                 tools,
                 task,
