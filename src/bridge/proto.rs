@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::adapter::{
-    E_ADAPTER_DM, E_ADAPTER_EDIT, E_ADAPTER_FILES, E_ADAPTER_SEND, E_ADAPTER_START,
-    E_ADAPTER_THREAD, E_ADAPTER_TYPING, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
+    E_ADAPTER_DM, E_ADAPTER_EDIT, E_ADAPTER_FILES, E_ADAPTER_SEND, E_ADAPTER_THREAD,
+    E_ADAPTER_TYPING, E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED,
 };
 use crate::files::{
     E_FILE_DENIED, E_FILE_FETCH, E_FILE_HOST, E_FILE_INCOMPLETE, E_FILE_PATH, E_FILE_REMOTE,
-    E_FILE_TOO_LARGE, E_FILE_TOO_MANY, E_FILE_UPLOAD_TIMEOUT, E_FILE_WRITE,
+    E_FILE_TOO_LARGE, E_FILE_WRITE,
 };
 
 /// The contract version both sides send in `hello` and `hello_ok`.
@@ -449,41 +449,41 @@ impl RequestKind {
     }
 }
 
-/// Codes the core knows: the adapter codes, the file codes and the link codes.
-const KNOWN_CODES: &[&str] = &[
-    E_ADAPTER_SEND,
-    E_ADAPTER_THREAD,
-    E_ADAPTER_TYPING,
-    E_ADAPTER_START,
-    E_ADAPTER_FILES,
-    E_ADAPTER_UPLOAD,
-    E_ADAPTER_UPLOAD_DENIED,
-    E_ADAPTER_DM,
-    E_ADAPTER_EDIT,
-    E_FILE_TOO_MANY,
-    E_FILE_FETCH,
-    E_FILE_HOST,
-    E_FILE_REMOTE,
-    E_FILE_WRITE,
-    E_FILE_PATH,
-    E_FILE_INCOMPLETE,
-    E_FILE_DENIED,
-    E_FILE_UPLOAD_TIMEOUT,
-    E_FILE_TOO_LARGE,
-    super::E_BRIDGE_PROTO,
-    super::E_BRIDGE_BUSY,
-    super::E_BRIDGE_UNSUPPORTED,
-    super::E_BRIDGE_BAD_REQUEST,
-    super::E_BRIDGE_PEER,
-    super::E_BRIDGE_DOWN,
-    super::E_BRIDGE_PLATFORM,
-];
+impl RequestKind {
+    /// The codes a bridge `err` answering this request may carry as they are: the
+    /// request's own adapter code, the upload codes for `file` and the per-download file
+    /// codes for `fetch`. Link codes, codes the core makes itself and codes of other
+    /// operations never pass, so a confused bridge cannot steer the dispatcher's
+    /// branches (`E_ADAPTER_UPLOAD_DENIED`, `E_FILE_*`) from the wrong operation.
+    fn passed_codes(self) -> &'static [&'static str] {
+        match self {
+            RequestKind::Send | RequestKind::React => &[E_ADAPTER_SEND],
+            RequestKind::Edit => &[E_ADAPTER_EDIT],
+            RequestKind::Thread => &[E_ADAPTER_THREAD],
+            RequestKind::Dm => &[E_ADAPTER_DM],
+            RequestKind::Status => &[E_ADAPTER_TYPING],
+            RequestKind::File => &[E_ADAPTER_UPLOAD, E_ADAPTER_UPLOAD_DENIED, E_ADAPTER_FILES],
+            RequestKind::Fetch => &[
+                E_ADAPTER_FILES,
+                E_FILE_FETCH,
+                E_FILE_HOST,
+                E_FILE_REMOTE,
+                E_FILE_WRITE,
+                E_FILE_PATH,
+                E_FILE_INCOMPLETE,
+                E_FILE_DENIED,
+                E_FILE_TOO_LARGE,
+            ],
+        }
+    }
+}
 
 /// The code and message the core reports for an `err` answering a `kind` request.
-/// A known code passes through; an unknown one becomes the request's default code, with
-/// the original code kept at the front of the message.
+/// A code of the request's family ([`RequestKind::passed_codes`]) passes through; any
+/// other becomes the request's default code, with the original code kept at the front
+/// of the message.
 pub fn map_error(kind: RequestKind, code: &str, message: &str) -> (&'static str, String) {
-    match KNOWN_CODES.iter().find(|known| **known == code) {
+    match kind.passed_codes().iter().find(|known| **known == code) {
         Some(known) => (known, message.to_owned()),
         None => (kind.default_code(), format!("{code}: {message}")),
     }
@@ -682,6 +682,43 @@ mod tests {
         ] {
             assert_eq!(map_error(kind, "E_NEW", "m").0, code);
         }
+    }
+
+    #[test]
+    fn known_codes_of_another_operation_or_the_link_do_not_pass() {
+        use crate::adapter::E_ADAPTER_START;
+        use crate::files::{E_FILE_TOO_MANY, E_FILE_UPLOAD_TIMEOUT};
+        // Codes the dispatcher branches on, from the wrong operation.
+        for (kind, code) in [
+            (RequestKind::Send, E_ADAPTER_UPLOAD_DENIED),
+            (RequestKind::Send, E_FILE_DENIED),
+            (RequestKind::Send, E_ADAPTER_START),
+            (RequestKind::Edit, E_ADAPTER_SEND),
+            (RequestKind::Fetch, E_ADAPTER_UPLOAD_DENIED),
+            (RequestKind::Fetch, E_FILE_UPLOAD_TIMEOUT),
+            (RequestKind::Fetch, E_FILE_TOO_MANY),
+            (RequestKind::File, E_FILE_TOO_LARGE),
+            (RequestKind::File, E_FILE_DENIED),
+        ] {
+            assert_eq!(
+                map_error(kind, code, "m"),
+                (kind.default_code(), format!("{code}: m")),
+                "{kind:?} {code}"
+            );
+        }
+        // Link codes, the core-made ones included, never pass.
+        for code in [
+            super::super::E_BRIDGE_DOWN,
+            super::super::E_BRIDGE_PLATFORM,
+            super::super::E_BRIDGE_UNSUPPORTED,
+            super::super::E_BRIDGE_BAD_REQUEST,
+        ] {
+            assert_eq!(map_error(RequestKind::Send, code, "m").0, E_ADAPTER_SEND);
+        }
+        assert_eq!(
+            map_error(RequestKind::Fetch, E_FILE_DENIED, "login page"),
+            (E_FILE_DENIED, "login page".to_owned())
+        );
     }
 
     async fn read_all(input: Vec<u8>) -> Vec<Result<Decoded, String>> {
