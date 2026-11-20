@@ -29,6 +29,7 @@
 //! ([`from_intent`]). Any jev error means "not a command", so the rules alone serve the owner
 //! while jev is off, paused, waiting or slow.
 
+use crate::consolidate;
 use crate::jev::{Answer as JevAnswer, Jev, Question, Request};
 use crate::memory::{
     self, Bucket, E_MEMORY_ARCHIVED, E_MEMORY_NOT_ARCHIVED, E_MEMORY_NOT_FOUND, Entry, Found,
@@ -374,14 +375,47 @@ pub(crate) fn says_always(text: &str) -> bool {
         || words.windows(3).any(|w| w == ["from", "now", "on"])
 }
 
-/// Whether `text` corrects the bot: it holds one of `patterns` as whole words in order, so
-/// `몇 번` matches "몇 번 말해" but not "몇 번째 줄" (moraedang on #59). Case is ignored.
+/// Whether `text` corrects the bot: it holds one of `patterns` (see [`holds_phrase`]), so
+/// `하지 말라고 했` matches "하지 말라고 했잖아" and `몇 번 말해` does not match "몇 번 버스 타?"
+/// (moraedang on #59 and #65). Case is ignored.
 pub(crate) fn says_correction(text: &str, patterns: &[String]) -> bool {
     let have = words(text);
-    patterns.iter().any(|pattern| {
-        let wanted = words(pattern);
-        !wanted.is_empty() && have.windows(wanted.len()).any(|w| w == wanted.as_slice())
-    })
+    patterns.iter().any(|pattern| holds_phrase(&have, pattern))
+}
+
+/// Whether the words `have` hold `pattern`: its parts (split at `…` or `...`) in order, any
+/// words between parts, the words of a part next to each other. Each word must be whole, but
+/// the pattern's very last word only has to start a word, so a Korean ending may follow it.
+/// A pattern without words matches nothing.
+fn holds_phrase(have: &[String], pattern: &str) -> bool {
+    let parts: Vec<Vec<String>> = pattern
+        .replace("...", "…")
+        .split('…')
+        .map(words)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(last) = parts.len().checked_sub(1) else {
+        return false;
+    };
+    let mut from = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let fits = |at: usize| {
+            part.iter().enumerate().all(|(k, wanted)| {
+                let word = &have[at + k];
+                if i == last && k == part.len() - 1 {
+                    word.starts_with(wanted.as_str())
+                } else {
+                    word == wanted
+                }
+            })
+        };
+        let end = have.len().saturating_sub(part.len());
+        match (from..=end).find(|&at| at + part.len() <= have.len() && fits(at)) {
+            Some(at) => from = at + part.len(),
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Whether `text` may be a boundary the observer saves without a command: it holds `always`,
@@ -835,18 +869,10 @@ fn show_all(memory: &MemoryHandle, key: &str, status: &str) -> String {
 
 /// The live self readings with their ids, then how many observations no reading names yet.
 fn show_self(memory: &MemoryHandle) -> String {
-    let state = memory::self_state(memory.root());
-    let today = memory.today();
-    let readings: Vec<&Entry> = state
-        .readings
-        .iter()
-        .filter(|e| !e.expired(today))
-        .collect();
-    let pending = state
-        .observations
-        .iter()
-        .filter(|e| !state.cited.contains(&e.id))
-        .count();
+    // The same offer consolidation makes, so "waiting" counts what it will still be offered.
+    let offer = consolidate::offer(&memory::self_state(memory.root()), memory.today());
+    let readings = &offer.readings;
+    let pending = offer.pending.len();
     let mut out = Vec::new();
     if readings.is_empty() {
         out.push("No readings about myself yet.".to_owned());
@@ -1268,23 +1294,39 @@ mod tests {
     fn correction_phrases_are_whole_words_in_order() {
         let patterns = crate::config::SelfConfig::default().correction_patterns;
         for text in [
-            "왜 또 영어로 답해?",
             "몇 번 말해야 돼",
+            "이거 몇 번을 말해야 알아들어?",
+            "몇 번째 말하는 거야",
+            "왜 또 영어로 답해?",
+            "또 그러네",
             "그러지 마 진짜",
-            "Why did you push to main?",
+            "그건 하지 말라고 했잖아",
+            "I told you to run the tests first.",
+            "Why did you push to main again?",
             "Please STOP DOING that.",
+            "Don't do that again.",
         ] {
             assert!(says_correction(text, &patterns), "{text}");
         }
+        // moraedang on #65: neutral questions that bare `몇 번` or `why did you` caught.
         for text in [
+            "몇 번 출구야?",
+            "몇 번 버스 타?",
+            "PR 몇 번이야?",
+            "몇 번 했어?",
+            "why did you pick serde here?",
             "몇 번째 줄이야?",
             "또 왜 그래",
-            "why you did that is fine",
             "a nonstop doing",
         ] {
             assert!(!says_correction(text, &patterns), "{text}");
         }
         assert!(!says_correction("anything", &[]));
+        assert!(!says_correction("anything", &["…".to_owned()]));
+        // `...` is the same gap as `…`, and the gap keeps the parts' order.
+        let gap = ["why did you ... again".to_owned()];
+        assert!(says_correction("why did you do it again", &gap));
+        assert!(!says_correction("again, why did you do it", &gap));
     }
 
     #[test]
@@ -1302,9 +1344,29 @@ mod tests {
     async fn show_self_lists_live_readings_and_counts_pending_corrections() {
         let dir = tempfile::tempdir().expect("tempdir");
         let today = Day::from_ymd(2026, 11, 21).expect("day");
-        let store = MemoryStore::open(dir.path(), Redactor::default(), Arc::new(move || today))
-            .expect("open");
+        let clock = Arc::new(std::sync::Mutex::new(today.plus_days(-40)));
+        let read = Arc::clone(&clock);
+        let store = MemoryStore::open(
+            dir.path(),
+            Redactor::default(),
+            Arc::new(move || *read.lock().expect("clock")),
+        )
+        .expect("open");
         let memory = MemoryHandle::spawn(store).expect("spawn");
+        // moraedang on #65: a correction older than 30 days is never offered again, so it
+        // does not count as waiting.
+        memory
+            .add(NewEntry {
+                text: "I was slow".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::SelfObs,
+                src: Source::observation(9, 0, 9, false),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add");
+        *clock.lock().expect("clock") = today;
         let empty = run(&memory, "k", 1, "", Command::ShowSelf).await.reply;
         assert!(
             empty.starts_with(

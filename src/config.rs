@@ -291,13 +291,23 @@ pub struct MemoryConfig {
     pub self_file: SelfConfig,
 }
 
+impl MemoryConfig {
+    /// Whether the self file runs: `[memory.self] enabled` and jev turned on. With jev off
+    /// (the default) moraebot records no correction, runs no consolidation and adds no self
+    /// block, so a default install starts no summarizer child for it (moraedang on #65).
+    pub fn self_file_on(&self) -> bool {
+        self.self_file.enabled && self.jev.enabled
+    }
+}
+
 /// The `[memory.self]` settings: the bot's self file (#59).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelfConfig {
     /// Whether owner corrections are recorded and promoted into the self block.
     pub enabled: bool,
-    /// Phrases that make an owner sentence a correction of the bot. Each matches as whole
-    /// words in order (`몇 번` does not match `몇 번째`); case is ignored.
+    /// Phrases that make an owner sentence a correction of the bot. Each matches as words in
+    /// order, the last one as a word start so Korean endings still match (`하지 말라고 했`
+    /// matches `하지 말라고 했잖아`); `…` or `...` allows any words in between. Case is ignored.
     pub correction_patterns: Vec<String>,
 }
 
@@ -306,13 +316,17 @@ impl Default for SelfConfig {
         Self {
             enabled: true,
             correction_patterns: [
+                "몇 번 말해",
+                "몇 번을 말해",
+                "몇 번째 말하",
                 "왜 또",
+                "또 그러",
                 "그러지 마",
-                "그러지 말라고",
-                "하지 말라고",
-                "몇 번",
-                "why did you",
+                "하지 말라고 했",
+                "I told you",
+                "why did you … again",
                 "stop doing",
+                "don't do that again",
             ]
             .iter()
             .map(|s| (*s).to_owned())

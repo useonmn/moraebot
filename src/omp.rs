@@ -1392,7 +1392,7 @@ impl OmpManager {
         };
         let (root, today) = (self.config.memory_dir(), (self.memory_clock)());
         let mut text = append_block(text, &core_memory_block(&root, today));
-        if self.config.memory.self_file.enabled {
+        if self.config.memory.self_file_on() {
             text = append_block(text, &self_memory_block(&root, today));
         }
         (text, refused)
@@ -2103,6 +2103,7 @@ mod tests {
         // `prompt` restarts the settled lead when this text changes.
         let (_dir, manager) = manager_with(None);
         let mut manager = manager.with_memory_clock(qa_clock("2026-11-20"));
+        manager.config.memory.jev.enabled = true;
         let mut store = qa_memory(&manager);
         let rule = store
             .add(qa_owner("Use rebase", memory::Bucket::Owner, 1))
@@ -2129,6 +2130,10 @@ mod tests {
         assert_eq!(after, format!("{core}\n\n{own}"));
         assert!(core.contains(&rule.id));
 
+        // moraedang on #65: with jev off (the default) the lead prompt is what it was before.
+        manager.config.memory.jev.enabled = false;
+        assert_eq!(manager.lead_append().0, before, "jev off, no self block");
+        manager.config.memory.jev.enabled = true;
         manager.config.memory.self_file.enabled = false;
         assert_eq!(
             manager.lead_append().0,

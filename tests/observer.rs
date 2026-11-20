@@ -2040,16 +2040,17 @@ async fn observer_adds_nothing_for_a_lane_sentence_the_lead_already_saved() {
     assert_eq!(texts(&fx, &Bucket::Thread(KEY.into())), [text]);
 }
 
-/// #59: an owner sentence that corrects the bot becomes a summarized self observation, with
-/// jev off too; `firm=1` comes from the owner's own always or never word.
+/// #59: with jev on, an owner sentence that corrects the bot becomes a summarized self
+/// observation; `firm=1` comes from the owner's own always or never word.
 #[tokio::test]
 async fn observer_records_the_owners_corrections_as_self_observations() {
-    let fx = Fixture::with(|config| config.memory.jev.enabled = false).await;
+    let fx = Fixture::new().await;
     let row = owner_turn(
         &fx,
         "m1",
-        "왜 또 영어로 답해? 앞으로 절대 그러지 마. 몇 번째 줄이야?",
+        "왜 또 영어로 답해? 앞으로 절대 그러지 마. 몇 번 버스 타?",
     );
+    fx.jev.answer(NOTHING.clone());
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let saved = fx.entries(&Bucket::SelfObs);
     let got: Vec<(&str, Option<&str>, Prov)> = saved
@@ -2079,19 +2080,52 @@ async fn observer_records_the_owners_corrections_as_self_observations() {
 
 #[tokio::test]
 async fn observer_never_records_a_lane_correction_or_one_with_the_self_file_off() {
-    let fx = Fixture::with(|config| config.memory.jev.enabled = false).await;
-    fx.lane("call-1", None, "왜 또 그러지 마. Why did you push?");
+    let fx = Fixture::new().await;
+    fx.lane("call-1", None, "왜 또 그러지 마. I told you so.");
+    // A lane window offers only the thread and project buckets.
+    fx.jev.answer(json!({
+        "save": {"type": "noul", "noul": 0.0},
+        "bucket": {"type": "choice", "choice": "thread"},
+        "span": {"type": "choice", "choice": "none"},
+    }));
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert!(fx.entries(&Bucket::SelfObs).is_empty());
 
-    let fx = Fixture::with(|config| {
-        config.memory.jev.enabled = false;
-        config.memory.self_file.enabled = false;
-    })
-    .await;
+    let fx = Fixture::with(|config| config.memory.self_file.enabled = false).await;
     owner_turn(&fx, "m1", "왜 또 영어로 답해?");
+    fx.jev.answer(NOTHING.clone());
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert!(fx.entries(&Bucket::SelfObs).is_empty());
+}
+
+/// moraedang on #65: with jev off (the default) a correction starts no summarizer child, so a
+/// summarizer outage cannot hold up jev-off jobs; they settle as before this PR.
+#[tokio::test]
+async fn observer_with_jev_off_records_nothing_and_never_waits_on_the_summarizer() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("fake-omp.log");
+    let fx = Fixture::with(|config| config.memory.jev.enabled = false)
+        .await
+        .with_summarizer(&[
+            ("FAKE_OMP_MODE", "error"),
+            ("FAKE_OMP_LOG", log.to_str().unwrap()),
+        ]);
+    owner_turn(&fx, "m1", "왜 또 영어로 답해? 앞으로 절대 그러지 마.");
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.backlog(), Backlog::default(), "the job settled at once");
+    assert!(
+        fx.store()
+            .memory_logged(
+                M_JEV_OFF,
+                "kind=group saved=0 skipped=0 requests=0 tokens=0"
+            )
+            .unwrap()
+    );
+    assert!(fx.entries(&Bucket::SelfObs).is_empty());
+    // Quiet for long enough: still no consolidation call.
+    fx.set_clock(fx.t0 + 11 * 60);
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(!log.exists(), "no summarizer child started");
 }
 
 /// Seeds one self observation the way the observer saves it.

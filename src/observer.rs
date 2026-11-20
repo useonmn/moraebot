@@ -23,7 +23,8 @@
 //! - A `group` job also records the owner's corrections of the bot (#59): an owner sentence
 //!   that holds a `[memory.self] correction_patterns` phrase as whole words becomes a summary
 //!   in `self/observations.md`, its source marked `firm=1` when the sentence itself holds an
-//!   always or never word. This runs with jev off too; lane, subagent and tool text never
+//!   always or never word. It runs only while jev is on (`MemoryConfig::self_file_on`), so a
+//!   default install starts no summarizer child for it; lane, subagent and tool text never
 //!   becomes an observation. Once a day, while the lead is quiet, [`crate::consolidate`]
 //!   promotes observations into `self/self.md`.
 //! - A `scan` job, and every group and lane job, first scans a session folder for subagent
@@ -825,7 +826,7 @@ impl Observer {
         let Some(turn) = group.rows.first().map(|row| row.id) else {
             return Ok(());
         };
-        if !settings.enabled {
+        if !self.config.memory.self_file_on() {
             return Ok(());
         }
         let owner_rows = group.rows.iter().filter(|row| row.origin == "owner");
@@ -858,7 +859,7 @@ impl Observer {
     /// ([`M_SELF_CONSOLIDATED`]) once it ran, even when its call failed: the observations then
     /// wait for the next day and `self/self.md` stays as it is.
     async fn consolidate_self(&self, now: i64) {
-        if !self.config.memory.self_file.enabled {
+        if !self.config.memory.self_file_on() {
             return;
         }
         let today = self.memory.today();

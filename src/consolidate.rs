@@ -98,7 +98,8 @@ fn firm(entry: &Entry) -> bool {
     entry
         .src
         .as_deref()
-        .is_some_and(|src| src.split(' ').any(|part| part == "firm=1"))
+        .and_then(|src| Source::new(src).ok())
+        .is_some_and(|src| src.is_firm())
 }
 
 /// The message of the consolidation call for `offer`.
@@ -295,6 +296,25 @@ mod tests {
             ["m-00000b"],
             "too old, already cited and lane lines stay out"
         );
+    }
+
+    #[test]
+    fn the_newest_observations_are_offered_up_to_the_cap() {
+        let many: Vec<Entry> = (0..MAX_OFFERED + 2)
+            .map(|n| obs(&format!("m-{n:06x}"), "2026-11-20", false))
+            .collect();
+        let offer = offer(&state(many, vec![], &[]), day(TODAY));
+        assert_eq!(offer.pending.len(), MAX_OFFERED);
+        assert_eq!(offer.pending[0].id, "m-000002", "the oldest two wait");
+    }
+
+    #[test]
+    fn the_firm_mark_is_read_from_the_source() {
+        assert!(firm(&obs("m-00000a", TODAY, true)));
+        assert!(!firm(&obs("m-00000a", TODAY, false)));
+        let mut odd = obs("m-00000a", TODAY, false);
+        odd.src = Some("obs row=1 s=0 turn=1 firm=10".to_owned());
+        assert!(!firm(&odd));
     }
 
     #[test]
