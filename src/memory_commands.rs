@@ -335,7 +335,7 @@ fn strip_always_prefix(text: &str) -> (bool, &str) {
 
 /// Whether an [`ALWAYS_WORDS`] word is anywhere in `text`: `항상` as a substring, `always` as a
 /// whole word.
-fn says_always(text: &str) -> bool {
+pub(crate) fn says_always(text: &str) -> bool {
     let lower = text.to_lowercase();
     ALWAYS_WORDS.iter().any(|word| {
         if word.is_ascii() {
@@ -555,7 +555,7 @@ fn classify_request(model: &str, sentences: &[(u32, String)]) -> Request {
 }
 
 /// Asks jev whether owner message `text` is a memory request: one call with the classify
-/// timeout, no retry. The sentences the redactor would change are not sent. `None` on any jev
+/// timeout, no retry; a timeout leaves jev's gate as it was ([`Jev::ask_quick`]). The sentences the redactor would change are not sent. `None` on any jev
 /// error, below `classify_threshold`, on intent `none`, or when [`from_intent`] finds an
 /// argument missing.
 pub async fn classify(jev: &Jev, redactor: &Redactor, text: &str) -> Option<Command> {
@@ -568,7 +568,7 @@ pub async fn classify(jev: &Jev, redactor: &Redactor, text: &str) -> Option<Comm
     }
     let config = jev.config();
     let request = classify_request(&config.model, &sentences);
-    let response = match jev.ask(&request, config.classify_timeout()).await {
+    let response = match jev.ask_quick(&request, config.classify_timeout()).await {
         Ok(response) => response,
         Err(err) => {
             tracing::info!(error = %err, "memory request not classified; rules only");
@@ -600,7 +600,7 @@ pub async fn classify(jev: &Jev, redactor: &Redactor, text: &str) -> Option<Comm
 }
 
 /// Whether a rule says not to do something.
-fn says_dont(text: &str) -> bool {
+pub(crate) fn says_dont(text: &str) -> bool {
     let lower = text.to_lowercase();
     [
         "하지 마",

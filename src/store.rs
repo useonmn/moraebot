@@ -464,6 +464,14 @@ impl JobPayload {
     }
 }
 
+/// What [`Store::pending_memory_jobs`] read: the jobs, and the ids of pending rows whose kind or
+/// payload does not decode.
+#[derive(Debug, Default)]
+pub struct PendingJobs {
+    pub jobs: Vec<MemoryJob>,
+    pub unreadable: Vec<i64>,
+}
+
 /// A pending memory job ([`Store::pending_memory_jobs`]). Times are unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryJob {
@@ -608,6 +616,7 @@ CREATE TABLE IF NOT EXISTS memory_log(
 CREATE TABLE IF NOT EXISTS memory_cursor(
     path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
     seen_at INTEGER NOT NULL
 );
@@ -887,8 +896,9 @@ impl Store {
         }
     }
 
-    /// Up to `limit` pending memory jobs, oldest first.
-    pub fn pending_memory_jobs(&self, limit: usize) -> Result<Vec<MemoryJob>, StoreError> {
+    /// Up to `limit` pending memory jobs, oldest first. A row whose kind or payload does not
+    /// decode is returned by id in `unreadable`, so one bad row never hides the others.
+    pub fn pending_memory_jobs(&self, limit: usize) -> Result<PendingJobs, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, partial, payload, attempts, created_at FROM memory_jobs
              WHERE state = 'pending' ORDER BY id LIMIT ?1",
@@ -905,23 +915,25 @@ impl Store {
                 ))
             })?
             .collect::<Result<_, _>>()?;
-        rows.into_iter()
-            .map(|(id, kind, partial, payload, attempts, created_at)| {
-                let kind =
-                    JobKind::parse(&kind).ok_or(StoreError::Invalid("bad memory job kind"))?;
-                let payload = payload
-                    .and_then(|json| JobPayload::parse(kind, &json).ok())
-                    .ok_or(StoreError::Invalid("bad memory job payload"))?;
-                Ok(MemoryJob {
+        let mut pending = PendingJobs::default();
+        for (id, kind, partial, payload, attempts, created_at) in rows {
+            let decoded = JobKind::parse(&kind).and_then(|kind| {
+                let payload = JobPayload::parse(kind, payload.as_deref()?).ok()?;
+                Some((kind, payload))
+            });
+            match decoded {
+                Some((kind, payload)) => pending.jobs.push(MemoryJob {
                     id,
                     kind,
                     partial,
                     payload,
                     attempts,
                     created_at,
-                })
-            })
-            .collect()
+                }),
+                None => pending.unreadable.push(id),
+            }
+        }
+        Ok(pending)
     }
 
     /// Moves each job out of `pending` (payload cleared) and writes its log row, and stores
@@ -1055,31 +1067,47 @@ impl Store {
         Ok(expired.len())
     }
 
-    /// Records subagent output `job.path` with `size` and `job.sha256`: when its cursor row
-    /// already holds that size and hash nothing changes (false); otherwise the cursor row is
-    /// written and one `subagent` job is stored, in one transaction (true). A file is so
-    /// queued once per content.
+    /// Whether subagent output `path` still has the `size` and `mtime` (nanoseconds) its cursor
+    /// row holds; the scan then skips the file without reading it.
+    pub fn artifact_unchanged(
+        &self,
+        path: &str,
+        size: i64,
+        mtime: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_cursor WHERE path = ?1 AND size = ?2 AND mtime = ?3)",
+            params![path, size, mtime],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Records subagent output `job.path` with `size`, `mtime` (nanoseconds) and `job.sha256`:
+    /// when its cursor row already holds that size and hash only the mtime is updated (false);
+    /// otherwise the cursor row is written and one `subagent` job is stored, in one
+    /// transaction (true). A file is so queued once per content.
     pub fn note_artifact(
         &mut self,
         job: &SubagentJob,
         size: i64,
+        mtime: i64,
         now: i64,
     ) -> Result<bool, StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let unchanged: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_cursor WHERE path = ?1 AND size = ?2 AND sha256 = ?3)",
-            params![job.path, size, job.sha256],
-            |r| r.get(0),
-        )?;
+        let unchanged = tx.execute(
+            "UPDATE memory_cursor SET mtime = ?4 WHERE path = ?1 AND size = ?2 AND sha256 = ?3",
+            params![job.path, size, job.sha256, mtime],
+        )? > 0;
         if unchanged {
+            tx.commit()?;
             return Ok(false);
         }
         tx.execute(
-            "INSERT INTO memory_cursor(path, size, sha256, seen_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(path) DO UPDATE SET size = ?2, sha256 = ?3, seen_at = ?4",
-            params![job.path, size, job.sha256, now],
+            "INSERT INTO memory_cursor(path, size, mtime, sha256, seen_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET size = ?2, mtime = ?3, sha256 = ?4, seen_at = ?5",
+            params![job.path, size, mtime, job.sha256, now],
         )?;
         let inserted = insert_job(
             &tx,
@@ -1091,6 +1119,21 @@ impl Store {
         tx.commit()?;
         self.wake_after(inserted);
         Ok(true)
+    }
+
+    /// Whether a subagent output file under `prefix` (a session folder path ending in `/`) was
+    /// last modified at or after inbox row `row` was received (less one second, for the
+    /// coarse clock file times use): the files a turn's subagents wrote, whichever scan found
+    /// them first.
+    pub fn artifact_written_since(&self, prefix: &str, row: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_cursor
+               WHERE substr(path, 1, length(?1)) = ?1
+                 AND mtime >= (SELECT (CAST(strftime('%s', received_at) AS INTEGER) - 1) * 1000000000
+                               FROM inbox WHERE id = ?2))",
+            params![prefix, row],
+            |r| r.get(0),
+        )?)
     }
 
     /// Writes one `memory_log` row.
@@ -3520,6 +3563,7 @@ mod tests {
     fn pending_jobs(s: &Store, kind: JobKind) -> Vec<MemoryJob> {
         s.pending_memory_jobs(100)
             .unwrap()
+            .jobs
             .into_iter()
             .filter(|job| job.kind == kind)
             .collect()
@@ -3662,10 +3706,10 @@ mod tests {
         let row = s.get(m).unwrap().unwrap();
         assert_eq!(row.state, State::Processing);
         assert_eq!(row.reply, None);
-        assert!(s.pending_memory_jobs(100).unwrap().is_empty());
+        assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
         assert!(s.fail_group(&[m, 9999], "E_TEST", &sample_trace()).is_err());
         assert_eq!(s.get(m).unwrap().unwrap().state, State::Processing);
-        assert!(s.pending_memory_jobs(100).unwrap().is_empty());
+        assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
         assert_eq!(wakes(&wake), 0);
     }
 
@@ -3727,7 +3771,7 @@ mod tests {
         );
         // A second start finds nothing processing and adds nothing.
         s.recover_on_start().unwrap();
-        assert_eq!(s.pending_memory_jobs(100).unwrap().len(), 2);
+        assert_eq!(s.pending_memory_jobs(100).unwrap().jobs.len(), 2);
     }
 
     #[test]
@@ -3752,6 +3796,32 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_memory_job_is_returned_apart() {
+        let (_d, _p, mut s) = open_tmp();
+        let job = |n: &str| SubagentJob {
+            path: format!("/s/{n}.md"),
+            session: "lead".into(),
+            task: n.into(),
+            sha256: n.into(),
+        };
+        for n in ["a", "b", "c"] {
+            assert!(s.note_artifact(&job(n), 1, 1, 100).unwrap());
+        }
+        s.conn
+            .execute(
+                "UPDATE memory_jobs SET payload = 'not json' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        s.conn
+            .execute("UPDATE memory_jobs SET kind = 'scan' WHERE id = 2", [])
+            .unwrap();
+        let pending = s.pending_memory_jobs(100).unwrap();
+        assert_eq!(pending.unreadable, [1, 2]);
+        assert_eq!(pending.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [3]);
+    }
+
+    #[test]
     fn memory_cursor_queues_a_new_or_changed_file_once() {
         let (_d, _p, mut s) = open_tmp();
         let job = |sha: &str| SubagentJob {
@@ -3760,10 +3830,15 @@ mod tests {
             task: "Explore_2".into(),
             sha256: sha.into(),
         };
-        assert!(s.note_artifact(&job("aa"), 10, 100).unwrap());
-        assert!(!s.note_artifact(&job("aa"), 10, 200).unwrap());
+        let path = "/s/lead/x/Explore_2.md";
+        assert!(!s.artifact_unchanged(path, 10, 7).unwrap());
+        assert!(s.note_artifact(&job("aa"), 10, 7, 100).unwrap());
+        assert!(s.artifact_unchanged(path, 10, 7).unwrap());
+        // Touched, same content: no job, but the new mtime is kept so the next scan skips it.
+        assert!(!s.note_artifact(&job("aa"), 10, 8, 200).unwrap());
+        assert!(s.artifact_unchanged(path, 10, 8).unwrap());
         assert_eq!(pending_jobs(&s, JobKind::Subagent).len(), 1);
-        assert!(s.note_artifact(&job("bb"), 12, 300).unwrap());
+        assert!(s.note_artifact(&job("bb"), 12, 9, 300).unwrap());
         let jobs = pending_jobs(&s, JobKind::Subagent);
         assert_eq!(
             jobs.iter()
@@ -3823,7 +3898,7 @@ mod tests {
             sha256: n.into(),
         };
         for (n, at) in [("a", 100), ("b", 100), ("c", 100), ("d", 900)] {
-            assert!(s.note_artifact(&job(n), 1, at).unwrap());
+            assert!(s.note_artifact(&job(n), 1, 1, at).unwrap());
         }
         let m = new_id(admit(&mut s, "m1", "k1"));
         assert!(s.claim(m).unwrap());
@@ -3831,6 +3906,7 @@ mod tests {
         let ids: Vec<i64> = s
             .pending_memory_jobs(100)
             .unwrap()
+            .jobs
             .iter()
             .map(|j| j.id)
             .collect();

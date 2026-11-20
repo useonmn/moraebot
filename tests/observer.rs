@@ -181,6 +181,7 @@ impl Fixture {
         let row = store
             .pending_memory_jobs(100)
             .unwrap()
+            .jobs
             .into_iter()
             .find_map(|job| match job.payload {
                 JobPayload::Lane(job) if job.lane == lane => Some(job.row),
@@ -336,6 +337,35 @@ async fn observer_core_save_is_shown_under_the_next_reply_even_after_a_restart()
         format!("답이에요\n\n{expected}")
     );
     assert!(store.pending_memory_notices(KEY).unwrap().is_empty());
+}
+
+/// Owner decision 5: jev's `core` or `boundary` answer alone does not put a sentence in core;
+/// it must say "always" (or "never" for a boundary), else it stays with the conversation.
+#[tokio::test]
+async fn observer_keeps_a_sentence_without_always_out_of_core() {
+    let fx = Fixture::new().await;
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.  Never force-push to main.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(json!({
+        "save": {"type": "noul", "noul": 0.9},
+        "bucket": {"type": "choice", "choice": "core"},
+        "span": {"type": "choice", "choice": "s0"},
+    }));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::Owner).is_empty());
+    let thread = fx.entries(&Bucket::Thread(KEY.into()));
+    assert_eq!(thread.len(), 1, "{thread:?}");
+    assert_eq!(thread[0].text, "릴리스는 금요일에 하자.");
+    assert!(fx.store().pending_memory_notices(KEY).unwrap().is_empty());
+
+    // A "never" sentence may be a boundary.
+    let next = fx.admit("m2", "Never force-push to main.");
+    fx.reply(next, None, "네", &trace(false, true));
+    fx.jev.answer(save("boundary", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let boundaries = fx.entries(&Bucket::Boundaries);
+    assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+    assert_eq!(boundaries[0].text, "Never force-push to main.");
 }
 
 #[tokio::test]
@@ -696,6 +726,7 @@ async fn observer_fails_a_bad_job_after_three_attempts_and_goes_on() {
     assert_eq!(
         fx.observer
             .scan_root(&fx.lead_root(), "lead", fx.t0)
+            .await
             .unwrap(),
         1
     );
@@ -727,6 +758,35 @@ async fn observer_fails_a_bad_job_after_three_attempts_and_goes_on() {
     );
     assert_eq!(fx.backlog(), Backlog::default());
     std::fs::set_permissions(&md, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Plan 4.2: one job whose payload no longer decodes is failed on its own and never blocks
+/// the queue.
+#[tokio::test]
+async fn observer_fails_an_unreadable_job_and_goes_on() {
+    let fx = Fixture::new().await;
+    let row = fx.admit("m1", "앞으로 답은 짧게 해줘.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.lane("call-1", None, "결과는 좋다.");
+    let config = fx.config.clone();
+    let memory = fx.memory.clone();
+    let clock = Arc::new(AtomicI64::new(fx.t0));
+    let (_root, db) = fx.into_db();
+    db.execute(
+        "UPDATE memory_jobs SET payload = '{' WHERE kind = 'group'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Arc::new(Mutex::new(
+        Store::open(&config.home.join(STORE_FILE)).unwrap(),
+    ));
+    let observer = observer(&config, &store, &memory, &clock);
+
+    assert_eq!(observer.run_once().await, Pass::Idle);
+    let store = store.lock().unwrap();
+    assert!(store.memory_logged(E_OBSERVER_JOB, "unreadable").unwrap());
+    assert_eq!(store.memory_backlog().unwrap(), Backlog::default());
 }
 
 #[tokio::test]
@@ -881,10 +941,22 @@ async fn subagent_file_is_queued_once_and_again_when_it_changes() {
     let fx = Fixture::new().await;
     let root = fx.lead_root();
     let md = Fixture::subagent_file(&root, "s1", "Explore_1", "처음 결과다.");
-    assert_eq!(fx.observer.scan_root(&root, "lead", fx.t0).unwrap(), 1);
-    assert_eq!(fx.observer.scan_root(&root, "lead", fx.t0).unwrap(), 0);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        0
+    );
+    // Same size: the change is seen through the new mtime (set here, so the test does not
+    // depend on the file system's timestamp granularity).
     std::fs::write(&md, "고친 결과다.").unwrap();
-    assert_eq!(fx.observer.scan_root(&root, "lead", fx.t0).unwrap(), 1);
+    touch(&md, 10);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        1
+    );
     assert_eq!(
         fx.backlog(),
         Backlog {
@@ -911,6 +983,64 @@ async fn subagent_file_is_queued_once_and_again_when_it_changes() {
     assert_eq!(changed, 1);
 }
 
+/// Sets `path`'s mtime to `seconds` after the epoch.
+fn touch(path: &Path, seconds: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+        .unwrap();
+}
+
+/// A file whose size and mtime match its cursor row is not read again: a content change
+/// that keeps both is not seen, which shows the scan skipped the read.
+#[tokio::test]
+async fn subagent_scan_skips_a_file_whose_size_and_mtime_did_not_change() {
+    let fx = Fixture::new().await;
+    let root = fx.lead_root();
+    let md = Fixture::subagent_file(&root, "s1", "Explore_1", "처음 결과다.");
+    touch(&md, 20);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        1
+    );
+    std::fs::write(&md, "고친 결과다.").unwrap();
+    touch(&md, 20);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        0
+    );
+    touch(&md, 21);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        1
+    );
+}
+
+/// Several group jobs in one pass: the first one's scan queues the file a later settled
+/// `task` turn wrote, and that later job does not report a layout fault.
+#[tokio::test]
+async fn subagent_layout_is_not_reported_when_an_earlier_job_found_the_file() {
+    let fx = Fixture::new().await;
+    assert_eq!(fx.observer.run_once().await, Pass::Idle, "the start scan");
+    let first = fx.admit("m1", "안녕.");
+    fx.reply(first, None, "안녕하세요", &trace(false, true));
+    let second = fx.admit("m2", "이 저장소를 조사해줘.");
+    Fixture::subagent_file(&fx.lead_root(), "s1", "Explore_1", "저장소는 Rust다.");
+    fx.reply(second, None, "조사했어요", &trace(true, true));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let (_root, db) = fx.into_db();
+    let layout: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM memory_log WHERE code = ?1",
+            [E_SUBAGENT_LAYOUT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(layout, 0);
+}
+
 #[tokio::test]
 async fn subagent_symlinks_and_oversized_files_are_skipped() {
     let fx = Fixture::new().await;
@@ -923,8 +1053,14 @@ async fn subagent_symlinks_and_oversized_files_are_skipped() {
     let big = Fixture::subagent_file(&root, "s2", "Big_1", &"가".repeat(100_000));
     assert!(std::fs::metadata(&big).unwrap().len() > moraebot::observer::MAX_ARTIFACT_BYTES);
 
-    assert_eq!(fx.observer.scan_root(&root, "lead", fx.t0).unwrap(), 0);
-    assert_eq!(fx.observer.scan_root(&root, "lead", fx.t0).unwrap(), 0);
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap(),
+        0
+    );
     assert_eq!(fx.backlog(), Backlog::default());
     let canonical = |p: &Path| {
         std::fs::canonicalize(p.parent().unwrap())

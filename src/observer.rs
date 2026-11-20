@@ -42,6 +42,7 @@ use crate::memory::{
     self, Bucket, E_MEMORY_STOPPED, ExcerptFilter, MAX_ENTRY_BYTES, MemoryHandle, NewEntry, Op,
     Outcome, Prov, Redactor, Source,
 };
+use crate::memory_commands::{says_always, says_dont};
 use crate::memory_tools::core_note;
 use crate::omp;
 use crate::store::{
@@ -304,7 +305,7 @@ impl Observer {
     pub async fn run_once(&self) -> Pass {
         let now = (self.now)();
         if !self.started.swap(true, Ordering::SeqCst) {
-            self.scan_everything(now);
+            self.scan_everything(now).await;
         }
         let expired = lock(&self.store).expire_memory_jobs(now, JOB_TTL_SECONDS, &self.omp_version);
         if let Err(err) = expired {
@@ -315,7 +316,12 @@ impl Observer {
         loop {
             let pending = lock(&self.store).pending_memory_jobs(BATCH + failed_here.len());
             let jobs: Vec<MemoryJob> = match pending {
-                Ok(jobs) => jobs
+                Ok(pending) if !pending.unreadable.is_empty() => {
+                    self.fail_unreadable(&pending.unreadable, now);
+                    continue;
+                }
+                Ok(pending) => pending
+                    .jobs
                     .into_iter()
                     .filter(|job| !failed_here.contains(&job.id))
                     .take(BATCH)
@@ -359,6 +365,27 @@ impl Observer {
                     until: self.jev_refused(&err, now),
                 };
             }
+        }
+    }
+
+    /// Settles pending rows whose kind or payload does not decode as `failed`, one
+    /// [`E_OBSERVER_JOB`] row each: no later pass can read them either.
+    fn fail_unreadable(&self, ids: &[i64], now: i64) {
+        let settled: Vec<Settled> = ids
+            .iter()
+            .map(|&id| Settled {
+                id,
+                end: JobEnd::Failed,
+                level: LogLevel::Error,
+                code: E_OBSERVER_JOB,
+                omp_version: self.omp_version.clone(),
+                jev_model: None,
+                detail: Some("unreadable".to_owned()),
+            })
+            .collect();
+        tracing::warn!(jobs = ?ids, "unreadable memory jobs failed");
+        if let Err(err) = lock(&self.store).settle_memory_jobs(&settled, &[], now) {
+            tracing::warn!(error = %err, "unreadable memory jobs not settled");
         }
     }
 
@@ -553,7 +580,8 @@ impl Observer {
                     &omp::lane_session_dir(&self.config, scan.lane),
                     &lane_session(scan.lane),
                     now,
-                )?;
+                )
+                .await?;
             }
         }
         if off && job.kind != JobKind::Scan && work.code == M_JOB_DONE {
@@ -570,12 +598,15 @@ impl Observer {
         now: i64,
         work: &mut Work,
     ) -> Result<(), Failure> {
-        let found = self.scan_root(&omp::lead_session_dir(&self.config), "lead", now)?;
+        self.scan_root(&omp::lead_session_dir(&self.config), "lead", now)
+            .await?;
+        // Decided from the cursor, not from this scan's count: an earlier job's scan in this
+        // pass, or one that ran while this turn was still going, may have queued the file.
         if let Some(trace) = &group.trace
             && !job.partial
             && trace.task
             && trace.settled
-            && found == 0
+            && !self.lead_artifact_written(group)?
         {
             self.layout_missing(job.id, now);
         }
@@ -612,8 +643,13 @@ impl Observer {
                             _ => thread,
                         }
                     }
-                    "core" => Bucket::Owner,
-                    "boundary" => Bucket::Boundaries,
+                    // Owner decision 5, in code and not only in jev's option text: a sentence
+                    // reaches core only when it says "always" (or, for a boundary, "never").
+                    "core" if says_always(&pick.sentence) => Bucket::Owner,
+                    "boundary" if says_always(&pick.sentence) || says_dont(&pick.sentence) => {
+                        Bucket::Boundaries
+                    }
+                    "core" | "boundary" => thread,
                     _ => continue,
                 };
                 // The design's last guard: the entry is the row's own sentence, verbatim.
@@ -667,7 +703,8 @@ impl Observer {
             &omp::lane_session_dir(&self.config, job.lane),
             &lane_session(job.lane),
             now,
-        )?;
+        )
+        .await?;
         let row = lock(&self.store).get(job.row)?;
         let Some(row) = row.filter(|row| row.origin == "lane") else {
             return Ok(());
@@ -720,10 +757,18 @@ impl Observer {
             work.code = W_SUBAGENT_SKIPPED;
             return Ok(());
         }
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        let bytes = match read_artifact(path) {
+            Ok(Some((bytes, _))) => bytes,
+            Ok(None) => {
+                work.code = W_SUBAGENT_SKIPPED;
+                return Ok(());
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 work.code = M_ARTIFACT_CHANGED;
+                return Ok(());
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                work.code = W_SUBAGENT_SKIPPED;
                 return Ok(());
             }
             Err(err) => {
@@ -772,8 +817,9 @@ impl Observer {
             .await
     }
 
-    /// Judges a lane or subagent text: every line that starts with `[moraebot` is dropped, then
-    /// every sentence the excerpt filter refuses, before anything is sent.
+    /// Judges a lane or subagent text: every line that starts with `[moraebot` is dropped
+    /// ([`lead::lane_own_sentences`]), then every sentence the excerpt filter refuses, before
+    /// anything is sent.
     async fn excerpts(
         &self,
         kind: Kind,
@@ -783,12 +829,7 @@ impl Observer {
         src: Source,
         work: &mut Work,
     ) -> Result<(), Failure> {
-        let own: String = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("[moraebot"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let candidates: Vec<(u32, String)> = memory::own_sentences(&own)
+        let candidates: Vec<(u32, String)> = lead::lane_own_sentences(text)
             .into_iter()
             .filter(|(_, s)| self.candidate(s) && self.filter.allows(s, &self.redactor).is_ok())
             .collect();
@@ -957,23 +998,23 @@ impl Observer {
     }
 
     /// The start scan: the lead's session folder and every lane's.
-    fn scan_everything(&self, now: i64) {
-        if let Err(err) = self.scan_root(&omp::lead_session_dir(&self.config), "lead", now) {
+    async fn scan_everything(&self, now: i64) {
+        if let Err(err) = self
+            .scan_root(&omp::lead_session_dir(&self.config), "lead", now)
+            .await
+        {
             tracing::warn!(error = %err, "lead session folder not scanned");
         }
         let Ok(lanes) = fs::read_dir(self.config.home.join("lanes")) else {
             return;
         };
-        for entry in lanes.flatten() {
-            let Some(id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<i64>().ok())
-            else {
-                continue;
-            };
+        let ids: Vec<i64> = lanes
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i64>().ok())
+            .collect();
+        for id in ids {
             let root = omp::lane_session_dir(&self.config, id);
-            if let Err(err) = self.scan_root(&root, &lane_session(id), now) {
+            if let Err(err) = self.scan_root(&root, &lane_session(id), now).await {
                 tracing::warn!(lane = id, error = %err, "lane session folder not scanned");
             }
         }
@@ -981,8 +1022,50 @@ impl Observer {
 
     /// Finds the subagent output files under session folder `root` (see
     /// [`artifact_problem`]) and queues each new or changed one as a `subagent` job of
-    /// `session`. Returns how many were new or changed.
-    pub fn scan_root(&self, root: &Path, session: &str, now: i64) -> Result<usize, StoreError> {
+    /// `session`. Returns how many were new or changed. The file work runs on a blocking
+    /// thread, so a large session folder never holds a runtime worker.
+    pub async fn scan_root(
+        &self,
+        root: &Path,
+        session: &str,
+        now: i64,
+    ) -> Result<usize, StoreError> {
+        let scanner = Scanner {
+            store: Arc::clone(&self.store),
+            omp_version: self.omp_version.clone(),
+        };
+        let (root, session) = (root.to_path_buf(), session.to_owned());
+        match tokio::task::spawn_blocking(move || scanner.scan(&root, &session, now)).await {
+            Ok(found) => found,
+            // A panic in the scan stays a panic of this job (caught in `run_once`).
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => Ok(0),
+        }
+    }
+
+    /// Whether the store knows a subagent output file under the lead's session folder that
+    /// was written during the turn of `group` (since its first row arrived), whichever scan
+    /// queued it.
+    fn lead_artifact_written(&self, group: &GroupJob) -> Result<bool, StoreError> {
+        let Ok(root) = fs::canonicalize(omp::lead_session_dir(&self.config)) else {
+            return Ok(false);
+        };
+        let Some(first) = group.rows.iter().map(|row| row.id).min() else {
+            return Ok(false);
+        };
+        let prefix = format!("{}/", root.to_string_lossy());
+        lock(&self.store).artifact_written_since(&prefix, first)
+    }
+}
+
+/// The subagent output scan, apart from the observer so it can run on a blocking thread.
+struct Scanner {
+    store: Arc<Mutex<Store>>,
+    omp_version: String,
+}
+
+impl Scanner {
+    fn scan(&self, root: &Path, session: &str, now: i64) -> Result<usize, StoreError> {
         let Ok(root) = fs::canonicalize(root) else {
             return Ok(0);
         };
@@ -1012,7 +1095,8 @@ impl Observer {
         Ok(found)
     }
 
-    /// Queues the `<task>.md` files of artifact folder `folder` that have a `<task>.jsonl`.
+    /// Queues the `<task>.md` files of artifact folder `folder` that have a `<task>.jsonl`. A
+    /// file whose size and mtime match its cursor row is not read again.
     fn scan_artifacts(
         &self,
         root: &Path,
@@ -1042,17 +1126,32 @@ impl Observer {
                 self.skipped(&path, reason, now)?;
                 continue;
             }
-            let Ok(bytes) = fs::read(&path) else {
+            let shown = path.to_string_lossy().into_owned();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
+            if lock(&self.store).artifact_unchanged(&shown, stamp_size(&meta), mtime_ns(&meta))? {
+                continue;
+            }
+            let (bytes, meta) = match read_artifact(&path) {
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    self.skipped(&path, "not a regular file or too large when opened", now)?;
+                    continue;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                    self.skipped(&path, "symlink", now)?;
+                    continue;
+                }
+                Err(_) => continue,
+            };
             let job = SubagentJob {
-                path: path.to_string_lossy().into_owned(),
+                path: shown,
                 session: session.to_owned(),
                 task,
                 sha256: sha256_hex(&bytes),
             };
-            let size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-            if lock(&self.store).note_artifact(&job, size, now)? {
+            if lock(&self.store).note_artifact(&job, stamp_size(&meta), mtime_ns(&meta), now)? {
                 found += 1;
             }
         }
@@ -1154,6 +1253,42 @@ fn artifact_problem(
         return Err("task name");
     }
     Ok(())
+}
+
+/// Reads subagent output `path` through one handle opened without following a symlink and
+/// without blocking on a FIFO, checking the opened file itself: `Ok(None)` when it is not a
+/// regular file or is larger than [`MAX_ARTIFACT_BYTES`]. A file swapped after
+/// [`artifact_problem`] checked it is so never followed, and never read without end. A
+/// symlink fails with `ELOOP`.
+fn read_artifact(path: &Path) -> std::io::Result<Option<(Vec<u8>, fs::Metadata)>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_ARTIFACT_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Ok(None);
+    }
+    Ok(Some((bytes, meta)))
+}
+
+fn stamp_size(meta: &fs::Metadata) -> i64 {
+    i64::try_from(meta.len()).unwrap_or(i64::MAX)
+}
+
+/// The modification time in nanoseconds since the epoch, as the cursor stores it.
+fn mtime_ns(meta: &fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.mtime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(meta.mtime_nsec())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

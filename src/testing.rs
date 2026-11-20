@@ -934,6 +934,8 @@ enum JevScript {
         body: Value,
     },
     Drop,
+    /// Keep the connection open and never answer.
+    Hang,
 }
 
 #[derive(Default)]
@@ -995,6 +997,11 @@ impl FakeJev {
     /// The next connection is closed without an answer.
     pub fn drop_next(&self) {
         self.push(JevScript::Drop);
+    }
+
+    /// The next connection stays open and is never answered.
+    pub fn hang_next(&self) {
+        self.push(JevScript::Hang);
     }
 
     pub fn requests(&self) -> Vec<JevRequest> {
@@ -1117,13 +1124,21 @@ async fn serve_jev(
             body: jev_reply_body(default_answers),
         })
     };
-    let JevScript::Reply {
-        status,
-        headers,
-        body,
-    } = script
-    else {
-        return;
+    let (status, headers, body) = match script {
+        JevScript::Reply {
+            status,
+            headers,
+            body,
+        } => (status, headers, body),
+        JevScript::Drop => return,
+        JevScript::Hang => {
+            // Held open by its own task, so the next connection is still served.
+            tokio::spawn(async move {
+                let _open = reader;
+                std::future::pending::<()>().await;
+            });
+            return;
+        }
     };
     let payload = body.to_string();
     let mut head = format!(

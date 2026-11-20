@@ -4693,6 +4693,7 @@ impl Harness {
             .unwrap()
             .pending_memory_jobs(100)
             .unwrap()
+            .jobs
             .into_iter()
             .filter(|job| job.kind == kind)
             .collect()

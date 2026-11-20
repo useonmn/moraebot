@@ -454,3 +454,31 @@ async fn jev_a_success_closes_the_breaker() {
     );
     assert_eq!(fake.requests().len(), 4);
 }
+
+#[tokio::test]
+async fn jev_a_quick_call_that_times_out_leaves_the_gate_open() {
+    let fake = FakeJev::start().await;
+    let clock = Clock::new();
+    let jev = client(&fake, &clock);
+    fake.hang_next();
+    assert_eq!(
+        jev.ask_quick(&request(), Duration::from_millis(200))
+            .await
+            .unwrap_err(),
+        transient(W_JEV_NETWORK, None, 0)
+    );
+    assert_eq!(jev.status(), JevStatus::Ready);
+    fake.answer(good_answers());
+    assert!(jev.ask(&request(), LIMIT).await.is_ok());
+    assert_eq!(fake.requests().len(), 2);
+
+    // The same timeout through `ask` counts as a failure and closes the gate.
+    fake.hang_next();
+    assert_eq!(
+        jev.ask(&request(), Duration::from_millis(200))
+            .await
+            .unwrap_err(),
+        transient(W_JEV_NETWORK, None, T0 + 2)
+    );
+    assert_eq!(jev.status(), JevStatus::Waiting { until: T0 + 2 });
+}

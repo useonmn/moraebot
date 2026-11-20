@@ -235,6 +235,8 @@ enum Outcome {
     Permanent(&'static str, Option<u16>),
     /// Code, status, and the server's requested wait in seconds.
     Transient(&'static str, Option<u16>, Option<i64>),
+    /// The call's own timeout ran out (the status when the head had arrived).
+    TimedOut(Option<u16>),
 }
 
 impl Jev {
@@ -288,6 +290,27 @@ impl Jev {
 
     /// Sends one request when the gate allows it. Never sleeps and never retries.
     pub async fn ask(&self, request: &Request, timeout: Duration) -> Result<Response, JevError> {
+        self.ask_counting(request, timeout, true).await
+    }
+
+    /// Like [`Jev::ask`], for a caller that gives up early (the memory request classifier):
+    /// when `timeout` runs out the call counts as no answer and leaves the gate as it was, so
+    /// a jev that answers after the short timeout but within the observer's never closes the
+    /// gate for the observer. Every other failure settles the gate as in [`Jev::ask`].
+    pub async fn ask_quick(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<Response, JevError> {
+        self.ask_counting(request, timeout, false).await
+    }
+
+    async fn ask_counting(
+        &self,
+        request: &Request,
+        timeout: Duration,
+        count_timeout: bool,
+    ) -> Result<Response, JevError> {
         if !self.enabled {
             return Err(JevError::Off);
         }
@@ -300,6 +323,15 @@ impl Jev {
             Outcome::Success(response) => {
                 *self.lock() = Gate::default();
                 Ok(response)
+            }
+            Outcome::TimedOut(status) if !count_timeout => {
+                let mut gate = self.lock();
+                gate.probing = false;
+                Err(JevError::Transient {
+                    code: W_JEV_NETWORK,
+                    status,
+                    retry_at: gate.retry_at,
+                })
             }
             failure => Err(self.settle(failure)),
         }
@@ -344,16 +376,31 @@ impl Jev {
                 gate.paused = Some(code);
                 JevError::Permanent { code, status }
             }
-            Outcome::Transient(code, status, asked) => {
-                gate.failures = gate.failures.saturating_add(1);
-                let delay = self.delay(gate.failures, asked);
-                gate.retry_at = now.saturating_add(delay);
-                JevError::Transient {
-                    code,
-                    status,
-                    retry_at: gate.retry_at,
-                }
+            Outcome::TimedOut(status) => {
+                self.transient(&mut gate, now, W_JEV_NETWORK, status, None)
             }
+            Outcome::Transient(code, status, asked) => {
+                self.transient(&mut gate, now, code, status, asked)
+            }
+        }
+    }
+
+    /// Counts one transient failure and sets the next retry time.
+    fn transient(
+        &self,
+        gate: &mut Gate,
+        now: i64,
+        code: &'static str,
+        status: Option<u16>,
+        asked: Option<i64>,
+    ) -> JevError {
+        gate.failures = gate.failures.saturating_add(1);
+        let delay = self.delay(gate.failures, asked);
+        gate.retry_at = now.saturating_add(delay);
+        JevError::Transient {
+            code,
+            status,
+            retry_at: gate.retry_at,
         }
     }
 
@@ -387,6 +434,7 @@ impl Jev {
             .await;
         let response = match sent {
             Ok(response) => response,
+            Err(err) if err.is_timeout() => return Outcome::TimedOut(None),
             Err(_) => return Outcome::Transient(W_JEV_NETWORK, None, None),
         };
         let status = response.status().as_u16();
@@ -401,6 +449,7 @@ impl Jev {
         }
         let body = match response.bytes().await {
             Ok(body) => body,
+            Err(err) if err.is_timeout() => return Outcome::TimedOut(Some(status)),
             Err(_) => return Outcome::Transient(W_JEV_NETWORK, Some(status), None),
         };
         match serde_json::from_slice::<Response>(&body) {
