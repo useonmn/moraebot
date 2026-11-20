@@ -9,6 +9,17 @@ use moraebot::init::{install_command, next_steps};
 
 const SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
 
+/// A temp folder short enough for the default bridge socket under it: on macOS the
+/// default is `~/Library/Application Support/moraebot/slack-bridge.sock`, and a home under
+/// the per-user temp folder (`/var/folders/..`) pushes it past the 103 bytes
+/// `sockaddr_un` allows there.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mb")
+        .tempdir_in("/tmp")
+        .expect("tempdir")
+}
+
 fn moraebot(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_moraebot"));
     cmd.env("MORAEBOT_HOME", home)
@@ -26,17 +37,6 @@ fn fake_executable(dir: &Path) -> std::path::PathBuf {
     fs::write(&path, script).expect("write executable");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
     path
-}
-
-/// A temp folder short enough for the default bridge socket under it: on macOS the
-/// default is `~/Library/Application Support/moraebot/slack-bridge.sock`, and a home under
-/// the per-user temp folder (`/var/folders/..`) pushes it past the 103 bytes
-/// `sockaddr_un` allows there.
-fn short_tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("mb")
-        .tempdir_in("/tmp")
-        .expect("tempdir")
 }
 
 fn run_init(home: &Path, input: &str) -> std::process::Output {
@@ -58,7 +58,7 @@ fn run_init(home: &Path, input: &str) -> std::process::Output {
 
 #[test]
 fn piped_init_writes_valid_config_and_private_token() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -105,8 +105,35 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 #[test]
+fn discord_init_works_where_no_bridge_socket_fits() {
+    let tmp = short_tempdir();
+    // Too deep for any bridge socket path: init and setup discord never need one.
+    let home = tmp.path().join("d".repeat(120)).join("home");
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    let output = run_init(&home, &input);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_with_input(&home, &["setup", "discord"], "\n\n\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = fs::read(home.join("config.toml")).expect("config");
+    let output = run_with_input(&home, &["setup", "slack"], "");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E_BRIDGE_SOCKET"));
+    assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
+}
+
+#[test]
 fn init_writes_the_onboarding_request() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("qa-mbhome");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -126,7 +153,7 @@ fn init_writes_the_onboarding_request() {
 
 #[test]
 fn onboarding_command_writes_the_request() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = home_without_request(tmp.path());
     let request = home.join("onboarding.request");
 
@@ -158,7 +185,7 @@ fn home_without_request(tmp: &Path) -> std::path::PathBuf {
 
 #[test]
 fn onboarding_command_can_greet_in_the_channel() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = home_without_request(tmp.path());
 
     let output = moraebot(&home)
@@ -181,7 +208,7 @@ fn onboarding_command_can_greet_in_the_channel() {
 
 #[test]
 fn onboarding_command_refuses_an_unknown_place() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = home_without_request(tmp.path());
 
     let output = moraebot(&home)
@@ -195,7 +222,7 @@ fn onboarding_command_refuses_an_unknown_place() {
 
 #[test]
 fn onboarding_command_without_config_fails() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("qa-mbhome");
     fs::create_dir(&home).expect("mkdir");
     let output = moraebot(&home)
@@ -208,7 +235,7 @@ fn onboarding_command_without_config_fails() {
 
 #[test]
 fn check_config_fails_on_loose_token_mode() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -227,7 +254,7 @@ fn check_config_fails_on_loose_token_mode() {
 /// moraedang on #46: `check-config` never prints a jev key written into `config.toml`.
 #[test]
 fn check_config_never_prints_a_key_written_into_the_config() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -253,14 +280,14 @@ fn check_config_never_prints_a_key_written_into_the_config() {
 
 #[test]
 fn unknown_subcommand_exits_2() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let output = moraebot(tmp.path()).arg("bogus").output().expect("run");
     assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
 fn config_carries_its_own_home() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -482,7 +509,7 @@ fn check_config(home: &Path) -> (bool, String) {
 
 #[test]
 fn setup_slack_moves_a_legacy_config_once() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let (home, legacy) = legacy_slack_home(tmp.path());
     let backup = home.join("config.toml.pre-bridge");
     let (ok, out) = check_config(&home);
@@ -572,7 +599,7 @@ fn setup_slack_moves_a_legacy_config_once() {
 
 #[test]
 fn failed_migration_leaves_the_legacy_config_for_the_next_run() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let (home, legacy) = legacy_slack_home(tmp.path());
     // A folder where slack-bridge.toml belongs makes the first write fail.
     let blocker = home.join("slack-bridge.toml");
@@ -631,7 +658,7 @@ fn a_socket_path_too_long_only_stops_the_slack_setup() {
 
 #[test]
 fn setup_without_config_fails_with_its_code() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let output = run_with_input(&tmp.path().join("home"), &["setup", "discord"], "");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("E_SETUP_NO_CONFIG"));
@@ -639,7 +666,7 @@ fn setup_without_config_fails_with_its_code() {
 
 #[test]
 fn guide_prints_embedded_guides() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     for name in ["discord", "slack"] {
         let output = moraebot(tmp.path())
             .args(["guide", name])
@@ -657,7 +684,7 @@ fn guide_prints_embedded_guides() {
 
 #[test]
 fn unknown_messenger_is_usage_error() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     for args in [["setup", "telegram"], ["guide", "telegram"]] {
         let output = moraebot(tmp.path()).args(args).output().expect("run");
         assert_eq!(output.status.code(), Some(2), "{args:?}");

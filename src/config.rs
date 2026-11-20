@@ -585,6 +585,9 @@ struct LegacySlackSection {
 /// paths are expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacySlack {
+    /// The old top-level `messenger` value (`None` when it was not set); the move makes
+    /// it `"bridge"`.
+    pub messenger: Option<String>,
     /// The socket path written into `[bridge]`, for `slack-bridge.toml` too.
     pub socket: PathBuf,
     pub channel_id: String,
@@ -1022,8 +1025,9 @@ impl Config {
             return Err(ConfigError::new(
                 E_SLACK_MOVED,
                 "messenger = \"slack\" is gone: Slack now runs in the separate \
-                 moraebot-slack-bridge process; use messenger = \"bridge\" with a [bridge] section \
-                 (`moraebot setup slack` writes both)",
+                 moraebot-slack-bridge process; set messenger = \"bridge\" with a [bridge] \
+                 section by hand, or set messenger = \"discord\" and run `moraebot setup slack`, \
+                 which writes both",
             ));
         }
         let messenger = match file.messenger.as_deref() {
@@ -1170,7 +1174,9 @@ impl Config {
         let bridge = toml::Value::try_from(bridge)
             .map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))?;
         table.insert("bridge".into(), bridge);
-        table.insert("messenger".into(), Platform::Bridge.as_str().into());
+        let messenger = table
+            .insert("messenger".into(), Platform::Bridge.as_str().into())
+            .and_then(|old| old.as_str().map(str::to_owned));
         let moved =
             toml::to_string(&table).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))?;
         let config = Self::from_toml(&moved, env)?;
@@ -1186,6 +1192,7 @@ impl Config {
             }
         }
         let legacy = LegacySlack {
+            messenger,
             socket,
             channel_id,
             bot_token_file: env.expand_tilde(&bot_token_file)?,
@@ -2572,6 +2579,7 @@ mod tests {
         assert_eq!(
             slack,
             LegacySlack {
+                messenger: Some("slack".into()),
                 socket: PathBuf::from("/h/u/run/slack-bridge.sock"),
                 channel_id: "C222".into(),
                 bot_token_file: fx.dir.path().join("secrets/slack-bot.token"),
@@ -2583,14 +2591,26 @@ mod tests {
             written.is_ok(),
             "the moved config loads with the normal loader"
         );
+        let discord = text.replace("messenger = \"slack\"", "messenger = \"discord\"");
+        let (config, slack) = legacy(&fx, &discord)
+            .expect("reads")
+            .expect("legacy section");
+        assert_eq!(config.messenger, Platform::Bridge);
+        assert_eq!(slack.messenger.as_deref(), Some("discord"));
     }
 
     #[test]
     fn no_legacy_slack_section_reads_as_none() {
         let fx = Fixture::new();
-        assert!(legacy(&fx, &fx.valid_toml()).expect("reads").is_none());
+        let path = fx.dir.path().join("config.toml");
         let slack_messenger = format!("messenger = \"slack\"\n{}", fx.valid_toml());
-        assert!(legacy(&fx, &slack_messenger).expect("reads").is_none());
+        for text in [fx.valid_toml(), slack_messenger] {
+            fs::write(&path, &text).expect("write config");
+            // The socket is only asked for when there is a section to move.
+            let unused = || Err(ConfigError::new(E_CONFIG_VALUE, "socket asked for"));
+            let read = Config::load_legacy_slack(&path, &fx.env, unused).expect("reads");
+            assert!(read.is_none(), "{text}");
+        }
     }
 
     #[test]

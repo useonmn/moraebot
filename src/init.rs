@@ -671,10 +671,15 @@ pub fn setup<R: BufRead, W: Write>(
         (SetupTarget::Slack, Some(legacy)) => {
             let allowed = config.bridge.as_ref().map_or(0, |b| b.access.allow.len());
             let socket = legacy.socket;
+            let switched = match legacy.messenger.as_deref() {
+                Some("slack") => String::new(),
+                Some(old) => format!(" (messenger was \"{old}\")"),
+                None => " (messenger was not set, which meant \"discord\")".to_owned(),
+            };
             writeln!(
                 prompter.out,
                 "Moving the old [slack] section to the bridge layout; nothing needs to be asked:\n\
-                 \x20 config.toml: messenger = \"bridge\" and [bridge] with owner_id, \
+                 \x20 config.toml: messenger = \"bridge\"{switched} and [bridge] with owner_id, \
                  max_bot_replies and {allowed} allow entries\n\
                  \x20 {}: channel_id and both token file paths\n\
                  \x20 both files: socket = {}\n\
@@ -756,22 +761,52 @@ fn pre_bridge_path(config_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Replaces `path` with a new file readable only by the owner.
+/// Replaces `path` with a new file readable only by the owner, atomically: the contents
+/// go to a fresh 0600 temp file in the same folder, are synced, and the temp file is
+/// renamed over `path`. A crash leaves either the old file or the new one, never a
+/// missing or half-written `path`; a symlink at `path` is replaced, not followed.
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     let io_err =
         |e: io::Error| ConfigError::new(E_IO, format!("cannot write {}: {e}", path.display()));
-    match fs::remove_file(path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io_err(io::Error::from(io::ErrorKind::InvalidInput)));
+    };
+    let mut temp_name = OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".new.{}", std::process::id()));
+    let temp = dir.join(temp_name);
+    // A temp file left by a killed run with the same pid.
+    match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err(e)),
     }
-    let mut file = fs::OpenOptions::new()
+    let written = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(io_err)?;
-    file.write_all(contents).map_err(io_err)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(contents)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, path));
+    if let Err(e) = written {
+        if let Err(cleanup) = fs::remove_file(&temp)
+            && cleanup.kind() != io::ErrorKind::NotFound
+        {
+            return Err(ConfigError::new(
+                E_IO,
+                format!(
+                    "cannot write {}: {e}; also cannot remove {}: {cleanup}",
+                    path.display(),
+                    temp.display()
+                ),
+            ));
+        }
+        return Err(io_err(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1460,5 +1495,29 @@ mod tests {
             percent_encode("a-b_c.d~E9 {\"é"),
             "a-b_c.d~E9%20%7B%22%C3%A9"
         );
+    }
+
+    #[test]
+    fn write_private_file_replaces_a_symlink_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, "keep").expect("write target");
+        let path = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
+
+        write_private_file(&path, b"new").expect("writes");
+        let meta = fs::symlink_metadata(&path).expect("stat");
+        assert!(meta.file_type().is_file(), "the symlink is replaced");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).expect("read"), b"new");
+        assert_eq!(fs::read(&elsewhere).expect("read target"), b"keep");
+
+        write_private_file(&path, b"newer").expect("rewrites");
+        assert_eq!(fs::read(&path).expect("read"), b"newer");
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file left: {names:?}");
     }
 }
