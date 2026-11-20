@@ -25,7 +25,9 @@
 //! `host_tool_call` per JSON line of FAKE_OMP_TOOL_CALLS
 //! (`{"tool": "<name>", "arguments": {...}, "id": "<toolCallId>"}`; without
 //! `id` the call id is `toolu_<pid>_<n>`, `n` counting calls over the child's
-//! life); every other prompt is answered like `ok`. In both modes each next
+//! life); a line `{"frame": {...}}` instead writes that frame as is (for example a
+//! `tool_execution_start` event) and goes straight on to the next line, waiting
+//! for nothing. Every other prompt is answered like `ok`. In both modes each next
 //! call, and the final reply, is written only after the matching
 //! `host_tool_result` frame arrived on stdin, so no transition depends on
 //! time. With FAKE_OMP_LOG set, each call also leaves a `CALL host_<n>` line
@@ -49,7 +51,9 @@
 //! later prompt with `"streamingBehavior":"steer"` is acknowledged and handled
 //! by FAKE_OMP_STEER_CASE: `merged` (one run answers both), `separate` (two
 //! runs, one answer each), `hold` (writes `{"type":"fake_held",...}` and then
-//! nothing more), anything else (an error `prompt_result` for both). Other
+//! nothing more), `tools` (runs the FAKE_OMP_TOOL_CALLS script as host tool
+//! calls, then one run answers both, like `merged`), anything else (an error
+//! `prompt_result` for both). Other
 //! prompts are answered like `ok`; other modes answer a steer frame like any
 //! prompt.
 //!
@@ -78,6 +82,8 @@ struct PlannedCall {
     tool: String,
     arguments: Value,
     tool_call_id: Option<String>,
+    /// Written as is instead of a host tool call.
+    frame: Option<Value>,
 }
 
 /// A host-tool turn in progress: the prompt it answers and the calls still to
@@ -87,6 +93,8 @@ struct ToolTurn {
     message: String,
     remaining: VecDeque<PlannedCall>,
     calls_made: usize,
+    /// A steer answered together with the main prompt once the calls are done.
+    steer: Option<(Value, String)>,
 }
 
 /// The main prompt of a `steer` turn, waiting for its steer.
@@ -352,6 +360,7 @@ impl Fake {
             message: prompt_message(frame).to_owned(),
             remaining: calls,
             calls_made: 0,
+            steer: None,
         };
         self.tool_turn = self.advance_tool_turn(turn, out);
     }
@@ -359,12 +368,28 @@ impl Fake {
     /// Emits the next host tool call, or finishes the turn when none is left.
     /// Returns the turn while it still waits for a `host_tool_result`.
     fn advance_tool_turn(&mut self, mut turn: ToolTurn, out: &mut impl Write) -> Option<ToolTurn> {
-        let Some(call) = turn.remaining.pop_front() else {
-            if self.lane && std::env::var_os("FAKE_OMP_LANE_HOLD_AFTER_TOOLS").is_some() {
-                return None;
+        let call = loop {
+            match turn.remaining.pop_front() {
+                Some(PlannedCall {
+                    frame: Some(frame), ..
+                }) => send(out, &frame),
+                Some(call) => break call,
+                None => {
+                    if self.lane && std::env::var_os("FAKE_OMP_LANE_HOLD_AFTER_TOOLS").is_some() {
+                        return None;
+                    }
+                    match &turn.steer {
+                        Some((steer_id, steer_message)) => {
+                            let text = format!("echo: {} + {steer_message}", turn.message);
+                            end_run(&text, json!({}), out);
+                            completed(&turn.prompt_id, out);
+                            completed(steer_id, out);
+                        }
+                        None => finish_echo(&turn.prompt_id, &turn.message, out),
+                    }
+                    return None;
+                }
             }
-            finish_echo(&turn.prompt_id, &turn.message, out);
-            return None;
         };
         turn.calls_made += 1;
         self.total_calls += 1;
@@ -440,6 +465,16 @@ impl Fake {
                 completed(steer_id, out);
             }
             "hold" => self.hold(out, "prompt"),
+            "tools" => {
+                let turn = ToolTurn {
+                    prompt_id: main.prompt_id.clone(),
+                    message: main.message.clone(),
+                    remaining: scripted_calls("FAKE_OMP_TOOL_CALLS"),
+                    calls_made: 0,
+                    steer: Some((steer_id.clone(), steer_message.to_owned())),
+                };
+                self.tool_turn = self.advance_tool_turn(turn, out);
+            }
             _ => {
                 send(out, &json!({"type": "agent_end", "messages": []}));
                 prompt_error(&main.prompt_id, out);
@@ -463,6 +498,7 @@ fn send_file_calls() -> VecDeque<PlannedCall> {
             tool: "send_file".to_owned(),
             arguments: json!({"path": path}),
             tool_call_id: None,
+            frame: None,
         })
         .collect()
 }
@@ -498,6 +534,14 @@ fn scripted_calls(variable: &str) -> VecDeque<PlannedCall> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let call: Value = serde_json::from_str(line).expect("tool script line is JSON");
+            if let Some(frame) = call.get("frame") {
+                return PlannedCall {
+                    tool: String::new(),
+                    arguments: Value::Null,
+                    tool_call_id: None,
+                    frame: Some(frame.clone()),
+                };
+            }
             PlannedCall {
                 tool: call
                     .get("tool")
@@ -506,6 +550,7 @@ fn scripted_calls(variable: &str) -> VecDeque<PlannedCall> {
                     .to_owned(),
                 arguments: call.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 tool_call_id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                frame: None,
             }
         })
         .collect()

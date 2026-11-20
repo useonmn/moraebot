@@ -1655,9 +1655,13 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
             "arguments": {"text": text, "bucket_hint": hint, "why": "qa"}
         })
     };
+    let search =
+        |arguments: Value| serde_json::json!({"tool": MEMORY_SEARCH_TOOL, "arguments": arguments});
     let calls = [
         write("릴리스는 금요일에 하자", "core"),
         write("릴리스는 금요일", "core"),
+        search(serde_json::json!({"query": "  "})),
+        search(serde_json::json!({"query": "x", "scope": "people"})),
     ];
     let lines: Vec<String> = calls.iter().map(Value::to_string).collect();
     let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
@@ -1666,7 +1670,7 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
         .with_extra_env([("FAKE_OMP_TOOL_CALLS", lines.join("\n"))])
         .with_memory_clock(Arc::new(move || today))
         .with_memory(memory.clone());
-    bounded(m.prompt(
+    let report = bounded(m.prompt(
         KEY_A,
         r,
         Sender::Owner,
@@ -1674,17 +1678,21 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
     ))
     .await;
 
+    // The lead's memory tools are exactly these two: nothing deletes, corrects or restores.
     let names: Vec<String> = h.frames("set_host_tools")[0]["tools"]
         .as_array()
         .expect("tool list")
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .filter(|n| n.starts_with("memory"))
         .collect();
-    assert!(names.iter().any(|n| n == MEMORY_SEARCH_TOOL), "{names:?}");
-    assert!(names.iter().any(|n| n == MEMORY_WRITE_TOOL), "{names:?}");
+    assert_eq!(names, [MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL]);
     let results = h.tool_results();
-    assert_eq!(results.len(), 2, "{results:?}");
-    assert!(results.iter().all(|(error, _)| !error), "{results:?}");
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(results[..2].iter().all(|(error, _)| !error), "{results:?}");
+    for (error, text) in &results[2..] {
+        assert!(*error && text.starts_with("E_MEMORY_ARGS"), "{text}");
+    }
     let whole: Value = serde_json::from_str(&results[0].1).expect("write json");
     let part: Value = serde_json::from_str(&results[1].1).expect("write json");
     assert_eq!(whole["provenance"], "owner");
@@ -1711,7 +1719,155 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
         .expect("inference entry saved");
     assert_eq!(guess.entry.prov, Prov::Inference);
     assert!(guess.entry.expires.is_some());
+    // The owner sees the standing rule the lead saved, under the reply.
+    let Outcome::Reply(reply) = &report.main.outcome else {
+        panic!("reply: {report:?}");
+    };
+    let id = whole["id"].as_str().unwrap();
+    let note = format!(
+        "\n\n[memory] saved {id} to core/owner: \"릴리스는 금요일에 하자\" (say `forget {id}` if that was not meant)"
+    );
+    assert!(reply.ends_with(&note), "{reply}");
+    assert_eq!(reply.matches("[memory] saved").count(), 1, "{reply}");
     bounded(m.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn an_outside_tool_call_makes_later_writes_tool_provenance() {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": "rusqlite 0.43 needs Rust 1.89", "bucket_hint": "thread", "why": "qa"}
+    });
+    // omp reports a web search the lead ran, then the lead saves what it read.
+    let web = serde_json::json!({"frame": {
+        "type": "tool_execution_start",
+        "toolCallId": "web-1",
+        "toolName": "web_search",
+        "args": {"query": "rusqlite msrv"}
+    }});
+    let script = [web, write.clone()].map(|v| v.to_string()).join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", script)])
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory.clone());
+    let first = owner_row(&h, "m-out-1", "run-tools");
+    bounded(m.prompt(
+        KEY_A,
+        first,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, first, "run-tools"),
+    ))
+    .await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let saved: Value = serde_json::from_str(&results[0].1).expect("write json");
+    assert_eq!(saved["provenance"], "tool", "{saved}");
+    bounded(m.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn an_owner_row_steered_into_a_lane_result_turn_gives_owner_provenance() {
+    use moraebot::memory::{Bucket, MemoryHandle, Prov};
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    // A lane result row of KEY_STEER, the main row of the turn.
+    let lane_row = {
+        let mut store = h.store.lock().unwrap();
+        store
+            .start_lane("call-1", KEY_STEER, "t", None, None, 3)
+            .expect("lane");
+        assert!(
+            store
+                .finish_lane(
+                    1,
+                    1,
+                    "CI는 cargo test를 돌린다. 끝",
+                    moraebot::store::LaneState::Idle,
+                    None
+                )
+                .expect("finish")
+        );
+        // Row ids count up: the lane result is the newest row.
+        let id = store.count().expect("count");
+        let row = store.get(id).expect("get").expect("lane row");
+        assert_eq!(row.origin, "lane");
+        id
+    };
+    let owner_text = "알았어. 릴리스는 금요일에 하자";
+    let owner = h.admit("m-steer-owner", owner_text);
+    let write = |text: &str, hint: &str| {
+        serde_json::json!({
+            "tool": MEMORY_WRITE_TOOL,
+            "arguments": {"text": text, "bucket_hint": hint, "why": "qa"}
+        })
+        .to_string()
+    };
+    let script = [
+        write("릴리스는 금요일에 하자", "core"),
+        write("CI는 cargo test를 돌린다.", "core"),
+    ]
+    .join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = Arc::new(
+        h.manager("steer")
+            .with_extra_env([
+                ("FAKE_OMP_STEER_CASE", "tools".to_owned()),
+                ("FAKE_OMP_TOOL_CALLS", script),
+            ])
+            .with_memory_clock(Arc::new(move || today))
+            .with_memory(memory.clone()),
+    );
+    let turn = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .prompt(KEY_STEER, lane_row, Sender::Owner, "lane result")
+                .await
+        })
+    };
+    turn_running(&manager, KEY_STEER).await;
+    assert!(manager.try_steer(
+        KEY_STEER,
+        owner,
+        Sender::Owner,
+        &lead::owner_input(KEY_STEER, owner, owner_text),
+        |_| true
+    ));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(codes(&report), (None, Some((owner, None))));
+
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let owned: Value = serde_json::from_str(&results[0].1).expect("write json");
+    let lane: Value = serde_json::from_str(&results[1].1).expect("write json");
+    assert_eq!(owned["provenance"], "owner", "{owned}");
+    assert_eq!(owned["bucket"], "core/owner");
+    assert_eq!(
+        lane["provenance"], "tool",
+        "a lane row never gives owner: {lane}"
+    );
+    assert_eq!(lane["bucket"], format!("thread:{KEY_STEER}"));
+    let flush = qa_note("flush", Bucket::Thread(KEY_B.into()));
+    bounded(memory.add(flush)).await.expect("flush");
+    let saved = memory
+        .show(owned["id"].as_str().unwrap())
+        .expect("show")
+        .expect("owner entry saved");
+    assert_eq!(saved.entry.prov, Prov::Owner);
+    assert_eq!(
+        saved.entry.src.as_deref(),
+        Some(format!("row={owner} s=1").as_str())
+    );
+    bounded(manager.shutdown_all()).await;
 }
 
 #[tokio::test]
