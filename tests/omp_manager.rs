@@ -1766,7 +1766,7 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
     assert_eq!(owner.entry.prov, Prov::Owner);
     assert_eq!(
         owner.entry.src.as_deref(),
-        Some(format!("row={r} s=1").as_str())
+        Some(format!("row={r} s=1 turn={r}").as_str())
     );
     let guess = memory
         .show(part["id"].as_str().unwrap())
@@ -2017,7 +2017,7 @@ async fn an_owner_row_steered_into_a_lane_result_turn_gives_owner_provenance() {
     assert_eq!(saved.entry.prov, Prov::Owner);
     assert_eq!(
         saved.entry.src.as_deref(),
-        Some(format!("row={owner} s=1").as_str())
+        Some(format!("row={owner} s=1 turn={lane_row}").as_str())
     );
     bounded(manager.shutdown_all()).await;
 }

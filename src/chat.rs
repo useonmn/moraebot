@@ -144,15 +144,34 @@ pub fn chat_session_name(key: &str) -> String {
 /// Exact omp argv (without the program) for a chat child. Unlike the lead (`omp_args`)
 /// there is no `--approval-mode yolo`, and every switch that adds a way to act is off.
 pub fn chat_args(config: &Config, key: &str, cwd: &Path) -> Vec<OsString> {
+    locked_args(
+        config,
+        &chat_session_dir(config, key),
+        cwd,
+        &chat_overlay_path(config),
+        CHAT_GUIDANCE,
+    )
+}
+
+/// Exact omp argv (without the program) for a child that cannot act on this machine: the
+/// chat child and the memory summarizer. `overlay` must hold [`CHAT_OVERLAY`]; `guidance`
+/// is appended to the system prompt.
+pub fn locked_args(
+    config: &Config,
+    session_dir: &Path,
+    cwd: &Path,
+    overlay: &Path,
+    guidance: &str,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
         .collect();
-    args.push(chat_session_dir(config, key).into());
+    args.push(session_dir.into());
     args.push("--cwd".into());
     args.push(cwd.into());
     args.push("--config".into());
-    args.push(chat_overlay_path(config).into());
+    args.push(overlay.into());
     for flag in [
         "--no-tools",
         "--no-extensions",
@@ -165,7 +184,7 @@ pub fn chat_args(config: &Config, key: &str, cwd: &Path) -> Vec<OsString> {
     ] {
         args.push(flag.into());
     }
-    args.push(format!("--append-system-prompt={CHAT_GUIDANCE}").into());
+    args.push(format!("--append-system-prompt={guidance}").into());
     if let Some(usd) = config.omp.max_cost_usd {
         args.push("--max-cost".into());
         args.push(usd.to_string().into());

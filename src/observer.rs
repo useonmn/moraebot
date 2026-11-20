@@ -2,12 +2,20 @@
 //! entries without the lead's help.
 //!
 //! - A `group` job (a settled, failed or restart-cut lead turn) judges the owner's own
-//!   sentences of its owner rows. An entry is always one whole owner sentence, word for word,
-//!   with `prov: owner` and its row and sentence number; jev only picks which sentence and
-//!   which file.
+//!   sentences of its owner rows, with `prov: owner` and its row, sentence and turn number;
+//!   jev only picks which sentence and which file, and the code checks the `core/` gates
+//!   against the picked sentence itself.
 //! - A `lane` job judges a lane result once, a `subagent` job one subagent output file. Their
 //!   sentences pass the excerpt filter ([`ExcerptFilter`]) before anything is sent, and are
 //!   saved as reference (`lane` or `subagent`), never in `core/`.
+//! - Every picked sentence is saved as a short summary, never as the sentence itself (#57):
+//!   the locked summarizer ([`Summarizer`]) writes one numbered line per picked sentence of a
+//!   job in one call, and a line is kept only when it is at most [`MAX_SUMMARY_CHARS`]
+//!   characters, the redactor would not change it and the excerpt filter allows it;
+//!   otherwise that line is dropped ([`W_MEMORY_SUMMARY_DROPPED`]). When the summarizer
+//!   cannot run, the pass waits and the job keeps its attempts; an answer that does not fit
+//!   the picks counts one attempt ([`E_MEMORY_SUMMARY`]). The sentence is never saved
+//!   instead.
 //! - A `scan` job, and every group and lane job, first scans a session folder for subagent
 //!   output files ([`Observer::scan_root`]); a new or changed file becomes a `subagent` job.
 //!
@@ -48,6 +56,8 @@ use crate::store::{
     GroupJob, JobEnd, JobKind, LaneJob, LogLevel, LogRow, MemoryJob, Settled, Store, StoreError,
     SubagentJob, ToolUse,
 };
+pub use crate::summarizer::E_MEMORY_SUMMARY;
+use crate::summarizer::Summarizer;
 
 /// A job settled after it was processed (`detail` holds the counts).
 pub const M_JOB_DONE: &str = "M_JOB_DONE";
@@ -70,6 +80,15 @@ pub const E_OBSERVER_JOB: &str = "E_OBSERVER_JOB";
 /// Processing a job panicked (counts as one attempt), or a pass panicked outside a job (the
 /// pass ends, the observer reports itself down until a pass ends normally).
 pub const E_OBSERVER_PANIC: &str = "E_OBSERVER_PANIC";
+/// A summary was not saved: empty, too long, holding a secret, or refused by the excerpt
+/// filter (`detail` names the reason).
+pub const W_MEMORY_SUMMARY_DROPPED: &str = "W_MEMORY_SUMMARY_DROPPED";
+
+/// The longest summary that is saved, in characters; a longer one is dropped, never cut.
+pub const MAX_SUMMARY_CHARS: usize = 280;
+/// The first wait after a summarizer failure; it doubles up to [`SUMMARY_WAIT_MAX`].
+const SUMMARY_WAIT: i64 = 60;
+const SUMMARY_WAIT_MAX: i64 = 30 * 60;
 
 /// Pending `lane`, `subagent` and `scan` jobs older than this expire (7 days).
 const JOB_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -138,18 +157,23 @@ impl Kind {
 /// What processing one job produced.
 #[derive(Debug)]
 struct Work {
+    job: i64,
     code: &'static str,
     entries: Vec<NewEntry>,
+    /// The sentences jev picked, summarized together once the job's windows are judged.
+    picked: Vec<Picked>,
     requests: u32,
     tokens: u64,
     model: Option<String>,
 }
 
 impl Work {
-    fn new() -> Self {
+    fn new(job: i64) -> Self {
         Self {
+            job,
             code: M_JOB_DONE,
             entries: Vec::new(),
+            picked: Vec::new(),
             requests: 0,
             tokens: 0,
             model: None,
@@ -163,6 +187,21 @@ enum Failure {
     Jev(JevError),
     /// A processing error that is not jev's: one failed attempt.
     Job(&'static str),
+    /// The summarizer could not run (spawn, provider error, timeout, tools listed): an outage,
+    /// not the job's fault. The pass waits; no attempt is counted.
+    SummaryOutage,
+    /// The summarizer's answer does not fit the job's picks (not one numbered line each): one
+    /// failed attempt, and the pass waits.
+    SummaryUnfit,
+}
+
+/// A sentence jev picked, waiting for its summary: the entry it becomes, but for its text.
+#[derive(Debug)]
+struct Picked {
+    sentence: String,
+    prov: Prov,
+    bucket: Bucket,
+    src: Source,
 }
 
 impl From<StoreError> for Failure {
@@ -184,6 +223,9 @@ pub struct Observer {
     store: Arc<Mutex<Store>>,
     memory: MemoryHandle,
     jev: Arc<Jev>,
+    summarizer: Summarizer,
+    /// Summarizer failures in a row; sets the wait after the next one.
+    summary_failures: std::sync::atomic::AtomicU32,
     redactor: Redactor,
     filter: ExcerptFilter,
     now: Now,
@@ -212,6 +254,8 @@ impl Observer {
     ) -> Self {
         Self {
             filter: ExcerptFilter::from_config(&config.memory.filter),
+            summarizer: Summarizer::new(config),
+            summary_failures: std::sync::atomic::AtomicU32::new(0),
             config: config.clone(),
             store,
             memory,
@@ -232,6 +276,16 @@ impl Observer {
     /// The omp version written with every settled job (`unknown` until set).
     pub fn with_omp_version(mut self, version: &str) -> Self {
         self.omp_version = version.to_owned();
+        self
+    }
+
+    /// Adds variables to the summarizer's child environment (tests script the fake omp).
+    pub fn with_summarizer_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        self.summarizer = self.summarizer.with_extra_env(vars);
         self
     }
 
@@ -363,6 +417,7 @@ impl Observer {
             }
             let mut finished: Vec<(MemoryJob, Work)> = Vec::new();
             let mut refused = None;
+            let mut summary_wait = None;
             for job in jobs {
                 let processed = AssertUnwindSafe(self.process(&job, now))
                     .catch_unwind()
@@ -388,6 +443,21 @@ impl Observer {
                         self.fail_attempt(job.id, code, now);
                         failed_here.insert(job.id);
                     }
+                    Ok(Err(Failure::SummaryOutage)) => {
+                        // Like jev's transient errors: the job keeps every attempt, and it and
+                        // the jobs behind it wait for the summarizer to come back.
+                        summary_wait = Some(now + self.summary_wait());
+                        break;
+                    }
+                    Ok(Err(Failure::SummaryUnfit)) => {
+                        // Like a jev answer that does not fit: one attempt of this job.
+                        if self.fail_attempt(job.id, E_MEMORY_SUMMARY, now) {
+                            failed_here.insert(job.id);
+                            continue;
+                        }
+                        summary_wait = Some(now + self.summary_wait());
+                        break;
+                    }
                     Err(_) => {
                         tracing::error!(job = job.id, "memory job panicked");
                         self.fail_attempt(job.id, E_OBSERVER_PANIC, now);
@@ -403,7 +473,19 @@ impl Observer {
                     until: self.jev_refused(&err, now),
                 };
             }
+            if let Some(until) = summary_wait {
+                return Pass::Waiting { until: Some(until) };
+            }
         }
+    }
+
+    /// The wait after one more summarizer failure: [`SUMMARY_WAIT`] seconds, doubled for each
+    /// failure in a row before it, at most [`SUMMARY_WAIT_MAX`].
+    fn summary_wait(&self) -> i64 {
+        let before = self.summary_failures.fetch_add(1, Ordering::SeqCst);
+        SUMMARY_WAIT
+            .saturating_mul(1i64 << before.min(16))
+            .min(SUMMARY_WAIT_MAX)
     }
 
     /// Settles pending rows whose kind or payload does not decode as `failed`, one
@@ -603,7 +685,7 @@ impl Observer {
     }
 
     async fn process(&self, job: &MemoryJob, now: i64) -> Result<Work, Failure> {
-        let mut work = Work::new();
+        let mut work = Work::new(job.id);
         let off = self.jev.status() == JevStatus::Off;
         match &job.payload {
             crate::store::JobPayload::Group(group) => {
@@ -624,6 +706,7 @@ impl Observer {
                 .await?;
             }
         }
+        self.summarize(&mut work).await?;
         if off && job.kind != JobKind::Scan && work.code == M_JOB_DONE {
             work.code = M_JEV_OFF;
         }
@@ -654,6 +737,9 @@ impl Observer {
             return Ok(());
         }
         let tools: &[ToolUse] = group.trace.as_ref().map_or(&[], |t| &t.tools);
+        let Some(turn) = group.rows.first().map(|row| row.id) else {
+            return Ok(());
+        };
         let mut rows: Vec<i64> = group
             .rows
             .iter()
@@ -692,14 +778,14 @@ impl Observer {
                     "core" | "boundary" => thread,
                     _ => continue,
                 };
-                // `pick` is a sentence of this window, cut from `row.text` above: the entry
-                // is the owner's own sentence, verbatim.
-                work.entries.push(entry(
-                    pick.sentence,
-                    Prov::Owner,
+                // The bucket was decided on the owner's own sentence above; only the stored
+                // text will be the summary.
+                work.picked.push(Picked {
+                    src: Source::row_sentence(row.id, pick.n, turn),
+                    sentence: pick.sentence,
+                    prov: Prov::Owner,
                     bucket,
-                    Source::row_sentence(row.id, pick.n),
-                ));
+                });
             }
         }
         Ok(())
@@ -808,7 +894,10 @@ impl Observer {
                         thread: thread_bucket(&lane.conversation_key),
                         project: self.lane_project(lane.repo.as_deref()),
                     },
-                    Source::new(&format!("lane={id} task={}", job.task)),
+                    Source::new(&format!(
+                        "lane={id} {}",
+                        subagent_source(&job.task, &job.sha256)
+                    )),
                 )
             }
             None => (
@@ -816,7 +905,7 @@ impl Observer {
                     thread: Bucket::General,
                     project: Bucket::General,
                 },
-                Source::new(&format!("lead task={}", job.task)),
+                Source::new(&format!("lead {}", subagent_source(&job.task, &job.sha256))),
             ),
         };
         let Ok(src) = src else {
@@ -858,10 +947,118 @@ impl Observer {
             } else {
                 place.project.clone()
             };
-            work.entries
-                .push(entry(pick.sentence, prov, bucket, src.clone()));
+            // One source per sentence, so each summary has its own and a job read again
+            // finds it whatever the summary says.
+            let Ok(src) = Source::new(&format!("{} s={}", src.as_str(), pick.n)) else {
+                self.dropped(work, "source");
+                continue;
+            };
+            work.picked.push(Picked {
+                sentence: pick.sentence,
+                prov,
+                bucket,
+                src,
+            });
         }
         Ok(())
+    }
+
+    /// Turns the job's picked sentences into entries: one summarizer call for all of them
+    /// (a job's picks are all of one kind), one numbered line back per sentence, each line
+    /// checked on its own. A line that fails a check is dropped (logged as
+    /// [`W_MEMORY_SUMMARY_DROPPED`]); the others are saved. The sentences go in through the
+    /// redactor, and every line comes out through it again.
+    async fn summarize(&self, work: &mut Work) -> Result<(), Failure> {
+        let picked = std::mem::take(&mut work.picked);
+        let Some(first) = picked.first() else {
+            return Ok(());
+        };
+        let kind = match first.prov {
+            Prov::Owner => "owner_message",
+            Prov::Lane => "lane_result",
+            _ => "subagent_report",
+        };
+        let notes: Vec<String> = picked
+            .iter()
+            .map(|pick| self.redactor.redact(&pick.sentence).0)
+            .collect();
+        let reply = match self.summarizer.summarize(kind, &notes).await {
+            Ok(reply) => reply,
+            Err(detail) => {
+                tracing::warn!(
+                    job = work.job,
+                    code = E_MEMORY_SUMMARY,
+                    %detail,
+                    "memory summarizer could not run; memory jobs wait"
+                );
+                return Err(Failure::SummaryOutage);
+            }
+        };
+        let Some(lines) = numbered_lines(&reply, picked.len()) else {
+            tracing::warn!(
+                job = work.job,
+                code = E_MEMORY_SUMMARY,
+                notes = picked.len(),
+                "memory summarizer answer does not fit"
+            );
+            return Err(Failure::SummaryUnfit);
+        };
+        self.summary_failures.store(0, Ordering::SeqCst);
+        for (pick, line) in picked.into_iter().zip(lines) {
+            let summary = match self.check_summary(&line) {
+                Ok(summary) => summary,
+                Err(reason) => {
+                    self.dropped(work, &reason);
+                    continue;
+                }
+            };
+            // A rule's summary must still state it as one (#57, point 3): it may not lose the
+            // always or never word that let the owner's sentence into core/.
+            let keeps_rule = match pick.bucket {
+                Bucket::Owner => says_always(&summary),
+                Bucket::Boundaries => says_boundary(&summary),
+                _ => true,
+            };
+            if !keeps_rule {
+                self.dropped(work, "rule_lost");
+                continue;
+            }
+            work.entries
+                .push(entry(summary, pick.prov, pick.bucket, pick.src));
+        }
+        Ok(())
+    }
+
+    /// One [`W_MEMORY_SUMMARY_DROPPED`] row for a summary of `work`'s job that is not saved.
+    fn dropped(&self, work: &Work, reason: &str) {
+        tracing::info!(job = work.job, reason, "memory summary dropped");
+        self.log(LogRow {
+            at: (self.now)(),
+            level: LogLevel::Warn,
+            code: W_MEMORY_SUMMARY_DROPPED,
+            job_id: Some(work.job),
+            omp_version: Some(self.omp_version.clone()),
+            jev_model: None,
+            detail: Some(format!("reason={reason}")),
+        });
+    }
+
+    /// `reply` folded to one line, or why it may not be saved.
+    fn check_summary(&self, reply: &str) -> Result<String, String> {
+        let summary = reply.split_whitespace().collect::<Vec<_>>().join(" ");
+        if summary.is_empty() {
+            return Err("empty".into());
+        }
+        if self.redactor.redact(&summary).1 {
+            return Err("secret".into());
+        }
+        if summary.chars().count() > MAX_SUMMARY_CHARS {
+            return Err("too_long".into());
+        }
+        self.filter
+            .allows(&summary, &self.redactor)
+            .map_err(|drop| format!("{drop:?}").to_lowercase())?;
+        Ok(summary)
     }
 
     fn window(&self) -> usize {
@@ -1206,6 +1403,38 @@ fn job_fault(err: &JevError) -> Option<&'static str> {
     }
 }
 
+/// The task part of a subagent source: the task and the first [`SHA_PREFIX`] hex digits of
+/// the file's content, so a changed output file gets sources of its own and a re-read of the
+/// same content finds its entries again.
+fn subagent_source(task: &str, sha256: &str) -> String {
+    let sha = sha256.get(..SHA_PREFIX).unwrap_or(sha256);
+    format!("task={task} sha={sha}")
+}
+
+/// Hex digits of a subagent file's sha256 in its sources.
+const SHA_PREFIX: usize = 12;
+
+/// The `count` summaries of a summarizer `reply`, in order: one line `<n>. <summary>` per
+/// note, numbered from 1 (blank lines ignored). `None` when the reply is not exactly that.
+fn numbered_lines(reply: &str, count: usize) -> Option<Vec<String>> {
+    let lines: Vec<&str> = reply
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() != count {
+        return None;
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            line.strip_prefix(&format!("{}.", i + 1))
+                .map(|rest| rest.trim().to_owned())
+        })
+        .collect()
+}
+
 /// Where a lane or subagent entry goes for jev's `thread` and every other answer.
 struct Place {
     thread: Bucket,
@@ -1273,9 +1502,12 @@ fn artifact_problem(
     if !inside {
         return Err("outside the session folder");
     }
+    // The longest source the task's entries get: the content sha and a sentence number.
+    let sha = "0".repeat(SHA_PREFIX);
+    let suffix = format!("{} s={}", subagent_source(task, &sha), u32::MAX);
     let src = match lane {
-        Some(id) => format!("lane={id} task={task}"),
-        None => format!("lead task={task}"),
+        Some(id) => format!("lane={id} {suffix}"),
+        None => format!("lead {suffix}"),
     };
     if Source::new(&src).is_err() {
         return Err("task name");

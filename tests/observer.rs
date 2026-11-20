@@ -19,8 +19,8 @@ use moraebot::memory::{
     self, Bucket, MemoryHandle, MemoryStore, NewEntry, Op, Prov, Redactor, Source,
 };
 use moraebot::observer::{
-    E_OBSERVER_JOB, E_OBSERVER_PANIC, E_SUBAGENT_LAYOUT, M_ARTIFACT_CHANGED, M_JEV_OFF, M_JOB_DONE,
-    Observer, Pass, W_SUBAGENT_SKIPPED,
+    E_MEMORY_SUMMARY, E_OBSERVER_JOB, E_OBSERVER_PANIC, E_SUBAGENT_LAYOUT, M_ARTIFACT_CHANGED,
+    M_JEV_OFF, M_JOB_DONE, Observer, Pass, W_MEMORY_SUMMARY_DROPPED, W_SUBAGENT_SKIPPED,
 };
 use moraebot::omp;
 use moraebot::store::{
@@ -66,6 +66,11 @@ fn test_config(root: &Path, omp_path: PathBuf, jev_url: &str) -> Config {
         omp: OmpConfig::default(),
         memory,
     }
+}
+
+/// What the fake summarizer (fake-omp in mode `ok`) saves for `sentence`: its echo.
+fn summarized(sentence: &str) -> String {
+    format!("echo: {sentence}")
 }
 
 /// Answers that save nothing.
@@ -114,7 +119,11 @@ impl Fixture {
     async fn with(adjust: impl FnOnce(&mut Config)) -> Self {
         let root = tempfile::tempdir().unwrap();
         let jev = FakeJev::start().await;
-        let mut config = test_config(root.path(), PathBuf::from("omp"), &jev.base_url());
+        let mut config = test_config(
+            root.path(),
+            PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+            &jev.base_url(),
+        );
         adjust(&mut config);
         let store = Arc::new(Mutex::new(
             Store::open(&config.home.join(STORE_FILE)).unwrap(),
@@ -139,6 +148,13 @@ impl Fixture {
             clock,
             observer,
         }
+    }
+
+    /// The fixture's observer with these variables in its summarizer's environment.
+    fn with_summarizer(mut self, vars: &[(&str, &str)]) -> Self {
+        self.observer = observer(&self.config, &self.store, &self.memory, &self.clock)
+            .with_summarizer_env(vars.iter().copied());
+        self
     }
 
     fn set_clock(&self, at: i64) {
@@ -304,7 +320,7 @@ fn observer(
 }
 
 #[tokio::test]
-async fn observer_saves_an_owner_sentence_word_for_word() {
+async fn observer_saves_a_summary_of_an_owner_sentence() {
     let fx = Fixture::new().await;
     let row = fx.admit("m1", "이건 그냥 잡담이야.  앞으로 답은 항상 한국어로 해줘.");
     fx.reply(row, None, "알겠어요", &trace(false, true));
@@ -313,11 +329,11 @@ async fn observer_saves_an_owner_sentence_word_for_word() {
 
     let saved = fx.entries(&Bucket::Owner);
     assert_eq!(saved.len(), 1, "{saved:?}");
-    assert_eq!(saved[0].text, "앞으로 답은 항상 한국어로 해줘.");
+    assert_eq!(saved[0].text, summarized("앞으로 답은 항상 한국어로 해줘."));
     assert_eq!(saved[0].prov, Prov::Owner);
     assert_eq!(
         saved[0].src.as_deref(),
-        Some(format!("row={row} s=1").as_str())
+        Some(format!("row={row} s=1 turn={row}").as_str())
     );
     let state = &fx.bodies()[0]["state"];
     assert_eq!(state["kind"], "owner_message");
@@ -366,7 +382,7 @@ async fn observer_keeps_a_sentence_without_always_out_of_core() {
     assert!(fx.entries(&Bucket::Owner).is_empty());
     let thread = fx.entries(&Bucket::Thread(KEY.into()));
     assert_eq!(thread.len(), 1, "{thread:?}");
-    assert_eq!(thread[0].text, "릴리스는 금요일에 하자.");
+    assert_eq!(thread[0].text, summarized("릴리스는 금요일에 하자."));
 
     // A "never" sentence may be a boundary.
     let next = fx.admit("m2", "Never force-push to main.");
@@ -375,7 +391,7 @@ async fn observer_keeps_a_sentence_without_always_out_of_core() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let boundaries = fx.entries(&Bucket::Boundaries);
     assert_eq!(boundaries.len(), 1, "{boundaries:?}");
-    assert_eq!(boundaries[0].text, "Never force-push to main.");
+    assert_eq!(boundaries[0].text, summarized("Never force-push to main."));
 }
 
 #[tokio::test]
@@ -390,7 +406,7 @@ async fn observer_never_makes_a_lane_sentence_the_owners() {
     assert_eq!(saved[0].prov, Prov::Lane);
     assert_eq!(
         saved[0].src.as_deref(),
-        Some(format!("lane={lane} seq=1").as_str())
+        Some(format!("lane={lane} seq=1 s=0").as_str())
     );
     assert_eq!(fx.bodies()[0]["state"]["kind"], "lane_result");
 }
@@ -408,18 +424,21 @@ async fn observer_gives_a_steered_owner_row_owner_and_the_lane_row_lane() {
     assert_eq!(fx.jev.requests().len(), 2);
 
     let saved = fx.entries(&Bucket::Thread(KEY.into()));
-    let by_text = |text: &str| saved.iter().find(|e| e.text == text).expect(text).clone();
+    let by_text = |text: &str| {
+        let text = summarized(text);
+        saved.iter().find(|e| e.text == text).expect(&text).clone()
+    };
     let lane_entry = by_text("CI는 PR마다 cargo test를 돌린다.");
     assert_eq!(lane_entry.prov, Prov::Lane);
     assert_eq!(
         lane_entry.src.as_deref(),
-        Some(format!("lane={lane} seq=1").as_str())
+        Some(format!("lane={lane} seq=1 s=0").as_str())
     );
     let owner_entry = by_text("릴리스는 금요일에 하자.");
     assert_eq!(owner_entry.prov, Prov::Owner);
     assert_eq!(
         owner_entry.src.as_deref(),
-        Some(format!("row={owner_row} s=0").as_str())
+        Some(format!("row={owner_row} s=0 turn={lane_row}").as_str())
     );
 }
 
@@ -495,7 +514,7 @@ async fn observer_never_saves_or_sends_a_filtered_sentence() {
     assert_eq!(saved.len(), 1);
     assert_eq!(
         saved[0].text,
-        "CI는 PR마다 cargo test --all-features를 돌린다."
+        summarized("CI는 PR마다 cargo test --all-features를 돌린다.")
     );
 }
 
@@ -621,7 +640,7 @@ async fn observer_processing_a_job_twice_adds_nothing() {
         text: "앞으로 답은 항상 한국어로 해줘.".into(),
         prov: Prov::Owner,
         bucket: Bucket::Owner,
-        src: Source::row_sentence(row, 0),
+        src: Source::row_sentence(row, 0, row),
         expires: None,
         why: Some("observed".into()),
     };
@@ -660,7 +679,7 @@ async fn observer_adds_no_second_entry_for_a_core_save_of_a_failed_lead_turn() {
         text: text.into(),
         prov: Prov::Owner,
         bucket: Bucket::Owner,
-        src: Source::row_sentence(row, 0),
+        src: Source::row_sentence(row, 0, row),
         expires: None,
         why: Some("qa".into()),
     };
@@ -711,10 +730,10 @@ async fn observer_keeps_every_entry_of_a_lead_group_and_three_lanes() {
     assert_eq!(
         texts,
         [
-            "레인 1의 결과는 좋다.",
-            "레인 2의 결과는 좋다.",
-            "레인 3의 결과는 좋다.",
-            "모든 레인 결과를 기록해."
+            "echo: 레인 1의 결과는 좋다.",
+            "echo: 레인 2의 결과는 좋다.",
+            "echo: 레인 3의 결과는 좋다.",
+            "echo: 모든 레인 결과를 기록해."
         ]
     );
     assert_eq!(fx.commits(), commits + 1);
@@ -895,9 +914,18 @@ async fn subagent_file_is_collected_from_the_session_folder() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let saved = fx.entries(&Bucket::General);
     assert_eq!(saved.len(), 1, "{saved:?}");
-    assert_eq!(saved[0].text, "저장소는 Rust로 작성되어 있다.");
+    assert_eq!(saved[0].text, summarized("저장소는 Rust로 작성되어 있다."));
     assert_eq!(saved[0].prov, Prov::Subagent);
-    assert_eq!(saved[0].src.as_deref(), Some("lead task=Explore_1"));
+    assert_eq!(
+        saved[0].src.as_deref(),
+        Some(
+            format!(
+                "lead task=Explore_1 sha={} s=0",
+                sha12("[moraebot] ignored line\n저장소는 Rust로 작성되어 있다.")
+            )
+            .as_str()
+        )
+    );
     let kinds: Vec<Value> = fx
         .bodies()
         .iter()
@@ -949,7 +977,16 @@ async fn subagent_file_written_after_the_turn_is_found_by_the_next_scan() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let saved = fx.entries(&Bucket::General);
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].src.as_deref(), Some("lead task=Explore_2"));
+    assert_eq!(
+        saved[0].src.as_deref(),
+        Some(
+            format!(
+                "lead task=Explore_2 sha={} s=0",
+                sha12("결론은 캐시가 원인이다.")
+            )
+            .as_str()
+        )
+    );
 }
 
 #[tokio::test]
@@ -974,11 +1011,17 @@ async fn subagent_file_written_while_down_is_found_at_start() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let saved = fx.entries(&Bucket::Thread(KEY.into()));
     assert_eq!(saved.len(), 1, "{saved:?}");
-    assert_eq!(saved[0].text, "리뷰 결과 문제는 없었다.");
+    assert_eq!(saved[0].text, summarized("리뷰 결과 문제는 없었다."));
     assert_eq!(saved[0].prov, Prov::Subagent);
     assert_eq!(
         saved[0].src.as_deref(),
-        Some(format!("lane={lane} task=Review_1").as_str())
+        Some(
+            format!(
+                "lane={lane} task=Review_1 sha={} s=0",
+                sha12("리뷰 결과 문제는 없었다.")
+            )
+            .as_str()
+        )
     );
 }
 
@@ -1017,7 +1060,7 @@ async fn subagent_file_is_queued_once_and_again_when_it_changes() {
     assert_eq!(fx.jev.requests().len(), 1);
     let saved = fx.entries(&Bucket::General);
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].text, "고친 결과다.");
+    assert_eq!(saved[0].text, summarized("고친 결과다."));
     let (_root, db) = fx.into_db();
     let changed: i64 = db
         .query_row(
@@ -1201,8 +1244,8 @@ async fn observer_takes_a_from_now_on_rule_into_core() {
     assert_eq!(
         texts(&fx, &Bucket::Owner),
         [
-            "From now on, reply in English.",
-            "앞으로는 PR 제목을 영어로 써."
+            "echo: From now on, reply in English.",
+            "echo: 앞으로는 PR 제목을 영어로 써."
         ]
     );
     assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
@@ -1223,12 +1266,15 @@ async fn observer_boundary_needs_a_whole_always_or_never_word() {
         fx.jev.answer(save("boundary", "s0"));
         assert_eq!(fx.observer.run_once().await, Pass::Idle);
     }
-    assert_eq!(texts(&fx, &Bucket::Boundaries), ["Push to main: never."]);
+    assert_eq!(
+        texts(&fx, &Bucket::Boundaries),
+        ["echo: Push to main: never."]
+    );
     assert_eq!(
         texts(&fx, &Bucket::Thread(KEY.into())),
         [
-            "Don't add emoji in this PR.",
-            "Whenever you're unsure, ask me."
+            "echo: Don't add emoji in this PR.",
+            "echo: Whenever you're unsure, ask me."
         ]
     );
 }
@@ -1342,7 +1388,7 @@ async fn observer_fails_a_job_jev_keeps_rejecting_and_goes_on() {
     );
     assert_eq!(
         texts(&fx, &Bucket::Thread(KEY.into())),
-        ["둘째 규칙은 저렇다."]
+        ["echo: 둘째 규칙은 저렇다."]
     );
     assert_eq!(fx.backlog(), Backlog::default());
     let status = restarted.status_line();
@@ -1389,7 +1435,7 @@ async fn observer_fails_a_job_whose_answers_never_fit_and_goes_on() {
     );
     assert_eq!(
         texts(&fx, &Bucket::Thread(KEY.into())),
-        ["둘째 규칙은 저렇다."]
+        ["echo: 둘째 규칙은 저렇다."]
     );
     assert_eq!(fx.backlog(), Backlog::default());
     let status = fx.observer.status_line();
@@ -1497,4 +1543,351 @@ async fn gateway_observes_a_reply_end_to_end() {
         sends.iter().all(|text| !text.contains("[memory]")),
         "{sends:?}"
     );
+}
+
+/// Every file of the memory folder outside `.git`, as text.
+fn memory_files(fx: &Fixture) -> String {
+    let mut all = String::new();
+    let mut folders = vec![fx.config.memory_dir()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                all.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    all
+}
+
+/// #57: the observer saves the summarizer's text, never the owner's sentence, with the row,
+/// sentence and turn as its source; the summarizer is the locked chat-style child and leaves
+/// no session folder behind.
+#[tokio::test]
+async fn observer_saves_the_summary_and_not_the_original() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("fake-omp.log");
+    let log_path = log.to_string_lossy().into_owned();
+    let fx = Fixture::new().await.with_summarizer(&[
+        ("FAKE_OMP_REPLY", "1. Replies should always be in Korean."),
+        ("FAKE_OMP_LOG", &log_path),
+    ]);
+    let row = fx.admit("m1", "앞으로 답은 항상 한국어로 해줘.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("core", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+
+    let saved = fx.entries(&Bucket::Owner);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0].text, "Replies should always be in Korean.");
+    assert_eq!(saved[0].prov, Prov::Owner);
+    assert_eq!(
+        saved[0].src.as_deref(),
+        Some(format!("row={row} s=0 turn={row}").as_str())
+    );
+    assert!(
+        !memory_files(&fx).contains("한국어로 해줘"),
+        "the original sentence is not stored"
+    );
+
+    let trace = std::fs::read_to_string(&log).unwrap();
+    let start = trace
+        .lines()
+        .find(|line| line.starts_with("START "))
+        .expect("the summarizer started");
+    for flag in [
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-context-files",
+        "--no-lsp",
+        "--no-pty",
+        "/summarizer/",
+        "omp-locked.yml",
+    ] {
+        assert!(start.contains(flag), "{flag}: {start}");
+    }
+    assert!(
+        trace.contains("[moraebot notes kind=owner_message]\\n1. 앞으로 답은 항상 한국어로 해줘."),
+        "{trace}"
+    );
+    let left: Vec<String> = std::fs::read_dir(fx.config.home.join("summarizer"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["omp-locked.yml"], "no session folder is left behind");
+}
+
+/// #57, moraedang on #60: a summarizer that cannot run is an outage, not the job's fault.
+/// The pass waits, longer each time, the job keeps every attempt and is saved once the
+/// summarizer is back; the sentence is never saved instead.
+#[tokio::test]
+async fn observer_waits_out_a_summarizer_outage_without_using_attempts() {
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_MODE", "error")]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+    fx.reply(row, None, "네", &trace(false, true));
+    let mut at = fx.t0;
+    for wait in [60, 120, 240, 480] {
+        fx.set_clock(at);
+        fx.jev.answer(save("thread", "s0"));
+        assert_eq!(
+            fx.observer.run_once().await,
+            Pass::Waiting {
+                until: Some(at + wait)
+            }
+        );
+        at += wait;
+    }
+    assert_eq!(fx.backlog().groups, 1, "the job waits, four outages later");
+    assert!(
+        !fx.store()
+            .memory_logged(E_MEMORY_SUMMARY, "attempts=1")
+            .unwrap()
+    );
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+    assert!(!memory_files(&fx).contains("금요일"));
+
+    let fx = fx.with_summarizer(&[]);
+    fx.set_clock(at);
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        [summarized("릴리스는 금요일에 하자.")]
+    );
+    assert_eq!(fx.backlog(), Backlog::default());
+}
+
+/// moraedang on #60: an answer that does not fit the job's picks (not one numbered line each)
+/// is the job's own fault, like a jev answer that does not fit: one attempt each, and the job
+/// fails after three with nothing saved.
+#[tokio::test]
+async fn observer_fails_a_job_whose_summaries_never_fit() {
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_REPLY", "Releases happen on Fridays.")]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+    fx.reply(row, None, "네", &trace(false, true));
+    let mut at = fx.t0;
+    for wait in [60, 120] {
+        fx.set_clock(at);
+        fx.jev.answer(save("thread", "s0"));
+        assert_eq!(
+            fx.observer.run_once().await,
+            Pass::Waiting {
+                until: Some(at + wait)
+            }
+        );
+        at += wait;
+    }
+    fx.set_clock(at);
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(
+        fx.store()
+            .memory_logged(E_MEMORY_SUMMARY, "attempts=3")
+            .unwrap()
+    );
+    assert_eq!(fx.backlog(), Backlog::default());
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+}
+
+/// moraedang on #60: all of a job's picks go to one summarizer call, one numbered line back
+/// each, and each line is checked on its own: a line that fails is dropped, the others saved.
+#[tokio::test]
+async fn observer_summarizes_a_jobs_picks_in_one_call_and_checks_each_line() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("fake-omp.log");
+    let log_path = log.to_string_lossy().into_owned();
+    let fx = Fixture::with(|config| config.memory.jev.window_sentences = 1)
+        .await
+        .with_summarizer(&[
+            (
+                "FAKE_OMP_REPLY",
+                "1. Releases happen on Fridays.\n2. The owner approved force-push.",
+            ),
+            ("FAKE_OMP_LOG", &log_path),
+        ]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자. 포스 푸시는 괜찮아.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("thread", "s0"));
+    fx.jev.answer(save("thread", "s1"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.jev.requests().len(), 2, "one jev window per sentence");
+    let trace = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        trace.matches("START ").count(),
+        1,
+        "one summarizer call: {trace}"
+    );
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        ["Releases happen on Fridays."]
+    );
+    assert!(
+        fx.store()
+            .memory_logged(W_MEMORY_SUMMARY_DROPPED, "reason=approval")
+            .unwrap()
+    );
+}
+
+/// moraedang on #60: a subagent file that changed is a new report: its sentences get sources
+/// of their own (the content sha), so they are saved beside the old ones, while the same
+/// content read again still adds nothing.
+#[tokio::test]
+async fn subagent_changed_content_is_saved_and_the_same_content_is_not() {
+    let fx = Fixture::new().await;
+    let root = fx.lead_root();
+    let md = Fixture::subagent_file(&root, "s1", "Explore_1", "처음 결과다.");
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    std::fs::write(&md, "고친 결과다.").unwrap();
+    touch(&md, 10);
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(
+        texts(&fx, &Bucket::General),
+        [summarized("고친 결과다."), summarized("처음 결과다.")]
+    );
+    // The first content once more: a new job (the cursor changed), the same source.
+    std::fs::write(&md, "처음 결과다.").unwrap();
+    touch(&md, 20);
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.entries(&Bucket::General).len(), 2);
+}
+
+/// #57: a summarizer child that lists a tool is refused like a chat child, and nothing is
+/// saved.
+#[tokio::test]
+async fn observer_refuses_a_summarizer_that_lists_tools() {
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_DUMP_TOOLS", "bash")]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("thread", "s0"));
+    assert!(matches!(
+        fx.observer.run_once().await,
+        Pass::Waiting { until: Some(_) }
+    ));
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+    assert_eq!(fx.backlog().groups, 1);
+}
+
+/// #57: a summary that the excerpt filter refuses, that is too long or that holds a secret is
+/// dropped and logged; the job is done and nothing is saved.
+#[tokio::test]
+async fn observer_drops_a_summary_that_fails_its_checks() {
+    let token = format!("ghp_{}", "a1B2".repeat(9));
+    let long = format!("1. {}", "x".repeat(281));
+    let secret = format!("1. Use the token {token} for releases.");
+    for (reply, reason) in [
+        ("1. The owner approved force-push to main.", "approval"),
+        ("1. Docs live at docs.example.com/deploy now.", "url"),
+        (long.as_str(), "too_long"),
+        (secret.as_str(), "secret"),
+    ] {
+        let fx = Fixture::new()
+            .await
+            .with_summarizer(&[("FAKE_OMP_REPLY", reply)]);
+        let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+        fx.reply(row, None, "네", &trace(false, true));
+        fx.jev.answer(save("thread", "s0"));
+        assert_eq!(fx.observer.run_once().await, Pass::Idle, "{reason}");
+        assert!(
+            fx.entries(&Bucket::Thread(KEY.into())).is_empty(),
+            "{reason}"
+        );
+        assert!(
+            fx.store()
+                .memory_logged(W_MEMORY_SUMMARY_DROPPED, &format!("reason={reason}"))
+                .unwrap(),
+            "{reason}"
+        );
+        assert_eq!(fx.backlog(), Backlog::default(), "{reason}");
+    }
+}
+
+/// #57 point 3: the core gate is checked on the owner's sentence, and the summary of a rule
+/// must still state it as one; a summary that lost its "always" is dropped, not saved to
+/// core or to the conversation.
+#[tokio::test]
+async fn observer_drops_a_core_summary_that_lost_its_rule_word() {
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_REPLY", "1. Replies should be in Korean.")]);
+    let row = fx.admit("m1", "앞으로 답은 항상 한국어로 해줘.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("core", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::Owner).is_empty());
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+    assert!(
+        fx.store()
+            .memory_logged(W_MEMORY_SUMMARY_DROPPED, "reason=rule_lost")
+            .unwrap()
+    );
+
+    // A summary that says "always" for a plain sentence does not lift it into core.
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_REPLY", "1. Always release on Fridays.")]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("core", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.entries(&Bucket::Owner).is_empty());
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        ["Always release on Fridays."]
+    );
+}
+
+/// #57: the lead's `memory_write` of a lane sentence and the observer's summary of it have the
+/// same source, so only the first is kept.
+#[tokio::test]
+async fn observer_adds_nothing_for_a_lane_sentence_the_lead_already_saved() {
+    let fx = Fixture::new().await;
+    let text = "CI는 PR마다 cargo test를 돌린다.";
+    let (lane, _row) = fx.lane("call-1", None, text);
+    let lead_save = NewEntry {
+        text: text.into(),
+        prov: Prov::Lane,
+        bucket: Bucket::Thread(KEY.into()),
+        src: Source::lane_sentence(lane, 1, 0),
+        expires: None,
+        why: Some("qa".into()),
+    };
+    fx.memory
+        .apply_batch(vec![Op::Add(lead_save)])
+        .await
+        .unwrap()
+        .into_iter()
+        .for_each(|r| assert!(r.is_ok()));
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(texts(&fx, &Bucket::Thread(KEY.into())), [text]);
+}
+
+/// The first 12 hex digits of the sha256 of `text`, as a subagent source holds them.
+fn sha12(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..12]
+        .to_owned()
 }
