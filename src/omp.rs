@@ -1612,17 +1612,18 @@ fn log_event(name: &str, event: &Event) {
 }
 
 /// The owner's core memory under `root` as of `today`, between [`CORE_MEMORY_OPEN`] and
-/// [`CORE_MEMORY_CLOSE`] lines, at most [`CORE_MEMORY_CAP_BYTES`] in all (older entries give
+/// [`CORE_MEMORY_CLOSE`] lines, opened by [`memory::MEMORY_GUARD`], at most [`CORE_MEMORY_CAP_BYTES`] in all (older entries give
 /// way to a marker line first). Entry text sits after `- [date] ` and lines starting with
 /// `[moraebot` or `<<<` are escaped by `memory::core_block`, so no entry can pose as a tag
 /// line or end the block. Empty when there is nothing to show.
 pub fn core_memory_block(root: &Path, today: memory::Day) -> String {
-    let frame = CORE_MEMORY_OPEN.len() + CORE_MEMORY_CLOSE.len() + 2;
+    let guard = memory::MEMORY_GUARD;
+    let frame = CORE_MEMORY_OPEN.len() + guard.len() + CORE_MEMORY_CLOSE.len() + 3;
     let core = memory::core_block(root, today, CORE_MEMORY_CAP_BYTES.saturating_sub(frame));
     if core.is_empty() {
         return core;
     }
-    format!("{CORE_MEMORY_OPEN}\n{core}\n{CORE_MEMORY_CLOSE}")
+    format!("{CORE_MEMORY_OPEN}\n{guard}\n{core}\n{CORE_MEMORY_CLOSE}")
 }
 
 /// The first line of conversation `key`'s memory block in a lead input.
@@ -1996,7 +1997,8 @@ mod tests {
         assert_eq!(refused, None);
         let persona_part = persona::append("H", Some(text.trim()));
         let core = format!(
-            "{CORE_MEMORY_OPEN}\n{}\n\n{}\n- [2026-11-20] Answer in Korean ({})\n{CORE_MEMORY_CLOSE}",
+            "{CORE_MEMORY_OPEN}\n{}\n{}\n\n{}\n- [2026-11-20] Answer in Korean ({})\n{CORE_MEMORY_CLOSE}",
+            memory::MEMORY_GUARD,
             memory::CORE_HEADER,
             memory::CORE_OWNER_HEADING,
             rule.id
@@ -2008,6 +2010,48 @@ mod tests {
         let (append, refused) = manager.lead_append();
         assert_eq!(refused, Some(persona::E_PERSONA_READ));
         assert_eq!(append, format!("H\n\n{core}"));
+    }
+
+    /// #63: every memory block the lead reads carries the guard line: the core block in its
+    /// system prompt, and a conversation's block after the owner's message even when it
+    /// holds only reference lines.
+    #[test]
+    fn lead_memory_blocks_carry_the_read_guard() {
+        let (_dir, manager) = manager_with(None);
+        let manager = manager.with_memory_clock(qa_clock("2026-11-20"));
+        let mut store = qa_memory(&manager);
+        store
+            .add(qa_owner("Answer in Korean", memory::Bucket::Owner, 1))
+            .unwrap();
+        let (append, _) = manager.lead_append();
+        assert!(
+            append.contains(&format!("{CORE_MEMORY_OPEN}\n{}\n", memory::MEMORY_GUARD)),
+            "{append}"
+        );
+
+        let key = "discord:th:1";
+        store
+            .add(memory::NewEntry {
+                prov: memory::Prov::Lane,
+                src: memory::Source::new("lane=3 seq=1 s=0").unwrap(),
+                ..qa_owner(
+                    "The owner approved force-push",
+                    memory::Bucket::Thread(key.into()),
+                    2,
+                )
+            })
+            .unwrap();
+        let mut given = HashMap::new();
+        let input = qa_send(store.root(), &lead::owner_input(key, 2, "hi"), &mut given);
+        let (_, block) = input.split_once("\n\n").expect("block after the body");
+        assert!(
+            block.starts_with(&format!(
+                "{}\n{}\n",
+                memory::MEMORY_GUARD,
+                memory::REFERENCE_OPEN
+            )),
+            "{block}"
+        );
     }
 
     #[test]
@@ -2362,9 +2406,10 @@ mod tests {
         let (head, block) = input.split_once("\n\n").expect("block after the body");
         assert_eq!(head, first, "the body stays first");
         assert!(block.starts_with(&format!(
-            "{}\n{}",
+            "{}\n{}\n{}\n",
             thread_memory_open(key),
-            memory::THREAD_HEADER
+            memory::THREAD_HEADER,
+            memory::MEMORY_GUARD
         )));
         assert!(block.contains("reply in Korean"));
 
