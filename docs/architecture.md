@@ -691,7 +691,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 | 봇 답장 상한 | `max_bot_replies`: 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수 | 없음 (제한 없음) | 불가 |
 | 작업 폴더 | omp가 일하는 폴더 (`--cwd`) | 없음 (필수) | 불가 (열린 질문 11) |
 | 모델 | omp가 쓸 AI 모델 | omp 기본값 | 주인만 가능 (열린 질문 12) |
-| jev (memory observer) | `[memory.jev]` and `[memory.filter]`; the key only from `TYPESAFE_API_KEY` or `api_key_file`; `enabled = false` turns it off (docs/memory.md) | on when a key is found | 불가 |
+| jev (memory observer) | `[memory.jev]` and `[memory.filter]`; the key only from `TYPESAFE_API_KEY` or `api_key_file`; `enabled = true` and a key turn it on (docs/memory.md) | off | 불가 |
 
 규칙은 하나입니다. **봇을 빼앗을 수 있는 항목은 파일에서만 바꿉니다.**
 

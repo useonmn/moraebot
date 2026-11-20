@@ -46,6 +46,7 @@ fn test_config(root: &Path, omp_path: PathBuf, jev_url: &str) -> Config {
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let mut memory = MemoryConfig::default();
     memory.jev.base_url = jev_url.to_owned();
+    memory.jev.enabled = true;
     memory.jev.set_env_key(Some("JEV_KEY_SENTINEL_0d17".into()));
     Config {
         messenger: Platform::Discord,
@@ -841,7 +842,7 @@ async fn observer_fails_an_unreadable_job_and_goes_on() {
 
 #[tokio::test]
 async fn observer_settles_jobs_without_requests_when_jev_is_off() {
-    let fx = Fixture::with(|config| config.memory.jev.enabled = Some(false)).await;
+    let fx = Fixture::with(|config| config.memory.jev.enabled = false).await;
     let row = fx.admit("m1", "앞으로 답은 짧게 해줘.");
     fx.reply(row, None, "네", &trace(false, true));
     fx.lane("call-1", None, "결과는 좋다.");

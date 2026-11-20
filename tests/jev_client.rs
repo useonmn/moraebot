@@ -34,6 +34,7 @@ impl Clock {
 
 fn config(base_url: String) -> JevConfig {
     let mut config = JevConfig {
+        enabled: true,
         base_url,
         ..JevConfig::default()
     };
@@ -194,7 +195,7 @@ async fn jev_without_a_key_is_paused_and_sends_nothing() {
     let fake = FakeJev::start().await;
     let clock = Clock::new();
     let enabled = JevConfig {
-        enabled: Some(true),
+        enabled: true,
         base_url: fake.base_url(),
         ..JevConfig::default()
     };
@@ -214,8 +215,18 @@ async fn jev_without_a_key_is_paused_and_sends_nothing() {
     assert_eq!(off.ask(&request(), LIMIT).await.unwrap_err(), JevError::Off);
 
     let mut keyed_but_off = config(fake.base_url());
-    keyed_but_off.enabled = Some(false);
+    keyed_but_off.enabled = false;
     let off = Jev::new(keyed_but_off, clock.now());
+    assert_eq!(off.ask(&request(), LIMIT).await.unwrap_err(), JevError::Off);
+
+    // Owner decision on #46: jev is opt-in, so a key with the default settings stays off.
+    let mut keyed_by_default = JevConfig {
+        base_url: fake.base_url(),
+        ..JevConfig::default()
+    };
+    keyed_by_default.set_env_key(Some("KEY_SENTINEL_1".into()));
+    let off = Jev::new(keyed_by_default, clock.now());
+    assert_eq!(off.status(), JevStatus::Off);
     assert_eq!(off.ask(&request(), LIMIT).await.unwrap_err(), JevError::Off);
 
     assert!(fake.requests().is_empty());

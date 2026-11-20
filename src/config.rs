@@ -286,8 +286,8 @@ pub struct MemoryConfig {
 /// The `[memory.jev]` settings: how moraebot asks jev (TypeSafe System One).
 #[derive(Debug, Clone, PartialEq)]
 pub struct JevConfig {
-    /// Absent means on exactly when a key is found.
-    pub enabled: Option<bool>,
+    /// jev runs only when this is true and a key is found; a key alone turns nothing on.
+    pub enabled: bool,
     /// A file holding the key. `TYPESAFE_API_KEY` wins over it.
     pub api_key_file: Option<PathBuf>,
     /// The `TYPESAFE_API_KEY` value, handed over by `main.rs`. Never read from or written to
@@ -310,7 +310,7 @@ pub struct JevConfig {
 impl Default for JevConfig {
     fn default() -> Self {
         Self {
-            enabled: None,
+            enabled: false,
             api_key_file: None,
             env_key: None,
             base_url: "https://api.typesafe.ai".to_owned(),
@@ -349,9 +349,9 @@ impl JevConfig {
         (!key.is_empty()).then(|| Secret::new(key))
     }
 
-    /// `enabled` when set, else whether a key is found.
+    /// Whether `memory.jev.enabled` is true. Without a key jev then stays paused.
     pub fn is_enabled(&self) -> bool {
-        self.enabled.unwrap_or_else(|| self.api_key().is_some())
+        self.enabled
     }
 
     pub fn timeout(&self) -> Duration {
@@ -696,7 +696,7 @@ impl MemoryConfig {
         let section = section.unwrap_or_default();
         let jev_section = section.jev.unwrap_or_default();
         let mut jev = JevConfig {
-            enabled: jev_section.enabled,
+            enabled: jev_section.enabled.unwrap_or(false),
             api_key_file: jev_section
                 .api_key_file
                 .map(|path| env.expand_tilde(&path))
@@ -837,7 +837,7 @@ impl MemoryConfig {
             bucket_none: changed(&q.bucket_none, &dq.bucket_none),
         };
         let jev_section = JevSection {
-            enabled: jev.enabled,
+            enabled: jev.enabled.then_some(true),
             api_key_file: jev.api_key_file.clone(),
             base_url: changed(&jev.base_url, &d.base_url),
             model: changed(&jev.model, &d.model),
@@ -873,7 +873,11 @@ impl MemoryConfig {
     fn key_check(&self) -> Check {
         let jev = &self.jev;
         let result = if !jev.is_enabled() {
-            Ok("off".to_owned())
+            Ok(if jev.api_key().is_some() {
+                "off (a key is set; memory.jev.enabled = true turns jev on)".to_owned()
+            } else {
+                "off".to_owned()
+            })
         } else if jev.env_key.is_some() {
             Ok("key from TYPESAFE_API_KEY".to_owned())
         } else if let Some(path) = &jev.api_key_file {
@@ -899,15 +903,46 @@ impl MemoryConfig {
     }
 }
 
-/// `https://`, or plain `http://` to the loopback host only (tests and local proxies).
+/// `https://` to any host, or plain `http://` to the loopback host only (tests and local
+/// proxies), judged by a URL parser: `http://127.0.0.1:80@evil.com/` names `evil.com`. A URL
+/// with a user name or password is refused.
 fn base_url_is_safe(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
     }
-    ["http://127.0.0.1", "http://localhost"].iter().any(|host| {
-        url.strip_prefix(host)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
-    })
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
+        _ => false,
+    }
+}
+
+/// The `E_CONFIG_PARSE` error for `text`. toml's message quotes the offending line, so when
+/// the file holds an `api_key` key (never valid: the key lives in the environment or in
+/// `api_key_file`) or the error names it, a fixed message is returned instead, so the key is
+/// never printed by `check-config` or the gateway's start error.
+fn parse_error(text: &str, err: &toml::de::Error) -> ConfigError {
+    let names_key = |key: &str| {
+        key.rsplit('.')
+            .next()
+            .is_some_and(|last| last.trim().trim_matches(['"', '\'']) == "api_key")
+    };
+    let key_line = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .any(|(key, _)| names_key(key));
+    if key_line || err.message().contains("`api_key`") {
+        return ConfigError::new(
+            E_CONFIG_PARSE,
+            "config.toml holds an `api_key` key, which is not allowed (the line is not shown, so \
+             the key is not printed): remove it and set TYPESAFE_API_KEY or \
+             memory.jev.api_key_file instead",
+        );
+    }
+    ConfigError::new(E_CONFIG_PARSE, err.to_string())
 }
 
 /// One line of `check-config` output.
@@ -934,8 +969,7 @@ impl Config {
 
     /// Parses config text and resolves defaults. Filesystem checks live in [`Config::validate`].
     pub fn from_toml(text: &str, env: &Env) -> Result<Config, ConfigError> {
-        let file: ConfigFile =
-            toml::from_str(text).map_err(|e| ConfigError::new(E_CONFIG_PARSE, e.to_string()))?;
+        let file: ConfigFile = toml::from_str(text).map_err(|e| parse_error(text, &e))?;
 
         let access_mode = match file.access_mode.as_deref() {
             None | Some("owner_only") => AccessMode::OwnerOnly,
@@ -1717,20 +1751,10 @@ mod tests {
             (2, 60, 5, 300)
         );
         assert!(cfg.memory.filter.commands.contains(&"sh".to_owned()));
-        assert!(!jev.is_enabled(), "no key: off");
-
-        let key = key_file(&fx, "k\n");
-        let with_key = format!(
-            "{}[memory.jev]\napi_key_file = {}\n",
-            fx.valid_toml(),
-            quoted(&key)
-        );
-        assert!(fx.load(&with_key).expect("loads").memory.jev.is_enabled());
-        let off = format!("{with_key}enabled = false\n");
-        assert!(!fx.load(&off).expect("loads").memory.jev.is_enabled());
+        assert!(!jev.is_enabled(), "off by default");
         let mut env_only = cfg.memory.jev.clone();
         env_only.set_env_key(Some("k".into()));
-        assert!(env_only.is_enabled());
+        assert!(!env_only.is_enabled(), "a key alone is off");
     }
 
     #[test]
@@ -1845,6 +1869,73 @@ mod tests {
         ] {
             fx.load(&with_url(good)).expect(good);
         }
+    }
+
+    /// moraedang on #46: a URL parser reads `127.0.0.1:80@` as userinfo, so the host of these
+    /// is `evil.com` and the key would travel there in plain text.
+    #[test]
+    fn memory_config_refuses_userinfo_in_the_jev_url() {
+        let fx = Fixture::new();
+        let with_url =
+            |url: &str| format!("{}[memory.jev]\nbase_url = \"{url}\"\n", fx.valid_toml());
+        for bad in [
+            "http://127.0.0.1:80@evil.com/",
+            "http://localhost:x@evil.com/",
+            "https://user:pw@api.typesafe.ai",
+            "https://user@api.typesafe.ai",
+            "not a url",
+        ] {
+            assert_eq!(code(fx.load(&with_url(bad))), E_CONFIG_VALUE, "{bad}");
+        }
+        fx.load(&with_url("http://[::1]:4100/"))
+            .expect("IPv6 loopback");
+    }
+
+    /// moraedang on #46: toml's parse error quotes the offending line, so a key written into
+    /// `config.toml` must never reach the error text.
+    #[test]
+    fn memory_config_never_echoes_a_key_written_into_the_file() {
+        let fx = Fixture::new();
+        let sentinel = "KEY_SENTINEL_e41f";
+        for text in [
+            format!(
+                "{}[memory.jev]\napi_key = \"{sentinel}\"\n",
+                fx.valid_toml()
+            ),
+            format!("{}[memory.jev]\napi_key = \"{sentinel}\n", fx.valid_toml()),
+            format!(
+                "{}[memory]\njev.api_key = \"{sentinel}\"\n",
+                fx.valid_toml()
+            ),
+        ] {
+            let err = fx.load(&text).expect_err("refused");
+            assert_eq!(err.code, E_CONFIG_PARSE);
+            assert!(!err.to_string().contains(sentinel), "{err}");
+            assert!(!format!("{err:?}").contains(sentinel), "{err:?}");
+        }
+    }
+
+    /// Owner decision on #46: jev is opt-in. A key alone turns nothing on.
+    #[test]
+    fn memory_config_jev_needs_enabled_and_a_key() {
+        let fx = Fixture::new();
+        let key = key_file(&fx, "k\n");
+        let with_key = format!(
+            "{}[memory.jev]\napi_key_file = {}\n",
+            fx.valid_toml(),
+            quoted(&key)
+        );
+        let keyed = fx.load(&with_key).expect("loads");
+        assert!(!keyed.memory.jev.is_enabled(), "a key alone is off");
+        let check = keyed
+            .checks()
+            .into_iter()
+            .find(|c| c.name == "memory.jev key")
+            .expect("key check");
+        let detail = check.result.expect("passes");
+        assert!(detail.starts_with("off"), "{detail}");
+        let on = format!("{with_key}enabled = true\n");
+        assert!(fx.load(&on).expect("loads").memory.jev.is_enabled());
     }
 
     #[test]

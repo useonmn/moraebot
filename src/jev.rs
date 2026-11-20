@@ -240,10 +240,14 @@ enum Outcome {
 }
 
 impl Jev {
-    /// Reads the key once. Enabled without a key starts paused with `E_JEV_AUTH`.
+    /// Reads the key once. jev runs only when `memory.jev.enabled` is true; enabled without a
+    /// key starts paused with `E_JEV_AUTH`, and a key without `enabled` is logged once as off.
     pub fn new(config: JevConfig, now: Now) -> Self {
         let key = config.api_key();
-        let enabled = config.enabled.unwrap_or(key.is_some());
+        let enabled = config.enabled;
+        if !enabled && key.is_some() {
+            tracing::info!("a jev key is set but memory.jev.enabled is not true; jev is off");
+        }
         let gate = Gate {
             paused: (enabled && key.is_none()).then_some(E_JEV_AUTH),
             ..Gate::default()

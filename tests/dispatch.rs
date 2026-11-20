@@ -4282,6 +4282,7 @@ const JEV_T0: i64 = 1_800_000_000;
 /// jev on `fake` with a key.
 fn jev_on(fake: &FakeJev) -> JevConfig {
     let mut jev = MemoryConfig::default().jev;
+    jev.enabled = true;
     jev.base_url = fake.base_url();
     jev.set_env_key(Some("JEV_KEY_SENTINEL_2b7e".into()));
     jev
@@ -4512,7 +4513,7 @@ async fn show_memory_names_the_jev_state_and_the_backlog() {
     let dir = tempfile::tempdir().unwrap();
     // jev on without a key: paused with E_JEV_AUTH from the start.
     let mut jev = MemoryConfig::default().jev;
-    jev.enabled = Some(true);
+    jev.enabled = true;
     let (h, _memory) = Harness::open(dir.path(), "ok").attach_observer(jev);
     let mut n = 9800;
     let mut say = |text: &str| {
