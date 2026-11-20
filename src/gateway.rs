@@ -7,7 +7,9 @@
 //! Shutdown order: stop taking events from the adapter, let the event being handled
 //! finish its store write, drop the in-flight turn, stop the lanes, kill and reap the
 //! lead and every lane child, then mark the interrupted rows and lanes `needs_check` so
-//! nothing is re-prompted, then stop the memory observer and wait for the memory writer.
+//! nothing is re-prompted, then stop the memory observer, and wait until the memory writer
+//! and the inbox released their locks: a detached thread (an observer scan, an omp host tool
+//! call) may still hold the store for a moment after its task was stopped.
 //!
 //! The memory observer ([`Observer`]) runs as its own task beside the dispatcher, not as one
 //! of its supervised tasks: a fault in memory code never stops the gateway.
@@ -42,8 +44,8 @@ pub const E_SHUTDOWN_TIMEOUT: &str = "E_SHUTDOWN_TIMEOUT";
 
 /// Capacity of the queue between the adapter and the dispatcher.
 const EVENT_QUEUE: usize = 64;
-/// How long shutdown waits for the memory worker to finish its last commit and release the lock.
-const MEMORY_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long shutdown waits for the memory worker and the inbox to release their locks.
+const RELEASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long shutdown waits for the memory observer's pass before it aborts it.
 const OBSERVER_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -173,7 +175,9 @@ impl Gateway {
         self.omp.running_turn()
     }
 
-    /// Serves until `shutdown` resolves (or the adapter stops), then shuts down cleanly.
+    /// Serves until `shutdown` resolves (or the adapter stops), then shuts down cleanly; on a
+    /// clean stop it first waits, `RELEASE_LIMIT` for both together, until the memory lock and
+    /// the inbox are free.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), GatewayError> {
         let Self {
             config,
@@ -241,13 +245,25 @@ impl Gateway {
             let _ = observer.await;
         }
         recovered?;
-        // The dispatcher and the observer held the last memory handles; wait for the worker to release the
-        // memory lock so the home is free when `run` returns.
-        let released = tokio::task::spawn_blocking(move || memory_exit.wait(MEMORY_STOP_LIMIT))
-            .await
-            .unwrap_or(false);
-        if !released {
+        // The dispatcher and the observer held the last memory handles, and the gateway's is the
+        // last store handle it can drop itself; wait for the worker and any detached thread still
+        // holding the store, so the home is free when `run` returns.
+        let store_closed = lock(&store).closed();
+        drop(store);
+        let (memory_released, store_released) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + RELEASE_LIMIT;
+            let memory = memory_exit.wait(RELEASE_LIMIT);
+            let store =
+                store_closed.wait(deadline.saturating_duration_since(std::time::Instant::now()));
+            (memory, store)
+        })
+        .await
+        .unwrap_or((false, false));
+        if !memory_released {
             tracing::warn!("memory worker still running at shutdown");
+        }
+        if !store_released {
+            tracing::warn!("inbox still open at shutdown");
         }
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
