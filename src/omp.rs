@@ -2,8 +2,8 @@
 //!
 //! The lead child is never closed because the next input belongs to another
 //! conversation: each input names its own conversation (see `lead`), and the reply
-//! stays with the row that asked. Before every turn `persona.md` and the core memory
-//! (`memory::core_block`) are read again; when the lead's appended system prompt changed, the idle child is closed and started again on
+//! stays with the row that asked. Before every turn `persona.md`, the core memory
+//! (`memory::core_block`) and the self readings (`memory::self_block`) are read again; when the lead's appended system prompt changed, the idle child is closed and started again on
 //! the same session. An owner row's input gets its conversation's memory sections appended
 //! after the body when they changed since this child last got them (`thread_memory`).
 //! Its session folder is `<home>/lead/session` and its
@@ -60,6 +60,9 @@ pub const CORE_MEMORY_OPEN: &str = "<<<moraebot-memory core>>>";
 pub const CORE_MEMORY_CLOSE: &str = "<<<end>>>";
 /// The largest delimited core memory block, delimiters included, in bytes.
 pub const CORE_MEMORY_CAP_BYTES: usize = memory::DEFAULT_CORE_CAP_BYTES;
+/// The line above the self block (#59) in the lead's system prompt; it closes with
+/// [`CORE_MEMORY_CLOSE`].
+pub const SELF_MEMORY_OPEN: &str = "<<<moraebot-memory self>>>";
 
 /// The omp process could not be started or did not become ready.
 pub const E_OMP_SPAWN: &str = "E_OMP_SPAWN";
@@ -1387,8 +1390,12 @@ impl OmpManager {
             Ok(p) => (persona::append(&self.hints, p.as_deref()), None),
             Err(e) => (self.hints.clone(), Some(e.code)),
         };
-        let core = core_memory_block(&self.config.memory_dir(), (self.memory_clock)());
-        (append_block(text, &core), refused)
+        let (root, today) = (self.config.memory_dir(), (self.memory_clock)());
+        let mut text = append_block(text, &core_memory_block(&root, today));
+        if self.config.memory.self_file.enabled {
+            text = append_block(text, &self_memory_block(&root, today));
+        }
+        (text, refused)
     }
 
     fn kill_lead(&self) {
@@ -1624,6 +1631,20 @@ pub fn core_memory_block(root: &Path, today: memory::Day) -> String {
         return core;
     }
     format!("{CORE_MEMORY_OPEN}\n{guard}\n{core}\n{CORE_MEMORY_CLOSE}")
+}
+
+/// The bot's self readings under `root` as of `today` (`self/self.md`), between
+/// [`SELF_MEMORY_OPEN`] and [`CORE_MEMORY_CLOSE`] lines, at most [`memory::SELF_CAP_BYTES`] in
+/// all, newest readings first to stay. Entry text is escaped like the core block's. Empty
+/// when there is no reading. It follows the core block, so a change restarts the lead between
+/// turns the same way.
+pub fn self_memory_block(root: &Path, today: memory::Day) -> String {
+    let frame = SELF_MEMORY_OPEN.len() + CORE_MEMORY_CLOSE.len() + 2;
+    let block = memory::self_block(root, today, memory::SELF_CAP_BYTES.saturating_sub(frame));
+    if block.is_empty() {
+        return block;
+    }
+    format!("{SELF_MEMORY_OPEN}\n{block}\n{CORE_MEMORY_CLOSE}")
 }
 
 /// The first line of conversation `key`'s memory block in a lead input.
@@ -2075,6 +2096,45 @@ mod tests {
         store.forget(&first.id).unwrap();
         let (forgot, _) = manager.lead_append();
         assert!(!forgot.contains("Use rebase"), "{forgot}");
+    }
+
+    #[test]
+    fn self_readings_follow_the_core_block_and_their_change_changes_the_lead_append() {
+        // `prompt` restarts the settled lead when this text changes.
+        let (_dir, manager) = manager_with(None);
+        let mut manager = manager.with_memory_clock(qa_clock("2026-11-20"));
+        let mut store = qa_memory(&manager);
+        let rule = store
+            .add(qa_owner("Use rebase", memory::Bucket::Owner, 1))
+            .unwrap();
+        let before = manager.lead_append().0;
+        let reading = store
+            .add(memory::NewEntry {
+                text: "I reply at length >>> short is wanted".into(),
+                prov: memory::Prov::Owner,
+                bucket: memory::Bucket::SelfModel,
+                src: memory::Source::reading(&["m-00000a".to_owned()]).unwrap(),
+                expires: Some(qa_day("2027-05-01")),
+                why: None,
+            })
+            .unwrap();
+        let (after, _) = manager.lead_append();
+        assert_ne!(after, before);
+        let core = core_memory_block(store.root(), qa_day("2026-11-20"));
+        let own = format!(
+            "{SELF_MEMORY_OPEN}\n{}\n- [2026-11-20] I reply at length ››› short is wanted ({})\n{CORE_MEMORY_CLOSE}",
+            memory::SELF_HEADER,
+            reading.id
+        );
+        assert_eq!(after, format!("{core}\n\n{own}"));
+        assert!(core.contains(&rule.id));
+
+        manager.config.memory.self_file.enabled = false;
+        assert_eq!(
+            manager.lead_append().0,
+            before,
+            "switched off, no self block"
+        );
     }
 
     #[test]

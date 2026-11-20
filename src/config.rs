@@ -287,6 +287,38 @@ impl fmt::Debug for Secret {
 pub struct MemoryConfig {
     pub jev: JevConfig,
     pub filter: FilterConfig,
+    /// `[memory.self]`.
+    pub self_file: SelfConfig,
+}
+
+/// The `[memory.self]` settings: the bot's self file (#59).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfConfig {
+    /// Whether owner corrections are recorded and promoted into the self block.
+    pub enabled: bool,
+    /// Phrases that make an owner sentence a correction of the bot. Each matches as whole
+    /// words in order (`몇 번` does not match `몇 번째`); case is ignored.
+    pub correction_patterns: Vec<String>,
+}
+
+impl Default for SelfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            correction_patterns: [
+                "왜 또",
+                "그러지 마",
+                "그러지 말라고",
+                "하지 말라고",
+                "몇 번",
+                "why did you",
+                "stop doing",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+        }
+    }
 }
 
 /// The `[memory.jev]` settings: how moraebot asks jev (TypeSafe System One).
@@ -636,6 +668,17 @@ struct MemorySection {
     jev: Option<JevSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterSection>,
+    #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+    self_file: Option<SelfSection>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SelfSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correction_patterns: Option<Vec<String>>,
 }
 
 /// On-disk `[memory.jev]`. There is deliberately no key field: the key lives in the
@@ -778,7 +821,15 @@ impl MemoryConfig {
         if let Some(lists) = section.filter {
             take!(filter, lists, [approval, credentials, commands]);
         }
-        let memory = Self { jev, filter };
+        let mut self_file = SelfConfig::default();
+        if let Some(section) = section.self_file {
+            take!(self_file, section, [enabled, correction_patterns]);
+        }
+        let memory = Self {
+            jev,
+            filter,
+            self_file,
+        };
         memory.check_values()?;
         Ok(memory)
     }
@@ -848,6 +899,14 @@ impl MemoryConfig {
                 ));
             }
         }
+        if self
+            .self_file
+            .correction_patterns
+            .iter()
+            .any(|pattern| pattern.trim().is_empty())
+        {
+            return bad("memory.self.correction_patterns must not hold an empty pattern".into());
+        }
         Ok(())
     }
 
@@ -892,9 +951,18 @@ impl MemoryConfig {
             credentials: changed(&self.filter.credentials, &df.credentials),
             commands: changed(&self.filter.commands, &df.commands),
         };
+        let ds = SelfConfig::default();
+        let self_file = SelfSection {
+            enabled: changed(&self.self_file.enabled, &ds.enabled),
+            correction_patterns: changed(
+                &self.self_file.correction_patterns,
+                &ds.correction_patterns,
+            ),
+        };
         let section = MemorySection {
             jev: (!is_empty_section(&jev_section)).then_some(jev_section),
             filter: (!is_empty_section(&filter)).then_some(filter),
+            self_file: (!is_empty_section(&self_file)).then_some(self_file),
         };
         (!is_empty_section(&section)).then_some(section)
     }
@@ -1959,6 +2027,29 @@ mod tests {
             again.memory.filter.credentials,
             FilterConfig::default().credentials
         );
+    }
+
+    #[test]
+    fn memory_self_section_round_trips_and_refuses_an_empty_pattern() {
+        let fx = Fixture::new();
+        let unchanged = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(unchanged.memory.self_file, SelfConfig::default());
+        assert!(unchanged.memory.self_file.enabled);
+        let text = format!(
+            "{}[memory.self]\nenabled = false\ncorrection_patterns = [\"다시 해\"]\n",
+            fx.valid_toml()
+        );
+        let cfg = fx.load(&text).expect("loads");
+        assert!(!cfg.memory.self_file.enabled);
+        assert_eq!(cfg.memory.self_file.correction_patterns, ["다시 해"]);
+        let written = cfg.to_toml().expect("serializes");
+        assert!(written.contains("[memory.self]"), "{written}");
+        assert_eq!(fx.load(&written).expect("reloads").memory, cfg.memory);
+        let empty = format!(
+            "{}[memory.self]\ncorrection_patterns = [\" \"]\n",
+            fx.valid_toml()
+        );
+        assert_eq!(fx.load(&empty).expect_err("refused").code, E_CONFIG_VALUE);
     }
 
     #[test]

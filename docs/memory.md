@@ -12,6 +12,8 @@ core/boundaries.md     things you said never to do
 projects/<repo>/notes.md
 projects/_general.md
 threads/<conversation>.md
+self/observations.md   your corrections of moraebot, one summary per line
+self/self.md           readings promoted from them, shown to the lead
 archive/...            forgotten or replaced entries, same paths as above
 ```
 
@@ -29,6 +31,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `기억해(<repo>): X` | Saves X for that project. |
 | `항상 기억해: X`, `always remember: X` | Saves X as a core rule. If X says not to do something ("하지 마", "never", "don't"), it goes to the boundaries. |
 | `뭐 기억해?`, `what do you remember?` | Lists the core rules, the boundaries and this conversation's entries. |
+| `너 자신에 대해 뭐 기억해?`, `what do you know about yourself?` | Lists the self readings ([The self file](#the-self-file)) and how many corrections wait for consolidation. |
 | `m-1a2b3c 보여줘` | Shows one entry. |
 | `m-1a2b3c 고쳐: new text` | Saves your new text and archives the old entry as replaced. |
 | `m-1a2b3c 지워`, `forget m-1a2b3c` | Asks once; your next message there answers it (`응`/`yes` forgets, `아니`/`no` keeps). |
@@ -56,7 +59,7 @@ The lead has no tool that corrects, forgets or restores an entry; only your comm
 
 ## Memory tools
 
-- `memory_search(query, scope)` (lead and every lane): a plain search, case ignored, of the entry texts or an entry id. `scope` is `all` (core, projects and conversations, the default), `core`, `projects`, `threads` or `archive` (forgotten or replaced entries, shown under a header that says none of them is in force). A lane searches only its own projects, `projects/_general.md` and `core/boundaries.md` (and their archive copies), never other projects or any conversation. Expired entries are skipped. The newest 20 matches are shown like the read blocks below (your words under a heading, everything else quoted as `확인 안 됨` reference lines), and a last line counts the rest.
+- `memory_search(query, scope)` (lead and every lane): a plain search, case ignored, of the entry texts or an entry id. `scope` is `all` (core, projects and conversations, the default), `core`, `projects`, `threads` or `archive` (forgotten or replaced entries, shown under a header that says none of them is in force). A lane searches only its own projects, `projects/_general.md` and `core/boundaries.md` (and their archive copies), never other projects or any conversation. No search reads `self/` or its archive copies: the lead sees the self readings only as the self block below, and a lane never sees them. Expired entries are skipped. The newest 20 matches are shown like the read blocks below (your words under a heading, everything else quoted as `확인 안 됨` reference lines), and a last line counts the rest.
 - `memory_write(text, bucket_hint, why)` (lead only, never lanes): queues one entry for moraebot's writer and returns its id at once; the write and its commit happen in the background, and `why` becomes the commit message. moraebot, not the lead, decides whose words it is. It counts as yours only when `text` is one whole sentence of a message you sent in that turn (the message itself or one steered into it), copied exactly, and not pasted: a sentence on a `>`-quoted line or inside a code fence (```` ``` ```` or `~~~`) is someone else's text. Anything else is a `tool` entry when the lead has used, since it last started, any tool other than local file reads, searches and edits and moraebot's own tools (so bash, eval, web search, fetch, a browser, GitHub and MCP tools, a subagent, or `read` of a URL all count), or when the turn answers a lane result (a lane may have read the web); it is an `inference` entry otherwise. Both expire in 30 days. A lane result's words are not saved as `lane` entries by `memory_write` yet: that waits for the lane-result filter of P2. `bucket_hint` is `thread` (the default), `project:<owner/name>`, `project` (`projects/_general.md`), `core` or `boundary`. `core` and `boundary` take only your exact sentence; any other entry goes to the conversation, and the tool result says so. The tool tells the lead that saves are internal, so it does not mention or confirm one unless you asked it to remember something.
 
 ## What the lead sees
@@ -64,6 +67,8 @@ The lead has no tool that corrects, forgets or restores an entry; only your comm
 Before every lead turn moraebot reads `core/owner.md` and `core/boundaries.md` and appends them to the lead's system prompt, after the persona, between `<<<moraebot-memory core>>>` and `<<<end>>>`. The appended text (guidance, messenger hints, persona and this block) is written to `~/.moraebot/lead/append.md` (mode 0600, folder 0700) just before the lead starts, and omp gets only the file's path (`--append-system-prompt=<path>`), so the memory never shows in the process list. omp reads the file once, when it starts. The block stays within 6 KiB; when it doesn't fit, the newest entries are kept and the block ends with `[기억 N개 생략: memory_search로 찾을 수 있음]`. Expired entries are skipped.
 
 When the core changes (always-remember, correct, forget, restore), the lead restarts before its next turn, the same way it does when `persona.md` changes. That is why a plain `기억해` goes to the conversation, not the core.
+
+After the core block comes the self block, between `<<<moraebot-memory self>>>` and `<<<end>>>`: the readings of `self/self.md` under a fixed header that says they are readings to test, not rules, and that your current message wins. It stays within 2 KiB (the newest readings are kept, the rest counted), skips expired readings, and is escaped like the core block. When it changes, the lead restarts before its next turn too; consolidation runs only while the lead is quiet, so that is at most once a day. With `memory.self.enabled = false` there is no self block.
 
 Conversation and project entries go into the lead's input, after your message, between `<<<moraebot-memory thread=<conversation>>>>` and `<<<end rules>>>`: the conversation's own notes, plus the notes of every project the message names (`usunmn/moraebot`, or just `moraebot`; a last part shorter than three letters must be written in full). moraebot remembers what it gave each conversation since the lead last started and only sends a bucket again when it changed; a bucket that became empty is sent once as "nothing saved now". Lane results never pull memory in.
 
@@ -118,6 +123,14 @@ When the summarizer cannot run (omp does not start, lists a tool, the model prov
 
 Entries saved before summaries were introduced stay as they are.
 
+### The self file
+
+When one of your sentences in a turn corrects moraebot, the observer also saves a summary of it in `self/observations.md` (summarizer kind `owner_correction`, source `obs row=<id> s=<n> turn=<turn>`). A sentence is a correction when it holds one of `memory.self.correction_patterns` as whole words in order (`왜 또`, `그러지 마`, `하지 말라고`, `몇 번`, `why did you`, `stop doing`, ...), so `몇 번` matches "몇 번 말해야 돼" but not "몇 번째 줄이야?". The source gets `firm=1` when your own sentence holds an always or never word (the same whole-word checks as the core and the boundaries: `항상`, `절대`, `앞으로`, `always`, `never`, "from now on"). This runs with jev off too. Only your own rows are read: a lane result, a subagent report or a tool's output never becomes an observation, and only owner lines may live in `self/`. The lead's `memory_write` cannot write there.
+
+Once a day, when the lead has been quiet for 10 minutes (nothing queued or running, no inbox change), the observer runs consolidation: one call to the same locked summarizer, with its own fixed prompt, offering the current readings and the observations of the last 30 days that no reading names yet. The model groups the observations by the behavior they correct and words one reading per group; whether two corrections are about the same behavior is its call. The code then decides what is saved: a group may name only observations it was offered, each observation counts once, and a group becomes a reading only when it holds two of them (so two corrections within 30 days) or one marked `firm=1`. A reading's text passes the same checks as a summary, and its source names its observations (`from=m-a.m-b`). A group may confirm a reading again: that reading is replaced by the new text. A reading lives 6 months from the day it was saved or confirmed (a reading you correct with `m-... 고쳐:` too); one nobody confirms expires, leaves the self block, and is archived at the next consolidation. When the call fails or its answer does not parse, the observations wait for the next day and `self/self.md` stays as it is.
+
+Promotions are never announced in a conversation. `너 자신에 대해 뭐 기억해?` lists the readings with their ids, and `보여줘`, `고쳐`, `지워` and `되살려` work on them, and on observations, like on any entry.
+
 Only your sentences become rules; lane and subagent lines stay reference lines, never sit in the core and expire after 30 days. A lane result is judged once, by its own job, not again by the lead turn that reads it. Subagent reports are found by scanning the session folders of the lead and the lanes for omp 18.22.2's `<task>.md` output files (at most 256 KiB, no symlinks), after a turn and at start; a file whose size and modification time are unchanged is not read again, and each content is judged once.
 
 A lane or subagent sentence is dropped before anything is sent when it talks about approval or permission, credentials or tokens, holds a secret moraebot recognizes, a URL, or a shell command (`[memory.filter]` below). Your own sentences are not filtered this way: a secret in one is replaced by a `[redacted:...]` marker before jev or the summarizer sees it, and the sentence is judged as usual. One shorter than 4 characters, or one longer than an entry may be, is never sent and never saved. A summary differs each time it is written, so a sentence is matched by its source, not its text: a job read again adds nothing, and an entry you forgot does not come back. A subagent file that changed is a new report: the content's sha in the source gives its sentences sources of their own. When the lead already saved the same lane or owner sentence with `memory_write` (same source), the observer adds no summary of it; when the observer saved it first and the summary is still live, `memory_write` returns that entry's id and saves nothing. A summary you forgot does not stop the lead from saving the sentence again. All entries of one pass are one git commit whose message ends in `observed`.
@@ -169,6 +182,8 @@ Every key is optional.
 | `memory.filter.approval` | built in (`오너`, `승인`, `owner`, `approve`, `permission`, ...) | Lane or subagent sentences with one of these are dropped. |
 | `memory.filter.credentials` | built in (`토큰`, `비밀번호`, `token`, `password`, `secret`, `api key`, ...) | Same. |
 | `memory.filter.commands` | built in (`$ `, `./`, `\| sh`, `&&`, `rm -rf`, `sudo`, `curl`, ...) | Same. |
+| `memory.self.enabled` | `true` | `false` stops recording corrections, consolidation and the self block. |
+| `memory.self.correction_patterns` | built in (`왜 또`, `그러지 마`, `그러지 말라고`, `하지 말라고`, `몇 번`, `why did you`, `stop doing`) | Phrases that make your sentence a correction of moraebot; each matches as whole words in order, case ignored. The list replaces the built-in one. |
 
 Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Sentences are NFKC-normalized first, so full-width and mathematical letters and other compatibility forms are matched as their plain letters, and look-alikes of `.`, `/`, `|` and `:` as those characters. A lane or subagent sentence is dropped when it holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents), a word that mixes Latin with Cyrillic or Greek letters (a Cyrillic `о` in "owner"), or Hangul typed as conjoining jamo, so none of these can hide a listed word.
 
@@ -199,6 +214,9 @@ The `memory_log` table of `inbox.sqlite` keeps one row per settled job and per p
 | `W_MEMORY_BACKLOG` | More than 10,000 jobs are waiting. |
 | `W_SUBAGENT_SKIPPED` | A subagent file was skipped (symlink, too large, outside its folder, bad name). |
 | `E_SUBAGENT_LAYOUT` | A lead turn ran a subagent but no output file was found where omp 18.22.2 writes it: omp's layout may have changed. Logged once per run. |
+| `M_SELF_CONSOLIDATED` | Self consolidation ran for a day (`detail` is `day=<date>`); it runs again the next day. |
+| `E_SELF_CONSOLIDATE` | The consolidation call could not run (`detail` `run`) or its answer did not parse (`answer`); the observations wait for the next day. |
+| `W_SELF_GROUP_DROPPED` | A group of the consolidation answer was not saved; `detail` is `reason=below_bar`, `unoffered`, `unknown_reading`, `source` or a summary check's reason. |
 | `W_OMP_VERSION` | You were told about an omp version moraebot was not checked against (`detail` is the version). |
 
 ## Coming from 0.2.0

@@ -1149,6 +1149,20 @@ impl Store {
         })
     }
 
+    /// Whether the lead has been quiet for `seconds` before `now` (unix seconds): no inbox row
+    /// is queued or being processed, and none changed in that time. Self consolidation (#59)
+    /// runs only then, so the lead restart a changed self block brings costs no waiting owner.
+    pub fn lead_quiet(&self, now: i64, seconds: i64) -> Result<bool, StoreError> {
+        let (busy, last): (i64, Option<i64>) = self.conn.query_row(
+            "SELECT COALESCE(SUM(state IN ('queued', 'processing')), 0),
+                    MAX(CAST(strftime('%s', updated_at) AS INTEGER))
+             FROM inbox",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(busy == 0 && last.is_none_or(|at| now - at >= seconds))
+    }
+
     /// Deletes memory log rows and settled memory jobs older than 30 days before `now`.
     /// Pending jobs and cursor rows are kept.
     pub fn prune_memory(&mut self, now: i64) -> Result<(), StoreError> {
