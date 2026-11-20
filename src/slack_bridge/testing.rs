@@ -1,5 +1,6 @@
 //! Offline Slack fakes for the bridge tests: `FakeSlackTransport` records every Web API
-//! call and drives scripted Socket Mode sessions. Nothing reaches the network.
+//! call and drives scripted Socket Mode sessions, and [`TestBridge`] runs a whole bridge
+//! on it in process. Nothing reaches the network.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -12,12 +13,89 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 use crate::adapter::AdapterError;
+use crate::bridge::client::{BridgeAdapter, BridgeOptions, HELLO_CACHE, UnixConnector};
+use crate::bridge::peer::own_uid;
+use crate::bridge::socket::SOCKET_NAME;
 use crate::files::Progress;
 use crate::slack_bridge::slack::{
     E_SLACK_API, E_SLACK_AUTH, PostOutcome, SlackSocket, SlackTransport, SocketMessage,
     upload_error_code, upload_status_code,
 };
+use crate::slack_bridge::{Bridge, BridgeError, BridgeParts, STATE_DIR};
 use crate::testing::{create_private_file, write_failure};
+
+/// The channel a [`TestBridge`] reports as `home`.
+pub const TEST_CHANNEL: &str = "C222";
+
+/// A bridge on a [`FakeSlackTransport`], with its socket and state under one folder.
+pub struct TestBridge {
+    pub fake: Arc<FakeSlackTransport>,
+    pub dir: PathBuf,
+    bridge: Bridge,
+}
+
+impl TestBridge {
+    /// Starts a bridge in `dir` that accepts cores of this uid.
+    pub async fn start(dir: &Path, fake: Arc<FakeSlackTransport>) -> Self {
+        Self::start_with(dir, fake, own_uid())
+            .await
+            .expect("the test bridge starts")
+    }
+
+    /// Starts a bridge in `dir` that accepts only cores running as `expected_uid`.
+    pub async fn start_with(
+        dir: &Path,
+        fake: Arc<FakeSlackTransport>,
+        expected_uid: u32,
+    ) -> Result<Self, BridgeError> {
+        let bridge = Bridge::start(BridgeParts {
+            state_dir: dir.join(STATE_DIR),
+            socket: Self::socket_in(dir),
+            channel_id: TEST_CHANNEL.to_owned(),
+            transport: fake.clone(),
+            expected_uid,
+        })
+        .await?;
+        Ok(Self {
+            fake,
+            dir: dir.to_owned(),
+            bridge,
+        })
+    }
+
+    /// The socket path a bridge started in `dir` listens on.
+    pub fn socket_in(dir: &Path) -> PathBuf {
+        dir.join("run").join(SOCKET_NAME)
+    }
+
+    pub fn socket(&self) -> &Path {
+        self.bridge.socket()
+    }
+
+    pub fn spool_dir(&self) -> PathBuf {
+        self.dir.join(STATE_DIR).join("spool")
+    }
+
+    /// A core-side [`BridgeAdapter`] connected to this bridge with `owner_id` and `allow`.
+    pub async fn connect(&self, owner_id: &str, allow: &[&str]) -> BridgeAdapter {
+        let options = BridgeOptions {
+            owner_id: owner_id.to_owned(),
+            allow: allow.iter().map(|id| (*id).to_owned()).collect(),
+            hello_cache: self.dir.join(HELLO_CACHE),
+            first_hello_wait: Duration::from_secs(10),
+        };
+        BridgeAdapter::open_with(
+            options,
+            Arc::new(UnixConnector::new(self.socket().to_owned())),
+        )
+        .await
+        .expect("the core connects to the test bridge")
+    }
+
+    pub async fn shutdown(self) {
+        self.bridge.shutdown().await;
+    }
+}
 
 /// What `FakeSlackTransport` saw, in call order.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -398,6 +476,7 @@ impl SlackTransport for FakeSlackTransport {
             });
             state.download_bytes.get(url).cloned().unwrap_or_default()
         });
+        progress.check_limit(bytes.len() as u64)?;
         create_private_file(dest)?
             .write_all(&bytes)
             .map_err(|e| write_failure(&e))?;

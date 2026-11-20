@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 # Scripted stand-in for omp used by the offline tests (no required-features on purpose,
 # so env!("CARGO_BIN_EXE_fake-omp") works under a plain `cargo test`).
+# Holds the Slack connection for a core with messenger = "bridge" (docs/bridge.md).
+[[bin]]
+name = "moraebot-slack-bridge"
+path = "src/bin/moraebot-slack-bridge.rs"
+
 [[bin]]
 name = "fake-omp"
 path = "tests/bin/fake_omp.rs"
