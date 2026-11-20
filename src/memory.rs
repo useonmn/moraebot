@@ -1995,12 +1995,26 @@ fn run_git(root: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, 
         _ => MemoryError::io("git", &e),
     };
     let mut child = command.spawn().map_err(failed)?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        // The input is small (one line per file); git reads it all before answering.
-        stdin.write_all(input).map_err(failed)?;
-    }
-    let output = child.wait_with_output().map_err(failed)?;
+    let stdin = child.stdin.take();
+    // `cat-file --batch` answers while it reads: with an input and an answer larger than
+    // the pipe buffers, writing all of the input before reading would block both sides. So
+    // the input is written on its own thread (closing stdin when done) while stdout drains.
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = input
+            .zip(stdin)
+            .map(|(input, mut stdin)| scope.spawn(move || stdin.write_all(input)));
+        let output = child.wait_with_output();
+        let written = writer.map_or(Ok(()), |writer| {
+            writer
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("git stdin writer panicked")))
+        });
+        (output, written)
+    });
+    let output = output.map_err(failed)?;
+    // A git that failed may have stopped reading; its stderr says more than the broken pipe.
     if output.status.success() {
+        written.map_err(failed)?;
         Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3449,5 +3463,36 @@ mod tests {
                 .iter()
                 .any(|c| c.contains(&id) && c.contains("dependency fact"))
         );
+    }
+
+    #[test]
+    fn run_git_answers_a_batch_larger_than_the_pipe_buffers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        run_git(&root, &["init", "-q"], None).expect("init");
+        fs::write(root.join("a.md"), "x".repeat(1500)).expect("write");
+        run_git(&root, &["add", "a.md"], None).expect("add");
+        run_git(&root, &["commit", "-q", "-m", "a"], None).expect("commit");
+        // 80 KB of requests and 12 MB of answers: both exceed a pipe buffer (64 KiB), so git
+        // stops reading requests until its answers are read.
+        const REQUESTS: usize = 8000;
+        let input = "HEAD:a.md\n".repeat(REQUESTS);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_git(
+                &root,
+                &["cat-file", "--batch"],
+                Some(input.as_bytes()),
+            ));
+        });
+        let stdout = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("git cat-file --batch returned within 60 s")
+            .expect("cat-file");
+        let answers = stdout
+            .windows(b" blob 1500\n".len())
+            .filter(|w| *w == b" blob 1500\n")
+            .count();
+        assert_eq!(answers, REQUESTS);
     }
 }

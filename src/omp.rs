@@ -23,7 +23,7 @@
 //! once per stretch, and the dispatcher posts one notice in its conversation. moraebot never
 //! stops a turn for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -31,7 +31,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -165,11 +165,15 @@ impl TurnReport {
 }
 
 /// Result of one lead turn: the main row's report (with every file `send_file` queued
-/// during the turn) and, when a row was steered into it, that row's id and outcome.
+/// during the turn), when a row was steered into it, that row's id and outcome, and the
+/// turn's memory notes ([`TurnContext::memory_notes`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReport {
     pub main: TurnReport,
     pub steered: Option<(i64, Outcome)>,
+    /// Shown to the owner whatever the outcome: a `memory_write` to core or boundary is
+    /// committed even when the turn fails or is interrupted.
+    pub memory_notes: Vec<String>,
 }
 
 /// The lead turn that is running: its main row, conversation and the sender of the main
@@ -185,8 +189,9 @@ pub struct TurnContext {
     pub sender: Sender,
     pub steered_row_id: Option<i64>,
     pub outside_tools: bool,
-    /// Lines added under the turn's reply: owner sentences `memory_write` saved to `core` or
-    /// `boundary`, so the owner sees every standing rule the lead saved.
+    /// Owner sentences `memory_write` saved to `core` or `boundary`, one line each, so the
+    /// owner sees every standing rule the lead saved: dispatch posts them under the group's
+    /// reply, or after its failure notice when it did not reply ([`GroupReport::memory_notes`]).
     pub memory_notes: Vec<String>,
 }
 
@@ -211,6 +216,44 @@ impl TurnContext {
     }
 }
 
+/// The tool call ids of the lead's `tool_execution_start` events its event drain has handled.
+/// omp sends a call's `tool_execution_start` before its `host_tool_call`, but the client runs
+/// a host tool on its own thread at once while the drain may still be behind; a host tool
+/// that reads what the drain records (`memory_write` reads `outside_tools`) first waits for
+/// its own start, so every event before its call has been applied. Cleared at each turn.
+#[derive(Debug, Default)]
+pub struct ToolStarts {
+    seen: Mutex<HashSet<String>>,
+    changed: Condvar,
+}
+
+impl ToolStarts {
+    fn note(&self, event: &Event) {
+        if let Event::Notification(RpcNotification::RpcAgentEvent(
+            RpcAgentEvent::ToolExecutionStart(start),
+        )) = event
+        {
+            lock(&self.seen).insert(start.tool_call_id.clone());
+            self.changed.notify_all();
+        }
+    }
+
+    fn clear(&self) {
+        lock(&self.seen).clear();
+    }
+
+    /// Waits at most `bound` until the drain handled the start of call `tool_call_id`; false
+    /// when it did not come.
+    pub fn wait_for(&self, tool_call_id: &str, bound: Duration) -> bool {
+        let seen = lock(&self.seen);
+        let (mut seen, _) = self
+            .changed
+            .wait_timeout_while(seen, bound, |seen| !seen.contains(tool_call_id))
+            .unwrap_or_else(PoisonError::into_inner);
+        seen.remove(tool_call_id)
+    }
+}
+
 /// Marks the lead child (`seen`) and its running turn when `event` starts a tool call that
 /// may read outside text.
 fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event: &Event) {
@@ -226,21 +269,6 @@ fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, seen: &AtomicBool, event
     seen.store(true, Ordering::Relaxed);
     if let Some(turn) = lock(turn).as_mut() {
         turn.outside_tools = true;
-    }
-}
-
-/// The main outcome with the turn's memory notes under its reply. A turn that did not reply
-/// cannot carry them, so they are logged instead.
-fn with_memory_notes(key: &str, outcome: Outcome, notes: Vec<String>) -> Outcome {
-    if notes.is_empty() {
-        return outcome;
-    }
-    match outcome {
-        Outcome::Reply(text) => Outcome::Reply(format!("{text}\n\n{}", notes.join("\n"))),
-        other => {
-            tracing::warn!(conversation = %key, notes = notes.len(), code = other.code(), "turn did not reply; core memory notes not shown");
-            other
-        }
     }
 }
 
@@ -615,10 +643,13 @@ fn disarm(kill: &LeadKill) {
     }
 }
 
-/// The steer sent into the open turn: its row and the receiver of its result.
+/// The steer sent into the open turn: its row, the receiver of its result, and what its
+/// input gave its conversation (recorded in [`Given`] once the steer was not rejected).
 struct Steer {
     row_id: i64,
     result: oneshot::Receiver<Result<PromptTurn, RpcError>>,
+    fresh: Fresh,
+    epoch: u64,
 }
 
 /// The lead turn that accepts a steer: set by `prompt` before the main frame is sent,
@@ -632,13 +663,58 @@ struct OpenTurn {
     requests: mpsc::Sender<PromptRequest>,
     /// The lead child's [`Given`], for the steer's memory block.
     given: Given,
+    /// What the main input gave its conversation, not recorded until the turn ends: the steer
+    /// counts it as given, since the main prompt was accepted before any steer can join.
+    main_fresh: Fresh,
+    /// The compaction epoch the main input was built in ([`GivenState::epoch`]): after a
+    /// compaction the steer no longer counts `main_fresh` as given.
+    main_epoch: u64,
     steer: Option<Steer>,
 }
 
-/// Per conversation key, per memory bucket label: the hash of the bucket's section last put
-/// into that conversation's lead input. Kept per lead child, so a new child gets every block
-/// again.
-type Given = Arc<Mutex<HashMap<String, HashMap<String, u64>>>>;
+impl OpenTurn {
+    /// The turn takes a steer from `sender` in conversation `key`: same conversation and
+    /// sender, the lead reported `agent_start`, and no steer yet.
+    fn accepts(&self, key: &str, sender: Sender) -> bool {
+        self.key == key && self.sender == sender && self.started && self.steer.is_none()
+    }
+}
+
+/// What a lead child was given ([`GivenState`]). Kept per lead child, so a new child gets
+/// every block again.
+type Given = Arc<Mutex<GivenState>>;
+
+#[derive(Debug, Default)]
+struct GivenState {
+    /// Per conversation key, per memory bucket label: the hash of the bucket's section last
+    /// put into that conversation's lead input that the child took.
+    sections: HashMap<String, HashMap<String, u64>>,
+    /// Counts the child's context compactions ([`note_compaction`]): an input built before
+    /// one is not recorded after it.
+    epoch: u64,
+}
+
+/// Forgets what the lead child was given when omp reports a compaction of its context
+/// (`auto_compaction_end` or `manual_compaction_end` that was neither aborted nor skipped):
+/// the memory blocks of earlier inputs may have been summarised away, so every section goes
+/// in again with the next owner input. A compaction that ended in an error also counts; that
+/// costs one block sent again, never a lost one.
+fn note_compaction(given: &Given, event: &Event) {
+    let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
+        return;
+    };
+    let compacted = match agent {
+        RpcAgentEvent::AutoCompactionEnd(end) => !end.aborted && end.skipped != Some(true),
+        RpcAgentEvent::ManualCompactionEnd(end) => !end.aborted && end.skipped != Some(true),
+        _ => false,
+    };
+    if compacted {
+        let mut given = lock(given);
+        given.sections.clear();
+        given.epoch += 1;
+        tracing::info!("omp compacted the lead's context; its memory sections go in again");
+    }
+}
 
 type SteerGate = Arc<Mutex<Option<OpenTurn>>>;
 
@@ -736,7 +812,7 @@ struct Live {
     append: String,
     /// False while the last turn ended with work still pending (`sessionSettled: false`).
     settled: bool,
-    /// The memory sections this child was given, per conversation.
+    /// The memory sections this child was given, per conversation; cleared by a compaction.
     given: Given,
     /// The child has used a tool that may read outside text (see [`TurnContext`]).
     outside: Arc<AtomicBool>,
@@ -781,6 +857,8 @@ pub struct OmpManager {
     /// How long a lead turn may show no progress before `lead_stalled` reports it.
     stall_after: Duration,
     lead_watch: Arc<Mutex<LeadWatch>>,
+    /// The lead's tool call starts its event drain handled, for `memory_write`.
+    tool_starts: Arc<ToolStarts>,
     extra_env: Vec<(OsString, OsString)>,
     hints: String,
     /// Today's date for the core memory block (expired entries are left out).
@@ -824,6 +902,7 @@ impl OmpManager {
             store,
             turn_timeout,
             lead_watch: Default::default(),
+            tool_starts: Default::default(),
             extra_env: Vec::new(),
             hints: String::new(),
             memory_clock: memory::system_clock(),
@@ -997,6 +1076,7 @@ impl OmpManager {
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
                         steered: None,
+                        memory_notes: Vec::new(),
                     };
                 }
             }
@@ -1012,12 +1092,17 @@ impl OmpManager {
             ..TurnContext::new(row_id, key, sender)
         });
         lock(&self.lead_watch).begin(key);
-        let (text, fresh) = thread_memory(
-            &self.config.memory_dir(),
-            (self.memory_clock)(),
-            text,
-            &lock(&current.given),
-        );
+        self.tool_starts.clear();
+        let (text, fresh, epoch) = {
+            let given = lock(&current.given);
+            let (text, fresh) = thread_memory(
+                &self.config.memory_dir(),
+                (self.memory_clock)(),
+                text,
+                &given.sections,
+            );
+            (text, fresh, given.epoch)
+        };
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text,
@@ -1035,13 +1120,12 @@ impl OmpManager {
                 started: false,
                 requests: current.requests.clone(),
                 given: Arc::clone(&current.given),
+                main_fresh: fresh.clone(),
+                main_epoch: epoch,
                 steer: None,
             });
             current.requests.send(request).is_ok()
         };
-        if sent {
-            record_given(&current.given, fresh);
-        }
         let main = if sent {
             result.await.unwrap_or(Err(RpcError::Closed))
         } else {
@@ -1052,6 +1136,10 @@ impl OmpManager {
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
         let mut settled = turn_settled(&main);
         let main = map_result(main);
+        // Only an input the child took is given: a rejected prompt never reached it.
+        if sent && !rejected(&main) {
+            record_given(&current.given, fresh, epoch);
+        }
 
         let mut killed = false;
         let steered = match steer {
@@ -1059,6 +1147,8 @@ impl OmpManager {
             Some(Steer {
                 row_id: steer_row,
                 mut result,
+                fresh: steer_fresh,
+                epoch: steer_epoch,
             }) => {
                 let outcome = if main_timed_out {
                     // Never let the child outlive the turn limit by waiting for the steer.
@@ -1080,6 +1170,9 @@ impl OmpManager {
                         }
                     }
                 };
+                if !rejected(&outcome) {
+                    record_given(&current.given, steer_fresh, steer_epoch);
+                }
                 Some((steer_row, outcome))
             }
         };
@@ -1101,16 +1194,16 @@ impl OmpManager {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
         }
-        let notes = lock(&self.turn)
+        let memory_notes = lock(&self.turn)
             .take()
             .map(|turn| turn.memory_notes)
             .unwrap_or_default();
-        let main = with_memory_notes(key, main, notes);
         lock(&self.lead_watch).end();
         self.running.send_replace(None);
         GroupReport {
             main: report(key, main, files),
             steered,
+            memory_notes,
         }
     }
 
@@ -1120,6 +1213,11 @@ impl OmpManager {
     /// holds no steer yet; then `claim` gets the turn's main row id and must claim the row in the store
     /// (false: nothing is sent). Like in `prompt`, an owner row's input gets its changed memory
     /// sections appended. Returns whether the row was steered.
+    ///
+    /// The memory block reads files and runs git, so it is built with the gate released (the
+    /// lead's event callback takes the gate for every event): the turn is checked and copied
+    /// first, then checked again, claimed and sent under the gate. A block built for a turn
+    /// that ended meanwhile is dropped.
     pub fn try_steer(
         &self,
         key: &str,
@@ -1128,13 +1226,28 @@ impl OmpManager {
         text: &str,
         claim: impl FnOnce(i64) -> bool,
     ) -> bool {
+        let (main_row_id, view, epoch) = {
+            let gate = lock(&self.gate);
+            let Some(turn) = gate.as_ref().filter(|turn| turn.accepts(key, sender)) else {
+                return false;
+            };
+            let (view, epoch) = given_view(&turn.given, &turn.main_fresh, turn.main_epoch);
+            (turn.main_row_id, view, epoch)
+        };
+        let (text, fresh) = thread_memory(
+            &self.config.memory_dir(),
+            (self.memory_clock)(),
+            text,
+            &view,
+        );
+
         let mut gate = lock(&self.gate);
-        let Some(turn) = gate.as_mut() else {
+        let Some(turn) = gate
+            .as_mut()
+            .filter(|turn| turn.main_row_id == main_row_id && turn.accepts(key, sender))
+        else {
             return false;
         };
-        if turn.key != key || turn.sender != sender || !turn.started || turn.steer.is_some() {
-            return false;
-        }
         if !claim(turn.main_row_id) {
             return false;
         }
@@ -1142,12 +1255,6 @@ impl OmpManager {
         if let Some(context) = lock(&self.turn).as_mut() {
             context.steered_row_id = Some(row_id);
         }
-        let (text, fresh) = thread_memory(
-            &self.config.memory_dir(),
-            (self.memory_clock)(),
-            text,
-            &lock(&turn.given),
-        );
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text,
@@ -1157,10 +1264,13 @@ impl OmpManager {
             done,
         };
         // A failed send drops `done`, so the claimed row is reported as a lost child.
-        if turn.requests.send(request).is_ok() {
-            record_given(&turn.given, fresh);
-        }
-        turn.steer = Some(Steer { row_id, result });
+        let _ = turn.requests.send(request);
+        turn.steer = Some(Steer {
+            row_id,
+            result,
+            fresh,
+            epoch,
+        });
         tracing::info!(conversation = %key, row = row_id, main = turn.main_row_id, "steered into the running turn");
         true
     }
@@ -1237,15 +1347,19 @@ impl OmpManager {
                 memory.clone(),
                 Arc::clone(&self.store),
                 Arc::clone(&self.turn),
+                Arc::clone(&self.tool_starts),
             ));
         }
         let turn = Arc::clone(&self.turn);
+        let given = Given::default();
+        let compacted = Arc::clone(&given);
         let outside = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&outside);
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
         let lead_watch = Arc::clone(&self.lead_watch);
+        let tool_starts = Arc::clone(&self.tool_starts);
         let worker = std::thread::Builder::new()
             .name("omp-lead".to_owned())
             .spawn(move || {
@@ -1264,6 +1378,9 @@ impl OmpManager {
                         lock(&lead_watch).note(event);
                         note_agent_start(&gate, &running, event);
                         note_outside_tool(&turn, &seen, event);
+                        note_compaction(&compacted, event);
+                        // Last: a host tool waiting on its own start sees every effect above.
+                        tool_starts.note(event);
                     },
                 );
                 match opened {
@@ -1307,7 +1424,7 @@ impl OmpManager {
             sent_files,
             append,
             settled: true,
-            given: Given::default(),
+            given,
             outside,
         })
     }
@@ -1468,11 +1585,50 @@ fn thread_memory(
     )
 }
 
-/// Remembers what an input that was sent gave its conversation.
-fn record_given(given: &Given, fresh: Fresh) {
-    if let Some((key, sections)) = fresh {
-        lock(given).entry(key).or_default().extend(sections);
+/// Remembers what an input the child took gave its conversation, unless the child's context
+/// was compacted since the input was built (`epoch` is [`GivenState::epoch`] then): the block
+/// may be gone again, so it goes in with the next input.
+fn record_given(given: &Given, fresh: Fresh, epoch: u64) {
+    let mut given = lock(given);
+    if given.epoch != epoch {
+        return;
     }
+    if let Some((key, sections)) = fresh {
+        given.sections.entry(key).or_default().extend(sections);
+    }
+}
+
+/// What the steer's input counts as given: the child's sections with the open turn's main
+/// input (`main_fresh`, accepted but not recorded yet, built in `main_epoch`) on top, and the
+/// compaction epoch. After a compaction since the main input was built, its block may have
+/// been summarised away, so it is not counted and the steer carries it again.
+fn given_view(
+    given: &Given,
+    main_fresh: &Fresh,
+    main_epoch: u64,
+) -> (HashMap<String, HashMap<String, u64>>, u64) {
+    let given = lock(given);
+    let mut view = given.sections.clone();
+    if given.epoch == main_epoch
+        && let Some((key, sections)) = main_fresh
+    {
+        view.entry(key.clone())
+            .or_default()
+            .extend(sections.iter().cloned());
+    }
+    (view, given.epoch)
+}
+
+/// The prompt was refused before it ran ([`map_result`]'s [`E_PROMPT_REJECTED`]): the child
+/// never saw its input.
+fn rejected(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failed {
+            code: E_PROMPT_REJECTED,
+            ..
+        }
+    )
 }
 
 fn text_hash(text: &str) -> u64 {
@@ -1497,6 +1653,25 @@ mod tests {
     use omp_rpc::{AgentStartEvent, PromptError, PromptResultEvent};
 
     const TICK: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_host_tool_waits_until_the_drain_handled_its_start() {
+        let starts = Arc::new(ToolStarts::default());
+        let drain = Arc::clone(&starts);
+        let start: omp_rpc::ToolExecutionStartEvent = serde_json::from_value(
+            serde_json::json!({"toolCallId": "call-1", "toolName": "memory_write"}),
+        )
+        .expect("start event");
+        let event = Event::Notification(RpcNotification::RpcAgentEvent(
+            RpcAgentEvent::ToolExecutionStart(start),
+        ));
+        let noted = std::thread::spawn(move || drain.note(&event));
+        assert!(starts.wait_for("call-1", Duration::from_secs(30)));
+        noted.join().expect("drain thread");
+        // Each start is taken once; one that never came gives up at the bound.
+        assert!(!starts.wait_for("call-1", Duration::from_millis(10)));
+        assert!(!starts.wait_for("call-2", Duration::from_millis(10)));
+    }
 
     fn agent_event() -> Event {
         Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(

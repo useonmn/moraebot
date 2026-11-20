@@ -1719,17 +1719,85 @@ async fn memory_write_through_the_lead_decides_provenance_in_code() {
         .expect("inference entry saved");
     assert_eq!(guess.entry.prov, Prov::Inference);
     assert!(guess.entry.expires.is_some());
-    // The owner sees the standing rule the lead saved, under the reply.
-    let Outcome::Reply(reply) = &report.main.outcome else {
-        panic!("reply: {report:?}");
-    };
-    let id = whole["id"].as_str().unwrap();
-    let note = format!(
-        "\n\n[memory] saved {id} to core/owner: \"릴리스는 금요일에 하자\" (say `forget {id}` if that was not meant)"
+    // The owner sees the standing rule the lead saved: dispatch posts the group's notes.
+    assert!(
+        matches!(&report.main.outcome, Outcome::Reply(reply) if !reply.contains("[memory]")),
+        "{report:?}"
     );
-    assert!(reply.ends_with(&note), "{reply}");
-    assert_eq!(reply.matches("[memory] saved").count(), 1, "{reply}");
+    let id = whole["id"].as_str().unwrap();
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(id, "릴리스는 금요일에 하자")]
+    );
     bounded(m.shutdown_all()).await;
+}
+
+fn core_owner_note(id: &str, text: &str) -> String {
+    format!(
+        "[memory] saved {id} to core/owner: \"{text}\" (say `forget {id}` if that was not meant)"
+    )
+}
+
+/// Runs one owner turn of KEY_A whose lead saves `RULE` to core with `memory_write` and then
+/// ends its turn as FAKE_OMP_TOOLS_END says; returns the report and the saved entry's id.
+async fn core_save_in_a_turn_that_ends(end: &str) -> (GroupReport, String) {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+    const RULE: &str = "릴리스는 금요일에 하자";
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let r = owner_row(&h, "m-end-1", &format!("run-tools. {RULE}"));
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": RULE, "bucket_hint": "core", "why": "qa"}
+    });
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([
+            ("FAKE_OMP_TOOL_CALLS", write.to_string()),
+            ("FAKE_OMP_TOOLS_END", end.to_owned()),
+        ])
+        .with_turn_timeout(Duration::from_secs(5))
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory);
+    let report = bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, &format!("run-tools. {RULE}")),
+    ))
+    .await;
+    let results = h.tool_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let saved: Value = serde_json::from_str(&results[0].1).expect("write json");
+    assert_eq!(saved["bucket"], "core/owner", "{saved}");
+    bounded(m.shutdown_all()).await;
+    (report, saved["id"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn a_core_save_is_reported_when_the_turn_fails() {
+    let (report, id) = core_save_in_a_turn_that_ends("error").await;
+    assert_eq!(report.main.outcome.code(), Some(omp::E_PROMPT_ERROR));
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(&id, "릴리스는 금요일에 하자")]
+    );
+}
+
+#[tokio::test]
+async fn a_core_save_is_reported_when_the_turn_needs_check() {
+    let (report, id) = core_save_in_a_turn_that_ends("hang").await;
+    assert!(
+        matches!(report.main.outcome, Outcome::NeedsCheck { .. }),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.memory_notes,
+        [core_owner_note(&id, "릴리스는 금요일에 하자")]
+    );
 }
 
 #[tokio::test]
@@ -1918,4 +1986,186 @@ async fn conversation_memory_follows_the_body_once_until_it_changes() {
     assert!(messages[3].starts_with(&format!("{last}\n\n{open}")));
     assert!(messages[3].contains("keep PRs small"));
     bounded(manager.shutdown_all()).await;
+}
+
+/// Saves one owner note in KEY_A's conversation memory.
+fn remember_in_key_a(h: &Harness) {
+    let thread = moraebot::memory::Bucket::Thread(KEY_A.into());
+    qa_memory_store(h)
+        .add(qa_note("reply in Korean", thread))
+        .expect("add");
+}
+
+/// The messages of every `prompt` frame the lead received, in order.
+fn prompt_messages(h: &Harness) -> Vec<String> {
+    h.frames("prompt")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_rejected_prompt_gives_its_memory_block_again() {
+    let h = Harness::new();
+    remember_in_key_a(&h);
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([("FAKE_OMP_REJECT_TRIGGER", "reject-me".to_owned())])
+        .with_memory_clock(Arc::new(move || today));
+    let refused = bounded(manager.prompt(
+        KEY_A,
+        1,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, 1, "reject-me"),
+    ))
+    .await;
+    assert_eq!(refused.main.outcome.code(), Some(omp::E_PROMPT_REJECTED));
+    let pid = manager.child_pid().await;
+    assert!(pid.is_some(), "a rejected prompt keeps its child");
+    bounded(manager.prompt(
+        KEY_A,
+        2,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, 2, "second"),
+    ))
+    .await;
+    assert_eq!(manager.child_pid().await, pid, "the same child");
+
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 2);
+    let open = omp::thread_memory_open(KEY_A);
+    for message in &messages {
+        assert!(
+            message.contains(&open) && message.contains("reply in Korean"),
+            "{message}"
+        );
+    }
+    bounded(manager.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn compaction_gives_the_memory_block_again() {
+    let h = Harness::new();
+    remember_in_key_a(&h);
+    // omp compacts the lead's context during the second turn.
+    let compaction = serde_json::json!({"frame": {
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    }});
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", compaction.to_string())])
+        .with_memory_clock(Arc::new(move || today));
+    for (row, body) in [(1, "first"), (2, "run-tools"), (3, "third")] {
+        let report = bounded(manager.prompt(
+            KEY_A,
+            row,
+            Sender::Owner,
+            &lead::owner_input(KEY_A, row, body),
+        ))
+        .await;
+        assert!(
+            matches!(report.main.outcome, Outcome::Reply(_)),
+            "{report:?}"
+        );
+    }
+
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 3);
+    let open = omp::thread_memory_open(KEY_A);
+    assert!(messages[0].contains(&open), "{}", messages[0]);
+    assert!(
+        !messages[1].contains(&open),
+        "unchanged memory is not sent again before the compaction"
+    );
+    assert!(
+        messages[2].contains(&open) && messages[2].contains("reply in Korean"),
+        "the compaction may have summarised the block away: {}",
+        messages[2]
+    );
+    bounded(manager.shutdown_all()).await;
+}
+
+/// One owner turn in KEY_STEER, whose conversation memory holds one owner note, with a
+/// steer joined to it (fake-omp `steer` / `merged`, plus `env`): the main input's
+/// `followUp` frame message and the steer frame message the lead received.
+async fn main_and_steer_messages(h: &Harness, env: Vec<(&str, String)>) -> (String, String) {
+    let thread = moraebot::memory::Bucket::Thread(KEY_STEER.into());
+    qa_memory_store(h)
+        .add(qa_note("reply in Korean", thread))
+        .expect("add");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = Arc::new(
+        h.manager("steer")
+            .with_extra_env([("FAKE_OMP_STEER_CASE", "merged".to_owned())])
+            .with_extra_env(env)
+            .with_memory_clock(Arc::new(move || today)),
+    );
+    let main = lead::owner_input(KEY_STEER, 1, "m1");
+    let turn = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.prompt(KEY_STEER, 1, Sender::Owner, &main).await })
+    };
+    turn_running(&manager, KEY_STEER).await;
+    let steer = lead::owner_input(KEY_STEER, 2, "m2");
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, &steer, |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+    bounded(manager.shutdown_all()).await;
+
+    let mains: Vec<String> = h
+        .frames("prompt")
+        .iter()
+        .filter(|f| f["streamingBehavior"] == "followUp")
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect();
+    let steers = h.steer_frames();
+    assert_eq!((mains.len(), steers.len()), (1, 1));
+    let steer_message = steers[0]["message"].as_str().unwrap().to_owned();
+    (mains[0].clone(), steer_message)
+}
+
+#[tokio::test]
+async fn a_steer_counts_the_main_inputs_memory_block_as_given() {
+    let h = Harness::new();
+    let (main, steer) = main_and_steer_messages(&h, Vec::new()).await;
+    let open = omp::thread_memory_open(KEY_STEER);
+    assert!(
+        main.contains(&open) && main.contains("reply in Korean"),
+        "{main}"
+    );
+    assert_eq!(
+        steer,
+        lead::owner_input(KEY_STEER, 2, "m2"),
+        "the block went in with the main input of the same turn"
+    );
+}
+
+#[tokio::test]
+async fn a_steer_after_a_mid_turn_compaction_carries_the_memory_block_again() {
+    let h = Harness::new();
+    // omp compacts the lead's context after it accepted the main prompt, before the steer.
+    let compaction = serde_json::json!({
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    });
+    let (main, steer) =
+        main_and_steer_messages(&h, vec![("FAKE_OMP_STEER_FRAME", compaction.to_string())]).await;
+    let open = omp::thread_memory_open(KEY_STEER);
+    assert!(main.contains(&open), "{main}");
+    assert!(
+        steer.contains(&open) && steer.contains("reply in Korean"),
+        "the compaction may have summarised the main input's block away: {steer}"
+    );
 }

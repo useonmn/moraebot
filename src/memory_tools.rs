@@ -18,10 +18,12 @@
 //!
 //! `core` and `boundary` take only owner sentences; any other entry goes to the conversation.
 //! An owner sentence saved to `core` or `boundary` is also named to the owner under the
-//! turn's reply ([`TurnContext::memory_notes`]), so a wrong save is visible.
+//! turn's reply, or after its notice when the turn did not reply
+//! ([`TurnContext::memory_notes`]), so a wrong save is visible.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use omp_rpc::{HostTool, HostToolError, ToolLoadMode};
 use serde_json::{Map, Value, json};
@@ -30,7 +32,7 @@ use crate::memory::{
     self, Bucket, Clock, E_MEMORY_BUCKET, MemoryError, MemoryHandle, NewEntry, Prov, SearchScope,
     Source,
 };
-use crate::omp::TurnContext;
+use crate::omp::{ToolStarts, TurnContext};
 use crate::store::{InboxRow, Store};
 
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
@@ -40,6 +42,9 @@ pub const MEMORY_WRITE_TOOL: &str = "memory_write";
 pub const E_MEMORY_NO_TURN: &str = "E_MEMORY_NO_TURN";
 /// A tool argument is missing or not usable.
 pub const E_MEMORY_ARGS: &str = "E_MEMORY_ARGS";
+
+/// How long `memory_write` waits for the lead's event drain to reach its own call.
+const TOOL_START_BOUND: Duration = Duration::from_secs(5);
 
 /// The longest `why`, in characters, after control characters and line breaks are removed.
 pub const MAX_WHY_CHARS: usize = 200;
@@ -149,6 +154,7 @@ pub fn write_tool(
     memory: MemoryHandle,
     store: Arc<Mutex<Store>>,
     turn: Arc<Mutex<Option<TurnContext>>>,
+    starts: Arc<ToolStarts>,
 ) -> HostTool {
     HostTool::new(
         MEMORY_WRITE_TOOL,
@@ -175,10 +181,20 @@ pub fn write_tool(
             "required": ["text", "bucket_hint", "why"],
             "additionalProperties": false
         })),
-        move |arguments, _| {
-            let Some(context) = lock(&turn).clone() else {
+        move |arguments, call| {
+            // Provenance needs every event before this call applied (an outside read the lead
+            // ran just before). When the call's own start never comes, count the turn as
+            // having read outside text: the more careful label.
+            let caught_up = starts.wait_for(call.tool_call_id(), TOOL_START_BOUND);
+            let Some(mut context) = lock(&turn).clone() else {
                 return Err(refused(E_MEMORY_NO_TURN, "no lead turn is running"));
             };
+            if !caught_up {
+                tracing::warn!(
+                    "memory_write ran before its tool_execution_start; outside text assumed"
+                );
+                context.outside_tools = true;
+            }
             let rows: Vec<InboxRow> = {
                 let store = lock(&store);
                 context
@@ -291,7 +307,8 @@ pub fn plan_write(
     })
 }
 
-/// The line under the turn's reply that names an owner sentence saved to `core` or `boundary`.
+/// The line shown with the turn's outcome that names an owner sentence saved to `core` or
+/// `boundary`.
 fn core_note(id: &str, bucket: &str, text: &str) -> String {
     const SHOWN: usize = 80;
     let mut shown: String = text.chars().take(SHOWN).collect();

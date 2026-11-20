@@ -25,7 +25,9 @@
 //! `host_tool_call` per JSON line of FAKE_OMP_TOOL_CALLS
 //! (`{"tool": "<name>", "arguments": {...}, "id": "<toolCallId>"}`; without
 //! `id` the call id is `toolu_<pid>_<n>`, `n` counting calls over the child's
-//! life); a line `{"frame": {...}}` instead writes that frame as is (for example a
+//! life; a lead fake writes a `tool_execution_start` frame with the same
+//! `toolCallId`, `toolName` and `args` just before each call, like omp); a line
+//! `{"frame": {...}}` instead writes that frame as is (for example a
 //! `tool_execution_start` event) and goes straight on to the next line, waiting
 //! for nothing. Every other prompt is answered like `ok`. In both modes each next
 //! call, and the final reply, is written only after the matching
@@ -41,13 +43,24 @@
 //! With FAKE_OMP_LANE_HOLD_AFTER_TOOLS set, a lane fake in mode `tools` writes nothing
 //! after the last scripted call's `host_tool_result` (no final reply), like `hang`.
 //!
+//! End of a lead tool turn: FAKE_OMP_TOOLS_END=error ends a lead fake's tool turn
+//! (after its last scripted call) with `agent_end` and an error `prompt_result`;
+//! `hang` writes nothing more, like `hang`. Unset or anything else: the echo reply.
+//!
+//! Refused prompt: a prompt whose message contains FAKE_OMP_REJECT_TRIGGER (unset
+//! or empty: none) gets an error `response` (code `E_PROMPT_REFUSED`) in every
+//! mode, and no run.
+//!
 //! Touch on a refused call: FAKE_OMP_TOUCH_ON_TOOL_ERROR=<path> with
 //! FAKE_OMP_TOUCH_AFTER_ERRORS=<n> (default 1) creates `<path>` empty (parents
 //! are not created) when the n-th `host_tool_result` frame with
 //! `"isError": true` arrives, counted over the child's life, before the next
 //! call or the final reply is written. It applies to any fake, lead or lane.
 //!
-//! Steer: in mode `steer` the first prompt answers `agent_start` and waits. A
+//! Steer: in mode `steer` the first prompt answers `agent_start` and waits; with
+//! FAKE_OMP_STEER_FRAME set (a JSON frame), that frame is written as is between the
+//! prompt's response and `agent_start` (for example an `auto_compaction_end` after the
+//! main prompt was accepted, seen before the steer gate opens). A
 //! later prompt with `"streamingBehavior":"steer"` is acknowledged and handled
 //! by FAKE_OMP_STEER_CASE: `merged` (one run answers both), `separate` (two
 //! runs, one answer each), `hold` (writes `{"type":"fake_held",...}` and then
@@ -298,6 +311,13 @@ impl Fake {
                     .unwrap_or_default();
                 respond_ok(out, &id, command, json!({"toolNames": names}));
             }
+            "prompt" if refused(frame) => respond_err(
+                out,
+                &id,
+                command,
+                "prompt refused by fake-omp",
+                "E_PROMPT_REFUSED",
+            ),
             "prompt" if mode == "send_file" => {
                 let calls = send_file_calls();
                 self.start_tool_turn(&id, frame, calls, out);
@@ -385,7 +405,17 @@ impl Fake {
                             completed(&turn.prompt_id, out);
                             completed(steer_id, out);
                         }
-                        None => finish_echo(&turn.prompt_id, &turn.message, out),
+                        None => {
+                            let end = std::env::var("FAKE_OMP_TOOLS_END").unwrap_or_default();
+                            match end.as_str() {
+                                "error" if !self.lane => {
+                                    send(out, &json!({"type": "agent_end", "messages": []}));
+                                    prompt_error(&turn.prompt_id, out);
+                                }
+                                "hang" if !self.lane => {}
+                                _ => finish_echo(&turn.prompt_id, &turn.message, out),
+                            }
+                        }
                     }
                     return None;
                 }
@@ -403,6 +433,18 @@ impl Fake {
         });
         if let Some(path) = std::env::var_os("FAKE_OMP_LOG") {
             log_line(Path::new(&path), &format!("CALL host_{n}"));
+        }
+        if !self.lane {
+            // Like omp, a lead's call starts with `tool_execution_start` for the same id.
+            send(
+                out,
+                &json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": tool_call_id,
+                    "toolName": call.tool,
+                    "args": call.arguments,
+                }),
+            );
         }
         send(
             out,
@@ -428,6 +470,11 @@ impl Fake {
         } else if !self.first_prompt_seen {
             self.first_prompt_seen = true;
             respond_ok(out, id, "prompt", json!({"agentInvoked": true}));
+            if let Ok(frame) = std::env::var("FAKE_OMP_STEER_FRAME") {
+                let frame: Value =
+                    serde_json::from_str(&frame).expect("FAKE_OMP_STEER_FRAME is a JSON frame");
+                send(out, &frame);
+            }
             send(out, &json!({"type": "agent_start"}));
             self.steer_turn = Some(SteerTurn {
                 prompt_id: id.clone(),
@@ -482,6 +529,12 @@ impl Fake {
             }
         }
     }
+}
+
+/// The prompt's message contains FAKE_OMP_REJECT_TRIGGER (unset or empty: never).
+fn refused(frame: &Value) -> bool {
+    std::env::var("FAKE_OMP_REJECT_TRIGGER")
+        .is_ok_and(|trigger| !trigger.is_empty() && prompt_message(frame).contains(&trigger))
 }
 
 /// FAKE_OMP_SEND_FILE as `send_file` calls (unset or empty: one empty path).
