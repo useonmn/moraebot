@@ -384,13 +384,25 @@ async fn serve_core(stream: UnixStream, ctx: Arc<Ctx>, mut stop: watch::Receiver
     session.close();
     // Let the writer flush what is queued (a `bye` included), then close the link.
     drop(session);
-    if tokio::time::timeout(SESSION_STOP_WAIT, &mut writer)
+    finish_writer(&mut writer).await;
+    tracing::info!("core session ended");
+}
+
+/// Waits up to [`SESSION_STOP_WAIT`] for the writer to flush, then aborts it.
+///
+/// `Session::serve` may already have awaited `writer` to completion (when the link
+/// stopped taking frames); a finished `JoinHandle` must not be polled again, since tokio
+/// panics on a poll after completion.
+async fn finish_writer(writer: &mut JoinHandle<()>) {
+    if writer.is_finished() {
+        return;
+    }
+    if tokio::time::timeout(SESSION_STOP_WAIT, &mut *writer)
         .await
         .is_err()
     {
         writer.abort();
     }
-    tracing::info!("core session ended");
 }
 
 struct Running {
@@ -926,5 +938,20 @@ async fn fetch(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_writer_already_awaited_by_serve_is_not_polled_again() {
+        let mut writer = tokio::spawn(async {});
+        // What `Session::serve` does when the link stops taking frames.
+        tokio::select! {
+            _ = &mut writer => {}
+        }
+        finish_writer(&mut writer).await;
     }
 }
