@@ -301,6 +301,7 @@ impl Rig {
             access_mode: AccessMode::OwnerOnly,
             discord,
             slack,
+            bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };

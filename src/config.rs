@@ -203,6 +203,9 @@ impl<Id> Default for Access<Id> {
 pub enum Platform {
     Discord,
     Slack,
+    /// A separate bridge process on a unix socket (see `docs/bridge.md`). The bridge
+    /// names the real platform in its hello.
+    Bridge,
 }
 
 impl Platform {
@@ -210,6 +213,7 @@ impl Platform {
         match self {
             Platform::Discord => "discord",
             Platform::Slack => "slack",
+            Platform::Bridge => "bridge",
         }
     }
 }
@@ -228,6 +232,15 @@ pub struct SlackConfig {
     pub channel_id: String,
     pub bot_token_file: PathBuf,
     pub app_token_file: PathBuf,
+    pub access: Access<String>,
+}
+
+/// `[bridge]`: where the bridge listens and who may talk to moraebot. Ids are opaque
+/// text; the messenger behind the bridge defines their format.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    pub socket: PathBuf,
+    pub owner_id: String,
     pub access: Access<String>,
 }
 
@@ -479,6 +492,7 @@ pub struct Config {
     pub messenger: Platform,
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
+    pub bridge: Option<BridgeConfig>,
     pub work_dir: PathBuf,
     pub omp_path: PathBuf,
     pub home: PathBuf,
@@ -493,6 +507,7 @@ impl fmt::Debug for Config {
             .field("messenger", &self.messenger)
             .field("discord", &self.discord)
             .field("slack", &self.slack)
+            .field("bridge", &self.bridge)
             .field("work_dir", &self.work_dir)
             .field("omp_path", &self.omp_path)
             .field("home", &self.home)
@@ -527,6 +542,8 @@ struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     slack: Option<SlackSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    bridge: Option<BridgeSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     omp: Option<OmpSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemorySection>,
@@ -558,6 +575,19 @@ struct SlackSection {
     bot_token_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     app_token_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bot_replies: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<AllowSection<String>>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_bot_replies: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -986,10 +1016,13 @@ impl Config {
         let messenger = match file.messenger.as_deref() {
             None | Some("discord") => Platform::Discord,
             Some("slack") => Platform::Slack,
+            Some("bridge") => Platform::Bridge,
             Some(other) => {
                 return Err(ConfigError::new(
                     E_MESSENGER,
-                    format!("messenger '{other}' is not available; use 'discord' or 'slack'"),
+                    format!(
+                        "messenger '{other}' is not available; use 'discord', 'slack' or 'bridge'"
+                    ),
                 ));
             }
         };
@@ -1001,9 +1034,11 @@ impl Config {
             env,
         )?;
         let slack = slack_config(file.slack, access_mode, env)?;
+        let bridge = bridge_config(file.bridge, access_mode, env)?;
         let missing = match messenger {
             Platform::Discord => discord.is_none().then_some("[discord]"),
             Platform::Slack => slack.is_none().then_some("[slack]"),
+            Platform::Bridge => bridge.is_none().then_some("[bridge]"),
         };
         if let Some(section) = missing {
             return Err(ConfigError::new(
@@ -1057,6 +1092,7 @@ impl Config {
             messenger,
             discord,
             slack,
+            bridge,
             work_dir,
             omp_path: env.expand_tilde(&omp_path)?,
             home,
@@ -1098,6 +1134,12 @@ impl Config {
                 max_bot_replies: s.access.max_bot_replies,
                 allow: allow_sections(&s.access),
             }),
+            bridge: self.bridge.as_ref().map(|b| BridgeSection {
+                socket: Some(b.socket.clone()),
+                owner_id: Some(b.owner_id.clone()),
+                max_bot_replies: b.access.max_bot_replies,
+                allow: allow_sections(&b.access),
+            }),
             omp: has_omp_limits.then_some(OmpSection {
                 turn_timeout_minutes: self.omp.turn_timeout_minutes,
                 max_cost_usd: self.omp.max_cost_usd,
@@ -1118,15 +1160,18 @@ impl Config {
         match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.owner_id.to_string()),
             Platform::Slack => self.slack.as_ref().map(|s| s.owner_id.clone()),
+            Platform::Bridge => self.bridge.as_ref().map(|b| b.owner_id.clone()),
         }
         .unwrap_or_default()
     }
 
-    /// The active messenger's channel id as text.
+    /// The active messenger's channel id as text. Empty for the bridge, whose channel
+    /// comes from the `home` of its hello.
     pub fn channel_id(&self) -> String {
         match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.channel_id.to_string()),
             Platform::Slack => self.slack.as_ref().map(|s| s.channel_id.clone()),
+            Platform::Bridge => None,
         }
         .unwrap_or_default()
     }
@@ -1135,21 +1180,23 @@ impl Config {
     /// Token files are checked for every configured messenger; the inactive one is advisory.
     pub fn checks(&self) -> Vec<Check> {
         let active = self.messenger;
-        let mut checks = vec![
-            Check {
-                name: "owner_id",
-                result: self.check_owner(),
-                advisory: false,
-            },
-            Check {
-                name: match active {
-                    Platform::Discord => "discord.channel_id",
-                    Platform::Slack => "slack.channel_id",
-                },
+        let mut checks = vec![Check {
+            name: "owner_id",
+            result: self.check_owner(),
+            advisory: false,
+        }];
+        let channel_name = match active {
+            Platform::Discord => Some("discord.channel_id"),
+            Platform::Slack => Some("slack.channel_id"),
+            Platform::Bridge => None,
+        };
+        if let Some(name) = channel_name {
+            checks.push(Check {
+                name,
                 result: self.check_channel(),
                 advisory: false,
-            },
-        ];
+            });
+        }
         if self.access_mode == AccessMode::Allowlist {
             match active {
                 Platform::Discord => {
@@ -1167,6 +1214,15 @@ impl Config {
                             "slack.allow",
                             "slack.max_bot_replies",
                             &slack.access,
+                        ));
+                    }
+                }
+                Platform::Bridge => {
+                    if let Some(bridge) = &self.bridge {
+                        checks.extend(access_checks(
+                            "bridge.allow",
+                            "bridge.max_bot_replies",
+                            &bridge.access,
                         ));
                     }
                 }
@@ -1190,6 +1246,13 @@ impl Config {
                 name: "slack app_token_file",
                 result: check_token_file(&slack.app_token_file),
                 advisory,
+            });
+        }
+        if let Some(bridge) = &self.bridge {
+            checks.push(Check {
+                name: "bridge socket",
+                result: check_socket_path(&bridge.socket),
+                advisory: active != Platform::Bridge,
             });
         }
         checks.push(self.memory.key_check());
@@ -1264,6 +1327,7 @@ impl Config {
         let channel = match self.messenger {
             Platform::Discord => self.discord.as_ref().map(|d| d.channel_id.to_string()),
             Platform::Slack => self.slack.as_ref().map(|s| s.channel_id.clone()),
+            Platform::Bridge => None,
         }
         .unwrap_or_default();
         if channel.trim_matches('0').is_empty() {
@@ -1298,6 +1362,11 @@ impl Config {
     /// Validates only the active messenger's override file; the built-in defaults live in
     /// the adapters.
     fn check_hints(&self) -> Result<String, ConfigError> {
+        if self.messenger == Platform::Bridge {
+            // The override file is named after the platform the bridge reports in its
+            // hello, which is unknown until it connects.
+            return Ok("checked when the bridge connects".to_owned());
+        }
         let platform = self.messenger.as_str();
         let path = crate::hints::override_path(&self.home, platform);
         if !path.exists() {
@@ -1621,6 +1690,69 @@ fn slack_config(
         app_token_file: env.expand_tilde(&app_token_file)?,
         access,
     }))
+}
+
+/// The core does not know the id format of the messenger behind the bridge, so an id
+/// only has to be non-empty text without whitespace.
+fn bridge_config(
+    section: Option<BridgeSection>,
+    mode: AccessMode,
+    env: &Env,
+) -> Result<Option<BridgeConfig>, ConfigError> {
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    let socket = section
+        .socket
+        .ok_or_else(|| ConfigError::new(E_CONFIG_VALUE, "bridge.socket is required"))?;
+    let owner_id = section
+        .owner_id
+        .ok_or_else(|| ConfigError::new(E_OWNER_MISSING, "bridge.owner_id is required"))?;
+    check_bridge_id("bridge.owner_id", &owner_id)?;
+    let access = access_config(
+        "bridge",
+        mode,
+        &owner_id,
+        section.allow,
+        section.max_bot_replies,
+        |name, id, _kind| check_bridge_id(name, id),
+    )?;
+    Ok(Some(BridgeConfig {
+        socket: env.expand_tilde(&socket)?,
+        owner_id,
+        access,
+    }))
+}
+
+fn check_bridge_id(name: &str, id: &str) -> Result<(), ConfigError> {
+    if id.is_empty() || id.chars().any(char::is_whitespace) {
+        return Err(ConfigError::new(
+            E_CONFIG_VALUE,
+            format!("{name} must be a non-empty id without spaces"),
+        ));
+    }
+    Ok(())
+}
+
+/// The bridge socket must be an absolute path that fits a unix socket address
+/// (`sockaddr_un`, about 104 bytes on macOS and 108 on Linux).
+fn check_socket_path(path: &Path) -> Result<String, ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::new(
+            E_CONFIG_VALUE,
+            format!("bridge.socket {} must be an absolute path", path.display()),
+        ));
+    }
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|e| {
+        ConfigError::new(
+            E_CONFIG_VALUE,
+            format!(
+                "bridge.socket {} cannot be a unix socket address ({e}); choose a shorter path",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(path.display().to_string())
 }
 
 /// A Slack id is an uppercase letter or digit string with a kind prefix.
@@ -2575,6 +2707,143 @@ mod tests {
         let slack_active = format!("messenger = \"slack\"\n{both}");
         let cfg = fx.load(&slack_active).expect("loads");
         assert_eq!(code(cfg.validate()), E_TOKEN_MODE);
+    }
+
+    fn bridge_toml(fx: &Fixture, socket: &str) -> String {
+        format!(
+            "messenger = \"bridge\"\nomp_path = {}\n[bridge]\nsocket = {}\nowner_id = \"U111\"\n",
+            quoted(&fx.omp),
+            toml::Value::from(socket)
+        )
+    }
+
+    fn check<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no check named {name}"))
+    }
+
+    #[test]
+    fn bridge_section_loads_and_round_trips() {
+        let fx = Fixture::new();
+        let text = format!(
+            "access_mode = \"allowlist\"\n{}max_bot_replies = 3\n\
+             [[bridge.allow]]\nid = \"U333\"\nkind = \"user\"\n\
+             [[bridge.allow]]\nid = \"B444\"\nkind = \"bot\"\n",
+            bridge_toml(&fx, "~/run/slack-bridge.sock")
+        );
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.messenger, Platform::Bridge);
+        assert_eq!(cfg.messenger.as_str(), "bridge");
+        let bridge = cfg.bridge.clone().expect("bridge section");
+        assert_eq!(bridge.socket, fx.dir.path().join("run/slack-bridge.sock"));
+        assert_eq!(bridge.owner_id, "U111");
+        assert_eq!(bridge.access.max_bot_replies, Some(3));
+        let ids: Vec<_> = bridge.access.allow.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["U333", "B444"]);
+        assert_eq!(cfg.owner_id(), "U111");
+        assert_eq!(cfg.channel_id(), "", "the channel comes from the hello");
+
+        let text = cfg.to_toml().expect("serializes");
+        assert!(text.contains("[bridge]"));
+        let again = fx.load(&text).expect("reloads");
+        assert_eq!(again.messenger, Platform::Bridge);
+        let again = again.bridge.expect("bridge section");
+        assert_eq!(again.socket, bridge.socket);
+        assert_eq!(again.owner_id, bridge.owner_id);
+        assert_eq!(again.access, bridge.access);
+    }
+
+    #[test]
+    fn bridge_active_without_section_is_messenger_missing() {
+        let fx = Fixture::new();
+        let text = format!("messenger = \"bridge\"\n{}", fx.valid_toml());
+        assert_eq!(code(fx.load(&text)), E_MESSENGER_MISSING);
+    }
+
+    #[test]
+    fn bridge_section_values_are_checked() {
+        let fx = Fixture::new();
+        let no_socket = format!(
+            "messenger = \"bridge\"\nomp_path = {}\n[bridge]\nowner_id = \"U111\"\n",
+            quoted(&fx.omp)
+        );
+        assert_eq!(code(fx.load(&no_socket)), E_CONFIG_VALUE);
+        let base = bridge_toml(&fx, "/run/b.sock");
+        let no_owner = base.replace("owner_id = \"U111\"\n", "");
+        assert_eq!(code(fx.load(&no_owner)), E_OWNER_MISSING);
+        for owner in ["", "U1 11"] {
+            let text = base.replace("\"U111\"", &format!("\"{owner}\""));
+            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "{owner:?}");
+        }
+        let allowlist = format!("access_mode = \"allowlist\"\n{base}");
+        for entry in [
+            "[[bridge.allow]]\nid = \"\"\nkind = \"user\"\n",
+            "[[bridge.allow]]\nid = \"U111\"\nkind = \"user\"\n",
+            "[[bridge.allow]]\nid = \"U333\"\n",
+        ] {
+            assert_eq!(
+                code(fx.load(&format!("{allowlist}{entry}"))),
+                E_CONFIG_VALUE,
+                "{entry}"
+            );
+        }
+        let owner_only = format!("{base}[[bridge.allow]]\nid = \"U333\"\nkind = \"user\"\n");
+        assert_eq!(code(fx.load(&owner_only)), E_CONFIG_VALUE);
+    }
+
+    #[test]
+    fn bridge_checks_the_socket_and_skips_the_channel() {
+        let fx = Fixture::new();
+        let socket = fx.dir.path().join("b.sock");
+        let cfg = fx
+            .load(&bridge_toml(&fx, socket.to_str().expect("utf-8")))
+            .expect("loads");
+        let checks = cfg.checks();
+        assert!(check(&checks, "bridge socket").result.is_ok());
+        assert!(!check(&checks, "bridge socket").advisory);
+        assert!(checks.iter().all(|c| !c.name.ends_with("channel_id")));
+        assert!(check(&checks, "hints").result.is_ok());
+        cfg.validate().expect("a valid bridge config passes");
+
+        let relative = fx.load(&bridge_toml(&fx, "run/b.sock")).expect("loads");
+        assert_eq!(code(relative.validate()), E_CONFIG_VALUE);
+        let long = format!("/{}/b.sock", "d".repeat(120));
+        let long = fx.load(&bridge_toml(&fx, &long)).expect("loads");
+        assert_eq!(
+            code(check(&long.checks(), "bridge socket").result.clone()),
+            E_CONFIG_VALUE
+        );
+
+        // A bridge section next to an active Discord is advisory only.
+        let discord = format!(
+            "{}[bridge]\nsocket = \"run/b.sock\"\nowner_id = \"U111\"\n",
+            fx.valid_toml()
+        );
+        let cfg = fx.load(&discord).expect("loads");
+        assert!(check(&cfg.checks(), "bridge socket").advisory);
+        cfg.validate()
+            .expect("the inactive bridge does not fail validation");
+    }
+
+    #[test]
+    fn bridge_allowlist_is_reported() {
+        let fx = Fixture::new();
+        let socket = fx.dir.path().join("b.sock");
+        let text = format!(
+            "access_mode = \"allowlist\"\n{}[[bridge.allow]]\nid = \"B444\"\nkind = \"bot\"\n",
+            bridge_toml(&fx, socket.to_str().expect("utf-8"))
+        );
+        let checks = fx.load(&text).expect("loads").checks();
+        assert_eq!(
+            code(check(&checks, "bridge.allow").result.clone()),
+            W_ALLOWLIST
+        );
+        assert_eq!(
+            code(check(&checks, "bridge.max_bot_replies").result.clone()),
+            W_BOT_REPLIES
+        );
     }
 
     #[test]

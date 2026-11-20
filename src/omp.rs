@@ -1915,6 +1915,7 @@ mod tests {
                 access: Default::default(),
             }),
             slack: None,
+            bridge: None,
             omp: OmpConfig {
                 turn_timeout_minutes,
                 ..OmpConfig::default()

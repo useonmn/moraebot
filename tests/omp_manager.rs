@@ -49,6 +49,7 @@ impl Harness {
                 access: Default::default(),
             }),
             slack: None,
+            bridge: None,
             omp,
             memory: moraebot::config::MemoryConfig::default(),
         };

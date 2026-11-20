@@ -185,6 +185,7 @@ impl Rig {
                 }),
                 None,
             ),
+            Platform::Bridge => unreachable!("the files rig has no bridge"),
         };
         let config = Config {
             messenger,
@@ -194,6 +195,7 @@ impl Rig {
             access_mode: AccessMode::OwnerOnly,
             discord,
             slack,
+            bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
