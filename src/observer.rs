@@ -4,15 +4,19 @@
 //! - A `group` job (a settled, failed or restart-cut lead turn) judges the owner's own
 //!   sentences of its owner rows, with `prov: owner` and its row, sentence and turn number;
 //!   jev only picks which sentence and which file, and the code checks the `core/` gates
-//!   against the picked sentence itself.
+//!   against the picked sentence itself. The owner's words are saved freely, the omo way
+//!   (#63): only secrets are taken out (redacted before jev or the summarizer sees them,
+//!   and again on the summary), never an approval, URL or command word; memory is guarded
+//!   where it is read instead ([`memory::MEMORY_GUARD`]).
 //! - A `lane` job judges a lane result once, a `subagent` job one subagent output file. Their
 //!   sentences pass the excerpt filter ([`ExcerptFilter`]) before anything is sent, and are
 //!   saved as reference (`lane` or `subagent`), never in `core/`.
 //! - Every picked sentence is saved as a short summary, never as the sentence itself (#57):
 //!   the locked summarizer ([`Summarizer`]) writes one numbered line per picked sentence of a
 //!   job in one call, and a line is kept only when it is at most [`MAX_SUMMARY_CHARS`]
-//!   characters, the redactor would not change it and the excerpt filter allows it;
-//!   otherwise that line is dropped ([`W_MEMORY_SUMMARY_DROPPED`]). When the summarizer
+//!   characters and, for a lane or subagent line, the redactor would not change it and the
+//!   excerpt filter allows it (an owner line is redacted instead); otherwise that line is
+//!   dropped ([`W_MEMORY_SUMMARY_DROPPED`]). When the summarizer
 //!   cannot run, the pass waits and the job keeps its attempts; an answer that does not fit
 //!   the picks counts one attempt ([`E_MEMORY_SUMMARY`]). The sentence is never saved
 //!   instead.
@@ -752,9 +756,12 @@ impl Observer {
             let Some(row) = row.filter(|row| row.origin == "owner") else {
                 continue;
             };
+            // The owner's words are kept whatever they say; only secrets are taken out, and a
+            // sentence that was nothing but a secret is no candidate.
             let candidates: Vec<(u32, String)> = memory::own_sentences(&row.text)
                 .into_iter()
-                .filter(|(_, s)| self.candidate(s))
+                .map(|(n, s)| (n, self.redactor.redact(&s).0))
+                .filter(|(_, s)| self.candidate(s) && self.candidate(&without_markers(s)))
                 .collect();
             for window in candidates.chunks(self.window()).take(OWNER_WINDOWS) {
                 let Some(pick) = self.judge(Kind::Owner, window, Some(tools), work).await? else {
@@ -1005,7 +1012,7 @@ impl Observer {
         };
         self.summary_failures.store(0, Ordering::SeqCst);
         for (pick, line) in picked.into_iter().zip(lines) {
-            let summary = match self.check_summary(&line) {
+            let summary = match self.check_summary(&line, pick.prov) {
                 Ok(summary) => summary,
                 Err(reason) => {
                     self.dropped(work, &reason);
@@ -1043,21 +1050,28 @@ impl Observer {
         });
     }
 
-    /// `reply` folded to one line, or why it may not be saved.
-    fn check_summary(&self, reply: &str) -> Result<String, String> {
+    /// `reply` folded to one line, or why it may not be saved. A summary of the owner's words
+    /// (`prov` owner) has its secrets redacted and skips the excerpt filter (#63); any other
+    /// summary with a secret, or one the excerpt filter refuses, is dropped.
+    fn check_summary(&self, reply: &str, prov: Prov) -> Result<String, String> {
         let summary = reply.split_whitespace().collect::<Vec<_>>().join(" ");
         if summary.is_empty() {
             return Err("empty".into());
         }
-        if self.redactor.redact(&summary).1 {
-            return Err("secret".into());
-        }
+        let (redacted, secret) = self.redactor.redact(&summary);
+        let summary = match (prov, secret) {
+            (Prov::Owner, _) => redacted,
+            (_, true) => return Err("secret".into()),
+            (_, false) => summary,
+        };
         if summary.chars().count() > MAX_SUMMARY_CHARS {
             return Err("too_long".into());
         }
-        self.filter
-            .allows(&summary, &self.redactor)
-            .map_err(|drop| format!("{drop:?}").to_lowercase())?;
+        if prov != Prov::Owner {
+            self.filter
+                .allows(&summary, &self.redactor)
+                .map_err(|drop| format!("{drop:?}").to_lowercase())?;
+        }
         Ok(summary)
     }
 
@@ -1066,7 +1080,8 @@ impl Observer {
     }
 
     /// A sentence that may be sent and saved: at least four characters, at most
-    /// [`MAX_ENTRY_BYTES`], and nothing the redactor would change.
+    /// [`MAX_ENTRY_BYTES`], and nothing the redactor would change (an owner sentence comes
+    /// here already redacted; a lane or subagent one with a secret is dropped).
     fn candidate(&self, sentence: &str) -> bool {
         sentence.chars().count() >= MIN_SENTENCE_CHARS
             && sentence.len() <= MAX_ENTRY_BYTES
@@ -1433,6 +1448,20 @@ fn numbered_lines(reply: &str, count: usize) -> Option<Vec<String>> {
                 .map(|rest| rest.trim().to_owned())
         })
         .collect()
+}
+
+/// `text` without the redactor's `[redacted:...]` markers, its words joined by single spaces:
+/// what is left of a redacted sentence.
+fn without_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[redacted:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        rest = after.find(']').map_or("", |end| &after[end + 1..]);
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Where a lane or subagent entry goes for jev's `thread` and every other answer.
