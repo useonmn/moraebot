@@ -36,7 +36,12 @@ Only messages from you (the owner) are checked, and only ones without attachment
 
 A sentence that only mentions an id, a question such as `기억해?`, or a bare `X 기억해` (often a question without the `?`) goes to the lead as usual. moraebot sends no notice when it saves something on its own (nothing does yet in P1a).
 
-The lead has no tool that changes memory.
+The lead has no tool that corrects, forgets or restores an entry; only your commands above do that.
+
+## Memory tools
+
+- `memory_search(query, scope)` (lead and every lane): a plain search, case ignored, of the entry texts or an entry id. `scope` is `all` (core, projects and conversations, the default), `core`, `projects`, `threads` or `archive` (forgotten or replaced entries, shown under a header that says none of them is in force). Expired entries are skipped. The newest 20 matches are shown like the read blocks below (your words under a heading, everything else quoted as `확인 안 됨` reference lines), and a last line counts the rest.
+- `memory_write(text, bucket_hint, why)` (lead only, never lanes): queues one entry for moraebot's writer and returns its id at once; the write and its commit happen in the background, and `why` becomes the commit message. moraebot, not the lead, decides whose words it is. It counts as yours only when `text` is one whole sentence of a message you sent in that turn (the message itself or one steered into it), copied exactly. Anything else is a `tool` entry when the turn used web search, fetch, a browser, GitHub tools, `read` of a URL, `gh`/`curl`/`wget` in bash, or a subagent, and an `inference` entry otherwise; both expire in 30 days. `bucket_hint` is `thread` (the default), `project:<owner/name>`, `project` (`projects/_general.md`), `core` or `boundary`. `core` and `boundary` take only your exact sentence; any other entry goes to the conversation, and the tool result says so.
 
 ## What the lead sees
 

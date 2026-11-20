@@ -1637,7 +1637,81 @@ fn qa_note(text: &str, bucket: moraebot::memory::Bucket) -> moraebot::memory::Ne
         bucket,
         src: moraebot::memory::Source::row(1),
         expires: None,
+        why: None,
     }
+}
+
+#[tokio::test]
+async fn memory_write_through_the_lead_decides_provenance_in_code() {
+    use moraebot::memory::{Bucket, MemoryHandle, Prov};
+    use moraebot::memory_tools::{MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL};
+
+    let h = Harness::new();
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let r = owner_row(&h, "m-mw-1", "run-tools. 릴리스는 금요일에 하자");
+    let write = |text: &str, hint: &str| {
+        serde_json::json!({
+            "tool": MEMORY_WRITE_TOOL,
+            "arguments": {"text": text, "bucket_hint": hint, "why": "qa"}
+        })
+    };
+    let calls = [
+        write("릴리스는 금요일에 하자", "core"),
+        write("릴리스는 금요일", "core"),
+    ];
+    let lines: Vec<String> = calls.iter().map(Value::to_string).collect();
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", lines.join("\n"))])
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory.clone());
+    bounded(m.prompt(
+        KEY_A,
+        r,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, r, "run-tools"),
+    ))
+    .await;
+
+    let names: Vec<String> = h.frames("set_host_tools")[0]["tools"]
+        .as_array()
+        .expect("tool list")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(names.iter().any(|n| n == MEMORY_SEARCH_TOOL), "{names:?}");
+    assert!(names.iter().any(|n| n == MEMORY_WRITE_TOOL), "{names:?}");
+    let results = h.tool_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results.iter().all(|(error, _)| !error), "{results:?}");
+    let whole: Value = serde_json::from_str(&results[0].1).expect("write json");
+    let part: Value = serde_json::from_str(&results[1].1).expect("write json");
+    assert_eq!(whole["provenance"], "owner");
+    assert_eq!(whole["bucket"], "core/owner");
+    assert_eq!(part["provenance"], "inference");
+    assert_eq!(part["bucket"], format!("thread:{KEY_A}"));
+    assert!(part["note"].is_string(), "{part}");
+    // The worker takes jobs in order, so once a later add is answered both writes are done.
+    let flush = qa_note("flush", Bucket::Thread(KEY_B.into()));
+    bounded(memory.add(flush)).await.expect("flush");
+    let owner = memory
+        .show(whole["id"].as_str().unwrap())
+        .expect("show")
+        .expect("owner entry saved");
+    assert_eq!(owner.bucket, Bucket::Owner);
+    assert_eq!(owner.entry.prov, Prov::Owner);
+    assert_eq!(
+        owner.entry.src.as_deref(),
+        Some(format!("row={r} s=1").as_str())
+    );
+    let guess = memory
+        .show(part["id"].as_str().unwrap())
+        .expect("show")
+        .expect("inference entry saved");
+    assert_eq!(guess.entry.prov, Prov::Inference);
+    assert!(guess.entry.expires.is_some());
+    bounded(m.shutdown_all()).await;
 }
 
 #[tokio::test]

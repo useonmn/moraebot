@@ -21,6 +21,7 @@ use moraebot::lane::{E_LANE_IDLE, E_LANE_STOPPED};
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, REPORT_FOOTER};
 use moraebot::lead;
 use moraebot::lead::LaneResult;
+use moraebot::memory_tools::{MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL};
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
 use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REMOVE, E_LANE_REPO};
@@ -379,9 +380,10 @@ async fn lane_start_returns_id_and_result_row_wakes_dispatcher() {
     );
     let tools = h.frames_after_start(0, "set_host_tools");
     assert_eq!(tools.len(), 1, "{tools:?}");
-    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 3);
     assert_eq!(tools[0]["tools"][0]["name"], done::LANE_DONE_TOOL);
     assert_eq!(tools[0]["tools"][1]["name"], LANE_REPORT_TOOL);
+    assert_eq!(tools[0]["tools"][2]["name"], MEMORY_SEARCH_TOOL);
     omp.shutdown_all().await;
 }
 
@@ -698,7 +700,14 @@ async fn lane_with_done_line_gets_lane_done() {
         .iter()
         .map(|t| &t["name"])
         .collect();
-    assert_eq!(names, [done::LANE_DONE_TOOL, LANE_REPORT_TOOL]);
+    assert_eq!(
+        names,
+        [done::LANE_DONE_TOOL, LANE_REPORT_TOOL, MEMORY_SEARCH_TOOL]
+    );
+    assert!(
+        !names.contains(&&json!(MEMORY_WRITE_TOOL)),
+        "lanes never write memory"
+    );
     let prompts = h.frames_after_start(0, "prompt");
     assert_eq!(prompts.len(), 1, "{prompts:?}");
     assert!(has_done_footer(&prompts[0], "file ."), "{prompts:?}");
@@ -1824,7 +1833,14 @@ async fn lane_report_is_news_while_the_lane_runs() {
         .iter()
         .map(|t| &t["name"])
         .collect();
-    assert_eq!(names, [done::LANE_DONE_TOOL, LANE_REPORT_TOOL]);
+    assert_eq!(
+        names,
+        [done::LANE_DONE_TOOL, LANE_REPORT_TOOL, MEMORY_SEARCH_TOOL]
+    );
+    assert!(
+        !names.contains(&&json!(MEMORY_WRITE_TOOL)),
+        "lanes never write memory"
+    );
 }
 
 #[tokio::test]
@@ -2057,6 +2073,7 @@ async fn lane_reads_boundaries_and_its_projects_owner_and_lane_lines_only() {
         bucket,
         src: Source::new("lane=3 seq=1").unwrap(),
         expires: None,
+        why: None,
     };
     for entry in [
         note("answer in Korean", Prov::Owner, Bucket::Owner),

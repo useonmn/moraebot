@@ -102,7 +102,8 @@ impl Gateway {
             memory::system_clock(),
         )?)?;
         let omp = OmpManager::new(config.clone(), Arc::clone(&store))
-            .with_hints(lead::system_prompt(&guidance, &hints));
+            .with_hints(lead::system_prompt(&guidance, &hints))
+            .with_memory(memory.clone());
         let tools =
             onboarding::host_tools(Arc::clone(&store), config.home.clone(), omp.turn_context());
         let omp = omp.with_host_tools(tools);

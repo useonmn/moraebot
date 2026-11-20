@@ -1515,6 +1515,10 @@ impl LaneManager {
             None => Vec::new(),
         };
         tools.push(self.lane_report_tool(job, activity));
+        tools.push(crate::memory_tools::search_tool(
+            self.config.memory_dir(),
+            Arc::clone(&self.memory_clock),
+        ));
         let OpenedChild {
             client, session_id, ..
         } = omp::open_child(

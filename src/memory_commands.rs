@@ -470,6 +470,7 @@ pub async fn run(memory: &MemoryHandle, key: &str, row_id: i64, command: Command
                 bucket: bucket_for(&target, key),
                 src: Source::row(row_id),
                 expires: None,
+                why: None,
             };
             Answer::say(match memory.add(entry).await {
                 Ok(added) => {

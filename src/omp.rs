@@ -172,13 +172,52 @@ pub struct GroupReport {
 }
 
 /// The lead turn that is running: its main row, conversation and the sender of the main
-/// row. Host-tool handlers read it through [`OmpManager::turn_context`]; management tools
-/// refuse a turn whose sender is not the owner.
+/// row, the row steered into it, and whether it used a tool that reads the web or GitHub
+/// ([`crate::memory_tools::reads_outside`]). Host-tool handlers read it through
+/// [`OmpManager::turn_context`]; management tools refuse a turn whose sender is not the owner,
+/// and `memory_write` decides provenance from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnContext {
     pub row_id: i64,
     pub conversation_key: String,
     pub sender: Sender,
+    pub steered_row_id: Option<i64>,
+    pub outside_tools: bool,
+}
+
+impl TurnContext {
+    /// The main row and fresh turn state.
+    pub fn new(row_id: i64, conversation_key: &str, sender: Sender) -> Self {
+        Self {
+            row_id,
+            conversation_key: conversation_key.to_owned(),
+            sender,
+            steered_row_id: None,
+            outside_tools: false,
+        }
+    }
+
+    /// The inbox rows of the group: the main row, then the steered one.
+    pub fn group_rows(&self) -> Vec<i64> {
+        std::iter::once(self.row_id)
+            .chain(self.steered_row_id)
+            .collect()
+    }
+}
+
+/// Marks the running turn when `event` starts a tool call that reads the web or GitHub.
+fn note_outside_tool(turn: &Mutex<Option<TurnContext>>, event: &Event) {
+    let Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::ToolExecutionStart(
+        start,
+    ))) = event
+    else {
+        return;
+    };
+    if crate::memory_tools::reads_outside(&start.tool_name, start.args.as_ref())
+        && let Some(turn) = lock(turn).as_mut()
+    {
+        turn.outside_tools = true;
+    }
 }
 
 /// The `send_file` host tool. The handler (on the client's own thread) only checks the
@@ -718,6 +757,8 @@ pub struct OmpManager {
     hints: String,
     /// Today's date for the core memory block (expired entries are left out).
     memory_clock: memory::Clock,
+    /// The memory writer for the lead's `memory_write`; `None` leaves the tool out.
+    memory: Option<memory::MemoryHandle>,
     host_tools: Vec<HostTool>,
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
@@ -758,6 +799,7 @@ impl OmpManager {
             extra_env: Vec::new(),
             hints: String::new(),
             memory_clock: memory::system_clock(),
+            memory: None,
             host_tools: Vec::new(),
             live: Default::default(),
             lead_kill: Default::default(),
@@ -832,6 +874,13 @@ impl OmpManager {
             .expect("lane manager not shared yet")
             .memory_clock = Arc::clone(&clock);
         self.memory_clock = clock;
+        self
+    }
+
+    /// Gives the lead `memory_write`, which queues entries for `memory`'s worker. The lead
+    /// always has `memory_search`; lanes never get `memory_write`.
+    pub fn with_memory(mut self, memory: memory::MemoryHandle) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -930,11 +979,7 @@ impl OmpManager {
 
         // The live mutex is held for the whole turn, so the bucket belongs to this turn only.
         take_sent(&current.sent_files);
-        *lock(&self.turn) = Some(TurnContext {
-            row_id,
-            conversation_key: key.to_owned(),
-            sender,
-        });
+        *lock(&self.turn) = Some(TurnContext::new(row_id, key, sender));
         lock(&self.lead_watch).begin(key);
         let (text, fresh) = thread_memory(
             &self.config.memory_dir(),
@@ -1058,6 +1103,10 @@ impl OmpManager {
         if !claim(turn.main_row_id) {
             return false;
         }
+        // Before the steer is sent, so a `memory_write` it causes sees its row.
+        if let Some(context) = lock(&self.turn).as_mut() {
+            context.steered_row_id = Some(row_id);
+        }
         let (text, fresh) = thread_memory(
             &self.config.memory_dir(),
             (self.memory_clock)(),
@@ -1141,6 +1190,18 @@ impl OmpManager {
         )];
         tools.extend(self.host_tools.iter().cloned());
         tools.extend(self.lanes.host_tools());
+        tools.push(crate::memory_tools::search_tool(
+            self.config.memory_dir(),
+            Arc::clone(&self.memory_clock),
+        ));
+        if let Some(memory) = &self.memory {
+            tools.push(crate::memory_tools::write_tool(
+                memory.clone(),
+                Arc::clone(&self.store),
+                Arc::clone(&self.turn),
+            ));
+        }
+        let turn = Arc::clone(&self.turn);
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
@@ -1162,6 +1223,7 @@ impl OmpManager {
                         // Counted first: whoever sees the turn start also sees its progress.
                         lock(&lead_watch).note(event);
                         note_agent_start(&gate, &running, event);
+                        note_outside_tool(&turn, event);
                     },
                 );
                 match opened {
@@ -1403,6 +1465,45 @@ mod tests {
         )))
     }
 
+    fn tool_start(name: &str, args: Value) -> Event {
+        Event::Notification(RpcNotification::RpcAgentEvent(
+            RpcAgentEvent::ToolExecutionStart(omp_rpc::ToolExecutionStartEvent {
+                tool_call_id: "call-1".into(),
+                tool_name: name.into(),
+                args: Some(args),
+                intent: None,
+            }),
+        ))
+    }
+
+    #[test]
+    fn a_web_or_github_tool_call_marks_the_running_turn() {
+        let turn = Mutex::new(None);
+        let web = tool_start("web_search", serde_json::json!({"query": "x"}));
+        note_outside_tool(&turn, &web);
+        assert_eq!(*turn.lock().unwrap(), None, "no turn, nothing to mark");
+
+        *turn.lock().unwrap() = Some(TurnContext::new(4, "discord:th:1", Sender::Owner));
+        note_outside_tool(&turn, &agent_event());
+        note_outside_tool(
+            &turn,
+            &tool_start("bash", serde_json::json!({"command": "cargo test"})),
+        );
+        assert!(!turn.lock().unwrap().as_ref().unwrap().outside_tools);
+        note_outside_tool(
+            &turn,
+            &tool_start("bash", serde_json::json!({"command": "gh issue view 39"})),
+        );
+        let marked = turn.lock().unwrap().clone().unwrap();
+        assert!(marked.outside_tools);
+        assert_eq!(marked.group_rows(), [4]);
+        let steered = TurnContext {
+            steered_row_id: Some(9),
+            ..marked
+        };
+        assert_eq!(steered.group_rows(), [4, 9]);
+    }
+
     #[test]
     fn lead_watch_reports_a_quiet_turn_once_per_stretch() {
         let base = Instant::now();
@@ -1535,6 +1636,7 @@ mod tests {
             bucket,
             src: memory::Source::row(row),
             expires: None,
+            why: None,
         }
     }
 
