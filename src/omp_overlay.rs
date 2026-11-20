@@ -28,7 +28,10 @@ pub const E_OMP_OVERLAY: &str = "E_OMP_OVERLAY";
 /// omp is not the version the overlay merge was checked against.
 pub const W_OMP_VERSION: &str = "W_OMP_VERSION";
 
-/// The omp version whose `--config` merge the overlay was checked against.
+/// The omp version whose `--config` merge the overlay was checked against. It also stands for
+/// a second fact: a one-line `--append-system-prompt` value is read as a file, once, at start
+/// (`resolvePromptInput`, `system-prompt.ts`), which keeps the lead's and the lanes' memory
+/// out of argv (`omp::write_append_file`). An omp upgrade means re-checking both.
 pub const CHECKED_OMP_VERSION: &str = "18.22.2";
 
 /// The overlay of the lead and lane children. Same memory keys as the chat overlay
@@ -105,7 +108,7 @@ pub fn check(omp: &Path) -> Result<OverlayCheck, ConfigError> {
     })?;
     let warning = (version != CHECKED_OMP_VERSION).then(|| {
         format!(
-            "{W_OMP_VERSION}: omp {version} is not {CHECKED_OMP_VERSION}, the version the memory overlay was checked against; check that `--config` still merges per key and that memory.backend off still turns omp's memory off"
+            "{W_OMP_VERSION}: omp {version} is not {CHECKED_OMP_VERSION}, the version the memory overlay was checked against; check that `--config` still merges per key, that memory.backend off still turns omp's memory off, and that a one-line --append-system-prompt value is still read as a file once at start"
         )
     });
     Ok(OverlayCheck { version, warning })

@@ -3,7 +3,7 @@
 //! The dispatcher asks [`parse`] about the text of every owner row (`origin = 'owner'`)
 //! before the row can be steered into a running turn or queued for the lead. Lane-result
 //! rows and chat senders never reach it, so the same words in a lane report or a web page do
-//! nothing. Detection is rule-based for now (P2 replaces it with a jev classifier):
+//! nothing. The rules come first:
 //!
 //! - remember: `기억해: <text>`, `<text> 기억해(줘/둬/놔)`, `remember: <text>`,
 //!   `remember that <text>`. Saved in the conversation's thread bucket; `기억해(<repo>):` /
@@ -20,10 +20,17 @@
 //! A question (`... 기억해?`) is not a remember request, and id commands must be short (at
 //! most [`MAX_ID_COMMAND_WORDS`] words) so a sentence that merely mentions an id and a verb
 //! still goes to the lead.
+//!
+//! A message the rules did not match goes to jev ([`classify`]) only when it holds memory
+//! words or an entry id ([`looks_like_memory_request`]). jev picks the intent and, for a
+//! remember request, the sentence; every other argument comes from the owner's own text
+//! ([`from_intent`]). Any jev error means "not a command", so the rules alone serve the owner
+//! while jev is off, paused, waiting or slow.
 
+use crate::jev::{Answer as JevAnswer, Jev, Question, Request};
 use crate::memory::{
-    Bucket, E_MEMORY_ARCHIVED, E_MEMORY_NOT_ARCHIVED, E_MEMORY_NOT_FOUND, Entry, Found,
-    MemoryError, MemoryHandle, NewEntry, Prov, Source,
+    self, Bucket, E_MEMORY_ARCHIVED, E_MEMORY_NOT_ARCHIVED, E_MEMORY_NOT_FOUND, Entry, Found,
+    MemoryError, MemoryHandle, NewEntry, Prov, Redactor, Source,
 };
 
 /// An id command (show one, forget, restore) has at most this many words.
@@ -307,17 +314,38 @@ fn parse_remember(text: &str) -> Option<Command> {
     remember(body, always, None)
 }
 
-/// `항상 ` / `always ` at the start.
+/// The words that make a remember request a standing (core) rule.
+const ALWAYS_WORDS: [&str; 2] = ["항상", "always"];
+
+/// `항상 ` / `always ` at the start (case ignored).
 fn strip_always_prefix(text: &str) -> (bool, &str) {
     let text = text.trim_start();
-    for word in ["항상", "always", "Always"] {
-        if let Some(rest) = text.strip_prefix(word)
+    for word in ALWAYS_WORDS {
+        if let Some(rest) = text
+            .get(..word.len())
+            .filter(|head| head.eq_ignore_ascii_case(word))
+            .map(|_| &text[word.len()..])
             && rest.starts_with(char::is_whitespace)
         {
             return (true, rest.trim_start());
         }
     }
     (false, text)
+}
+
+/// Whether an [`ALWAYS_WORDS`] word is anywhere in `text`: `항상` as a substring, `always` as a
+/// whole word.
+fn says_always(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ALWAYS_WORDS.iter().any(|word| {
+        if word.is_ascii() {
+            lower
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == *word)
+        } else {
+            lower.contains(word)
+        }
+    })
 }
 
 /// `기억해: <body>`, `기억해(<repo>): <body>`, `remember that <body>`; returns the repo, if
@@ -365,6 +393,210 @@ fn remember(body: &str, always: bool, repo: Option<String>) -> Option<Command> {
         text: body.to_owned(),
         target,
     })
+}
+
+/// Words that make a message worth asking jev about. Verbs such as `지워`, `delete` or `fix`
+/// count only together with an entry id: alone they are ordinary coding requests.
+const MEMORY_WORDS: [&str; 7] = [
+    "기억", "잊어", "잊지", "remember", "forget", "memory", "memories",
+];
+
+/// The distinct entry ids in `text`, in order.
+fn ids_in(text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in text.split_whitespace().filter_map(id_of) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Whether an owner message the rules did not match may still be a memory request: it holds
+/// an entry id or one of [`MEMORY_WORDS`] (case ignored).
+pub fn looks_like_memory_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    !ids_in(&lower).is_empty() || MEMORY_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// What jev says an owner message asks of the memory store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    Remember,
+    Show,
+    Correct,
+    Forget,
+    Restore,
+}
+
+/// The `intent` options, in wire order; `none` last.
+const INTENTS: [(&str, &str, Option<Intent>); 6] = [
+    (
+        "remember",
+        "Save something new in the assistant's memory.",
+        Some(Intent::Remember),
+    ),
+    (
+        "show",
+        "Show what the assistant remembers, or one saved entry.",
+        Some(Intent::Show),
+    ),
+    (
+        "correct",
+        "Replace a saved entry with new text.",
+        Some(Intent::Correct),
+    ),
+    (
+        "forget",
+        "Delete or forget a saved entry.",
+        Some(Intent::Forget),
+    ),
+    (
+        "restore",
+        "Bring back a forgotten entry.",
+        Some(Intent::Restore),
+    ),
+    ("none", "None of these.", None),
+];
+
+const REQUEST_QUESTION: &str = "Is the owner asking the assistant to save, show, change, delete \
+     or restore something in its own saved memory?";
+const REQUEST_YES: &str = "The owner asks for a change to, or a look at, the assistant's own saved \
+     memory.";
+const REQUEST_NO: &str = "The owner asks for other work, asks a question about the past, or only \
+     mentions memory in passing.";
+const INTENT_QUESTION: &str = "What does the owner want done with the assistant's memory?";
+const SPAN_QUESTION: &str = "Which one sentence is the thing to remember?";
+
+/// The command for jev's `intent`, with every argument taken from the owner's `text`; `span`
+/// is the whole sentence jev picked to remember. `None` when an argument is missing: the
+/// message then goes to the lead.
+pub fn from_intent(intent: Intent, text: &str, span: Option<&str>) -> Option<Command> {
+    let ids = ids_in(text);
+    let one = match ids.as_slice() {
+        [id] => Some(id.clone()),
+        _ => None,
+    };
+    match intent {
+        Intent::Show => Some(one.map_or(Command::Show, Command::ShowOne)),
+        Intent::Forget => one.map(Command::Forget),
+        Intent::Restore => one.map(Command::Restore),
+        Intent::Correct => {
+            let id = one?;
+            let rest: Vec<String> = memory::own_sentences(text)
+                .into_iter()
+                .map(|(_, sentence)| sentence)
+                .filter(|sentence| ids_in(sentence).is_empty())
+                .collect();
+            (!rest.is_empty()).then(|| Command::Correct {
+                id,
+                text: rest.join(" "),
+            })
+        }
+        Intent::Remember => {
+            let span = span.map(str::trim).filter(|s| !s.is_empty())?;
+            let target = match (says_always(text), says_dont(span)) {
+                (true, true) => Target::Boundaries,
+                (true, false) => Target::Core,
+                (false, _) => Target::Conversation,
+            };
+            Some(Command::Remember {
+                text: span.to_owned(),
+                target,
+            })
+        }
+    }
+}
+
+/// The jev request for owner message sentences `sentences` (`own_sentences` numbering).
+fn classify_request(model: &str, sentences: &[(u32, String)]) -> Request {
+    let mut span: Vec<(String, String)> = sentences
+        .iter()
+        .map(|(n, _)| (format!("s{n}"), format!("Sentence s{n}.")))
+        .collect();
+    span.push((
+        "none".into(),
+        "No sentence is something to remember.".into(),
+    ));
+    Request {
+        model: model.to_owned(),
+        state: serde_json::json!({
+            "kind": "owner_message",
+            "sentences": sentences.iter().map(|(n, s)| format!("s{n}: {s}")).collect::<Vec<_>>(),
+        }),
+        questions: vec![
+            (
+                "request".into(),
+                Question::Noul {
+                    instructions: REQUEST_QUESTION.into(),
+                    yes: REQUEST_YES.into(),
+                    no: REQUEST_NO.into(),
+                },
+            ),
+            (
+                "intent".into(),
+                Question::Choice {
+                    instructions: INTENT_QUESTION.into(),
+                    options: INTENTS
+                        .iter()
+                        .map(|(name, text, _)| ((*name).to_owned(), (*text).to_owned()))
+                        .collect(),
+                },
+            ),
+            (
+                "span".into(),
+                Question::Choice {
+                    instructions: SPAN_QUESTION.into(),
+                    options: span,
+                },
+            ),
+        ],
+    }
+}
+
+/// Asks jev whether owner message `text` is a memory request: one call with the classify
+/// timeout, no retry. The sentences the redactor would change are not sent. `None` on any jev
+/// error, below `classify_threshold`, on intent `none`, or when [`from_intent`] finds an
+/// argument missing.
+pub async fn classify(jev: &Jev, redactor: &Redactor, text: &str) -> Option<Command> {
+    let sentences: Vec<(u32, String)> = memory::own_sentences(text)
+        .into_iter()
+        .filter(|(_, sentence)| !redactor.redact(sentence).1)
+        .collect();
+    if sentences.is_empty() {
+        return None;
+    }
+    let config = jev.config();
+    let request = classify_request(&config.model, &sentences);
+    let response = match jev.ask(&request, config.classify_timeout()).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::info!(error = %err, "memory request not classified; rules only");
+            return None;
+        }
+    };
+    let choice = |name: &str| match response.answers.get(name) {
+        Some(JevAnswer::Choice { choice, .. }) => Some(choice.as_str()),
+        _ => None,
+    };
+    let asked = match response.answers.get("request") {
+        Some(JevAnswer::Noul { noul }) => *noul,
+        _ => 0.0,
+    };
+    if asked < config.classify_threshold {
+        return None;
+    }
+    let intent = INTENTS
+        .iter()
+        .find(|(name, _, _)| choice("intent") == Some(*name))
+        .and_then(|(_, _, intent)| *intent)?;
+    let span = choice("span").and_then(|picked| {
+        sentences
+            .iter()
+            .find(|(n, _)| picked == format!("s{n}"))
+            .map(|(_, sentence)| sentence.as_str())
+    });
+    from_intent(intent, text, span)
 }
 
 /// Whether a rule says not to do something.
@@ -460,8 +692,14 @@ impl Answer {
 }
 
 /// Runs `command` from owner row `row_id` of conversation `key`. Forget only asks (see
-/// [`forget`]).
-pub async fn run(memory: &MemoryHandle, key: &str, row_id: i64, command: Command) -> Answer {
+/// [`forget`]). `status` (the observer's state, may be empty) heads the full listing.
+pub async fn run(
+    memory: &MemoryHandle,
+    key: &str,
+    row_id: i64,
+    status: &str,
+    command: Command,
+) -> Answer {
     match command {
         Command::Remember { text, target } => {
             let entry = NewEntry {
@@ -487,7 +725,7 @@ pub async fn run(memory: &MemoryHandle, key: &str, row_id: i64, command: Command
                 Err(err) => failure("the entry", &err),
             })
         }
-        Command::Show => Answer::say(show_all(memory, key)),
+        Command::Show => Answer::say(show_all(memory, key, status)),
         Command::ShowOne(id) => Answer::say(match memory.show(&id) {
             Ok(Some(found)) => found_line(&found),
             Ok(None) => format!("No memory entry {id}."),
@@ -534,8 +772,18 @@ pub async fn forget(memory: &MemoryHandle, id: &str, yes: bool) -> String {
     }
 }
 
-/// Core, boundaries and conversation `key`'s entries, with their ids.
-fn show_all(memory: &MemoryHandle, key: &str) -> String {
+/// `status` as the first line when not empty, then core, boundaries and conversation `key`'s
+/// entries, with their ids.
+fn show_all(memory: &MemoryHandle, key: &str, status: &str) -> String {
+    let listing = list_all(memory, key);
+    if status.is_empty() {
+        listing
+    } else {
+        format!("{status}\n{listing}")
+    }
+}
+
+fn list_all(memory: &MemoryHandle, key: &str) -> String {
     let mut sections = vec![
         ("Always (core rules):", Bucket::Owner),
         ("Not to do (core):", Bucket::Boundaries),
@@ -709,7 +957,7 @@ mod tests {
         let key = "discord:th:111";
         let run_text = |text: &str| parse(text).expect("a command");
 
-        let saved = run(&memory, key, 7, run_text("회의는 3시 기억해줘")).await;
+        let saved = run(&memory, key, 7, "", run_text("회의는 3시 기억해줘")).await;
         assert!(saved.reply.starts_with("Remembered m-"), "{}", saved.reply);
         let id = memory
             .entries(&Bucket::Thread(key.into()))
@@ -718,13 +966,20 @@ mod tests {
             .clone();
         assert!(memory.entries(&Bucket::Owner).expect("core").is_empty());
 
-        let shown = run(&memory, key, 8, Command::Show).await.reply;
+        let shown = run(&memory, key, 8, "", Command::Show).await.reply;
         assert!(
             shown.contains(&id) && shown.contains("회의는 3시"),
             "{shown}"
         );
 
-        let fixed = run(&memory, key, 9, run_text(&format!("{id} 고쳐: 회의는 4시"))).await;
+        let fixed = run(
+            &memory,
+            key,
+            9,
+            "",
+            run_text(&format!("{id} 고쳐: 회의는 4시")),
+        )
+        .await;
         assert!(fixed.reply.starts_with(&format!("Replaced {id} with m-")));
         let new_id = memory
             .entries(&Bucket::Thread(key.into()))
@@ -732,7 +987,7 @@ mod tests {
             .id
             .clone();
 
-        let asked = run(&memory, key, 10, run_text(&format!("{new_id} 지워"))).await;
+        let asked = run(&memory, key, 10, "", run_text(&format!("{new_id} 지워"))).await;
         assert_eq!(asked.confirm_forget.as_deref(), Some(new_id.as_str()));
         assert!(
             !memory
@@ -753,13 +1008,135 @@ mod tests {
                 .is_empty()
         );
 
-        let back = run(&memory, key, 11, Command::Restore(new_id.clone())).await;
+        let back = run(&memory, key, 11, "", Command::Restore(new_id.clone())).await;
         assert!(back.reply.starts_with("Restored"), "{}", back.reply);
         assert_eq!(
-            run(&memory, key, 12, Command::Forget("m-ffffff".into()))
+            run(&memory, key, 12, "", Command::Forget("m-ffffff".into()))
                 .await
                 .reply,
             "No memory entry m-ffffff."
+        );
+    }
+
+    #[test]
+    fn looks_like_memory_request_needs_memory_words_or_an_id() {
+        for text in [
+            "그 얘기 기억해 둘래?",
+            "Please keep this in your memory",
+            "아까 그거 잊어버리면 안 돼",
+            "m-1f3a2b 이제 필요 없어",
+            "FORGET the deploy rule",
+        ] {
+            assert!(looks_like_memory_request(text), "{text}");
+        }
+        for text in [
+            "이 파일 지워줘",
+            "delete the old branch",
+            "fix the failing test",
+            "PR 고쳐줘",
+            "",
+        ] {
+            assert!(!looks_like_memory_request(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn from_intent_takes_every_argument_from_the_owners_text() {
+        let text = "m-1f3a2b 그거 이제 틀렸어. 회의는 4시야.";
+        assert_eq!(
+            from_intent(Intent::Correct, text, None),
+            Some(Command::Correct {
+                id: "m-1f3a2b".into(),
+                text: "회의는 4시야.".into()
+            })
+        );
+        assert_eq!(
+            from_intent(Intent::Forget, "m-1f3a2b 이제 필요 없어", None),
+            Some(Command::Forget("m-1f3a2b".into()))
+        );
+        assert_eq!(
+            from_intent(Intent::Restore, "m-0c4d5e 다시 살려 놔", None),
+            Some(Command::Restore("m-0c4d5e".into()))
+        );
+        assert_eq!(
+            from_intent(Intent::Show, "m-0c4d5e 내용이 뭐였지", None),
+            Some(Command::ShowOne("m-0c4d5e".into()))
+        );
+        assert_eq!(
+            from_intent(Intent::Show, "내가 말한 거 뭐 남아 있어", None),
+            Some(Command::Show)
+        );
+        // An argument jev cannot supply is missing: the message goes to the lead.
+        assert_eq!(from_intent(Intent::Forget, "그거 잊어줘", None), None);
+        assert_eq!(
+            from_intent(Intent::Restore, "m-1f3a2b m-0c4d5e 살려", None),
+            None
+        );
+        assert_eq!(
+            from_intent(Intent::Correct, "m-1f3a2b 고쳐줘", None),
+            None,
+            "no sentence without the id"
+        );
+        assert_eq!(
+            from_intent(Intent::Remember, "이거 기억해 둘래", None),
+            None
+        );
+        // The remember text is the picked sentence, whole, as the owner wrote it.
+        assert_eq!(
+            from_intent(
+                Intent::Remember,
+                "오늘 고마웠어. 배포는 금요일에 안 해. 잘 자",
+                Some("배포는 금요일에 안 해.")
+            ),
+            Some(Command::Remember {
+                text: "배포는 금요일에 안 해.".into(),
+                target: Target::Conversation
+            })
+        );
+    }
+
+    #[test]
+    fn a_classified_remember_goes_to_core_only_with_always() {
+        let target = |text: &str, span: &str| match from_intent(Intent::Remember, text, Some(span))
+        {
+            Some(Command::Remember { target, .. }) => target,
+            other => panic!("expected Remember, got {other:?}"),
+        };
+        assert_eq!(
+            target(
+                "존댓말로 답해줘, 이거 꼭 기억해",
+                "존댓말로 답해줘, 이거 꼭 기억해"
+            ),
+            Target::Conversation
+        );
+        assert_eq!(
+            target(
+                "앞으로 항상 존댓말로 답해. 기억해 둬",
+                "앞으로 항상 존댓말로 답해."
+            ),
+            Target::Core
+        );
+        assert_eq!(
+            target(
+                "Keep this in memory. Always answer in Korean.",
+                "Always answer in Korean."
+            ),
+            Target::Core
+        );
+        assert_eq!(
+            target(
+                "기억해 둬. 금요일엔 배포하지 마. 항상이야",
+                "금요일엔 배포하지 마."
+            ),
+            Target::Boundaries
+        );
+        assert_eq!(
+            target(
+                "remember: the alwayson flag stays",
+                "the alwayson flag stays"
+            ),
+            Target::Conversation,
+            "always only as a whole word"
         );
     }
 }

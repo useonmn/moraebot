@@ -245,6 +245,17 @@ impl Observer {
         self.progress.subscribe()
     }
 
+    /// The jev client this observer asks; the dispatcher's memory request classifier shares it,
+    /// and with it the gate.
+    pub fn jev(&self) -> &Jev {
+        &self.jev
+    }
+
+    /// The redactor of the memory store, which also hides the jev key.
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
     /// One line for the owner: jev's state and how many jobs wait.
     pub fn status_line(&self) -> String {
         let backlog = lock(&self.store).memory_backlog().unwrap_or_default();

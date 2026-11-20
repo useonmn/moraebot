@@ -91,6 +91,8 @@ pub struct Gateway {
     observer: Observer,
     /// Notified by the store after every commit that queued a memory job.
     memory_wake: Arc<Notify>,
+    /// What the start check found about omp (`None` in tests that skip the check).
+    omp_check: Option<OverlayCheck>,
 }
 
 impl Gateway {
@@ -141,13 +143,16 @@ impl Gateway {
             omp,
             observer,
             memory_wake,
+            omp_check: None,
         })
     }
 
     /// Hands over what the start check found about omp: its version goes with every memory
-    /// job the observer settles (`unknown` without this call).
+    /// job the observer settles (`unknown` without this call), and a version warning goes to
+    /// the owner once per version (`N_OMP_VERSION`).
     pub fn with_omp_check(mut self, check: &OverlayCheck) -> Self {
         self.observer = self.observer.with_omp_version(&check.version);
+        self.omp_check = Some(check.clone());
         self
     }
 
@@ -179,15 +184,21 @@ impl Gateway {
             omp,
             observer,
             memory_wake,
+            omp_check,
         } = self;
         let mut inbound = adapter.start().await?;
+        let observer = Arc::new(observer);
+        let mut dispatcher = Dispatcher::new(&config, adapter, Arc::clone(&store), omp)
+            .with_memory(memory)
+            .with_observer(Arc::clone(&observer));
+        if let Some(check) = omp_check {
+            dispatcher = dispatcher.with_omp_check(check);
+        }
+        let dispatcher = Arc::new(dispatcher);
         let (stop_observer, observer_stopped) = oneshot::channel::<()>();
-        let mut observer = tokio::spawn(Arc::new(observer).run(memory_wake, async {
+        let mut observer = tokio::spawn(observer.run(memory_wake, async {
             let _ = observer_stopped.await;
         }));
-        let dispatcher = Arc::new(
-            Dispatcher::new(&config, adapter, Arc::clone(&store), omp).with_memory(memory),
-        );
         let (events, queue) = mpsc::channel(EVENT_QUEUE);
         let mut dispatch = tokio::spawn(dispatcher.run(queue));
         tracing::info!("gateway started");

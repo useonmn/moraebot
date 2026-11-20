@@ -27,10 +27,11 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -392,13 +393,19 @@ fn turn_settled(turn: &Result<PromptTurn, RpcError>) -> bool {
         .is_none_or(|r| r.session_settled)
 }
 
-/// Exact omp argv (without the program) for one child. Non-empty `hints` become one
-/// `--append-system-prompt=<hints>` element; message text never goes into argv, but the hints
-/// carry the lead's core memory and a lane's memory block, so they are visible in the
-/// process list to other local users of this machine and count against `ARG_MAX`. `cwd` is
-/// the work folder for the lead and for a lane without a repo, else the lane's worktree.
-/// `--config <home>/omp-overlay.yml` turns omp's own memory off ([`crate::omp_overlay`]).
-pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) -> Vec<OsString> {
+/// Exact omp argv (without the program) for one child. `append` is the private file
+/// [`write_append_file`] wrote; it becomes one `--append-system-prompt=<absolute path>`
+/// element, so the lead's core memory and a lane's memory block never appear in the process
+/// list (omp 18.22.2 reads a one-line value as a file, once, at start). Message text never
+/// goes into argv either. `cwd` is the work folder for the lead and for a lane without a
+/// repo, else the lane's worktree. `--config <home>/omp-overlay.yml` turns omp's own memory
+/// off ([`crate::omp_overlay`]).
+pub fn omp_args(
+    config: &Config,
+    cwd: &Path,
+    session_dir: &Path,
+    append: Option<&Path>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["--mode", "rpc", "--no-ui", "--session-dir"]
         .into_iter()
         .map(OsString::from)
@@ -410,8 +417,10 @@ pub fn omp_args(config: &Config, cwd: &Path, session_dir: &Path, hints: &str) ->
     args.push(crate::omp_overlay::overlay_path(&config.home).into());
     args.push("--approval-mode".into());
     args.push("yolo".into());
-    if !hints.is_empty() {
-        args.push(format!("--append-system-prompt={hints}").into());
+    if let Some(path) = append {
+        let mut arg = OsString::from("--append-system-prompt=");
+        arg.push(path);
+        args.push(arg);
     }
     if let Some(usd) = config.omp.max_cost_usd {
         args.push("--max-cost".into());
@@ -445,6 +454,66 @@ pub fn lane_session_dir(config: &Config, lane_id: i64) -> PathBuf {
         .join("lanes")
         .join(lane_id.to_string())
         .join("session")
+}
+
+/// `<home>/lead/append.md`: the lead's appended system prompt.
+pub fn lead_append_path(config: &Config) -> PathBuf {
+    config.home.join("lead").join("append.md")
+}
+
+/// `<home>/lanes/<id>/append.md`: a lane's appended system prompt.
+pub fn lane_append_path(config: &Config, lane_id: i64) -> PathBuf {
+    config
+        .home
+        .join("lanes")
+        .join(lane_id.to_string())
+        .join("append.md")
+}
+
+/// Numbers the temp files of [`write_append_file`] within this process.
+static APPEND_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Writes a child's appended system prompt `text` to `path` (mode `0o600`, parent `0o700`)
+/// through a temp file that is synced and renamed over it, and returns the absolute path for
+/// [`omp_args`]. Empty `text` writes nothing and returns `None` (no argument). A path with a
+/// line break is refused: omp reads such a value as literal text, not as a file. Written
+/// before every start; a running child never reads it again.
+pub fn write_append_file(path: &Path, text: &str) -> std::io::Result<Option<PathBuf>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let path = std::path::absolute(path)?;
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\n' | b'\r'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} holds a line break", path.display()),
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        private_dir(dir)?;
+    }
+    let n = APPEND_TMP.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("md.{}.{n}.tmp", std::process::id()));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, &path));
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(Some(path))
 }
 
 /// `<home>/logs/omp-<name>.stderr.log`; `name` is `lead::LEAD_SESSION` or `lane-<id>`.
@@ -1339,10 +1408,16 @@ impl OmpManager {
         crate::omp_overlay::write_overlay(&self.config.home)
             .map_err(|e| Outcome::failed(crate::omp_overlay::E_OMP_OVERLAY, e))?;
         let command = private_dir(&session_dir)
-            .and_then(|()| {
+            .and_then(|()| write_append_file(&lead_append_path(&self.config), &append))
+            .and_then(|append_file| {
                 child_command(
                     &self.config,
-                    omp_args(&self.config, &self.config.work_dir, &session_dir, &append),
+                    omp_args(
+                        &self.config,
+                        &self.config.work_dir,
+                        &session_dir,
+                        append_file.as_deref(),
+                    ),
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )

@@ -1,8 +1,9 @@
 //! Lanes: separate headless omp children started by the lead through host tools. Messenger-agnostic.
 //!
 //! The lead calls `lane_start`, `lane_message` and `lane_status` (registered on the lead
-//! child next to `send_file`). A lane is its own omp RPC child with no appended system
-//! prompt; it runs one prompt on a worker thread and closes. A lane with a done line gets
+//! child next to `send_file`). A lane is its own omp RPC child whose appended system prompt
+//! is only its memory block, passed as a private file (`omp::write_append_file`); it runs one
+//! prompt on a worker thread and closes. A lane with a done line gets
 //! exactly one host tool, `lane_done`: the lane claims its work is done, moraebot runs
 //! the Done checks inside that call and refuses a claim that fails them. Its result is
 //! stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same transaction as
@@ -1481,7 +1482,8 @@ impl LaneManager {
     }
 
     /// `Err` is a failure before the prompt was sent (the child did not open). The child's
-    /// system prompt gets the job's memory block ([`memory::lane_block`]), read now.
+    /// system prompt gets the job's memory block ([`memory::lane_block`]), read now and passed
+    /// as the private file `<home>/lanes/<id>/append.md`.
     fn run_prompt(
         self: &Arc<Self>,
         job: &Job,
@@ -1505,9 +1507,12 @@ impl LaneManager {
         })?;
         let command = omp::private_dir(&session_dir)
             .and_then(|()| {
+                omp::write_append_file(&omp::lane_append_path(&self.config, job.id), &memory)
+            })
+            .and_then(|append| {
                 omp::child_command(
                     &self.config,
-                    omp::omp_args(&self.config, &cwd, &session_dir, &memory),
+                    omp::omp_args(&self.config, &cwd, &session_dir, append.as_deref()),
                     &omp::stderr_log_path(&self.config, &name),
                     &self.extra_env,
                 )

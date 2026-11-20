@@ -24,6 +24,7 @@ use moraebot::lead::LaneResult;
 use moraebot::memory_tools::{MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL};
 use moraebot::omp::{self, OmpManager, Outcome};
 use moraebot::store::{LaneState, Store};
+use moraebot::testing::appended;
 use moraebot::worktree::{self, E_LANE_GIT, E_LANE_REMOVE, E_LANE_REPO};
 use serde_json::{Value, json};
 
@@ -2104,12 +2105,7 @@ async fn lane_reads_boundaries_and_its_projects_owner_and_lane_lines_only() {
     let lines = h.log_lines();
     let starts = h.lane_starts();
     assert_eq!(starts.len(), 1);
-    let appends: Vec<String> = start_argv(&lines[starts[0]])
-        .into_iter()
-        .filter_map(|a| a.strip_prefix("--append-system-prompt=").map(str::to_owned))
-        .collect();
-    assert_eq!(appends.len(), 1, "{appends:?}");
-    let block = &appends[0];
+    let block = &appended(&lines[starts[0]]);
     assert!(block.starts_with("<<<moraebot-memory lane>>>"), "{block}");
     for present in [
         "never force-push",
@@ -2122,4 +2118,65 @@ async fn lane_reads_boundaries_and_its_projects_owner_and_lane_lines_only() {
         assert!(!block.contains(absent), "{absent}: {block}");
     }
     bounded(omp.shutdown_all()).await;
+}
+
+/// A lane's memory block reaches omp as a private file: argv names
+/// `<home>/lanes/<id>/append.md` and holds none of the block, the file is the owner's only,
+/// and omp read the block from it at start.
+#[tokio::test]
+async fn lane_prompt_is_passed_as_a_private_file() {
+    use moraebot::memory::{Bucket, Day, MemoryStore, NewEntry, Prov, Redactor, Source};
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    let repo = qa_repo(&h);
+    let today = Day::parse("2026-11-20").unwrap();
+    let mut store = MemoryStore::open(&h.config.home, Redactor::default(), Arc::new(move || today))
+        .expect("memory store");
+    store
+        .add(NewEntry {
+            text: "never force-push".into(),
+            prov: Prov::Owner,
+            bucket: Bucket::Boundaries,
+            src: Source::row(1),
+            expires: None,
+            why: None,
+        })
+        .expect("add");
+    drop(store);
+    let omp = h
+        .manager("ok", &[lane_start_repo("t1", "file .", json!(repo))])
+        .with_extra_env(GIT_ENV)
+        .with_memory_clock(Arc::new(move || today));
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let lines = h.log_lines();
+    let starts = h.lane_starts();
+    assert_eq!(starts.len(), 1);
+    let start = &lines[starts[0]];
+    bounded(omp.shutdown_all()).await;
+
+    let path = omp::lane_append_path(&h.config, 1);
+    assert!(path.is_absolute());
+    let flags: Vec<String> = start_argv(start)
+        .into_iter()
+        .filter(|a| a.starts_with("--append-system-prompt"))
+        .collect();
+    assert_eq!(
+        flags,
+        [format!("--append-system-prompt={}", path.display())]
+    );
+    assert!(
+        !start
+            .split_once(" argv=")
+            .unwrap()
+            .1
+            .contains("never force-push"),
+        "{start}"
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("<<<moraebot-memory lane>>>"), "{text}");
+    assert!(text.contains("never force-push"), "{text}");
+    assert_eq!(appended(start), text, "omp read the file at start");
 }

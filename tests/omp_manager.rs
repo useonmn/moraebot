@@ -12,6 +12,7 @@ use moraebot::omp::{self, GroupReport, OmpManager, Outcome};
 use moraebot::onboarding;
 use moraebot::persona;
 use moraebot::store::{Admitted, OnboardingRow, OnboardingState, Store};
+use moraebot::testing::appended;
 use serde_json::Value;
 
 const KEY_A: &str = "discord:th:1300000000000000001";
@@ -241,9 +242,78 @@ async fn flag_present_when_hints_set() {
         .find(|l| l.starts_with("START pid="))
         .unwrap();
     let mut expected = expected_argv(&h.config);
-    expected.extend(["--append-system-prompt=probe hints", "--max-cost", "2.5"].map(str::to_owned));
+    let flag = format!(
+        "--append-system-prompt={}",
+        omp::lead_append_path(&h.config).display()
+    );
+    expected.extend([flag, "--max-cost".to_owned(), "2.5".to_owned()]);
     assert_eq!(start_argv(&start), expected);
+    assert_eq!(appended(&start), "probe hints");
     manager.shutdown_all().await;
+}
+
+/// The lead's hints, persona and core memory reach omp as a private file: argv names the file
+/// and holds none of the text, the file is the owner's only (`0600`, folder `0700`), and omp
+/// read exactly the appended prompt from it at start.
+#[tokio::test]
+async fn lead_prompt_is_passed_as_a_private_file() {
+    let h = Harness::new();
+    save_sora(&h);
+    let mut store = qa_memory_store(&h);
+    store
+        .add(qa_note(
+            "Answer in Korean always",
+            moraebot::memory::Bucket::Owner,
+        ))
+        .expect("core rule");
+    drop(store);
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("ok")
+        .with_hints("probe hints".into())
+        .with_memory_clock(Arc::new(move || today));
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .unwrap();
+    bounded(manager.shutdown_all()).await;
+
+    let path = omp::lead_append_path(&h.config);
+    assert!(path.is_absolute());
+    let argv = start_argv(&start);
+    let flags: Vec<&String> = argv
+        .iter()
+        .filter(|a| a.starts_with("--append-system-prompt"))
+        .collect();
+    assert_eq!(
+        flags,
+        [&format!("--append-system-prompt={}", path.display())]
+    );
+    for secret in [
+        "probe hints",
+        "Name: Sora",
+        "Answer in Korean",
+        omp::CORE_MEMORY_OPEN,
+    ] {
+        assert!(
+            !start.split_once(" argv=").unwrap().1.contains(secret),
+            "{secret} in argv"
+        );
+    }
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("probe hints"), "{text}");
+    assert!(text.contains("Name: Sora"), "{text}");
+    let core = text
+        .split_once(omp::CORE_MEMORY_OPEN)
+        .expect("core memory block")
+        .1;
+    assert!(core.contains("Answer in Korean always"), "{core}");
+    assert_eq!(appended(&start), text, "omp read the file at start");
 }
 
 #[tokio::test]
@@ -264,17 +334,13 @@ async fn no_flag_when_hints_empty() {
     manager.shutdown_all().await;
 }
 
-/// Per `START` line in log order, its `--append-system-prompt=` argv elements.
-fn appends(h: &Harness) -> Vec<Vec<String>> {
+/// Per `START` line in log order, the appended system prompt that child read at start (empty
+/// when it had none).
+fn appends(h: &Harness) -> Vec<String> {
     h.log_lines()
         .iter()
         .filter(|l| l.starts_with("START pid="))
-        .map(|l| {
-            start_argv(l)
-                .into_iter()
-                .filter(|a| a.starts_with("--append-system-prompt="))
-                .collect()
-        })
+        .map(|l| appended(l))
         .collect()
 }
 
@@ -295,13 +361,10 @@ async fn lead_appends_persona_after_hints() {
     let manager = h.manager("ok").with_hints("H".into());
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let loaded = persona::load(&h.config.home).unwrap();
-    let expected = format!(
-        "--append-system-prompt={}",
-        persona::append("H", loaded.as_deref())
-    );
+    let expected = persona::append("H", loaded.as_deref());
     let appends = appends(&h);
-    assert_eq!(appends, vec![vec![expected]]);
-    assert!(appends[0][0].contains("Name: Sora"));
+    assert_eq!(appends, vec![expected]);
+    assert!(appends[0].contains("Name: Sora"));
     bounded(manager.shutdown_all()).await;
 }
 
@@ -354,8 +417,8 @@ async fn persona_change_restarts_the_lead_before_the_next_turn() {
         assert_eq!(argv, &expected_argv(&h.config));
     }
     assert_eq!(appends.len(), 2);
-    let first = appends[0].concat();
-    let second = appends[1].concat();
+    let first = &appends[0];
+    let second = &appends[1];
     assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
     assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
 }
@@ -379,10 +442,7 @@ async fn unchanged_persona_keeps_the_lead() {
 async fn removed_persona_restarts_without_it() {
     let h = Harness::new();
     save_sora(&h);
-    let first = format!(
-        "--append-system-prompt={}",
-        persona::append("H", persona::load(&h.config.home).unwrap().as_deref())
-    );
+    let first = persona::append("H", persona::load(&h.config.home).unwrap().as_deref());
     let m = h.manager("ok").with_hints("H".into());
     bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     std::fs::remove_file(persona::path(&h.config.home)).unwrap();
@@ -390,10 +450,7 @@ async fn removed_persona_restarts_without_it() {
     let appends = appends(&h);
     bounded(m.shutdown_all()).await;
 
-    assert_eq!(
-        appends,
-        vec![vec![first], vec!["--append-system-prompt=H".to_owned()]]
-    );
+    assert_eq!(appends, vec![first, "H".to_owned()]);
 }
 
 #[tokio::test]
@@ -415,8 +472,8 @@ async fn refused_persona_change_restarts_without_it() {
     bounded(m.shutdown_all()).await;
 
     assert_eq!(appends.len(), 2);
-    assert!(appends[0][0].contains("Name: Sora"));
-    assert_eq!(appends[1], vec!["--append-system-prompt=H".to_owned()]);
+    assert!(appends[0].contains("Name: Sora"));
+    assert_eq!(appends[1], "H");
     assert_eq!(code, persona::E_PERSONA_SECRET);
 }
 
@@ -449,8 +506,8 @@ async fn onboarding_finish_applies_from_the_next_turn() {
 
     assert_eq!(after_first, 1);
     assert_eq!(pids.len(), 2);
-    assert!(!appends[0].concat().contains("Name: Sora"));
-    assert!(appends[1].concat().contains("Name: Sora"));
+    assert!(!appends[0].contains("Name: Sora"));
+    assert!(appends[1].contains("Name: Sora"));
     assert_eq!(tools.len(), 2);
     for frame in &tools {
         let names: Vec<&str> = frame["tools"]
@@ -493,8 +550,8 @@ async fn unsettled_session_defers_the_restart_until_settled() {
     assert_eq!(after_second, 1);
     assert_eq!(pids.len(), 2);
     assert_eq!(appends.len(), 2);
-    let first = appends[0].concat();
-    let second = appends[1].concat();
+    let first = &appends[0];
+    let second = &appends[1];
     assert!(first.contains("Name: Sora") && !first.contains("Name: Kai"));
     assert!(second.contains("Name: Kai") && !second.contains("Name: Sora"));
 }
@@ -537,7 +594,7 @@ async fn failed_restart_reports_the_start_failure_then_starts_again() {
     assert_eq!(r3, Outcome::Reply("echo: more".into()));
     assert_eq!(pids.len(), 2);
     assert_eq!(appends.len(), 2);
-    assert!(appends[1].concat().contains("Name: Kai"));
+    assert!(appends[1].contains("Name: Kai"));
 }
 
 #[tokio::test]
@@ -551,10 +608,7 @@ async fn refused_persona_is_left_out() {
     .unwrap();
     let manager = h.manager("ok").with_hints("H".into());
     bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
-    assert_eq!(
-        appends(&h),
-        vec![vec!["--append-system-prompt=H".to_owned()]]
-    );
+    assert_eq!(appends(&h), vec!["H".to_owned()]);
     assert_eq!(
         persona::load(&h.config.home).unwrap_err().code,
         persona::E_PERSONA_SECRET

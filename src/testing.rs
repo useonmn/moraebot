@@ -886,6 +886,20 @@ impl SlackTransport for FakeSlackTransport {
     }
 }
 
+/// The appended system prompt a fake-omp child read at start, from its log line
+/// `START pid=<pid> prompt=<json> argv=<json>`: the contents of the file its
+/// `--append-system-prompt` argument named when it started (a later start may have rewritten
+/// the file since), empty when it had no such argument.
+pub fn appended(start_line: &str) -> String {
+    let (_, rest) = start_line
+        .split_once(" prompt=")
+        .expect("prompt field in START line");
+    let (prompt, _) = rest.split_once(" argv=").expect("argv field in START line");
+    serde_json::from_str::<Option<String>>(prompt)
+        .expect("prompt JSON")
+        .unwrap_or_default()
+}
+
 /// Starts a loopback HTTP server that accepts every connection and never answers; returns
 /// its `http://` base URL. The server lives as long as the runtime.
 pub async fn silent_http_server() -> String {
