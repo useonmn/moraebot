@@ -1988,3 +1988,105 @@ async fn conversation_memory_follows_the_body_once_until_it_changes() {
     bounded(manager.shutdown_all()).await;
 }
 
+/// Saves one owner note in KEY_A's conversation memory.
+fn remember_in_key_a(h: &Harness) {
+    let thread = moraebot::memory::Bucket::Thread(KEY_A.into());
+    qa_memory_store(h)
+        .add(qa_note("reply in Korean", thread))
+        .expect("add");
+}
+
+/// The messages of every `prompt` frame the lead received, in order.
+fn prompt_messages(h: &Harness) -> Vec<String> {
+    h.frames("prompt")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_rejected_prompt_gives_its_memory_block_again() {
+    let h = Harness::new();
+    remember_in_key_a(&h);
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("ok")
+        .with_extra_env([("FAKE_OMP_REJECT_TRIGGER", "reject-me".to_owned())])
+        .with_memory_clock(Arc::new(move || today));
+    let refused = bounded(manager.prompt(
+        KEY_A,
+        1,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, 1, "reject-me"),
+    ))
+    .await;
+    assert_eq!(refused.main.outcome.code(), Some(omp::E_PROMPT_REJECTED));
+    let pid = manager.child_pid().await;
+    assert!(pid.is_some(), "a rejected prompt keeps its child");
+    bounded(manager.prompt(
+        KEY_A,
+        2,
+        Sender::Owner,
+        &lead::owner_input(KEY_A, 2, "second"),
+    ))
+    .await;
+    assert_eq!(manager.child_pid().await, pid, "the same child");
+
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 2);
+    let open = omp::thread_memory_open(KEY_A);
+    for message in &messages {
+        assert!(
+            message.contains(&open) && message.contains("reply in Korean"),
+            "{message}"
+        );
+    }
+    bounded(manager.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn compaction_gives_the_memory_block_again() {
+    let h = Harness::new();
+    remember_in_key_a(&h);
+    // omp compacts the lead's context during the second turn.
+    let compaction = serde_json::json!({"frame": {
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    }});
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", compaction.to_string())])
+        .with_memory_clock(Arc::new(move || today));
+    for (row, body) in [(1, "first"), (2, "run-tools"), (3, "third")] {
+        let report = bounded(manager.prompt(
+            KEY_A,
+            row,
+            Sender::Owner,
+            &lead::owner_input(KEY_A, row, body),
+        ))
+        .await;
+        assert!(
+            matches!(report.main.outcome, Outcome::Reply(_)),
+            "{report:?}"
+        );
+    }
+
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 3);
+    let open = omp::thread_memory_open(KEY_A);
+    assert!(messages[0].contains(&open), "{}", messages[0]);
+    assert!(
+        !messages[1].contains(&open),
+        "unchanged memory is not sent again before the compaction"
+    );
+    assert!(
+        messages[2].contains(&open) && messages[2].contains("reply in Korean"),
+        "the compaction may have summarised the block away: {}",
+        messages[2]
+    );
+    bounded(manager.shutdown_all()).await;
+}

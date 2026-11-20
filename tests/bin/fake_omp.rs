@@ -45,6 +45,10 @@
 //! (after its last scripted call) with `agent_end` and an error `prompt_result`;
 //! `hang` writes nothing more, like `hang`. Unset or anything else: the echo reply.
 //!
+//! Refused prompt: a prompt whose message contains FAKE_OMP_REJECT_TRIGGER (unset
+//! or empty: none) gets an error `response` (code `E_PROMPT_REFUSED`) in every
+//! mode, and no run.
+//!
 //! Touch on a refused call: FAKE_OMP_TOUCH_ON_TOOL_ERROR=<path> with
 //! FAKE_OMP_TOUCH_AFTER_ERRORS=<n> (default 1) creates `<path>` empty (parents
 //! are not created) when the n-th `host_tool_result` frame with
@@ -302,6 +306,13 @@ impl Fake {
                     .unwrap_or_default();
                 respond_ok(out, &id, command, json!({"toolNames": names}));
             }
+            "prompt" if refused(frame) => respond_err(
+                out,
+                &id,
+                command,
+                "prompt refused by fake-omp",
+                "E_PROMPT_REFUSED",
+            ),
             "prompt" if mode == "send_file" => {
                 let calls = send_file_calls();
                 self.start_tool_turn(&id, frame, calls, out);
@@ -496,6 +507,12 @@ impl Fake {
             }
         }
     }
+}
+
+/// The prompt's message contains FAKE_OMP_REJECT_TRIGGER (unset or empty: never).
+fn refused(frame: &Value) -> bool {
+    std::env::var("FAKE_OMP_REJECT_TRIGGER")
+        .is_ok_and(|trigger| !trigger.is_empty() && prompt_message(frame).contains(&trigger))
 }
 
 /// FAKE_OMP_SEND_FILE as `send_file` calls (unset or empty: one empty path).

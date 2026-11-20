@@ -605,10 +605,13 @@ fn disarm(kill: &LeadKill) {
     }
 }
 
-/// The steer sent into the open turn: its row and the receiver of its result.
+/// The steer sent into the open turn: its row, the receiver of its result, and what its
+/// input gave its conversation (recorded in [`Given`] once the steer was not rejected).
 struct Steer {
     row_id: i64,
     result: oneshot::Receiver<Result<PromptTurn, RpcError>>,
+    fresh: Fresh,
+    epoch: u64,
 }
 
 /// The lead turn that accepts a steer: set by `prompt` before the main frame is sent,
@@ -622,13 +625,47 @@ struct OpenTurn {
     requests: mpsc::Sender<PromptRequest>,
     /// The lead child's [`Given`], for the steer's memory block.
     given: Given,
+    /// What the main input gave its conversation, not recorded until the turn ends: the steer
+    /// counts it as given, since the main prompt was accepted before any steer can join.
+    main_fresh: Fresh,
     steer: Option<Steer>,
 }
 
-/// Per conversation key, per memory bucket label: the hash of the bucket's section last put
-/// into that conversation's lead input. Kept per lead child, so a new child gets every block
-/// again.
-type Given = Arc<Mutex<HashMap<String, HashMap<String, u64>>>>;
+/// What a lead child was given ([`GivenState`]). Kept per lead child, so a new child gets
+/// every block again.
+type Given = Arc<Mutex<GivenState>>;
+
+#[derive(Debug, Default)]
+struct GivenState {
+    /// Per conversation key, per memory bucket label: the hash of the bucket's section last
+    /// put into that conversation's lead input that the child took.
+    sections: HashMap<String, HashMap<String, u64>>,
+    /// Counts the child's context compactions ([`note_compaction`]): an input built before
+    /// one is not recorded after it.
+    epoch: u64,
+}
+
+/// Forgets what the lead child was given when omp reports a compaction of its context
+/// (`auto_compaction_end` or `manual_compaction_end` that was neither aborted nor skipped):
+/// the memory blocks of earlier inputs may have been summarised away, so every section goes
+/// in again with the next owner input. A compaction that ended in an error also counts; that
+/// costs one block sent again, never a lost one.
+fn note_compaction(given: &Given, event: &Event) {
+    let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
+        return;
+    };
+    let compacted = match agent {
+        RpcAgentEvent::AutoCompactionEnd(end) => !end.aborted && end.skipped != Some(true),
+        RpcAgentEvent::ManualCompactionEnd(end) => !end.aborted && end.skipped != Some(true),
+        _ => false,
+    };
+    if compacted {
+        let mut given = lock(given);
+        given.sections.clear();
+        given.epoch += 1;
+        tracing::info!("omp compacted the lead's context; its memory sections go in again");
+    }
+}
 
 type SteerGate = Arc<Mutex<Option<OpenTurn>>>;
 
@@ -726,7 +763,7 @@ struct Live {
     append: String,
     /// False while the last turn ended with work still pending (`sessionSettled: false`).
     settled: bool,
-    /// The memory sections this child was given, per conversation.
+    /// The memory sections this child was given, per conversation; cleared by a compaction.
     given: Given,
     /// The child has used a tool that may read outside text (see [`TurnContext`]).
     outside: Arc<AtomicBool>,
@@ -1003,12 +1040,16 @@ impl OmpManager {
             ..TurnContext::new(row_id, key, sender)
         });
         lock(&self.lead_watch).begin(key);
-        let (text, fresh) = thread_memory(
-            &self.config.memory_dir(),
-            (self.memory_clock)(),
-            text,
-            &lock(&current.given),
-        );
+        let (text, fresh, epoch) = {
+            let given = lock(&current.given);
+            let (text, fresh) = thread_memory(
+                &self.config.memory_dir(),
+                (self.memory_clock)(),
+                text,
+                &given.sections,
+            );
+            (text, fresh, given.epoch)
+        };
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text,
@@ -1026,13 +1067,11 @@ impl OmpManager {
                 started: false,
                 requests: current.requests.clone(),
                 given: Arc::clone(&current.given),
+                main_fresh: fresh.clone(),
                 steer: None,
             });
             current.requests.send(request).is_ok()
         };
-        if sent {
-            record_given(&current.given, fresh);
-        }
         let main = if sent {
             result.await.unwrap_or(Err(RpcError::Closed))
         } else {
@@ -1043,6 +1082,10 @@ impl OmpManager {
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
         let mut settled = turn_settled(&main);
         let main = map_result(main);
+        // Only an input the child took is given: a rejected prompt never reached it.
+        if sent && !rejected(&main) {
+            record_given(&current.given, fresh, epoch);
+        }
 
         let mut killed = false;
         let steered = match steer {
@@ -1050,6 +1093,8 @@ impl OmpManager {
             Some(Steer {
                 row_id: steer_row,
                 mut result,
+                fresh: steer_fresh,
+                epoch: steer_epoch,
             }) => {
                 let outcome = if main_timed_out {
                     // Never let the child outlive the turn limit by waiting for the steer.
@@ -1071,6 +1116,9 @@ impl OmpManager {
                         }
                     }
                 };
+                if !rejected(&outcome) {
+                    record_given(&current.given, steer_fresh, steer_epoch);
+                }
                 Some((steer_row, outcome))
             }
         };
@@ -1133,12 +1181,9 @@ impl OmpManager {
         if let Some(context) = lock(&self.turn).as_mut() {
             context.steered_row_id = Some(row_id);
         }
-        let (text, fresh) = thread_memory(
-            &self.config.memory_dir(),
-            (self.memory_clock)(),
-            text,
-            &lock(&turn.given),
-        );
+        let (view, epoch) = given_view(&turn.given, &turn.main_fresh);
+        let (text, fresh) =
+            thread_memory(&self.config.memory_dir(), (self.memory_clock)(), text, &view);
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text,
@@ -1148,10 +1193,13 @@ impl OmpManager {
             done,
         };
         // A failed send drops `done`, so the claimed row is reported as a lost child.
-        if turn.requests.send(request).is_ok() {
-            record_given(&turn.given, fresh);
-        }
-        turn.steer = Some(Steer { row_id, result });
+        let _ = turn.requests.send(request);
+        turn.steer = Some(Steer {
+            row_id,
+            result,
+            fresh,
+            epoch,
+        });
         tracing::info!(conversation = %key, row = row_id, main = turn.main_row_id, "steered into the running turn");
         true
     }
@@ -1231,6 +1279,8 @@ impl OmpManager {
             ));
         }
         let turn = Arc::clone(&self.turn);
+        let given = Given::default();
+        let compacted = Arc::clone(&given);
         let outside = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&outside);
         let lead_kill = Arc::clone(&self.lead_kill);
@@ -1255,6 +1305,7 @@ impl OmpManager {
                         lock(&lead_watch).note(event);
                         note_agent_start(&gate, &running, event);
                         note_outside_tool(&turn, &seen, event);
+                        note_compaction(&compacted, event);
                     },
                 );
                 match opened {
@@ -1298,7 +1349,7 @@ impl OmpManager {
             sent_files,
             append,
             settled: true,
-            given: Given::default(),
+            given,
             outside,
         })
     }
@@ -1459,11 +1510,42 @@ fn thread_memory(
     )
 }
 
-/// Remembers what an input that was sent gave its conversation.
-fn record_given(given: &Given, fresh: Fresh) {
-    if let Some((key, sections)) = fresh {
-        lock(given).entry(key).or_default().extend(sections);
+/// Remembers what an input the child took gave its conversation, unless the child's context
+/// was compacted since the input was built (`epoch` is [`GivenState::epoch`] then): the block
+/// may be gone again, so it goes in with the next input.
+fn record_given(given: &Given, fresh: Fresh, epoch: u64) {
+    let mut given = lock(given);
+    if given.epoch != epoch {
+        return;
     }
+    if let Some((key, sections)) = fresh {
+        given.sections.entry(key).or_default().extend(sections);
+    }
+}
+
+/// What the steer's input counts as given: the child's sections with the open turn's main
+/// input (`main_fresh`, accepted but not recorded yet) on top, and the compaction epoch.
+fn given_view(given: &Given, main_fresh: &Fresh) -> (HashMap<String, HashMap<String, u64>>, u64) {
+    let given = lock(given);
+    let mut view = given.sections.clone();
+    if let Some((key, sections)) = main_fresh {
+        view.entry(key.clone())
+            .or_default()
+            .extend(sections.iter().cloned());
+    }
+    (view, given.epoch)
+}
+
+/// The prompt was refused before it ran ([`map_result`]'s [`E_PROMPT_REJECTED`]): the child
+/// never saw its input.
+fn rejected(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failed {
+            code: E_PROMPT_REJECTED,
+            ..
+        }
+    )
 }
 
 fn text_hash(text: &str) -> u64 {
