@@ -53,18 +53,19 @@ jobs:
           test "v$v" = "$GITHUB_REF_NAME"
 
       - name: Build
-        run: cargo build --release --locked --bin moraebot
+        run: cargo build --release --locked --bin moraebot --bin moraebot-slack-bridge
 
       - name: Smoke test
         run: |
           v="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="moraebot") | .version')"
           test "$(target/release/moraebot --version)" = "moraebot $v"
+          test "$(target/release/moraebot-slack-bridge --version)" = "moraebot-slack-bridge $v"
 
       - name: Package
         run: |
           asset="moraebot-${{ matrix.target }}.tar.gz"
-          tar -czf "$asset" -C target/release moraebot
-          test "$(tar -tzf "$asset")" = moraebot
+          tar -czf "$asset" -C target/release moraebot moraebot-slack-bridge
+          test "$(tar -tzf "$asset" | sort)" = "$(printf 'moraebot\nmoraebot-slack-bridge')"
 
       - uses: actions/upload-artifact@v4
         with:

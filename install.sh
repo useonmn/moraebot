@@ -1,10 +1,11 @@
 #!/bin/sh
-# Install or upgrade moraebot from a GitHub release (Apple Silicon macOS, Linux x86_64 or aarch64).
+# Install or upgrade moraebot and moraebot-slack-bridge from a GitHub release
+# (Apple Silicon macOS, Linux x86_64 or aarch64).
 #
 #   curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
 #
 # MORAEBOT_VERSION      release tag such as v0.1.0 (default: latest)
-# MORAEBOT_INSTALL_DIR  where the binary goes (default: $HOME/.local/bin)
+# MORAEBOT_INSTALL_DIR  where the binaries go (default: $HOME/.local/bin)
 # MORAEBOT_DOWNLOAD_BASE  release base URL (default: the GitHub releases page)
 #
 # Exit codes: 0 installed, 1 any failure (nothing is replaced on failure).
@@ -24,8 +25,11 @@ E_ARCHIVE="E_ARCHIVE"
 E_SMOKE="E_SMOKE"
 E_REPLACE="E_REPLACE"
 
+BRIDGE="moraebot-slack-bridge"
+
 tmp=""
 new=""
+new_bridge=""
 
 fail() {
     printf 'moraebot install error: %s: %s\n' "$1" "$2" >&2
@@ -35,6 +39,9 @@ fail() {
 cleanup() {
     if [ -n "$new" ]; then
         rm -f "$new"
+    fi
+    if [ -n "$new_bridge" ]; then
+        rm -f "$new_bridge"
     fi
     if [ -n "$tmp" ]; then
         rm -rf "$tmp"
@@ -110,19 +117,28 @@ main() {
     (cd "$tmp" && printf '%s\n' "$line" | $SHA256 -c >/dev/null 2>&1) ||
         fail "$E_CHECKSUM" "checksum mismatch for $ASSET; nothing was installed"
 
-    tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot ||
-        fail "$E_ARCHIVE" "$ASSET does not contain moraebot"
+    tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot "$BRIDGE" ||
+        fail "$E_ARCHIVE" "$ASSET does not contain moraebot and $BRIDGE; nothing was installed"
 
+    # Both new binaries are written and run before either old file is replaced.
     new="$install_dir/.moraebot.new.$$"
+    new_bridge="$install_dir/.$BRIDGE.new.$$"
     cp "$tmp/moraebot" "$new" || fail "$E_REPLACE" "could not write $new"
-    chmod 755 "$new" || fail "$E_REPLACE" "could not make $new executable"
+    cp "$tmp/$BRIDGE" "$new_bridge" || fail "$E_REPLACE" "could not write $new_bridge"
+    chmod 755 "$new" "$new_bridge" || fail "$E_REPLACE" "could not make the new binaries executable"
     installed="$("$new" --version </dev/null)" ||
         fail "$E_SMOKE" "the downloaded moraebot does not run; nothing was installed"
+    installed_bridge="$("$new_bridge" --version </dev/null)" ||
+        fail "$E_SMOKE" "the downloaded $BRIDGE does not run; nothing was installed"
     mv -f "$new" "$install_dir/moraebot" ||
         fail "$E_REPLACE" "could not replace $install_dir/moraebot"
     new=""
+    mv -f "$new_bridge" "$install_dir/$BRIDGE" ||
+        fail "$E_REPLACE" "could not replace $install_dir/$BRIDGE"
+    new_bridge=""
 
     printf 'Installed %s to %s\n' "$installed" "$install_dir/moraebot"
+    printf 'Installed %s to %s\n' "$installed_bridge" "$install_dir/$BRIDGE"
 
     case ":${PATH:-}:" in
         *":$install_dir:"*) cmd="moraebot" ;;

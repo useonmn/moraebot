@@ -15,6 +15,13 @@ fn fake_moraebot(version_line: &str, version_exit: i32) -> Vec<u8> {
     .into_bytes()
 }
 
+fn fake_bridge(version_exit: i32) -> Vec<u8> {
+    format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo 'moraebot-slack-bridge 1.0.0'\n  exit {version_exit}\nfi\nexit 0\n"
+    )
+    .into_bytes()
+}
+
 fn run_ok(cmd: &mut Command) -> Output {
     let output = cmd.output().expect("spawn helper command");
     assert!(output.status.success(), "helper command failed: {cmd:?}");
@@ -48,8 +55,15 @@ fn publish_release(dir: &Path, binary: &[u8]) {
     publish_assets(dir, &[(ASSET, binary)]);
 }
 
-/// Writes each archive (holding `moraebot` = the bytes) and one `SHA256SUMS.txt` for all of them.
+/// Writes each archive (holding `moraebot` = the bytes and a working fake bridge) and one
+/// `SHA256SUMS.txt` for all of them.
 fn publish_assets(dir: &Path, assets: &[(&str, &[u8])]) {
+    publish_assets_with(dir, assets, Some(&fake_bridge(0)));
+}
+
+/// Like `publish_assets`, but the archives hold `bridge` as `moraebot-slack-bridge`, or no
+/// bridge binary when it is `None`.
+fn publish_assets_with(dir: &Path, assets: &[(&str, &[u8])], bridge: Option<&[u8]>) {
     fs::create_dir_all(dir).expect("create release dir");
     let stage = dir.join("stage");
     for (name, binary) in assets {
@@ -57,6 +71,13 @@ fn publish_assets(dir: &Path, assets: &[(&str, &[u8])]) {
         let exe = stage.join("moraebot");
         fs::write(&exe, binary).expect("write fake moraebot");
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod fake");
+        let mut members = vec!["moraebot"];
+        if let Some(bridge) = bridge {
+            let exe = stage.join("moraebot-slack-bridge");
+            fs::write(&exe, bridge).expect("write fake bridge");
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod fake");
+            members.push("moraebot-slack-bridge");
+        }
         run_ok(
             Command::new("tar")
                 .env("COPYFILE_DISABLE", "1")
@@ -64,7 +85,7 @@ fn publish_assets(dir: &Path, assets: &[(&str, &[u8])]) {
                 .arg(dir.join(name))
                 .arg("-C")
                 .arg(&stage)
-                .arg("moraebot"),
+                .args(&members),
         );
         fs::remove_dir_all(&stage).expect("remove stage dir");
     }
@@ -158,11 +179,22 @@ impl Sandbox {
         self.bin_dir().join("moraebot")
     }
 
+    fn installed_bridge(&self) -> PathBuf {
+        self.bin_dir().join("moraebot-slack-bridge")
+    }
+
     fn put_existing(&self, bytes: &[u8]) {
         fs::create_dir_all(self.bin_dir()).expect("create bin dir");
         fs::write(self.installed(), bytes).expect("write existing binary");
         fs::set_permissions(self.installed(), fs::Permissions::from_mode(0o755))
             .expect("chmod existing");
+    }
+
+    fn put_existing_bridge(&self, bytes: &[u8]) {
+        fs::create_dir_all(self.bin_dir()).expect("create bin dir");
+        fs::write(self.installed_bridge(), bytes).expect("write existing bridge");
+        fs::set_permissions(self.installed_bridge(), fs::Permissions::from_mode(0o755))
+            .expect("chmod existing bridge");
     }
 
     fn command(&self, version: Option<&str>) -> Command {
@@ -202,7 +234,10 @@ impl Sandbox {
                     .to_string_lossy()
                     .into_owned()
             })
-            .filter(|name| name.starts_with(".moraebot.new."))
+            .filter(|name| {
+                name.starts_with(".moraebot.new.")
+                    || name.starts_with(".moraebot-slack-bridge.new.")
+            })
             .collect()
     }
 }
@@ -226,6 +261,95 @@ fn fresh_install_from_latest() {
         .permissions()
         .mode();
     assert_ne!(mode & 0o100, 0, "user execute bit missing: {mode:o}");
+    assert!(sb.leftover_temp_files().is_empty());
+}
+
+#[test]
+fn fresh_install_puts_both_binaries_in_place() {
+    let sb = Sandbox::new();
+    publish_release(&sb.latest(), &fake_moraebot("moraebot 1.0.0", 0));
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read(sb.installed_bridge()).expect("read installed bridge"),
+        fake_bridge(0)
+    );
+    let mode = fs::metadata(sb.installed_bridge())
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o100, 0, "user execute bit missing: {mode:o}");
+    assert!(sb.leftover_temp_files().is_empty());
+}
+
+#[test]
+fn archive_without_the_bridge_installs_nothing() {
+    let sb = Sandbox::new();
+    let old = fake_moraebot("moraebot 0.9.0", 0);
+    sb.put_existing(&old);
+    publish_assets_with(
+        &sb.latest(),
+        &[(ASSET, &fake_moraebot("moraebot 1.0.0", 0))],
+        None,
+    );
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("moraebot install error: E_ARCHIVE:"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), old);
+    assert!(!sb.installed_bridge().exists());
+    assert!(sb.leftover_temp_files().is_empty());
+}
+
+#[test]
+fn failing_bridge_smoke_run_keeps_both_old_files() {
+    let sb = Sandbox::new();
+    let old = fake_moraebot("moraebot 0.9.0", 0);
+    let old_bridge = fake_bridge(0);
+    sb.put_existing(&old);
+    sb.put_existing_bridge(&old_bridge);
+    publish_assets_with(
+        &sb.latest(),
+        &[(ASSET, &fake_moraebot("moraebot 1.0.0", 0))],
+        Some(&fake_bridge(1)),
+    );
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("moraebot install error: E_SMOKE:"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), old);
+    assert_eq!(
+        fs::read(sb.installed_bridge()).expect("read installed bridge"),
+        old_bridge
+    );
+    assert!(sb.leftover_temp_files().is_empty());
+}
+
+#[test]
+fn failing_core_smoke_run_keeps_the_old_bridge() {
+    let sb = Sandbox::new();
+    let old_bridge = b"#!/bin/sh\necho old bridge\n".to_vec();
+    sb.put_existing_bridge(&old_bridge);
+    publish_release(&sb.latest(), &fake_moraebot("broken", 1));
+
+    let output = sb.install(None);
+
+    assert_eq!(exit_code(&output), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read(sb.installed_bridge()).expect("read installed bridge"),
+        old_bridge
+    );
+    assert!(!sb.installed().exists());
     assert!(sb.leftover_temp_files().is_empty());
 }
 
