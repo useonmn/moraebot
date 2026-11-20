@@ -585,6 +585,8 @@ struct LegacySlackSection {
 /// paths are expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacySlack {
+    /// The socket path written into `[bridge]`, for `slack-bridge.toml` too.
+    pub socket: PathBuf,
     pub channel_id: String,
     pub bot_token_file: PathBuf,
     pub app_token_file: PathBuf,
@@ -1114,12 +1116,13 @@ impl Config {
     /// Reads a `config.toml` that still holds the pre-bridge `[slack]` section, for the
     /// one-time move in `moraebot setup slack`. Returns `None` without such a section.
     /// Otherwise the returned config has `messenger = "bridge"` and a `[bridge]` section at
-    /// `socket` with the old owner, reply limit and allow entries, and the Slack-only
-    /// values come back as [`LegacySlack`]. Nothing is written.
+    /// the path `socket` returns (asked only when there is a section to move) with the old
+    /// owner, reply limit and allow entries, and the Slack-only values come back as
+    /// [`LegacySlack`]. Nothing is written.
     pub fn load_legacy_slack(
         path: &Path,
         env: &Env,
-        socket: &Path,
+        socket: impl FnOnce() -> Result<PathBuf, ConfigError>,
     ) -> Result<Option<(Config, LegacySlack)>, ConfigError> {
         let text = fs::read_to_string(path).map_err(|e| {
             ConfigError::io(
@@ -1157,8 +1160,9 @@ impl Config {
         check_slack_id("slack.owner_id", &owner_id, &['U', 'W'])?;
         check_slack_id("slack.channel_id", &channel_id, &['C', 'G'])?;
 
+        let socket = socket()?;
         let bridge = BridgeSection {
-            socket: Some(socket.to_path_buf()),
+            socket: Some(socket.clone()),
             owner_id: Some(owner_id),
             max_bot_replies: section.max_bot_replies,
             allow: section.allow,
@@ -1182,6 +1186,7 @@ impl Config {
             }
         }
         let legacy = LegacySlack {
+            socket,
             channel_id,
             bot_token_file: env.expand_tilde(&bot_token_file)?,
             app_token_file: env.expand_tilde(&app_token_file)?,
@@ -2542,7 +2547,9 @@ mod tests {
     fn legacy(fx: &Fixture, text: &str) -> Result<Option<(Config, LegacySlack)>, ConfigError> {
         let path = fx.dir.path().join("config.toml");
         fs::write(&path, text).expect("write config");
-        Config::load_legacy_slack(&path, &fx.env, Path::new("/h/u/run/slack-bridge.sock"))
+        Config::load_legacy_slack(&path, &fx.env, || {
+            Ok(PathBuf::from("/h/u/run/slack-bridge.sock"))
+        })
     }
 
     #[test]
@@ -2565,6 +2572,7 @@ mod tests {
         assert_eq!(
             slack,
             LegacySlack {
+                socket: PathBuf::from("/h/u/run/slack-bridge.sock"),
                 channel_id: "C222".into(),
                 bot_token_file: fx.dir.path().join("secrets/slack-bot.token"),
                 app_token_file: fx.dir.path().join("secrets/slack-app.token"),

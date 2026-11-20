@@ -17,32 +17,40 @@ pub const E_INIT_EOF: &str = "E_INIT_EOF";
 pub const E_SETUP_NO_CONFIG: &str = "E_SETUP_NO_CONFIG";
 pub const E_SLACK_TOKEN_KIND: &str = "E_SLACK_TOKEN_KIND";
 
-/// Printed after `moraebot init` when the new config passed every check.
-pub const NEXT_STEPS: &str = "\
-Next steps:
-  moraebot check-config     check the setup again at any time
-  moraebot install-launchd  keep moraebot running in the background (macOS)
-  moraebot run              or run it in this terminal instead
-Then message the bot in its channel or in a DM. At its next start it says hello to you in a DM
-(in the channel if the DM fails) and asks a few questions about you; reply skip to skip them.
-";
-
-/// `NEXT_STEPS` for Linux, where the background service is the systemd user unit.
-pub const NEXT_STEPS_LINUX: &str = "\
-Next steps:
-  moraebot check-config     check the setup again at any time
-  moraebot install-systemd  keep moraebot running in the background (Linux)
-  moraebot run              or run it in this terminal instead
-Then message the bot in its channel or in a DM. At its next start it says hello to you in a DM
-(in the channel if the DM fails) and asks a few questions about you; reply skip to skip them.
-";
-
-/// The next steps for `os` (a `std::env::consts::OS` value).
-pub fn next_steps(os: &str) -> &'static str {
+/// The command that installs the background services on `os` (a `std::env::consts::OS`
+/// value): the systemd user units on Linux, the launchd agents elsewhere. For a bridge
+/// config it installs the bridge too.
+pub fn install_command(os: &str) -> &'static str {
     match os {
-        "linux" => NEXT_STEPS_LINUX,
-        _ => NEXT_STEPS,
+        "linux" => "moraebot install-systemd",
+        _ => "moraebot install-launchd",
     }
+}
+
+/// Printed after `moraebot init` when the new config passed every check, for `os` (a
+/// `std::env::consts::OS` value) and the messenger the config uses.
+pub fn next_steps(os: &str, messenger: Platform) -> String {
+    let system = if os == "linux" { "Linux" } else { "macOS" };
+    let (services, run) = match messenger {
+        Platform::Discord => (
+            "moraebot",
+            "  moraebot run              or run it in this terminal instead\n",
+        ),
+        Platform::Bridge => (
+            "moraebot and moraebot-slack-bridge",
+            "  moraebot-slack-bridge run  or run the Slack bridge in one terminal\n\
+             \x20 moraebot run              and moraebot in another\n",
+        ),
+    };
+    format!(
+        "Next steps:\n\
+         \x20 moraebot check-config     check the setup again at any time\n\
+         \x20 {:<26}keep {services} running in the background ({system})\n\
+         {run}\
+         Then message the bot in its channel or in a DM. At its next start it says hello to you in a DM\n\
+         (in the channel if the DM fails) and asks a few questions about you; reply skip to skip them.\n",
+        install_command(os)
+    )
 }
 
 const DEFAULT_WORK_DIR: &str = "~/moraebot-work";
@@ -464,8 +472,10 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         Ok(())
     }
 
-    /// Writes the config, the Slack bridge config when there is one and the typed
-    /// tokens, then runs the checks on what was written.
+    /// Writes the Slack bridge config when there is one, a copy of the old config when
+    /// `backup` is set, the config and the typed tokens, then runs the checks on what was
+    /// written. The bridge config goes first, so a failure before `config.toml` is
+    /// rewritten leaves a legacy `[slack]` section in place for the next run.
     fn finish(
         &mut self,
         config: &Config,
@@ -473,15 +483,28 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
         env: &Env,
         slack_bridge: Option<&SlackBridgeConfig>,
         tokens: Vec<PendingToken>,
+        backup: bool,
     ) -> Result<InitOutcome, ConfigError> {
         config.ensure_home_layout()?;
-        write_private_file(config_path, config.to_toml()?.as_bytes())?;
-        writeln!(self.out, "Wrote {}", config_path.display())?;
         let bridge_path = config.home.join(slack_bridge_config::FILE_NAME);
         if let Some(slack_bridge) = slack_bridge {
             write_private_file(&bridge_path, slack_bridge.to_toml()?.as_bytes())?;
             writeln!(self.out, "Wrote {}", bridge_path.display())?;
         }
+        if backup {
+            let backup_path = pre_bridge_path(config_path);
+            let old = fs::read(config_path).map_err(|e| {
+                ConfigError::io(E_IO, &format!("cannot read {}", config_path.display()), &e)
+            })?;
+            write_private_file(&backup_path, &old)?;
+            writeln!(
+                self.out,
+                "Kept the old config as {} (mode 600)",
+                backup_path.display()
+            )?;
+        }
+        write_private_file(config_path, config.to_toml()?.as_bytes())?;
+        writeln!(self.out, "Wrote {}", config_path.display())?;
         for (file, token) in tokens {
             if let Some(token) = token {
                 write_private_file(&file, token.as_bytes())?;
@@ -597,11 +620,15 @@ pub fn run<R: BufRead, W: Write>(
         &work_dir,
     )?;
     let slack_bridge = slack.as_ref().map(|s| &s.slack_bridge);
-    let outcome = prompter.finish(&config, &config_path, env, slack_bridge, tokens)?;
+    let outcome = prompter.finish(&config, &config_path, env, slack_bridge, tokens, false)?;
     request(&config.home, GreetTarget::Dm)
         .map_err(|e| ConfigError::new(E_ONBOARDING_REQUEST, e.detail))?;
     if outcome == (InitOutcome::Written { checks_ok: true }) {
-        write!(prompter.out, "{}", next_steps(std::env::consts::OS))?;
+        write!(
+            prompter.out,
+            "{}",
+            next_steps(std::env::consts::OS, config.messenger)
+        )?;
     }
     Ok(outcome)
 }
@@ -609,10 +636,14 @@ pub fn run<R: BufRead, W: Write>(
 /// `moraebot setup <messenger>`: asks only that messenger's required fields, keeps every
 /// other config value and makes the messenger the active one. `socket` yields the bridge
 /// socket path for a Slack setup when the config names none yet; it is called only then.
+///
+/// `setup slack` on a config that still holds the pre-bridge `[slack]` section asks
+/// nothing: it moves that section to `[bridge]` and `slack-bridge.toml` once, keeping
+/// the old file as `config.toml.pre-bridge`. The output ends with the install command.
 pub fn setup<R: BufRead, W: Write>(
     env: &Env,
     messenger: SetupTarget,
-    socket: impl FnOnce() -> Result<PathBuf, ConfigError>,
+    socket: impl Fn() -> Result<PathBuf, ConfigError>,
     input: R,
     out: W,
     is_tty: bool,
@@ -628,14 +659,43 @@ pub fn setup<R: BufRead, W: Write>(
             ),
         ));
     }
-    let mut config = Config::load(&config_path, env)?;
-    let (slack_bridge, tokens) = match messenger {
-        SetupTarget::Discord => {
+    let (mut config, legacy) = match messenger {
+        SetupTarget::Slack => match Config::load_legacy_slack(&config_path, env, &socket)? {
+            Some((config, legacy)) => (config, Some(legacy)),
+            None => (Config::load(&config_path, env)?, None),
+        },
+        SetupTarget::Discord => (Config::load(&config_path, env)?, None),
+    };
+    let migrating = legacy.is_some();
+    let (slack_bridge, tokens) = match (messenger, legacy) {
+        (SetupTarget::Slack, Some(legacy)) => {
+            let allowed = config.bridge.as_ref().map_or(0, |b| b.access.allow.len());
+            let socket = legacy.socket;
+            writeln!(
+                prompter.out,
+                "Moving the old [slack] section to the bridge layout; nothing needs to be asked:\n\
+                 \x20 config.toml: messenger = \"bridge\" and [bridge] with owner_id, \
+                 max_bot_replies and {allowed} allow entries\n\
+                 \x20 {}: channel_id and both token file paths\n\
+                 \x20 both files: socket = {}\n\
+                 Agent mode needs the new Slack app manifest: see `moraebot guide slack`.",
+                slack_bridge_config::FILE_NAME,
+                socket.display()
+            )?;
+            let slack_bridge = SlackBridgeConfig {
+                socket,
+                channel_id: legacy.channel_id,
+                bot_token_file: legacy.bot_token_file,
+                app_token_file: legacy.app_token_file,
+            };
+            (Some(slack_bridge), Vec::new())
+        }
+        (SetupTarget::Discord, _) => {
             let (section, tokens) = prompter.ask_discord(config.discord.as_ref(), &config.home)?;
             config.discord = Some(section);
             (None, tokens)
         }
-        SetupTarget::Slack => {
+        (SetupTarget::Slack, None) => {
             prompter.print_slack_link()?;
             // A broken bridge config only loses its defaults: every value is asked again.
             let existing =
@@ -661,13 +721,39 @@ pub fn setup<R: BufRead, W: Write>(
         }
     };
     config.messenger = messenger.platform();
-    let outcome = prompter.finish(&config, &config_path, env, slack_bridge.as_ref(), tokens)?;
+    let outcome = prompter.finish(
+        &config,
+        &config_path,
+        env,
+        slack_bridge.as_ref(),
+        tokens,
+        migrating,
+    )?;
     writeln!(
         prompter.out,
-        "{} is now the active messenger. Restart moraebot to use it.",
+        "{} is now the active messenger.",
         messenger.as_str()
     )?;
+    if outcome == (InitOutcome::Written { checks_ok: true }) {
+        let services = match messenger {
+            SetupTarget::Discord => "the background service",
+            SetupTarget::Slack => "both background services (moraebot and moraebot-slack-bridge)",
+        };
+        writeln!(
+            prompter.out,
+            "To install or restart {services}, run:\n  {}",
+            install_command(std::env::consts::OS)
+        )?;
+    }
     Ok(outcome)
+}
+
+/// Where `setup slack` keeps the config it replaced while moving a `[slack]` section:
+/// `config.toml.pre-bridge` next to it.
+fn pre_bridge_path(config_path: &Path) -> PathBuf {
+    let mut name = config_path.as_os_str().to_owned();
+    name.push(".pre-bridge");
+    PathBuf::from(name)
 }
 
 /// Replaces `path` with a new file readable only by the owner.
@@ -892,7 +978,7 @@ mod tests {
             result.expect("init runs"),
             InitOutcome::Written { checks_ok: true }
         );
-        assert!(out.ends_with(next_steps(std::env::consts::OS)));
+        assert!(out.ends_with(&next_steps(std::env::consts::OS, Platform::Discord)));
         let request = crate::onboarding::request_file(&fx.dir.path().join("mhome"));
         assert_eq!(mode_of(&request), 0o600);
         assert_eq!(fs::read_to_string(&request).unwrap(), "dm\n");
@@ -903,14 +989,61 @@ mod tests {
     }
 
     #[test]
-    fn next_steps_follow_the_os() {
-        assert_eq!(next_steps("macos"), NEXT_STEPS);
-        assert_eq!(next_steps("linux"), NEXT_STEPS_LINUX);
-        assert_ne!(NEXT_STEPS_LINUX, NEXT_STEPS);
-        assert!(
-            NEXT_STEPS_LINUX
-                .lines()
-                .any(|l| l.starts_with("  moraebot install-systemd "))
+    fn next_steps_follow_the_os_and_the_messenger() {
+        for (os, install) in [
+            ("linux", "moraebot install-systemd"),
+            ("macos", "moraebot install-launchd"),
+        ] {
+            assert_eq!(install_command(os), install);
+            for messenger in [Platform::Discord, Platform::Bridge] {
+                let text = next_steps(os, messenger);
+                assert!(
+                    text.lines()
+                        .any(|l| l.starts_with(&format!("  {install}  keep moraebot "))),
+                    "{text}"
+                );
+                let bridge_line = text
+                    .lines()
+                    .any(|l| l.starts_with("  moraebot-slack-bridge run "));
+                assert_eq!(bridge_line, messenger == Platform::Bridge, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn init_slack_ends_with_the_bridge_next_steps() {
+        let fx = Fixture::new();
+        let (result, out) = fx.setup_after_init_slack_output();
+        assert_eq!(
+            result.expect("init runs"),
+            InitOutcome::Written { checks_ok: true }
+        );
+        assert!(out.ends_with(&next_steps(std::env::consts::OS, Platform::Bridge)));
+    }
+
+    #[test]
+    fn setup_ends_with_the_install_command() {
+        let fx = Fixture::new();
+        assert!(fx.run(&fx.happy_input()).0.is_ok());
+        for (messenger, input) in [
+            (SetupTarget::Slack, fx.slack_input()),
+            (SetupTarget::Discord, "\n\n\n".to_string()),
+        ] {
+            let (result, out) = fx.setup(messenger, &input);
+            assert!(result.is_ok(), "{messenger:?}: {out}");
+            assert_eq!(
+                out.lines().last(),
+                Some(format!("  {}", install_command(std::env::consts::OS)).as_str()),
+                "{messenger:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_bridge_path_sits_next_to_the_config() {
+        assert_eq!(
+            pre_bridge_path(Path::new("/h/u/.moraebot/config.toml")),
+            Path::new("/h/u/.moraebot/config.toml.pre-bridge")
         );
     }
 
@@ -921,7 +1054,7 @@ mod tests {
         fs::write(fx.config_path(), "original").expect("write");
         let (result, out) = fx.run("n\n");
         assert_eq!(result.expect("init runs"), InitOutcome::Kept);
-        assert!(!out.contains(next_steps(std::env::consts::OS)));
+        assert!(!out.contains("Next steps:"));
         assert!(!crate::onboarding::request_file(&fx.dir.path().join("mhome")).exists());
     }
 
@@ -1255,8 +1388,12 @@ mod tests {
 
     impl Fixture {
         fn setup_after_init_slack(&self) -> Result<InitOutcome, ConfigError> {
+            self.setup_after_init_slack_output().0
+        }
+
+        fn setup_after_init_slack_output(&self) -> (Result<InitOutcome, ConfigError>, String) {
             let input = format!("2\nU111\nC222\n{BOT}\n{APP}\n{}\n\n", self.omp.display());
-            self.run(&input).0
+            self.run(&input)
         }
     }
 
@@ -1272,7 +1409,7 @@ mod tests {
             InitOutcome::Written { checks_ok: true }
         );
         assert!(!request.exists());
-        assert!(!out.contains(next_steps(std::env::consts::OS)));
+        assert!(!out.contains(&next_steps(std::env::consts::OS, Platform::Bridge)));
     }
 
     #[test]
