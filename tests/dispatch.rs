@@ -4872,10 +4872,7 @@ async fn memory_job_of_a_lane_result_turn_lists_the_steered_owner_row() {
 #[tokio::test]
 async fn a_core_save_of_a_failed_turn_is_not_posted_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let (h, id) = core_save_turn(dir.path(), "error", |h| {
-        h.adapter.fail_next_send_containing("[memory]")
-    })
-    .await;
+    let (h, id) = core_save_turn(dir.path(), "error", |h| h.adapter.fail_next_send()).await;
     assert_eq!(h.row(id).state, State::Failed);
     assert_eq!(h.row(id).reply, None, "nothing is stored to post later");
     assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
