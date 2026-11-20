@@ -33,7 +33,7 @@ use crate::memory::{
     Source,
 };
 use crate::omp::{ToolStarts, TurnContext};
-use crate::store::{InboxRow, Store};
+use crate::store::{InboxRow, Store, ToolSource};
 
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 pub const MEMORY_WRITE_TOOL: &str = "memory_write";
@@ -332,16 +332,11 @@ fn clean_why(why: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-/// Tools that only touch local files or moraebot itself: everything else a lead calls may
-/// read outside text.
-const LOCAL_TOOLS: [&str; 17] = [
-    "grep",
-    "find",
-    "glob",
-    "ls",
-    "edit",
-    "write",
-    "todo",
+/// omp tools that only touch local files (`read` of a local path is local too).
+const FS_TOOLS: [&str; 7] = ["grep", "find", "glob", "ls", "edit", "write", "todo"];
+
+/// moraebot's own host tools.
+const HOST_TOOLS: [&str; 10] = [
     crate::omp::SEND_FILE_TOOL,
     crate::lane::LANE_START_TOOL,
     crate::lane::LANE_MESSAGE_TOOL,
@@ -354,22 +349,48 @@ const LOCAL_TOOLS: [&str; 17] = [
     MEMORY_WRITE_TOOL,
 ];
 
-/// Whether a lead tool call may read text from outside (the web, GitHub, another program),
-/// judged by default-deny: only [`LOCAL_TOOLS`] and a `read` of a local path (no URL in its
-/// arguments) are local. `bash`, `eval`, `task`, MCP tools and every unknown name count as
-/// outside, since any of them can fetch text.
-pub fn reads_outside(tool_name: &str, args: Option<&Value>) -> bool {
+/// What a lead tool call may read or touch, from its name (omp's built-in names at the
+/// pinned `omp-rpc` version) and, for `read`, whether an argument holds a URL. Every
+/// unknown name, MCP tools (`mcp__*`) included, is [`ToolSource::Other`].
+pub fn tool_source(tool_name: &str, args: Option<&Value>) -> ToolSource {
     let name = tool_name.to_ascii_lowercase();
+    let name = name.as_str();
     if name == "read" {
-        let url = |s: &str| s.contains("://");
-        return args
+        let url = args
             .and_then(Value::as_object)
             .into_iter()
             .flat_map(|map| map.values())
             .filter_map(Value::as_str)
-            .any(url);
+            .any(|s| s.contains("://"));
+        return if url { ToolSource::Web } else { ToolSource::Fs };
     }
-    !LOCAL_TOOLS.contains(&name.as_str())
+    if HOST_TOOLS.contains(&name) {
+        return ToolSource::Host;
+    }
+    if FS_TOOLS.contains(&name) {
+        return ToolSource::Fs;
+    }
+    match name {
+        "web_search" | "fetch" | "web_fetch" | "browser" => ToolSource::Web,
+        "github" | "gh" => ToolSource::Github,
+        _ if name.starts_with("gh_") || name.starts_with("github_") || name.starts_with("glab") => {
+            ToolSource::Github
+        }
+        "task" => ToolSource::Task,
+        "bash" | "eval" | "debug" | "ida" | "run_code" => ToolSource::Shell,
+        _ => ToolSource::Other,
+    }
+}
+
+/// Whether a lead tool call may read text from outside (the web, GitHub, another program),
+/// judged by default-deny: only local file tools, a `read` of a local path (no URL in its
+/// arguments) and moraebot's host tools are local. `bash`, `eval`, `task`, MCP tools and
+/// every unknown name count as outside, since any of them can fetch text.
+pub fn reads_outside(tool_name: &str, args: Option<&Value>) -> bool {
+    !matches!(
+        tool_source(tool_name, args),
+        ToolSource::Fs | ToolSource::Host
+    )
 }
 
 #[cfg(test)]
@@ -604,6 +625,57 @@ mod tests {
             MEMORY_SEARCH_TOOL,
         ] {
             assert!(!reads_outside(name, None), "{name}");
+        }
+    }
+
+    #[test]
+    fn tool_source_agrees_with_reads_outside() {
+        use ToolSource::*;
+        let url = json!({"path": "https://example.com/a"});
+        let local = json!({"path": "src/main.rs"});
+        // (name, args, source, outside as `reads_outside` judged it before `tool_source`)
+        let cases: Vec<(&str, Option<&Value>, ToolSource, bool)> = vec![
+            ("read", Some(&url), Web, true),
+            ("read", Some(&local), Fs, false),
+            ("read", None, Fs, false),
+            ("grep", None, Fs, false),
+            ("Find", None, Fs, false),
+            ("glob", None, Fs, false),
+            ("ls", None, Fs, false),
+            ("edit", None, Fs, false),
+            ("write", None, Fs, false),
+            ("todo", None, Fs, false),
+            (crate::omp::SEND_FILE_TOOL, None, Host, false),
+            (crate::lane::LANE_START_TOOL, None, Host, false),
+            (crate::lane::LANE_MESSAGE_TOOL, None, Host, false),
+            (crate::lane::LANE_STATUS_TOOL, None, Host, false),
+            (crate::lane::LANE_CLOSE_TOOL, None, Host, false),
+            (crate::lane::LANE_STOP_TOOL, None, Host, false),
+            (crate::lane::LANE_REPORT_TOOL, None, Host, false),
+            (crate::onboarding::FINISH_TOOL, None, Host, false),
+            (MEMORY_SEARCH_TOOL, None, Host, false),
+            (MEMORY_WRITE_TOOL, None, Host, false),
+            ("web_search", None, Web, true),
+            ("fetch", None, Web, true),
+            ("web_fetch", None, Web, true),
+            ("browser", None, Web, true),
+            ("github", None, Github, true),
+            ("gh", None, Github, true),
+            ("gh_issue_view", None, Github, true),
+            ("github_pr", None, Github, true),
+            ("glab_mr", None, Github, true),
+            ("task", None, Task, true),
+            ("bash", Some(&local), Shell, true),
+            ("eval", None, Shell, true),
+            ("debug", None, Shell, true),
+            ("ida", None, Shell, true),
+            ("run_code", None, Shell, true),
+            ("mcp__context7__query", None, Other, true),
+            ("something_new", None, Other, true),
+        ];
+        for (name, args, source, outside) in cases {
+            assert_eq!(tool_source(name, args), source, "{name}");
+            assert_eq!(reads_outside(name, args), outside, "{name}");
         }
     }
 }
