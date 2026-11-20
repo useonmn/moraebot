@@ -433,8 +433,9 @@ moraebot은 자기 기억 저장소(`~/.moraebot/memory`, git)를 둡니다. lea
 **시작할 때 확인.** omp가 실제로 적용한 설정은 moraebot이 읽을 수 없습니다. `omp config`는 `--config` 오버레이를 읽지 않고, RPC `get_state`에는 설정이 없습니다. 그래서 `moraebot run`은 시작할 때 모델을 부르지 않고 두 가지를 확인합니다(#39 대안).
 - `omp config get <key> --json`으로 오버레이의 두 키를 omp가 아는지 봅니다. 모르면(omp가 키 이름을 바꾼 경우) 오버레이가 조용히 무시되어 omp 기억이 되살아나므로 `E_OMP_OVERLAY`로 시작을 거부합니다.
 - `omp --version`이 합치기를 확인한 버전(`omp_overlay::CHECKED_OMP_VERSION`, 지금 18.22.2)과 다르면 `W_OMP_VERSION` 경고를 로그에 남깁니다. 시작은 합니다.
+- `moraebot check-config`도 같은 두 가지를 확인해 `OK`/`WARN`/`FAIL omp overlay` 줄로 보여 줍니다. omp를 올린 뒤 서비스를 다시 띄우기 전에 확인할 수 있습니다.
 
-오버레이 파일은 gateway가 열 때마다 새로 씁니다(손으로 고쳐도 덮어씁니다). 이름이 0.2.0의 `omp/config-overlay.yml`과 다르므로 아래 옛 배치 검사와 겹치지 않습니다.
+오버레이 파일은 gateway가 열 때, 그리고 lead나 lane을 띄울 때마다 새로 씁니다(손으로 고치거나 lane 셸이 지워도 다음 spawn 전에 되돌아옵니다). 이름이 0.2.0의 `omp/config-overlay.yml`과 다르므로 아래 옛 배치 검사와 겹치지 않습니다.
 
 **0.2.0에서 올라올 때.** 새 기억 저장소(#39, docs/memory.md)가 `~/.moraebot/memory/`를 씁니다. 옛 배치(`memory/system` 등, `omp/config-overlay.yml`)가 남아 있으면 moraebot은 시작을 거부하고 지울 경로와 `rm -rf` 명령을 한 줄로 알려 줍니다. 코드가 지우지는 않습니다. 데이터베이스의 옛 기억 표는 쓰지 않습니다.
 

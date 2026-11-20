@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::ConfigError;
 
@@ -48,11 +49,16 @@ pub fn overlay_path(home: &Path) -> PathBuf {
     home.join("omp-overlay.yml")
 }
 
-/// Writes [`OMP_OVERLAY`] through a temp file renamed over it, so a child starting meanwhile
-/// never reads a partial file.
+/// Numbers the temp files of [`write_overlay`] within this process.
+static WRITE_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Writes [`OMP_OVERLAY`] through a temp file of its own renamed over it, so a child starting
+/// meanwhile never reads a partial file and two starts at once (the lead and a lane) do not
+/// take each other's temp file. Called before every lead and lane start.
 pub fn write_overlay(home: &Path) -> Result<(), ConfigError> {
     let path = overlay_path(home);
-    let temp = path.with_extension("yml.tmp");
+    let n = WRITE_TMP.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("yml.{}.{n}.tmp", std::process::id()));
     std::fs::write(&temp, OMP_OVERLAY)
         .and_then(|()| std::fs::rename(&temp, &path))
         .map_err(|e| {
@@ -187,7 +193,11 @@ mod tests {
         write_overlay(dir.path()).expect("written");
         let text = std::fs::read_to_string(overlay_path(dir.path())).expect("read");
         assert_eq!(text, OMP_OVERLAY);
-        assert!(!dir.path().join("omp-overlay.yml.tmp").exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["omp-overlay.yml"], "no temp file is left");
     }
 
     #[test]
@@ -223,6 +233,21 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn an_answer_for_another_key_refuses_start() {
+        // An omp that answers `config get` with some other setting's JSON does not know ours.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("omp");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 'omp/{CHECKED_OMP_VERSION}'; exit 0; fi\n\
+             echo '{{\"key\": \"other\", \"value\": null}}'\n"
+        );
+        std::fs::write(&path, script).expect("write fake omp");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(check(&path).expect_err("refused").code, E_OMP_OVERLAY);
     }
 
     #[test]
