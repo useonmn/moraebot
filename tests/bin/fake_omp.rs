@@ -25,7 +25,9 @@
 //! `host_tool_call` per JSON line of FAKE_OMP_TOOL_CALLS
 //! (`{"tool": "<name>", "arguments": {...}, "id": "<toolCallId>"}`; without
 //! `id` the call id is `toolu_<pid>_<n>`, `n` counting calls over the child's
-//! life); a line `{"frame": {...}}` instead writes that frame as is (for example a
+//! life; a lead fake writes a `tool_execution_start` frame with the same
+//! `toolCallId`, `toolName` and `args` just before each call, like omp); a line
+//! `{"frame": {...}}` instead writes that frame as is (for example a
 //! `tool_execution_start` event) and goes straight on to the next line, waiting
 //! for nothing. Every other prompt is answered like `ok`. In both modes each next
 //! call, and the final reply, is written only after the matching
@@ -428,6 +430,18 @@ impl Fake {
         });
         if let Some(path) = std::env::var_os("FAKE_OMP_LOG") {
             log_line(Path::new(&path), &format!("CALL host_{n}"));
+        }
+        if !self.lane {
+            // Like omp, a lead's call starts with `tool_execution_start` for the same id.
+            send(
+                out,
+                &json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": tool_call_id,
+                    "toolName": call.tool,
+                    "args": call.arguments,
+                }),
+            );
         }
         send(
             out,

@@ -23,7 +23,7 @@
 //! once per stretch, and the dispatcher posts one notice in its conversation. moraebot never
 //! stops a turn for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -31,7 +31,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,44 @@ impl TurnContext {
         std::iter::once(self.row_id)
             .chain(self.steered_row_id)
             .collect()
+    }
+}
+
+/// The tool call ids of the lead's `tool_execution_start` events its event drain has handled.
+/// omp sends a call's `tool_execution_start` before its `host_tool_call`, but the client runs
+/// a host tool on its own thread at once while the drain may still be behind; a host tool
+/// that reads what the drain records (`memory_write` reads `outside_tools`) first waits for
+/// its own start, so every event before its call has been applied. Cleared at each turn.
+#[derive(Debug, Default)]
+pub struct ToolStarts {
+    seen: Mutex<HashSet<String>>,
+    changed: Condvar,
+}
+
+impl ToolStarts {
+    fn note(&self, event: &Event) {
+        if let Event::Notification(RpcNotification::RpcAgentEvent(
+            RpcAgentEvent::ToolExecutionStart(start),
+        )) = event
+        {
+            lock(&self.seen).insert(start.tool_call_id.clone());
+            self.changed.notify_all();
+        }
+    }
+
+    fn clear(&self) {
+        lock(&self.seen).clear();
+    }
+
+    /// Waits at most `bound` until the drain handled the start of call `tool_call_id`; false
+    /// when it did not come.
+    pub fn wait_for(&self, tool_call_id: &str, bound: Duration) -> bool {
+        let seen = lock(&self.seen);
+        let (mut seen, _) = self
+            .changed
+            .wait_timeout_while(seen, bound, |seen| !seen.contains(tool_call_id))
+            .unwrap_or_else(PoisonError::into_inner);
+        seen.remove(tool_call_id)
     }
 }
 
@@ -816,6 +854,8 @@ pub struct OmpManager {
     /// How long a lead turn may show no progress before `lead_stalled` reports it.
     stall_after: Duration,
     lead_watch: Arc<Mutex<LeadWatch>>,
+    /// The lead's tool call starts its event drain handled, for `memory_write`.
+    tool_starts: Arc<ToolStarts>,
     extra_env: Vec<(OsString, OsString)>,
     hints: String,
     /// Today's date for the core memory block (expired entries are left out).
@@ -859,6 +899,7 @@ impl OmpManager {
             store,
             turn_timeout,
             lead_watch: Default::default(),
+            tool_starts: Default::default(),
             extra_env: Vec::new(),
             hints: String::new(),
             memory_clock: memory::system_clock(),
@@ -1048,6 +1089,7 @@ impl OmpManager {
             ..TurnContext::new(row_id, key, sender)
         });
         lock(&self.lead_watch).begin(key);
+        self.tool_starts.clear();
         let (text, fresh, epoch) = {
             let given = lock(&current.given);
             let (text, fresh) = thread_memory(
@@ -1301,6 +1343,7 @@ impl OmpManager {
                 memory.clone(),
                 Arc::clone(&self.store),
                 Arc::clone(&self.turn),
+                Arc::clone(&self.tool_starts),
             ));
         }
         let turn = Arc::clone(&self.turn);
@@ -1312,6 +1355,7 @@ impl OmpManager {
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
         let lead_watch = Arc::clone(&self.lead_watch);
+        let tool_starts = Arc::clone(&self.tool_starts);
         let worker = std::thread::Builder::new()
             .name("omp-lead".to_owned())
             .spawn(move || {
@@ -1331,6 +1375,8 @@ impl OmpManager {
                         note_agent_start(&gate, &running, event);
                         note_outside_tool(&turn, &seen, event);
                         note_compaction(&compacted, event);
+                        // Last: a host tool waiting on its own start sees every effect above.
+                        tool_starts.note(event);
                     },
                 );
                 match opened {
@@ -1595,6 +1641,25 @@ mod tests {
     use omp_rpc::{AgentStartEvent, PromptError, PromptResultEvent};
 
     const TICK: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_host_tool_waits_until_the_drain_handled_its_start() {
+        let starts = Arc::new(ToolStarts::default());
+        let drain = Arc::clone(&starts);
+        let start: omp_rpc::ToolExecutionStartEvent = serde_json::from_value(
+            serde_json::json!({"toolCallId": "call-1", "toolName": "memory_write"}),
+        )
+        .expect("start event");
+        let event = Event::Notification(RpcNotification::RpcAgentEvent(
+            RpcAgentEvent::ToolExecutionStart(start),
+        ));
+        let noted = std::thread::spawn(move || drain.note(&event));
+        assert!(starts.wait_for("call-1", Duration::from_secs(30)));
+        noted.join().expect("drain thread");
+        // Each start is taken once; one that never came gives up at the bound.
+        assert!(!starts.wait_for("call-1", Duration::from_millis(10)));
+        assert!(!starts.wait_for("call-2", Duration::from_millis(10)));
+    }
 
     fn agent_event() -> Event {
         Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(
