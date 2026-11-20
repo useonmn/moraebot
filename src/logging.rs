@@ -15,11 +15,17 @@ pub const E_LOG_DIR_NOT_WRITABLE: &str = "E_LOG_DIR_NOT_WRITABLE";
 
 const MAX_LOG_FILES: usize = 15;
 
-fn build(home: &Path) -> Result<(impl tracing::Subscriber + Send + Sync, WorkerGuard)> {
+/// File name prefix of the core's daily log.
+pub const CORE_LOG_PREFIX: &str = "moraebot.log";
+
+fn build(
+    home: &Path,
+    prefix: &str,
+) -> Result<(impl tracing::Subscriber + Send + Sync, WorkerGuard)> {
     let dir = home.join("logs");
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
-        .filename_prefix("moraebot.log")
+        .filename_prefix(prefix)
         .max_log_files(MAX_LOG_FILES)
         .build(&dir)
         .with_context(|| {
@@ -175,8 +181,9 @@ impl<'w> MakeWriter<'w> for Capture {
     }
 }
 
-pub fn init(home: &Path) -> Result<WorkerGuard> {
-    let (subscriber, guard) = build(home)?;
+/// Writes the process's log to `<home>/logs/<prefix>.<date>`.
+pub fn init(home: &Path, prefix: &str) -> Result<WorkerGuard> {
+    let (subscriber, guard) = build(home, prefix)?;
     subscriber.try_init()?;
     Ok(guard)
 }
@@ -191,30 +198,29 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn line_lands_in_daily_file() {
-        let home = tempfile::tempdir().unwrap();
-        let (subscriber, guard) = build(home.path()).unwrap();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!("logging-test-line-7f3a");
-        });
-        drop(guard);
+    fn line_lands_in_daily_file_named_by_the_prefix() {
+        for prefix in [CORE_LOG_PREFIX, "slack-bridge.log"] {
+            let home = tempfile::tempdir().unwrap();
+            let (subscriber, guard) = build(home.path(), prefix).unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("logging-test-line-7f3a");
+            });
+            drop(guard);
 
-        let logs = home.path().join("logs");
-        let file = fs::read_dir(&logs)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("moraebot.log")
-            })
-            .expect("a moraebot.log file");
-        assert!(
-            fs::read_to_string(file)
+            let logs = home.path().join("logs");
+            let names: Vec<_> = fs::read_dir(&logs)
                 .unwrap()
-                .contains("logging-test-line-7f3a")
-        );
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(names.len(), 1, "{names:?}");
+            let name = names[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(prefix), "{name}");
+            assert!(
+                fs::read_to_string(&names[0])
+                    .unwrap()
+                    .contains("logging-test-line-7f3a")
+            );
+        }
     }
 
     #[test]
@@ -507,7 +513,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let not_a_dir = root.path().join("home");
         fs::write(&not_a_dir, b"not a directory").unwrap();
-        let err = build(&not_a_dir).err().expect("build must fail");
+        let err = build(&not_a_dir, CORE_LOG_PREFIX)
+            .err()
+            .expect("build must fail");
         assert!(format!("{err:#}").starts_with(E_LOG_DIR_NOT_WRITABLE));
     }
 }

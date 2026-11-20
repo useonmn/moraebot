@@ -1,12 +1,13 @@
-//! Slack adapter (Socket Mode).
+//! The bridge's Slack link (Socket Mode and the Web API).
 //!
 //! The protocol core (frame parsing, event mapping, id encoding, text escaping and Web
 //! API response parsing) is pure. All I/O goes through the `SlackTransport` seam: the
 //! real `HttpTransport` (HTTPS Web API + outbound WebSocket, no listening socket) and
-//! `testing::FakeSlackTransport` for offline tests.
+//! `slack_bridge::testing::FakeSlackTransport` for offline tests.
 //!
 //! Id encoding: a Slack `ts` is unique only per channel, so message ids are
-//! `<channel>:<ts>` and thread ids are `<channel>:<thread_ts>`.
+//! `<channel>:<ts>` and thread ids are `<channel>:<thread_ts>`. Every DM is threaded
+//! (agent mode): a root DM is its own thread, `<channel>:<ts>`.
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,7 +29,9 @@ use crate::adapter::{
     E_ADAPTER_START, E_ADAPTER_UPLOAD_DENIED, InboundAttachment, InboundEvent, MessengerAdapter,
     SendResult, TypingHandle, next_backoff,
 };
-use crate::config::{Config, E_MESSENGER_MISSING};
+use crate::bridge::E_BRIDGE_SPOOL;
+use crate::bridge::proto::MAX_LINE;
+use crate::bridge::spool::Spool;
 use crate::files::{self, E_FILE_REMOTE, Progress};
 
 pub const PLATFORM: &str = "slack";
@@ -44,6 +47,12 @@ pub const E_SLACK_PROTOCOL: &str = "E_SLACK_PROTOCOL";
 /// A file upload step failed in a way that may work next time (network, 5xx, 429, or a
 /// transient Slack error).
 pub const E_SLACK_UPLOAD: &str = "E_SLACK_UPLOAD";
+
+/// The working status shown under a DM thread while a turn runs.
+pub const STATUS_TEXT: &str = "is working on it...";
+/// Slack removes a status after two minutes without a message, so it is set again this
+/// often while the turn runs.
+pub const STATUS_REFRESH: Duration = Duration::from_secs(90);
 
 /// The only host Slack serves file downloads and upload URLs from.
 pub const FILE_HOST: &str = "files.slack.com";
@@ -163,6 +172,12 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
     if let Some(subtype) = event.get("subtype")
         && !matches!(subtype.as_str(), Some("thread_broadcast" | "file_share"))
     {
+        // Info, not debug: a new subtype (for example under Slack's agent view) shows up
+        // here first.
+        tracing::info!(
+            subtype = subtype.as_str().unwrap_or("<not a string>"),
+            "slack message with an unhandled subtype dropped"
+        );
         return None;
     }
     let user = event.get("user").and_then(Value::as_str);
@@ -187,7 +202,9 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         if user != scope.owner_id && !listed {
             return None;
         }
-        None
+        // Agent mode: every DM is answered in a thread. A root DM opens its own thread.
+        let thread_ts = event.get("thread_ts").and_then(Value::as_str).unwrap_or(ts);
+        Some(format!("{channel}:{thread_ts}"))
     } else {
         if channel != scope.channel_id {
             return None;
@@ -256,6 +273,20 @@ pub fn post_body(channel: &str, thread_ts: Option<&str>, text: &str) -> Value {
     body
 }
 
+/// The DM channel and thread `ts` of a target that names a DM thread (`D...:<ts>`), the
+/// only kind of target that gets a working status.
+pub fn status_thread(target: &str) -> Option<(String, String)> {
+    match parse_target(target) {
+        Ok((channel, Some(ts))) if channel.starts_with('D') => Some((channel, ts)),
+        _ => None,
+    }
+}
+
+/// The `assistant.threads.setStatus` body; an empty `status` clears it.
+pub fn status_body(channel_id: &str, thread_ts: &str, status: &str) -> Value {
+    json!({ "channel_id": channel_id, "thread_ts": thread_ts, "status": status })
+}
+
 /// The `chat.update` body for the message `ts` in `channel`.
 pub fn update_body(channel: &str, ts: &str, text: &str) -> Value {
     json!({ "channel": channel, "ts": ts, "text": text })
@@ -288,6 +319,21 @@ pub fn parse_open_response(json: &Value) -> Result<String, AdapterError> {
 /// `auth.test` response -> the bot's user id.
 pub fn parse_auth_response(json: &Value) -> Result<String, AdapterError> {
     ok_field(json, "user_id", E_SLACK_AUTH)
+}
+
+/// A response that carries nothing but `ok` (`assistant.threads.setStatus`).
+pub fn parse_ok_response(json: &Value) -> Result<(), AdapterError> {
+    if json.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let reason = json
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Err(AdapterError {
+        code: E_SLACK_API,
+        message: reason.to_string(),
+    })
 }
 
 /// `chat.postMessage` response -> the new message's `ts`.
@@ -367,6 +413,7 @@ const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
 const UPDATE_MESSAGE_URL: &str = "https://slack.com/api/chat.update";
 const UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
 const COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
+const SET_STATUS_URL: &str = "https://slack.com/api/assistant.threads.setStatus";
 
 const INBOUND_BUFFER: usize = 64;
 const BACKOFF_START: Duration = Duration::from_secs(5);
@@ -440,6 +487,13 @@ pub trait SlackTransport: Send + Sync {
         title: &str,
         channel_id: &str,
         thread_ts: Option<&str>,
+    ) -> Result<(), AdapterError>;
+    /// `assistant.threads.setStatus` on a DM thread; an empty `status` clears it.
+    async fn set_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
     ) -> Result<(), AdapterError>;
 }
 
@@ -618,7 +672,11 @@ impl SlackTransport for HttpTransport {
 
     async fn connect(&self, url: &str) -> Result<Box<dyn SlackSocket>, AdapterError> {
         // The URL carries a connection ticket, so it never goes into an error message.
-        let (stream, _) = tokio_tungstenite::connect_async(url)
+        // A Slack event far above the bridge's line limit could never reach the core.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_LINE))
+            .max_frame_size(Some(MAX_LINE));
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
             .await
             .map_err(|err| api_error(E_SLACK_API, format!("websocket connect failed: {err}")))?;
         Ok(Box::new(WsSocket { stream }))
@@ -731,6 +789,27 @@ impl SlackTransport for HttpTransport {
             Err(_) => Err(upload_rate_limited("files.completeUploadExternal")),
         }
     }
+
+    async fn set_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
+    ) -> Result<(), AdapterError> {
+        let body = status_body(channel_id, thread_ts, status);
+        match self
+            .call(
+                SET_STATUS_URL,
+                &self.bot_token,
+                ApiBody::Json(&body),
+                E_SLACK_API,
+            )
+            .await?
+        {
+            Ok(json) => parse_ok_response(&json),
+            Err(_) => Err(rate_limited("assistant.threads.setStatus")),
+        }
+    }
 }
 
 fn upload_rate_limited(method: &str) -> AdapterError {
@@ -799,10 +878,108 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
 }
 
+/// Where the socket task puts inbound messages.
+enum Sink {
+    /// [`MessengerAdapter::start`]: ack, then map with a fixed scope and deliver.
+    Events {
+        scope: Scope,
+        tx: mpsc::Sender<InboundEvent>,
+    },
+    /// The bridge: write the raw payload to the spool, then ack. The bridge server maps
+    /// it at handover with the scope its core sent, and learns of it through `appended`.
+    Spool {
+        bot_user_id: String,
+        spool: Arc<Spool>,
+        filter: Arc<SpoolFilter>,
+        appended: watch::Sender<u64>,
+    },
+}
+
+/// The owner and allow list of the last core that said `hello_ok`.
+#[derive(Debug, Clone)]
+struct KnownAccess {
+    owner_id: String,
+    allow: Vec<String>,
+}
+
+/// Decides which Slack payloads the bridge writes to its spool, so traffic the core
+/// would never take cannot fill the spool while the core is away. The exact mapping
+/// still happens at handover ([`map_event`] with the scope of the connected core).
+pub struct SpoolFilter {
+    channel_id: String,
+    access: std::sync::RwLock<Option<KnownAccess>>,
+}
+
+impl SpoolFilter {
+    /// A filter for the configured channel that knows no owner yet.
+    pub fn new(channel_id: String) -> Self {
+        Self {
+            channel_id,
+            access: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Remembers the owner and allow list a core sent in `hello_ok`. They stay in
+    /// memory only: after a bridge restart the sender check waits for the next core.
+    pub fn set_access(&self, owner_id: &str, allow: &[String]) {
+        *self.access.write().expect("spool filter lock") = Some(KnownAccess {
+            owner_id: owner_id.to_owned(),
+            allow: allow.to_vec(),
+        });
+    }
+
+    /// Whether `payload` goes to the spool:
+    /// - a `message` event not posted by the bot itself;
+    /// - in a DM, or in the configured channel;
+    /// - once a core said who it accepts, from the owner or a listed id (`user` or
+    ///   `bot_id`). An event with neither (some subtypes) is kept, so the handover logs
+    ///   its subtype.
+    ///
+    /// Everything else is acked and dropped at once.
+    pub fn wants(&self, payload: &Value, bot_user_id: &str) -> bool {
+        let Some(event) = payload
+            .get("event")
+            .filter(|_| payload.get("type").and_then(Value::as_str) == Some("event_callback"))
+        else {
+            return false;
+        };
+        let field = |key: &str| event.get(key).and_then(Value::as_str);
+        if field("type") != Some("message") || field("user") == Some(bot_user_id) {
+            return false;
+        }
+        if field("channel_type") != Some("im") && field("channel") != Some(&self.channel_id) {
+            tracing::debug!("slack message from another channel not spooled");
+            return false;
+        }
+        let access = self.access.read().expect("spool filter lock");
+        let Some(access) = access.as_ref() else {
+            return true;
+        };
+        let senders: Vec<&str> = [field("user"), field("bot_id")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let known = senders
+            .iter()
+            .any(|id| *id == access.owner_id || access.allow.iter().any(|a| a == id));
+        if !senders.is_empty() && !known {
+            tracing::debug!("slack message from an unlisted sender not spooled");
+            return false;
+        }
+        true
+    }
+}
+
+/// Seconds since the unix epoch, the spool's clock.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
 struct SocketTask {
     transport: Arc<dyn SlackTransport>,
-    scope: Scope,
-    tx: mpsc::Sender<InboundEvent>,
+    sink: Sink,
     reconnects: watch::Sender<u64>,
     stop: watch::Receiver<bool>,
 }
@@ -936,12 +1113,18 @@ impl SocketTask {
                     envelope_id,
                     payload,
                 } => {
+                    // Spool before the ack: a message that could not be stored is not
+                    // acked, so Slack delivers it again.
+                    if !self.spool(&payload).await {
+                        continue;
+                    }
                     if let Err(err) = socket.send_text(ack_frame(&envelope_id)).await {
                         tracing::warn!(code = err.code, "slack ack failed");
                         return failed();
                     }
-                    if let Some(event) = map_event(&payload, &self.scope)
-                        && self.tx.send(event).await.is_err()
+                    if let Sink::Events { scope, tx } = &self.sink
+                        && let Some(event) = map_event(&payload, scope)
+                        && tx.send(event).await.is_err()
                     {
                         tracing::debug!("inbound receiver closed, slack message dropped");
                     }
@@ -958,6 +1141,56 @@ impl SocketTask {
             }
         }
     }
+
+    /// Writes a message payload to the spool when the sink is one. `false` when it should
+    /// have been stored and was not, so the envelope must stay unacked.
+    async fn spool(&self, payload: &Value) -> bool {
+        let Sink::Spool {
+            bot_user_id,
+            spool,
+            filter,
+            appended,
+        } = &self.sink
+        else {
+            return true;
+        };
+        if !filter.wants(payload, bot_user_id) {
+            return true;
+        }
+        // The append syncs the file and the folder; off the runtime workers, so a slow
+        // disk does not hold other tasks. The read loop still waits for it before the ack.
+        let (spool, payload) = (Arc::clone(spool), payload.clone());
+        let appended_seq =
+            tokio::task::spawn_blocking(move || spool.append(&payload, unix_now())).await;
+        let appended_seq = match appended_seq {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(
+                    code = E_BRIDGE_SPOOL,
+                    error = %err,
+                    "the spool write task failed, left unacked so slack sends it again"
+                );
+                return false;
+            }
+        };
+        match appended_seq {
+            Ok(Some(seq)) => {
+                tracing::debug!(seq, "slack message spooled");
+                appended.send_modify(|count| *count += 1);
+                true
+            }
+            // The spool is full; it logged the drop. Ack, or Slack keeps resending it.
+            Ok(None) => true,
+            Err(err) => {
+                tracing::error!(
+                    code = E_BRIDGE_SPOOL,
+                    error = %err,
+                    "could not spool a slack message, left unacked so slack sends it again"
+                );
+                false
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -966,7 +1199,12 @@ struct Runtime {
     task: Option<JoinHandle<()>>,
 }
 
-pub struct SlackAdapter {
+/// The bridge's connection to Slack: Socket Mode in, Web API out. The bridge server
+/// starts it with [`SlackLink::start_spooling`] and drives the Web API side through its
+/// [`MessengerAdapter`] methods. [`MessengerAdapter::start`] (map and deliver at once,
+/// with a fixed scope) remains for `tests/slack_link.rs`, which drives the link alone;
+/// the gateway tests run through the bridge.
+pub struct SlackLink {
     transport: Arc<dyn SlackTransport>,
     owner_id: String,
     channel_id: String,
@@ -976,21 +1214,7 @@ pub struct SlackAdapter {
     runtime: Mutex<Runtime>,
 }
 
-impl SlackAdapter {
-    pub fn from_config(config: &Config) -> Result<Self, AdapterError> {
-        let slack = config.slack.as_ref().ok_or_else(|| AdapterError {
-            code: E_MESSENGER_MISSING,
-            message: "the [slack] config section is missing".into(),
-        })?;
-        let transport = HttpTransport::new(&slack.bot_token_file, &slack.app_token_file)?;
-        Ok(Self::with_transport(
-            Arc::new(transport),
-            slack.owner_id.clone(),
-            slack.channel_id.clone(),
-        )
-        .with_allowed(slack.access.allow.iter().map(|e| e.id.clone()).collect()))
-    }
-
+impl SlackLink {
     /// The listed user ids that pass the adapter's filter besides the owner.
     pub fn with_allowed(mut self, allowed: Vec<String>) -> Self {
         self.allowed = allowed;
@@ -1011,6 +1235,122 @@ impl SlackAdapter {
             stop: watch::channel(false).0,
             runtime: Mutex::new(Runtime::default()),
         }
+    }
+
+    /// Starts the bridge's Slack side: `auth.test`, retried with backoff until it passes
+    /// (the bridge keeps serving its socket while Slack is unreachable), then Socket Mode
+    /// with every message `filter` wants written to `spool` before its ack and `appended`
+    /// bumped after it. The returned receiver holds the bot user id once `auth.test`
+    /// passed. The owner and allow list this link was built with are not used on this
+    /// path; `filter` gets them from the bridge server.
+    pub fn start_spooling(
+        &self,
+        spool: Arc<Spool>,
+        filter: Arc<SpoolFilter>,
+        appended: watch::Sender<u64>,
+    ) -> Result<watch::Receiver<Option<String>>, AdapterError> {
+        let mut runtime = self.runtime.lock().expect("runtime lock");
+        if runtime.started {
+            return Err(start_error("the slack link was already started".into()));
+        }
+        runtime.started = true;
+        let (bot_tx, bot_rx) = watch::channel(None);
+        let transport = self.transport.clone();
+        let reconnects = self.reconnects.clone();
+        let mut stop = self.stop.subscribe();
+        runtime.task = Some(tokio::spawn(async move {
+            let Some(bot_user_id) = authenticate(transport.as_ref(), &mut stop).await else {
+                return;
+            };
+            bot_tx.send_replace(Some(bot_user_id.clone()));
+            SocketTask {
+                transport,
+                sink: Sink::Spool {
+                    bot_user_id,
+                    spool,
+                    filter,
+                    appended,
+                },
+                reconnects,
+                stop,
+            }
+            .run()
+            .await;
+        }));
+        Ok(bot_rx)
+    }
+
+    /// Shows [`STATUS_TEXT`] under a DM thread target (`D...:<ts>`) and sets it again
+    /// every [`STATUS_REFRESH`] until the returned keeper is dropped, which clears it.
+    /// Other targets get `None` and no Slack call: until a live check shows otherwise,
+    /// agent mode statuses are used in DM threads only. A failed call is logged and
+    /// never reaches the turn.
+    pub fn keep_status(&self, target: &str) -> Option<StatusKeeper> {
+        let (channel, thread_ts) = status_thread(target)?;
+        let transport = self.transport.clone();
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let set = |status: &'static str| {
+                let transport = transport.clone();
+                let (channel, thread_ts) = (channel.clone(), thread_ts.clone());
+                async move {
+                    if let Err(err) = transport.set_status(&channel, &thread_ts, status).await {
+                        tracing::warn!(
+                            code = err.code,
+                            reason = %err.message,
+                            clear = status.is_empty(),
+                            "slack setStatus failed"
+                        );
+                    }
+                }
+            };
+            loop {
+                set(STATUS_TEXT).await;
+                tokio::select! {
+                    () = tokio::time::sleep(STATUS_REFRESH) => {}
+                    // A send or a dropped keeper both end the status.
+                    _ = &mut stopped => break,
+                }
+            }
+            set("").await;
+        });
+        Some(StatusKeeper { _stop: stop })
+    }
+}
+
+/// Keeps a DM thread's working status up; dropping it clears the status.
+pub struct StatusKeeper {
+    _stop: oneshot::Sender<()>,
+}
+
+/// `auth.test` until it passes, with the socket backoff between tries; `None` on stop.
+async fn authenticate(
+    transport: &dyn SlackTransport,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<String> {
+    let mut delay = BACKOFF_START;
+    loop {
+        let result = tokio::select! {
+            result = transport.auth_test() => result,
+            () = stopped(stop) => return None,
+        };
+        match result {
+            Ok(bot_user_id) => {
+                tracing::info!("slack auth.test passed");
+                return Some(bot_user_id);
+            }
+            Err(err) => tracing::error!(
+                code = err.code,
+                reason = %err.message,
+                retry_in_secs = delay.as_secs(),
+                "slack auth.test failed"
+            ),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = stopped(stop) => return None,
+        }
+        delay = next_backoff(delay, BACKOFF_START, BACKOFF_MAX);
     }
 }
 
@@ -1036,7 +1376,7 @@ fn edit_error(err: &AdapterError) -> AdapterError {
 }
 
 #[async_trait]
-impl MessengerAdapter for SlackAdapter {
+impl MessengerAdapter for SlackLink {
     fn platform(&self) -> &'static str {
         PLATFORM
     }
@@ -1053,7 +1393,7 @@ impl MessengerAdapter for SlackAdapter {
         {
             let mut runtime = self.runtime.lock().expect("runtime lock");
             if runtime.started {
-                return Err(start_error("the slack adapter was already started".into()));
+                return Err(start_error("the slack link was already started".into()));
             }
             runtime.started = true;
         }
@@ -1065,13 +1405,15 @@ impl MessengerAdapter for SlackAdapter {
         let (tx, rx) = mpsc::channel(INBOUND_BUFFER);
         let task = SocketTask {
             transport: self.transport.clone(),
-            scope: Scope {
-                owner_id: self.owner_id.clone(),
-                channel_id: self.channel_id.clone(),
-                bot_user_id,
-                allowed: self.allowed.clone(),
+            sink: Sink::Events {
+                scope: Scope {
+                    owner_id: self.owner_id.clone(),
+                    channel_id: self.channel_id.clone(),
+                    bot_user_id,
+                    allowed: self.allowed.clone(),
+                },
+                tx,
             },
-            tx,
             reconnects: self.reconnects.clone(),
             stop: self.stop.subscribe(),
         };
@@ -1322,8 +1664,46 @@ mod tests {
         m["channel_type"] = json!("im");
         let event = map_event(&payload(m), &scope()).unwrap();
         assert!(event.is_dm);
-        assert_eq!(event.thread_id, None);
+        // A root DM is its own thread.
+        assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
         assert_eq!(event.channel_id, "D333");
+    }
+
+    #[test]
+    fn dm_inside_a_thread_maps_to_that_thread() {
+        let mut m = msg("U111", "D333", "4.4");
+        m["channel_type"] = json!("im");
+        m["thread_ts"] = json!("3.3");
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(event.thread_id.as_deref(), Some("D333:3.3"));
+        assert_eq!(event.message_id, "D333:4.4");
+    }
+
+    #[test]
+    fn only_a_dm_thread_target_gets_a_status() {
+        assert_eq!(
+            status_thread("D333:3.3"),
+            Some(("D333".to_string(), "3.3".to_string()))
+        );
+        assert_eq!(status_thread("D333"), None);
+        assert_eq!(status_thread("C222:1.1"), None);
+        assert_eq!(status_thread("U111"), None);
+        assert_eq!(status_thread(""), None);
+    }
+
+    #[test]
+    fn status_body_and_ok_response() {
+        assert_eq!(
+            status_body("D333", "3.3", ""),
+            json!({ "channel_id": "D333", "thread_ts": "3.3", "status": "" })
+        );
+        assert!(parse_ok_response(&json!({ "ok": true })).is_ok());
+        let err = parse_ok_response(
+            &json!({ "ok": false, "error": "method_not_supported_for_channel_type" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_SLACK_API);
+        assert_eq!(err.message, "method_not_supported_for_channel_type");
     }
 
     #[test]
@@ -1737,5 +2117,50 @@ mod tests {
                 .code,
             E_SLACK_AUTH
         );
+    }
+
+    fn spool_event(event: Value) -> Value {
+        json!({ "type": "event_callback", "event": event })
+    }
+
+    #[test]
+    fn the_spool_filter_keeps_only_what_a_core_could_take() {
+        let filter = SpoolFilter::new("C222".to_owned());
+        let msg = |user: &str, channel: &str| {
+            let channel_type = if channel.starts_with('D') {
+                "im"
+            } else {
+                "channel"
+            };
+            spool_event(json!({
+                "type": "message", "user": user, "channel": channel,
+                "channel_type": channel_type, "ts": "1.1"
+            }))
+        };
+        let bot = spool_event(json!({
+            "type": "message", "bot_id": "B777", "channel": "C222",
+            "channel_type": "channel", "ts": "1.1"
+        }));
+        let edited = spool_event(json!({
+            "type": "message", "subtype": "message_changed", "channel": "C222",
+            "channel_type": "channel", "ts": "1.1"
+        }));
+
+        // Before any core: every sender, but only DMs and the configured channel.
+        assert!(filter.wants(&msg("U999", "D444"), "UBOT"));
+        assert!(filter.wants(&msg("U999", "C222"), "UBOT"));
+        assert!(!filter.wants(&msg("U111", "C999"), "UBOT"));
+        assert!(!filter.wants(&msg("UBOT", "C222"), "UBOT"));
+        assert!(!filter.wants(&json!({ "type": "event_callback" }), "UBOT"));
+
+        filter.set_access("U111", &["UPEER".to_owned(), "B777".to_owned()]);
+        assert!(filter.wants(&msg("U111", "D444"), "UBOT"));
+        assert!(filter.wants(&msg("U111", "C222"), "UBOT"));
+        assert!(filter.wants(&msg("UPEER", "D555"), "UBOT"));
+        assert!(filter.wants(&bot, "UBOT"), "a listed bot_id");
+        assert!(!filter.wants(&msg("U999", "D444"), "UBOT"));
+        assert!(!filter.wants(&msg("U999", "C222"), "UBOT"));
+        // No sender to check: kept, so the handover logs its subtype.
+        assert!(filter.wants(&edited, "UBOT"));
     }
 }

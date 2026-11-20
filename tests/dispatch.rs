@@ -80,7 +80,6 @@ fn test_config(root: &Path, omp_path: PathBuf) -> Config {
             token_file,
             access: Default::default(),
         }),
-        slack: None,
         bridge: None,
         omp: OmpConfig::default(),
         memory: moraebot::config::MemoryConfig::default(),
@@ -1664,7 +1663,8 @@ async fn injection_payload_reaches_omp_byte_for_byte_and_never_runs() {
 async fn token_sentinel_absent_from_logs_db_and_omp_io() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    let guard = moraebot::logging::init(&h.config.home).expect("logging");
+    let guard = moraebot::logging::init(&h.config.home, moraebot::logging::CORE_LOG_PREFIX)
+        .expect("logging");
     queued(h.handle(channel_msg("1300000000000000130", "hello")).await);
     h.drain().await;
     assert_eq!(h.sends().len(), 1);

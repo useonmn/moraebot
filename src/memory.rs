@@ -520,20 +520,15 @@ impl Redactor {
         Self::new(self.own.into_iter().chain(extra))
     }
 
-    /// The messenger tokens named in `config` (unreadable files are skipped).
+    /// The messenger tokens named in `config` (an unreadable file is skipped). Only
+    /// Discord's token lives in the core config; the Slack bridge keeps its own, and
+    /// Slack tokens in memory text are still caught by pattern.
     pub fn from_config(config: &Config) -> Self {
-        let mut files = Vec::new();
-        if let Some(discord) = &config.discord {
-            files.push(discord.token_file.clone());
-        }
-        if let Some(slack) = &config.slack {
-            files.push(slack.bot_token_file.clone());
-            files.push(slack.app_token_file.clone());
-        }
         Self::new(
-            files
+            config
+                .discord
                 .iter()
-                .filter_map(|path| fs::read_to_string(path).ok()),
+                .filter_map(|discord| fs::read_to_string(&discord.token_file).ok()),
         )
     }
 

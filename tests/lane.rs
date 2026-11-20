@@ -56,7 +56,6 @@ impl Harness {
                 token_file: home.join("secrets").join("discord.token"),
                 access: Default::default(),
             }),
-            slack: None,
             bridge: None,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),

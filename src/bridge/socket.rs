@@ -89,6 +89,13 @@ pub fn prepare_dir(socket: &Path) -> Result<(), ConfigError> {
             format!("the bridge socket has no folder: {}", socket.display()),
         )
     })?;
+    prepare_private_dir(dir, E_BRIDGE_SOCKET)
+}
+
+/// Makes `dir` a private folder of this user: created with mode 0700 when missing,
+/// tightened to 0700 when it is ours but open to others. A symlink, a non-folder or a
+/// folder of another uid is refused with `code`.
+pub fn prepare_private_dir(dir: &Path, code: &'static str) -> Result<(), ConfigError> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -98,18 +105,15 @@ pub fn prepare_dir(socket: &Path) -> Result<(), ConfigError> {
         .map_err(|err| ConfigError::io(E_IO, &format!("inspect {}", dir.display()), &err))?;
     if !meta.file_type().is_dir() {
         return Err(ConfigError::new(
-            E_BRIDGE_SOCKET,
-            format!(
-                "the bridge socket folder is not a folder: {}",
-                dir.display()
-            ),
+            code,
+            format!("not a folder: {}", dir.display()),
         ));
     }
     if meta.uid() != own_uid() {
         return Err(ConfigError::new(
-            E_BRIDGE_SOCKET,
+            code,
             format!(
-                "the bridge socket folder belongs to uid {}, not to this user: {}",
+                "the folder belongs to uid {}, not to this user: {}",
                 meta.uid(),
                 dir.display()
             ),

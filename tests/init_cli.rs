@@ -8,7 +8,9 @@ const SENTINEL: &str = "TOKEN_SENTINEL_9f3a";
 
 fn moraebot(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_moraebot"));
-    cmd.env("MORAEBOT_HOME", home).env("HOME", home);
+    cmd.env("MORAEBOT_HOME", home)
+        .env("HOME", home)
+        .env_remove("XDG_RUNTIME_DIR");
     cmd
 }
 
@@ -21,6 +23,17 @@ fn fake_executable(dir: &Path) -> std::path::PathBuf {
     fs::write(&path, script).expect("write executable");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
     path
+}
+
+/// A temp folder short enough for the default bridge socket under it: on macOS the
+/// default is `~/Library/Application Support/moraebot/slack-bridge.sock`, and a home under
+/// the per-user temp folder (`/var/folders/..`) pushes it past the 103 bytes
+/// `sockaddr_un` allows there.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mb")
+        .tempdir_in("/tmp")
+        .expect("tempdir")
 }
 
 fn run_init(home: &Path, input: &str) -> std::process::Output {
@@ -309,8 +322,8 @@ fn percent_decode(text: &str) -> String {
 }
 
 #[test]
-fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+fn init_then_setup_slack_writes_both_configs_and_activates_the_bridge() {
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -333,9 +346,26 @@ fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
         assert_eq!(mode, 0o600, "{name}");
     }
     let config_text = fs::read_to_string(home.join("config.toml")).expect("config.toml");
-    assert!(config_text.contains("messenger = \"slack\""));
-    assert!(config_text.contains("[discord]") && config_text.contains("[slack]"));
-    for text in [stdout.as_ref(), config_text.as_str()] {
+    let bridge_text = fs::read_to_string(home.join("slack-bridge.toml")).expect("bridge config");
+    let config: toml::Table = toml::from_str(&config_text).expect("config TOML");
+    let bridge_file: toml::Table = toml::from_str(&bridge_text).expect("bridge TOML");
+    assert_eq!(config["messenger"].as_str(), Some("bridge"));
+    assert!(config.contains_key("discord") && !config.contains_key("slack"));
+    let socket = config["bridge"]["socket"].as_str().expect("bridge.socket");
+    assert_eq!(
+        bridge_file["socket"].as_str(),
+        Some(socket),
+        "one socket path"
+    );
+    // The OS default (`XDG_RUNTIME_DIR` is removed, so Linux falls back to the home).
+    let default_socket = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/moraebot/slack-bridge.sock")
+    } else {
+        home.join("run/slack-bridge.sock")
+    };
+    assert_eq!(socket, default_socket.to_str().expect("utf-8"));
+    assert_eq!(bridge_file["channel_id"].as_str(), Some("C222"));
+    for text in [stdout.as_ref(), config_text.as_str(), bridge_text.as_str()] {
         assert!(!text.contains("SENTINEL"), "token leaked");
     }
 
@@ -352,7 +382,7 @@ fn init_then_setup_slack_keeps_tokens_private_and_activates_slack() {
 
 #[test]
 fn setup_prints_manifest_link_that_decodes_to_manifest() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -384,7 +414,7 @@ fn setup_prints_manifest_link_that_decodes_to_manifest() {
 
 #[test]
 fn failed_setup_leaves_config_byte_identical() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let home = tmp.path().join("home");
     let omp = fake_executable(tmp.path());
     let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
@@ -395,6 +425,32 @@ fn failed_setup_leaves_config_byte_identical() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("E_SLACK_TOKEN_KIND"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("E_INIT_EOF"));
+    assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
+}
+
+#[test]
+fn a_socket_path_too_long_only_stops_the_slack_setup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("h".repeat(100));
+    let omp = fake_executable(tmp.path());
+    let input = format!("1\n111\n222\n{SENTINEL}\n{}\n\n", omp.display());
+    let output = run_init(&home, &input);
+    assert!(
+        output.status.success(),
+        "a Discord init needs no socket: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = fs::read(home.join("config.toml")).expect("config");
+
+    let output = run_with_input(
+        &home,
+        &["setup", "slack"],
+        &format!("U111\nC222\n{BOT}\n{APP}\n"),
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("E_BRIDGE_SOCKET"), "{stderr}");
+    assert!(stderr.contains("this OS allows at most"), "{stderr}");
     assert_eq!(fs::read(home.join("config.toml")).expect("config"), before);
 }
 

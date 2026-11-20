@@ -1,5 +1,6 @@
 //! Offline end-to-end tests for files: the library-level gateway (`Gateway::open` + `run`)
-//! with the real `SlackAdapter` over `FakeSlackTransport`, with `FakeAdapter` standing in for
+//! with the core's `BridgeAdapter` linked to an in-process Slack bridge over
+//! `FakeSlackTransport`, with `FakeAdapter` standing in for
 //! a Discord-shaped messenger, and over a store file left by slice 2. The fakes never create
 //! folders, so the private inbox levels prove the gateway path made them. Nothing reaches
 //! the network.
@@ -14,16 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moraebot::adapter::{AttachmentRef, InboundAttachment, InboundEvent, MessengerAdapter};
-use moraebot::config::{AccessMode, Config, DiscordConfig, OmpConfig, Platform, SlackConfig};
+use moraebot::config::{AccessMode, BridgeConfig, Config, DiscordConfig, OmpConfig, Platform};
 use moraebot::dispatch::{N_FILE_NOT_SENT, notice_text};
 use moraebot::files::INBOX_DIR;
 use moraebot::gateway::{Gateway, GatewayError, STORE_FILE};
 use moraebot::lead;
-use moraebot::slack::{SlackAdapter, escape_text};
-use moraebot::store::{State, Store};
-use moraebot::testing::{
-    Call, FAKE_FILE_ID, FakeAdapter, FakeSlackSession, FakeSlackTransport, SlackFileCall,
+use moraebot::slack_bridge::slack::escape_text;
+use moraebot::slack_bridge::testing::{
+    AnsweredAdapter, FAKE_FILE_ID, FakeSlackSession, FakeSlackTransport, SlackFileCall, TestBridge,
 };
+use moraebot::store::{State, Store};
+use moraebot::testing::{Call, FakeAdapter};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -165,14 +167,12 @@ impl Rig {
         let work_dir = root.join("work");
         std::fs::create_dir_all(home.join("secrets")).expect("home");
         std::fs::create_dir_all(&work_dir).expect("work dir");
-        let (discord, slack) = match messenger {
-            Platform::Slack => (
+        let (discord, bridge) = match messenger {
+            Platform::Bridge => (
                 None,
-                Some(SlackConfig {
+                Some(BridgeConfig {
+                    socket: TestBridge::socket_in(&home),
                     owner_id: SLACK_OWNER.into(),
-                    channel_id: SLACK_CHANNEL.into(),
-                    bot_token_file: home.join("secrets").join("slack-bot.token"),
-                    app_token_file: home.join("secrets").join("slack-app.token"),
                     access: Default::default(),
                 }),
             ),
@@ -185,7 +185,6 @@ impl Rig {
                 }),
                 None,
             ),
-            Platform::Bridge => unreachable!("the files rig has no bridge"),
         };
         let config = Config {
             messenger,
@@ -194,8 +193,7 @@ impl Rig {
             home,
             access_mode: AccessMode::OwnerOnly,
             discord,
-            slack,
-            bridge: None,
+            bridge,
             omp: OmpConfig::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
@@ -295,12 +293,15 @@ fn listed_path(message: &str, name: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn slack_adapter(fake: &Arc<FakeSlackTransport>) -> Arc<dyn MessengerAdapter> {
-    Arc::new(SlackAdapter::with_transport(
-        fake.clone(),
-        SLACK_OWNER.into(),
-        SLACK_CHANNEL.into(),
-    ))
+/// Starts a Slack bridge on `fake` in the rig's home and returns it with the core's
+/// adapter connected to it. Shut the bridge down after the gateway stopped.
+async fn slack_bridge(
+    rig: &Rig,
+    fake: &Arc<FakeSlackTransport>,
+) -> (TestBridge, Arc<AnsweredAdapter>) {
+    let bridge = TestBridge::start(&rig.config.home, fake.clone()).await;
+    let adapter = bridge.connect_answered(SLACK_OWNER, &[]).await;
+    (bridge, adapter)
 }
 
 fn slack_message(envelope_id: &str, user: &str, ts: &str, text: &str) -> Value {
@@ -355,13 +356,14 @@ async fn slack_session(fake: &FakeSlackTransport, n: usize) -> FakeSlackSession 
 /// file omp sends back goes through the three upload steps into that thread.
 #[tokio::test]
 async fn e2e_slack_file_share_round_trip() {
-    let mut rig = Rig::new(Platform::Slack);
+    let mut rig = Rig::new(Platform::Bridge);
     let fake = Arc::new(FakeSlackTransport::new());
     fake.set_download_bytes(DOWNLOAD_URL, b"hello file\n".to_vec());
     let outbound = rig.outbound_file(b"from omp");
     let inbox = rig.work_dir().join(INBOX_DIR);
     assert!(!inbox.exists(), "no inbox before the first file");
-    let running = rig.start(slack_adapter(&fake), "send_file", Some(&outbound));
+    let (bridge, adapter) = slack_bridge(&rig, &fake).await;
+    let running = rig.start(adapter.clone(), "send_file", Some(&outbound));
     let session = slack_session(&fake, 1).await;
 
     session.frame(file_share("e1", SLACK_OWNER, "1.1", "please read"));
@@ -372,7 +374,10 @@ async fn e2e_slack_file_share_round_trip() {
             .any(|call| matches!(call, SlackFileCall::CompleteUpload { .. }))
     }))
     .await;
+    // Answered: the reply and the file.
+    bounded(adapter.wait_answered(2)).await;
     running.stop().await;
+    bridge.shutdown().await;
 
     let record = fake.record();
     let download = record
@@ -443,11 +448,12 @@ async fn e2e_slack_file_share_round_trip() {
 /// thread, the row is done, and a reconnect does not upload it again.
 #[tokio::test]
 async fn e2e_slack_size_refusal_skips_file_once() {
-    let mut rig = Rig::new(Platform::Slack);
+    let mut rig = Rig::new(Platform::Bridge);
     let fake = Arc::new(FakeSlackTransport::new());
     fake.set_download_bytes(DOWNLOAD_URL, b"hello file\n".to_vec());
     let outbound = rig.outbound_file(b"from omp");
-    let running = rig.start(slack_adapter(&fake), "send_file", Some(&outbound));
+    let (bridge, adapter) = slack_bridge(&rig, &fake).await;
+    let running = rig.start(adapter.clone(), "send_file", Some(&outbound));
     let session = slack_session(&fake, 1).await;
 
     session.frame(file_share("e1", SLACK_OWNER, "1.1", "please read"));
@@ -493,7 +499,10 @@ async fn e2e_slack_size_refusal_skips_file_once() {
             >= 2
     }))
     .await;
+    // Answered: two replies with files, the refused file, its notice, the marker reply and its file.
+    bounded(adapter.wait_answered(7)).await;
     running.stop().await;
+    bridge.shutdown().await;
 
     let calls = upload_calls(&fake);
     let count = |pred: fn(&SlackFileCall) -> bool| calls.iter().filter(|c| pred(c)).count();
@@ -540,17 +549,21 @@ async fn e2e_slack_size_refusal_skips_file_once() {
 /// A `file_share` from someone else is never stored and never downloaded.
 #[tokio::test]
 async fn e2e_slack_other_user_file_share_is_never_downloaded() {
-    let mut rig = Rig::new(Platform::Slack);
+    let mut rig = Rig::new(Platform::Bridge);
     let fake = Arc::new(FakeSlackTransport::new());
     fake.set_download_bytes(DOWNLOAD_URL, b"hello file\n".to_vec());
-    let running = rig.start(slack_adapter(&fake), "ok", None);
+    let (bridge, adapter) = slack_bridge(&rig, &fake).await;
+    let running = rig.start(adapter.clone(), "ok", None);
     let session = slack_session(&fake, 1).await;
 
     session.frame(file_share("e1", "U999", "1.1", "from a stranger"));
     // Frames are handled in order, so the owner's reply proves the stranger's was seen.
     session.frame(slack_message("e2", SLACK_OWNER, "2.2", "marker"));
     bounded(fake.wait_until(|record| !record.posts.is_empty())).await;
+    // Answered: the marker reply.
+    bounded(adapter.wait_answered(1)).await;
     running.stop().await;
+    bridge.shutdown().await;
 
     let store = rig.store();
     assert_eq!(
