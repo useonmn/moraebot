@@ -2090,3 +2090,62 @@ async fn compaction_gives_the_memory_block_again() {
     );
     bounded(manager.shutdown_all()).await;
 }
+
+/// One owner turn in KEY_STEER, whose conversation memory holds one owner note, with a
+/// steer joined to it (fake-omp `steer` / `merged`, plus `env`): the main input's
+/// `followUp` frame message and the steer frame message the lead received.
+async fn main_and_steer_messages(h: &Harness, env: Vec<(&str, String)>) -> (String, String) {
+    let thread = moraebot::memory::Bucket::Thread(KEY_STEER.into());
+    qa_memory_store(h)
+        .add(qa_note("reply in Korean", thread))
+        .expect("add");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let manager = Arc::new(
+        h.manager("steer")
+            .with_extra_env([("FAKE_OMP_STEER_CASE", "merged".to_owned())])
+            .with_extra_env(env)
+            .with_memory_clock(Arc::new(move || today)),
+    );
+    let main = lead::owner_input(KEY_STEER, 1, "m1");
+    let turn = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.prompt(KEY_STEER, 1, Sender::Owner, &main).await })
+    };
+    turn_running(&manager, KEY_STEER).await;
+    let steer = lead::owner_input(KEY_STEER, 2, "m2");
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, &steer, |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+    bounded(manager.shutdown_all()).await;
+
+    let mains: Vec<String> = h
+        .frames("prompt")
+        .iter()
+        .filter(|f| f["streamingBehavior"] == "followUp")
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect();
+    let steers = h.steer_frames();
+    assert_eq!((mains.len(), steers.len()), (1, 1));
+    let steer_message = steers[0]["message"].as_str().unwrap().to_owned();
+    (mains[0].clone(), steer_message)
+}
+
+#[tokio::test]
+async fn a_steer_counts_the_main_inputs_memory_block_as_given() {
+    let h = Harness::new();
+    let (main, steer) = main_and_steer_messages(&h, Vec::new()).await;
+    let open = omp::thread_memory_open(KEY_STEER);
+    assert!(
+        main.contains(&open) && main.contains("reply in Korean"),
+        "{main}"
+    );
+    assert_eq!(
+        steer,
+        lead::owner_input(KEY_STEER, 2, "m2"),
+        "the block went in with the main input of the same turn"
+    );
+}
+
