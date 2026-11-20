@@ -4,21 +4,23 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moraebot::adapter::{InboundEvent, MessengerAdapter};
-use moraebot::config::{AccessMode, Config, DiscordConfig, MemoryConfig, OmpConfig, Platform};
+use moraebot::config::{
+    AccessMode, Config, DiscordConfig, JevConfig, MemoryConfig, OmpConfig, Platform,
+};
 use moraebot::gateway::{Gateway, STORE_FILE};
-use moraebot::jev::{Jev, Now};
+use moraebot::jev::{E_JEV_REQUEST, E_JEV_RESPONSE, Jev, Now};
 use moraebot::lead::{self, LaneResult};
 use moraebot::memory::{
     self, Bucket, MemoryHandle, MemoryStore, NewEntry, Op, Prov, Redactor, Source,
 };
 use moraebot::observer::{
-    E_OBSERVER_JOB, E_SUBAGENT_LAYOUT, M_ARTIFACT_CHANGED, M_JEV_OFF, M_JOB_DONE, Observer, Pass,
-    W_SUBAGENT_SKIPPED,
+    E_OBSERVER_JOB, E_OBSERVER_PANIC, E_SUBAGENT_LAYOUT, M_ARTIFACT_CHANGED, M_JEV_OFF, M_JOB_DONE,
+    Observer, Pass, W_SUBAGENT_SKIPPED,
 };
 use moraebot::omp;
 use moraebot::store::{
@@ -234,6 +236,20 @@ impl Fixture {
         md
     }
 
+    /// Runs `sql` on the database while the store is closed (the store holds the database's
+    /// lock), then opens it again behind the same handle, so the observer keeps working on it.
+    fn with_store_closed(&self, sql: &str) {
+        let path = self.config.home.join(STORE_FILE);
+        let spare = Store::open(&self.root.path().join("spare.sqlite")).unwrap();
+        let mut store = self.store();
+        drop(std::mem::replace(&mut *store, spare));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        drop(std::mem::replace(&mut *store, Store::open(&path).unwrap()));
+    }
+
     fn lead_root(&self) -> PathBuf {
         omp::lead_session_dir(&self.config)
     }
@@ -245,6 +261,26 @@ impl Fixture {
         drop(self.store);
         (self.root, rusqlite::Connection::open(path).unwrap())
     }
+}
+
+/// Makes every update of a job's state fail, as a full disk or a busy database would.
+const FAIL_SETTLE: &str = "CREATE TRIGGER fail_settle BEFORE UPDATE OF state ON memory_jobs \
+                           BEGIN SELECT RAISE(ABORT, 'disk full'); END";
+
+/// Runs one pass on a thread of its own and waits up to [`BOUND`] for it: a pass that never
+/// yields cannot be bounded by a timer on the test's own runtime. `None` when it did not end
+/// in time (the thread is left behind).
+fn run_once_on_a_thread(observer: &Arc<Observer>) -> Option<Pass> {
+    let observer = Arc::clone(observer);
+    let (sent, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = sent.send(runtime.block_on(observer.run_once()));
+    });
+    ended.recv_timeout(BOUND).ok()
 }
 
 fn observer(
@@ -628,9 +664,16 @@ async fn observer_processing_a_job_twice_adds_nothing() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
     assert_eq!(fx.commits(), commits, "nothing new to commit");
-    assert!(
-        fx.store().pending_memory_notices(KEY).unwrap().is_empty(),
-        "no second notice for an entry that already existed"
+    // The cut pass never stored its notice (it is stored with the settle), so this one does,
+    // once (moraedang on #46).
+    let id = fx.entries(&Bucket::Owner)[0].id.clone();
+    assert_eq!(
+        fx.store().pending_memory_notices(KEY).unwrap(),
+        [moraebot::memory_tools::core_note(
+            &id,
+            &Bucket::Owner.label(),
+            "앞으로 답은 항상 한국어로 해줘."
+        )]
     );
     let (_root, db) = fx.into_db();
     let detail: String = db
@@ -1175,6 +1218,262 @@ async fn subagent_layout_code_is_logged_once() {
 
 /// `code, omp_version, jev_model, detail` of one memory log row.
 type LogLine = (String, Option<String>, Option<String>, Option<String>);
+
+/// The texts of `bucket`'s entries, sorted.
+fn texts(fx: &Fixture, bucket: &Bucket) -> Vec<String> {
+    let mut texts: Vec<String> = fx.entries(bucket).into_iter().map(|e| e.text).collect();
+    texts.sort_unstable();
+    texts
+}
+
+/// Admits `text` as owner message `mid` and settles its lead turn.
+fn owner_turn(fx: &Fixture, mid: &str, text: &str) -> i64 {
+    let row = fx.admit(mid, text);
+    fx.reply(row, None, "네", &trace(false, true));
+    row
+}
+
+/// moraedang on #46: "from now on" and "앞으로" make a standing rule, as the docs and jev's
+/// own `core` option text say.
+#[tokio::test]
+async fn observer_takes_a_from_now_on_rule_into_core() {
+    let fx = Fixture::new().await;
+    for (mid, text) in [
+        ("m1", "From now on, reply in English."),
+        ("m2", "앞으로는 PR 제목을 영어로 써."),
+    ] {
+        owner_turn(&fx, mid, text);
+        fx.jev.answer(save("core", "s0"));
+        assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    }
+    assert_eq!(
+        texts(&fx, &Bucket::Owner),
+        [
+            "From now on, reply in English.",
+            "앞으로는 PR 제목을 영어로 써."
+        ]
+    );
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+}
+
+/// moraedang on #46: the boundary gate is a whole-word match of always, never, 항상 or 절대, so
+/// "never" at a sentence's end counts, "whenever" does not, and a one-off "don't" is no
+/// boundary.
+#[tokio::test]
+async fn observer_boundary_needs_a_whole_always_or_never_word() {
+    let fx = Fixture::new().await;
+    for (mid, text) in [
+        ("m1", "Whenever you're unsure, ask me."),
+        ("m2", "Don't add emoji in this PR."),
+        ("m3", "Push to main: never."),
+    ] {
+        owner_turn(&fx, mid, text);
+        fx.jev.answer(save("boundary", "s0"));
+        assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    }
+    assert_eq!(texts(&fx, &Bucket::Boundaries), ["Push to main: never."]);
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        [
+            "Don't add emoji in this PR.",
+            "Whenever you're unsure, ask me."
+        ]
+    );
+}
+
+/// moraedang on #46: when the store cannot settle an unreadable job, the pass waits instead of
+/// reading the same job again at once, in a loop that never yields.
+#[tokio::test]
+async fn observer_waits_when_an_unreadable_job_cannot_be_settled() {
+    let fx = Fixture::new().await;
+    owner_turn(&fx, "m1", "앞으로 답은 짧게 해줘.");
+    fx.with_store_closed(&format!(
+        "UPDATE memory_jobs SET payload = '{{' WHERE kind = 'group'; {FAIL_SETTLE};"
+    ));
+    let observer = Arc::new(observer(&fx.config, &fx.store, &fx.memory, &fx.clock));
+
+    assert_eq!(
+        run_once_on_a_thread(&observer),
+        Some(Pass::Waiting { until: None })
+    );
+    fx.with_store_closed("DROP TRIGGER fail_settle");
+    assert_eq!(run_once_on_a_thread(&observer), Some(Pass::Idle));
+    assert_eq!(fx.backlog(), Backlog::default());
+}
+
+/// moraedang on #46: when settling fails after the entries were written, the pass backs off
+/// instead of asking jev again, and the core entry it committed still gets its note when the
+/// job runs again.
+#[tokio::test]
+async fn observer_backs_off_when_settling_fails_and_keeps_the_core_note() {
+    let fx = Fixture::new().await;
+    let text = "앞으로 답은 항상 한국어로 해줘.";
+    owner_turn(&fx, "m1", text);
+    fx.with_store_closed(FAIL_SETTLE);
+    fx.jev.answer(save("core", "s0"));
+    let pass = tokio::time::timeout(BOUND, fx.observer.run_once())
+        .await
+        .expect("the pass ends");
+    assert_eq!(pass, Pass::Waiting { until: None });
+    assert_eq!(fx.jev.requests().len(), 1, "jev is not asked again");
+    assert_eq!(fx.entries(&Bucket::Owner).len(), 1);
+    assert!(fx.store().pending_memory_notices(KEY).unwrap().is_empty());
+
+    fx.with_store_closed("DROP TRIGGER fail_settle");
+    fx.jev.answer(save("core", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let id = fx.entries(&Bucket::Owner)[0].id.clone();
+    let note = moraebot::memory_tools::core_note(&id, &Bucket::Owner.label(), text);
+    assert_eq!(fx.store().pending_memory_notices(KEY).unwrap(), [note]);
+    assert_eq!(fx.backlog(), Backlog::default());
+}
+
+/// moraedang on #46: a panic outside a job (here the clock, read first in every pass) never
+/// ends the observer silently: the pass says so, `status_line` reports the observer down, and
+/// the next pass goes on.
+#[tokio::test]
+async fn observer_survives_a_panic_outside_a_job_and_says_it_was_down() {
+    let fx = Fixture::new().await;
+    owner_turn(&fx, "m1", "첨째 규칙은 이렇다.");
+    let broken = Arc::new(AtomicBool::new(true));
+    let (time, flag) = (Arc::clone(&fx.clock), Arc::clone(&broken));
+    let now: Now = Arc::new(move || {
+        assert!(!flag.load(Ordering::SeqCst), "the clock is broken");
+        time.load(Ordering::SeqCst)
+    });
+    let time = Arc::clone(&fx.clock);
+    let jev_now: Now = Arc::new(move || time.load(Ordering::SeqCst));
+    let jev = Arc::new(Jev::new(fx.config.memory.jev.clone(), jev_now));
+    let observer = Observer::new(
+        &fx.config,
+        Arc::clone(&fx.store),
+        fx.memory.clone(),
+        jev,
+        Redactor::default(),
+        now,
+    );
+
+    assert_eq!(observer.run_once().await, Pass::Waiting { until: None });
+    let status = observer.status_line();
+    assert!(status.starts_with("Observer: down"), "{status}");
+    assert!(fx.store().memory_logged(E_OBSERVER_PANIC, "pass").unwrap());
+
+    broken.store(false, Ordering::SeqCst);
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.entries(&Bucket::Thread(KEY.into())).len(), 1);
+    let status = observer.status_line();
+    assert!(status.starts_with("Observer: jev ok"), "{status}");
+}
+
+/// moraedang on #46: a job jev rejects (another 4xx) counts one attempt each time and fails
+/// after three, so it never holds the queue, and jev is not left paused for it.
+#[tokio::test]
+async fn observer_fails_a_job_jev_keeps_rejecting_and_goes_on() {
+    let fx = Fixture::new().await;
+    owner_turn(&fx, "m1", "첫째 규칙은 이렇다.");
+    owner_turn(&fx, "m2", "둘째 규칙은 저렇다.");
+    let rejected = || json!({"error": "unprocessable"});
+    fx.jev.reply(422, &[], rejected());
+    assert_eq!(fx.observer.run_once().await, Pass::Waiting { until: None });
+    assert_eq!(fx.observer.run_once().await, Pass::Waiting { until: None });
+    assert_eq!(fx.jev.requests().len(), 1, "paused: nothing more is sent");
+
+    // Each restart tries the same job once more.
+    let restarted = observer(&fx.config, &fx.store, &fx.memory, &fx.clock);
+    fx.jev.reply(422, &[], rejected());
+    assert_eq!(restarted.run_once().await, Pass::Waiting { until: None });
+    let restarted = observer(&fx.config, &fx.store, &fx.memory, &fx.clock);
+    fx.jev.reply(422, &[], rejected());
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(restarted.run_once().await, Pass::Idle);
+    assert!(
+        fx.store()
+            .memory_logged(E_JEV_REQUEST, "attempts=3")
+            .unwrap()
+    );
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        ["둘째 규칙은 저렇다."]
+    );
+    assert_eq!(fx.backlog(), Backlog::default());
+    let status = restarted.status_line();
+    assert!(status.starts_with("Observer: jev ok"), "{status}");
+}
+
+/// moraedang on #46: a job whose answers never fit counts one attempt each time and fails
+/// after three; the breaker is not left counting its failures.
+#[tokio::test]
+async fn observer_fails_a_job_whose_answers_never_fit_and_goes_on() {
+    let fx = Fixture::new().await;
+    owner_turn(&fx, "m1", "첫째 규칙은 이렇다.");
+    owner_turn(&fx, "m2", "둘째 규칙은 저렇다.");
+    let unfit = || {
+        json!({
+            "model": "jev-1.14.0",
+            "answers": {},
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        })
+    };
+    fx.jev.reply(200, &[], unfit());
+    assert_eq!(
+        fx.observer.run_once().await,
+        Pass::Waiting {
+            until: Some(fx.t0 + 2)
+        }
+    );
+    fx.set_clock(fx.t0 + 2);
+    fx.jev.reply(200, &[], unfit());
+    assert_eq!(
+        fx.observer.run_once().await,
+        Pass::Waiting {
+            until: Some(fx.t0 + 6)
+        }
+    );
+    fx.set_clock(fx.t0 + 6);
+    fx.jev.reply(200, &[], unfit());
+    fx.jev.answer(save("thread", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(
+        fx.store()
+            .memory_logged(E_JEV_RESPONSE, "attempts=3")
+            .unwrap()
+    );
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        ["둘째 규칙은 저렇다."]
+    );
+    assert_eq!(fx.backlog(), Backlog::default());
+    let status = fx.observer.status_line();
+    assert!(status.starts_with("Observer: jev ok"), "{status}");
+}
+
+/// Owner decision on #46: jev is opt-in. With a key but without `enabled = true`, nothing is
+/// sent and jobs settle as `M_JEV_OFF`.
+#[tokio::test]
+async fn observer_sends_nothing_with_a_key_alone() {
+    let fx = Fixture::with(|config| {
+        let mut jev = JevConfig::default();
+        jev.base_url = config.memory.jev.base_url.clone();
+        jev.set_env_key(Some("JEV_KEY_SENTINEL_0d17".into()));
+        config.memory.jev = jev;
+    })
+    .await;
+    owner_turn(&fx, "m1", "앞으로 답은 짧게 해줘.");
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert!(fx.jev.requests().is_empty());
+    assert_eq!(fx.backlog(), Backlog::default());
+    assert!(
+        fx.store()
+            .memory_logged(
+                M_JEV_OFF,
+                "kind=group saved=0 skipped=0 requests=0 tokens=0"
+            )
+            .unwrap()
+    );
+    let status = fx.observer.status_line();
+    assert!(status.starts_with("Observer: jev off"), "{status}");
+}
 
 fn dm(message_id: &str, text: &str) -> InboundEvent {
     InboundEvent {

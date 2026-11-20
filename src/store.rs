@@ -1579,6 +1579,17 @@ impl Store {
         Ok(texts)
     }
 
+    /// Whether memory notice `text` was already stored: waiting in `memory_notices`, or in a
+    /// reply (a lead's own save, or an observer notice already shown).
+    pub fn memory_notice_known(&self, text: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_notices WHERE text = ?1)
+                 OR EXISTS(SELECT 1 FROM inbox WHERE instr(reply, ?1) > 0)",
+            [text],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Marks every row of a turn group `failed` with `code` and stores the turn's memory
     /// `notes` (if any) on the main row, the first of `ids` ([`store_notes`]), in one
     /// transaction that also stores the group's `partial` memory job.

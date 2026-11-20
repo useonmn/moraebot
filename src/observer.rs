@@ -12,8 +12,10 @@
 //!   output files ([`Observer::scan_root`]); a new or changed file becomes a `subagent` job.
 //!
 //! The observer runs beside the dispatcher, never inside it: a jev call that waits or fails
-//! never holds the owner's memory commands, and a bug here never stops the gateway. It never
-//! sleeps between retries either: when jev refuses a call the pass stops, every later job stays
+//! never holds the owner's memory commands, and a bug here never stops the gateway. A panic in
+//! a job counts as one failed attempt of that job; a panic elsewhere in a pass ends only that
+//! pass, is logged as [`E_OBSERVER_PANIC`] and shows in [`Observer::status_line`] until a pass
+//! ends normally again. It never sleeps between retries either: when jev refuses a call the pass stops, every later job stays
 //! pending, and [`Observer::run`] calls [`Observer::run_once`] again later. Entries go to the
 //! memory writer as one batch per pass ([`MemoryHandle::apply_batch`], one git commit) as
 //! [`Op::AddUnique`], so a job processed twice adds nothing.
@@ -37,12 +39,13 @@ use tokio::sync::{Notify, watch};
 
 use crate::config::Config;
 use crate::jev::{Answer, Jev, JevError, JevStatus, Now, Question, Request};
+use crate::jev::{E_JEV_REQUEST, E_JEV_RESPONSE};
 use crate::lead;
 use crate::memory::{
     self, Bucket, E_MEMORY_STOPPED, ExcerptFilter, MAX_ENTRY_BYTES, MemoryHandle, NewEntry, Op,
     Outcome, Prov, Redactor, Source,
 };
-use crate::memory_commands::{says_always, says_dont};
+use crate::memory_commands::{says_always, says_boundary};
 use crate::memory_tools::core_note;
 use crate::omp;
 use crate::store::{
@@ -68,10 +71,9 @@ pub const W_MEMORY_BACKLOG: &str = "W_MEMORY_BACKLOG";
 pub const W_MEMORY_WRITE: &str = "W_MEMORY_WRITE";
 /// A job could not be processed (unreadable row or file); counts as one attempt.
 pub const E_OBSERVER_JOB: &str = "E_OBSERVER_JOB";
-/// Processing a job panicked; counts as one attempt.
+/// Processing a job panicked (counts as one attempt), or a pass panicked outside a job (the
+/// pass ends, the observer reports itself down until a pass ends normally).
 pub const E_OBSERVER_PANIC: &str = "E_OBSERVER_PANIC";
-/// An owner sentence did not match its row when it was queued; saved as `inference`.
-pub const E_OBSERVER_VERBATIM: &str = "E_OBSERVER_VERBATIM";
 
 /// Pending `lane`, `subagent` and `scan` jobs older than this expire (7 days).
 const JOB_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -203,6 +205,8 @@ pub struct Observer {
     layout_logged: AtomicBool,
     pause_logged: AtomicBool,
     memory_stopped: AtomicBool,
+    /// The last pass panicked outside a job.
+    down: AtomicBool,
 }
 
 impl Observer {
@@ -232,6 +236,7 @@ impl Observer {
             layout_logged: AtomicBool::new(false),
             pause_logged: AtomicBool::new(false),
             memory_stopped: AtomicBool::new(false),
+            down: AtomicBool::new(false),
         }
     }
 
@@ -257,10 +262,14 @@ impl Observer {
         &self.redactor
     }
 
-    /// One line for the owner: jev's state and how many jobs wait.
+    /// One line for the owner: jev's state and how many jobs wait, or that the observer is
+    /// down after a panic.
     pub fn status_line(&self) -> String {
         let backlog = lock(&self.store).memory_backlog().unwrap_or_default();
         let waiting = backlog.groups + backlog.other;
+        if self.down.load(Ordering::SeqCst) {
+            return format!("Observer: down ({E_OBSERVER_PANIC}), retrying, {waiting} waiting");
+        }
         match self.jev.status() {
             JevStatus::Off => format!("Observer: jev off, {waiting} waiting"),
             JevStatus::Ready => format!("Observer: jev ok, {waiting} waiting"),
@@ -299,10 +308,37 @@ impl Observer {
         }
     }
 
-    /// Does everything that can be done at `now`: the start scan (first call only), expiry,
-    /// the daily prune, then the pending jobs in id order until none is left or jev refuses a
-    /// call.
+    /// Does everything that can be done now: the start scan (first call only), expiry, the
+    /// daily prune, then the pending jobs in id order until none is left or jev refuses a
+    /// call. A panic anywhere in the pass ends only the pass: it is logged as
+    /// [`E_OBSERVER_PANIC`], [`Self::status_line`] reports the observer down, and the pass
+    /// waits like a refused one.
     pub async fn run_once(&self) -> Pass {
+        match AssertUnwindSafe(self.pass()).catch_unwind().await {
+            Ok(pass) => {
+                self.down.store(false, Ordering::SeqCst);
+                pass
+            }
+            Err(_) => {
+                tracing::error!(code = E_OBSERVER_PANIC, "memory observer pass panicked");
+                self.down.store(true, Ordering::SeqCst);
+                // The injected clock may be what panicked.
+                let at = crate::jev::system_now()();
+                self.log(LogRow {
+                    at,
+                    level: LogLevel::Error,
+                    code: E_OBSERVER_PANIC,
+                    job_id: None,
+                    omp_version: Some(self.omp_version.clone()),
+                    jev_model: None,
+                    detail: Some("pass".to_owned()),
+                });
+                Pass::Waiting { until: None }
+            }
+        }
+    }
+
+    async fn pass(&self) -> Pass {
         let now = (self.now)();
         if !self.started.swap(true, Ordering::SeqCst) {
             self.scan_everything(now).await;
@@ -317,7 +353,9 @@ impl Observer {
             let pending = lock(&self.store).pending_memory_jobs(BATCH + failed_here.len());
             let jobs: Vec<MemoryJob> = match pending {
                 Ok(pending) if !pending.unreadable.is_empty() => {
-                    self.fail_unreadable(&pending.unreadable, now);
+                    if !self.fail_unreadable(&pending.unreadable, now) {
+                        return Pass::Waiting { until: None };
+                    }
                     continue;
                 }
                 Ok(pending) => pending
@@ -343,6 +381,17 @@ impl Observer {
                 match processed {
                     Ok(Ok(work)) => finished.push((job, work)),
                     Ok(Err(Failure::Jev(err))) => {
+                        // A rejected request or an answer that does not fit may be this
+                        // job's own fault: it counts one attempt, and a job given up no
+                        // longer holds jev's gate for the jobs behind it.
+                        if let Some(code) = job_fault(&err)
+                            && self.fail_attempt(job.id, code, now)
+                        {
+                            self.jev.release_job();
+                            self.pause_logged.store(false, Ordering::SeqCst);
+                            failed_here.insert(job.id);
+                            continue;
+                        }
                         refused = Some(err);
                         break;
                     }
@@ -369,8 +418,9 @@ impl Observer {
     }
 
     /// Settles pending rows whose kind or payload does not decode as `failed`, one
-    /// [`E_OBSERVER_JOB`] row each: no later pass can read them either.
-    fn fail_unreadable(&self, ids: &[i64], now: i64) {
+    /// [`E_OBSERVER_JOB`] row each: no later pass can read them either. False when the store
+    /// could not settle them; the pass then waits rather than reading them again at once.
+    fn fail_unreadable(&self, ids: &[i64], now: i64) -> bool {
         let settled: Vec<Settled> = ids
             .iter()
             .map(|&id| Settled {
@@ -384,17 +434,28 @@ impl Observer {
             })
             .collect();
         tracing::warn!(jobs = ?ids, "unreadable memory jobs failed");
-        if let Err(err) = lock(&self.store).settle_memory_jobs(&settled, &[], now) {
-            tracing::warn!(error = %err, "unreadable memory jobs not settled");
+        match lock(&self.store).settle_memory_jobs(&settled, &[], now) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "unreadable memory jobs not settled");
+                false
+            }
         }
     }
 
-    fn fail_attempt(&self, id: i64, code: &'static str, now: i64) {
+    /// Counts one failed attempt of job `id`; true when that was its last and it failed.
+    fn fail_attempt(&self, id: i64, code: &'static str, now: i64) -> bool {
         let failed = lock(&self.store).fail_memory_job_attempt(id, code, &self.omp_version, now);
         match failed {
-            Ok(true) => tracing::warn!(job = id, code, "memory job failed"),
-            Ok(false) => {}
-            Err(err) => tracing::warn!(job = id, error = %err, "memory job attempt not counted"),
+            Ok(true) => {
+                tracing::warn!(job = id, code, "memory job failed");
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                tracing::warn!(job = id, error = %err, "memory job attempt not counted");
+                false
+            }
         }
     }
 
@@ -477,7 +538,10 @@ impl Observer {
     }
 
     /// Writes every entry of `finished` in one batch, then settles the jobs with their log rows
-    /// and the owner's core notices. False when the memory writer has stopped.
+    /// and the owner's core notices. False when the memory writer has stopped or the jobs could
+    /// not be settled: the pass then waits, so jev is not asked about the same jobs again at
+    /// once. A core entry that already exists from such an earlier pass (same source and text,
+    /// so the same id) still gets its notice, unless that notice is already stored.
     async fn write(&self, finished: Vec<(MemoryJob, Work)>, now: i64) -> bool {
         let mut ops = Vec::new();
         let mut owners = Vec::new();
@@ -504,14 +568,27 @@ impl Observer {
         let mut notices = Vec::new();
         for ((index, planned), result) in owners.into_iter().zip(results) {
             match result {
-                Ok(Outcome::Added(added)) if added.created => {
-                    saved[index] += 1;
-                    if let Some(key) = &planned.notice
-                        && added.bucket.is_core()
-                    {
+                Ok(Outcome::Added(added)) => {
+                    if added.created {
+                        saved[index] += 1;
+                    } else {
+                        skipped[index] += 1;
+                    }
+                    let Some(key) = &planned.notice else {
+                        continue;
+                    };
+                    if !added.bucket.is_core() {
+                        continue;
+                    }
+                    let text = core_note(&added.id, &added.bucket.label(), &planned.entry.text);
+                    // An entry this observer committed before its settle failed has no notice
+                    // yet; one the lead saved has its line in a reply already.
+                    let owed = added.created
+                        || !lock(&self.store).memory_notice_known(&text).unwrap_or(true);
+                    if owed {
                         notices.push(MemoryNotice {
                             conversation_key: key.clone(),
-                            text: core_note(&added.id, &added.bucket.label(), &planned.entry.text),
+                            text,
                         });
                     }
                 }
@@ -554,8 +631,8 @@ impl Observer {
             .collect();
         let result = lock(&self.store).settle_memory_jobs(&settled, &notices, now);
         if let Err(err) = result {
-            tracing::warn!(error = %err, "memory jobs not settled; they run again");
-            return true;
+            tracing::warn!(error = %err, "memory jobs not settled; they run again later");
+            return false;
         }
         self.progress
             .send_modify(|count| *count += settled.len() as u64);
@@ -644,49 +721,25 @@ impl Observer {
                         }
                     }
                     // Owner decision 5, in code and not only in jev's option text: a sentence
-                    // reaches core only when it says "always" (or, for a boundary, "never").
+                    // reaches core/owner.md only when it states a standing rule ("always",
+                    // "from now on", ...), and core/boundaries.md only when it holds a whole
+                    // always or never word (see `says_always`, `says_boundary`).
                     "core" if says_always(&pick.sentence) => Bucket::Owner,
-                    "boundary" if says_always(&pick.sentence) || says_dont(&pick.sentence) => {
-                        Bucket::Boundaries
-                    }
+                    "boundary" if says_boundary(&pick.sentence) => Bucket::Boundaries,
                     "core" | "boundary" => thread,
                     _ => continue,
                 };
-                // The design's last guard: the entry is the row's own sentence, verbatim.
-                let verbatim = memory::own_sentences(&row.text)
-                    .into_iter()
-                    .any(|(n, s)| n == pick.n && s == pick.sentence);
-                let planned = if verbatim {
-                    Planned {
-                        notice: bucket.is_core().then(|| row.conversation_key.clone()),
-                        entry: entry(
-                            pick.sentence,
-                            Prov::Owner,
-                            bucket,
-                            Source::row_sentence(row.id, pick.n),
-                        ),
-                    }
-                } else {
-                    self.log(LogRow {
-                        at: now,
-                        level: LogLevel::Error,
-                        code: E_OBSERVER_VERBATIM,
-                        job_id: Some(job.id),
-                        omp_version: Some(self.omp_version.clone()),
-                        jev_model: None,
-                        detail: Some(format!("row={} s={}", row.id, pick.n)),
-                    });
-                    Planned {
-                        notice: None,
-                        entry: entry(
-                            pick.sentence,
-                            Prov::Inference,
-                            thread_bucket(&row.conversation_key),
-                            Source::row(row.id),
-                        ),
-                    }
-                };
-                work.entries.push(planned);
+                // `pick` is a sentence of this window, cut from `row.text` above: the entry
+                // is the owner's own sentence, verbatim.
+                work.entries.push(Planned {
+                    notice: bucket.is_core().then(|| row.conversation_key.clone()),
+                    entry: entry(
+                        pick.sentence,
+                        Prov::Owner,
+                        bucket,
+                        Source::row_sentence(row.id, pick.n),
+                    ),
+                });
             }
         }
         Ok(())
@@ -1175,6 +1228,23 @@ impl Scanner {
             jev_model: None,
             detail: Some(detail),
         })
+    }
+}
+
+/// The code of a jev failure that may come from the job's own request (a rejected request, an
+/// answer that does not fit), so it counts one attempt of that job. Nothing was sent for the
+/// other refusals, or the fault is not the job's.
+fn job_fault(err: &JevError) -> Option<&'static str> {
+    match err {
+        JevError::Permanent {
+            code: E_JEV_REQUEST,
+            ..
+        } => Some(E_JEV_REQUEST),
+        JevError::Transient {
+            code: E_JEV_RESPONSE,
+            ..
+        } => Some(E_JEV_RESPONSE),
+        _ => None,
     }
 }
 

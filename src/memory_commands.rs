@@ -333,19 +333,36 @@ fn strip_always_prefix(text: &str) -> (bool, &str) {
     (false, text)
 }
 
-/// Whether an [`ALWAYS_WORDS`] word is anywhere in `text`: `항상` as a substring, `always` as a
-/// whole word.
+/// The words of `text`, lowercased: the runs of letters, digits and `_` between every other
+/// character, so "whenever" is one word and "never." holds "never".
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `text` states a standing rule: `항상` anywhere, `always` as a whole word, the
+/// phrase "from now on", or `앞으로` / `앞으로는` as a whole word.
 pub(crate) fn says_always(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    ALWAYS_WORDS.iter().any(|word| {
-        if word.is_ascii() {
-            lower
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|w| w == *word)
-        } else {
-            lower.contains(word)
-        }
-    })
+    if text.contains("항상") {
+        return true;
+    }
+    let words = words(text);
+    words
+        .iter()
+        .any(|w| matches!(w.as_str(), "always" | "앞으로" | "앞으로는"))
+        || words.windows(3).any(|w| w == ["from", "now", "on"])
+}
+
+/// Whether `text` may be a boundary the observer saves without a command: it holds `always`,
+/// `never`, `항상`, `절대` or `절대로` as a whole word. A "don't" alone is no boundary: it is
+/// often meant for one task only.
+pub(crate) fn says_boundary(text: &str) -> bool {
+    words(text)
+        .iter()
+        .any(|w| matches!(w.as_str(), "always" | "never" | "항상" | "절대" | "절대로"))
 }
 
 /// `기억해: <body>`, `기억해(<repo>): <body>`, `remember that <body>`; returns the repo, if
@@ -1138,5 +1155,48 @@ mod tests {
             Target::Conversation,
             "always only as a whole word"
         );
+    }
+
+    /// moraedang on #46: "from now on" and "앞으로" state a standing rule, as the docs and jev's
+    /// own `core` option text say; each only as a whole phrase or word.
+    #[test]
+    fn from_now_on_states_a_standing_rule() {
+        for text in [
+            "From now on, reply in English.",
+            "Reply in English from now on.",
+            "앞으로는 PR을 영어로 올려.",
+            "앞으로 답은 짧게 해줘.",
+        ] {
+            assert!(says_always(text), "{text}");
+        }
+        for text in [
+            "Move it from nowhere onward.",
+            "Read it from now, only once.",
+            "PR을 영어로 올려.",
+        ] {
+            assert!(!says_always(text), "{text}");
+        }
+    }
+
+    /// moraedang on #46: a boundary word is a whole word, so "never" at a sentence's end
+    /// counts and "whenever" or a plain "don't" does not.
+    #[test]
+    fn boundary_words_are_whole_words() {
+        for text in [
+            "Push to main: never.",
+            "Never force-push to main.",
+            "Always run the tests first.",
+            "금요일엔 절대 배포하지 마.",
+            "항상 테스트부터 돌려.",
+        ] {
+            assert!(says_boundary(text), "{text}");
+        }
+        for text in [
+            "Whenever you're unsure, ask me.",
+            "Don't add emoji in this PR.",
+            "이번엔 배포하지 마.",
+        ] {
+            assert!(!says_boundary(text), "{text}");
+        }
     }
 }

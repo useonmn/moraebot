@@ -347,6 +347,19 @@ impl Jev {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Clears what calls made for one job left on the gate, once the caller has given that job
+    /// up: a pause by [`E_JEV_REQUEST`], the transient failure count and the retry time. A
+    /// pause by [`E_JEV_AUTH`] stays: no other job would get past it.
+    pub fn release_job(&self) {
+        let mut gate = self.lock();
+        if gate.paused == Some(E_JEV_REQUEST) {
+            gate.paused = None;
+        }
+        if gate.paused.is_none() {
+            *gate = Gate::default();
+        }
+    }
+
     /// Checks the gate and, when the breaker is open, claims the single probe.
     fn enter(&self) -> Result<(), JevError> {
         let now = (self.now)();
