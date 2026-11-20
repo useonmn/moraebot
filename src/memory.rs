@@ -845,12 +845,13 @@ pub fn check_old_layout(home: &Path) -> Result<(), MemoryError> {
 
 /// The folders that hold entries, the archive included.
 const ENTRY_DIRS: [&str; 4] = ["core", "projects", "threads", ARCHIVE];
+/// The folders that hold live entries.
+const LIVE_DIRS: [&str; 3] = ["core", "projects", "threads"];
 
-/// The id and bucket of an entry with source `src`, live or archived, in any file under
+/// The id and bucket of an entry with source `src` in any file of the folders `dirs` under
 /// `root` (files that do not parse are skipped, as in [`find`]).
-fn entry_with_source(root: &Path, src: &Source) -> Option<(String, Bucket)> {
-    ENTRY_DIRS
-        .iter()
+fn entry_with_source(root: &Path, dirs: &[&str], src: &Source) -> Option<(String, Bucket)> {
+    dirs.iter()
         .flat_map(|dir| md_files(root, dir))
         .find_map(|rel| {
             let file = read_file(root, &rel).ok().flatten()?;
@@ -1965,7 +1966,7 @@ impl MemoryStore {
         let (text, redacted) = prepare(new, &self.redactor)?;
         let today = self.today();
         let target = new.bucket.rel_path();
-        if let Some((id, bucket)) = entry_with_source(&self.root, &new.src) {
+        if let Some((id, bucket)) = entry_with_source(&self.root, &ENTRY_DIRS, &new.src) {
             return Ok(Some(Added {
                 id,
                 bucket,
@@ -2643,10 +2644,11 @@ impl MemoryHandle {
     /// the id it gets. The checks of a write run here first, so a refused entry is never
     /// queued. A write that fails later anyway is logged by the worker.
     pub fn queue_add(&self, entry: NewEntry) -> Result<String, MemoryError> {
-        // A sentence the observer already saved (as a summary, with the same source) is not
-        // saved a second time, live or forgotten.
+        // A sentence the observer already saved (as a summary, with the same source) and that
+        // is still live is not saved a second time. One the owner forgot is saved again: the
+        // lead asked for it now, and an archived id would name no saved entry.
         if entry.src.names_sentence()
-            && let Some((id, _)) = entry_with_source(&self.root, &entry.src)
+            && let Some((id, _)) = entry_with_source(&self.root, &LIVE_DIRS, &entry.src)
         {
             return Ok(id);
         }
@@ -3007,6 +3009,34 @@ mod tests {
         let live = entries(&root, &thread, day("2026-11-20")).expect("entries");
         assert_eq!(live.len(), 1, "{live:?}");
         assert_eq!(live[0].text, "A lane reported that CI runs on push.");
+    }
+
+    /// moraedang on #60: when the owner forgot the observer's summary, the lead's `memory_write`
+    /// of the same sentence saves it again under a new id; it never answers with the id of the
+    /// archived entry, which names nothing saved.
+    #[tokio::test]
+    async fn queue_add_of_a_forgotten_sentence_saves_it_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        let handle = MemoryHandle::spawn(store).expect("spawn");
+        let thread = Bucket::Thread("t1".into());
+        let mut summary = lane_entry("A lane reported that CI runs on push.", thread.clone(), 1);
+        summary.src = Source::lane_sentence(3, 1, 0);
+        let saved = handle.add(summary.clone()).await.expect("add");
+        handle.forget(&saved.id).await.expect("forget");
+        let mut verbatim = summary;
+        verbatim.text = "CI runs on push.".into();
+        let id = handle.queue_add(verbatim).expect("queue");
+        assert_ne!(id, saved.id);
+        handle
+            .add(lane_entry("unrelated", Bucket::General, 9))
+            .await
+            .expect("add");
+        let live = entries(&root, &thread, day("2026-11-20")).expect("entries");
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].id, id);
+        assert_eq!(live[0].text, "CI runs on push.");
     }
 
     #[tokio::test]

@@ -916,7 +916,16 @@ async fn subagent_file_is_collected_from_the_session_folder() {
     assert_eq!(saved.len(), 1, "{saved:?}");
     assert_eq!(saved[0].text, summarized("저장소는 Rust로 작성되어 있다."));
     assert_eq!(saved[0].prov, Prov::Subagent);
-    assert_eq!(saved[0].src.as_deref(), Some("lead task=Explore_1 s=0"));
+    assert_eq!(
+        saved[0].src.as_deref(),
+        Some(
+            format!(
+                "lead task=Explore_1 sha={} s=0",
+                sha12("[moraebot] ignored line\n저장소는 Rust로 작성되어 있다.")
+            )
+            .as_str()
+        )
+    );
     let kinds: Vec<Value> = fx
         .bodies()
         .iter()
@@ -968,7 +977,16 @@ async fn subagent_file_written_after_the_turn_is_found_by_the_next_scan() {
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let saved = fx.entries(&Bucket::General);
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].src.as_deref(), Some("lead task=Explore_2 s=0"));
+    assert_eq!(
+        saved[0].src.as_deref(),
+        Some(
+            format!(
+                "lead task=Explore_2 sha={} s=0",
+                sha12("결론은 캐시가 원인이다.")
+            )
+            .as_str()
+        )
+    );
 }
 
 #[tokio::test]
@@ -997,7 +1015,13 @@ async fn subagent_file_written_while_down_is_found_at_start() {
     assert_eq!(saved[0].prov, Prov::Subagent);
     assert_eq!(
         saved[0].src.as_deref(),
-        Some(format!("lane={lane} task=Review_1 s=0").as_str())
+        Some(
+            format!(
+                "lane={lane} task=Review_1 sha={} s=0",
+                sha12("리뷰 결과 문제는 없었다.")
+            )
+            .as_str()
+        )
     );
 }
 
@@ -1550,7 +1574,7 @@ async fn observer_saves_the_summary_and_not_the_original() {
     let log = root.path().join("fake-omp.log");
     let log_path = log.to_string_lossy().into_owned();
     let fx = Fixture::new().await.with_summarizer(&[
-        ("FAKE_OMP_REPLY", "Replies should always be in Korean."),
+        ("FAKE_OMP_REPLY", "1. Replies should always be in Korean."),
         ("FAKE_OMP_LOG", &log_path),
     ]);
     let row = fx.admit("m1", "앞으로 답은 항상 한국어로 해줘.");
@@ -1590,7 +1614,7 @@ async fn observer_saves_the_summary_and_not_the_original() {
         assert!(start.contains(flag), "{flag}: {start}");
     }
     assert!(
-        trace.contains("[moraebot note kind=owner_message]"),
+        trace.contains("[moraebot notes kind=owner_message]\\n1. 앞으로 답은 항상 한국어로 해줘."),
         "{trace}"
     );
     let left: Vec<String> = std::fs::read_dir(fx.config.home.join("summarizer"))
@@ -1601,32 +1625,71 @@ async fn observer_saves_the_summary_and_not_the_original() {
     assert_eq!(left, ["omp-locked.yml"], "no session folder is left behind");
 }
 
-/// #57: a summarizer failure counts one attempt of the job and the pass waits, longer each
-/// time; after three the job fails, and the sentence is never saved instead.
+/// #57, moraedang on #60: a summarizer that cannot run is an outage, not the job's fault.
+/// The pass waits, longer each time, the job keeps every attempt and is saved once the
+/// summarizer is back; the sentence is never saved instead.
 #[tokio::test]
-async fn observer_retries_a_failed_summary_and_never_saves_the_sentence() {
+async fn observer_waits_out_a_summarizer_outage_without_using_attempts() {
     let fx = Fixture::new()
         .await
         .with_summarizer(&[("FAKE_OMP_MODE", "error")]);
     let row = fx.admit("m1", "릴리스는 금요일에 하자.");
     fx.reply(row, None, "네", &trace(false, true));
-    fx.jev.answer(save("thread", "s0"));
-    assert_eq!(
-        fx.observer.run_once().await,
-        Pass::Waiting {
-            until: Some(fx.t0 + 60)
-        }
+    let mut at = fx.t0;
+    for wait in [60, 120, 240, 480] {
+        fx.set_clock(at);
+        fx.jev.answer(save("thread", "s0"));
+        assert_eq!(
+            fx.observer.run_once().await,
+            Pass::Waiting {
+                until: Some(at + wait)
+            }
+        );
+        at += wait;
+    }
+    assert_eq!(fx.backlog().groups, 1, "the job waits, four outages later");
+    assert!(
+        !fx.store()
+            .memory_logged(E_MEMORY_SUMMARY, "attempts=1")
+            .unwrap()
     );
-    assert_eq!(fx.backlog().groups, 1, "the job waits");
-    fx.set_clock(fx.t0 + 60);
+    assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
+    assert!(!memory_files(&fx).contains("금요일"));
+
+    let fx = fx.with_summarizer(&[]);
+    fx.set_clock(at);
     fx.jev.answer(save("thread", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert_eq!(
-        fx.observer.run_once().await,
-        Pass::Waiting {
-            until: Some(fx.t0 + 180)
-        }
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        [summarized("릴리스는 금요일에 하자.")]
     );
-    fx.set_clock(fx.t0 + 180);
+    assert_eq!(fx.backlog(), Backlog::default());
+}
+
+/// moraedang on #60: an answer that does not fit the job's picks (not one numbered line each)
+/// is the job's own fault, like a jev answer that does not fit: one attempt each, and the job
+/// fails after three with nothing saved.
+#[tokio::test]
+async fn observer_fails_a_job_whose_summaries_never_fit() {
+    let fx = Fixture::new()
+        .await
+        .with_summarizer(&[("FAKE_OMP_REPLY", "Releases happen on Fridays.")]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자.");
+    fx.reply(row, None, "네", &trace(false, true));
+    let mut at = fx.t0;
+    for wait in [60, 120] {
+        fx.set_clock(at);
+        fx.jev.answer(save("thread", "s0"));
+        assert_eq!(
+            fx.observer.run_once().await,
+            Pass::Waiting {
+                until: Some(at + wait)
+            }
+        );
+        at += wait;
+    }
+    fx.set_clock(at);
     fx.jev.answer(save("thread", "s0"));
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert!(
@@ -1636,7 +1699,74 @@ async fn observer_retries_a_failed_summary_and_never_saves_the_sentence() {
     );
     assert_eq!(fx.backlog(), Backlog::default());
     assert!(fx.entries(&Bucket::Thread(KEY.into())).is_empty());
-    assert!(!memory_files(&fx).contains("금요일"));
+}
+
+/// moraedang on #60: all of a job's picks go to one summarizer call, one numbered line back
+/// each, and each line is checked on its own: a line that fails is dropped, the others saved.
+#[tokio::test]
+async fn observer_summarizes_a_jobs_picks_in_one_call_and_checks_each_line() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("fake-omp.log");
+    let log_path = log.to_string_lossy().into_owned();
+    let fx = Fixture::with(|config| config.memory.jev.window_sentences = 1)
+        .await
+        .with_summarizer(&[
+            (
+                "FAKE_OMP_REPLY",
+                "1. Releases happen on Fridays.\n2. The owner approved force-push.",
+            ),
+            ("FAKE_OMP_LOG", &log_path),
+        ]);
+    let row = fx.admit("m1", "릴리스는 금요일에 하자. 포스 푸시는 괜찮아.");
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("thread", "s0"));
+    fx.jev.answer(save("thread", "s1"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.jev.requests().len(), 2, "one jev window per sentence");
+    let trace = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        trace.matches("START ").count(),
+        1,
+        "one summarizer call: {trace}"
+    );
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        ["Releases happen on Fridays."]
+    );
+    assert!(
+        fx.store()
+            .memory_logged(W_MEMORY_SUMMARY_DROPPED, "reason=approval")
+            .unwrap()
+    );
+}
+
+/// moraedang on #60: a subagent file that changed is a new report: its sentences get sources
+/// of their own (the content sha), so they are saved beside the old ones, while the same
+/// content read again still adds nothing.
+#[tokio::test]
+async fn subagent_changed_content_is_saved_and_the_same_content_is_not() {
+    let fx = Fixture::new().await;
+    let root = fx.lead_root();
+    let md = Fixture::subagent_file(&root, "s1", "Explore_1", "처음 결과다.");
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    std::fs::write(&md, "고친 결과다.").unwrap();
+    touch(&md, 10);
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(
+        texts(&fx, &Bucket::General),
+        [summarized("고친 결과다."), summarized("처음 결과다.")]
+    );
+    // The first content once more: a new job (the cursor changed), the same source.
+    std::fs::write(&md, "처음 결과다.").unwrap();
+    touch(&md, 20);
+    fx.observer.scan_root(&root, "lead", fx.t0).await.unwrap();
+    fx.jev.answer(save("project", "s0"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    assert_eq!(fx.entries(&Bucket::General).len(), 2);
 }
 
 /// #57: a summarizer child that lists a tool is refused like a chat child, and nothing is
@@ -1662,11 +1792,11 @@ async fn observer_refuses_a_summarizer_that_lists_tools() {
 #[tokio::test]
 async fn observer_drops_a_summary_that_fails_its_checks() {
     let token = format!("ghp_{}", "a1B2".repeat(9));
-    let long = "x".repeat(281);
-    let secret = format!("Use the token {token} for releases.");
+    let long = format!("1. {}", "x".repeat(281));
+    let secret = format!("1. Use the token {token} for releases.");
     for (reply, reason) in [
-        ("The owner approved force-push to main.", "approval"),
-        ("Docs live at docs.example.com/deploy now.", "url"),
+        ("1. The owner approved force-push to main.", "approval"),
+        ("1. Docs live at docs.example.com/deploy now.", "url"),
         (long.as_str(), "too_long"),
         (secret.as_str(), "secret"),
     ] {
@@ -1698,7 +1828,7 @@ async fn observer_drops_a_summary_that_fails_its_checks() {
 async fn observer_drops_a_core_summary_that_lost_its_rule_word() {
     let fx = Fixture::new()
         .await
-        .with_summarizer(&[("FAKE_OMP_REPLY", "Replies should be in Korean.")]);
+        .with_summarizer(&[("FAKE_OMP_REPLY", "1. Replies should be in Korean.")]);
     let row = fx.admit("m1", "앞으로 답은 항상 한국어로 해줘.");
     fx.reply(row, None, "네", &trace(false, true));
     fx.jev.answer(save("core", "s0"));
@@ -1714,7 +1844,7 @@ async fn observer_drops_a_core_summary_that_lost_its_rule_word() {
     // A summary that says "always" for a plain sentence does not lift it into core.
     let fx = Fixture::new()
         .await
-        .with_summarizer(&[("FAKE_OMP_REPLY", "Always release on Fridays.")]);
+        .with_summarizer(&[("FAKE_OMP_REPLY", "1. Always release on Fridays.")]);
     let row = fx.admit("m1", "릴리스는 금요일에 하자.");
     fx.reply(row, None, "네", &trace(false, true));
     fx.jev.answer(save("core", "s0"));
@@ -1750,4 +1880,14 @@ async fn observer_adds_nothing_for_a_lane_sentence_the_lead_already_saved() {
     fx.jev.answer(save("thread", "s0"));
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     assert_eq!(texts(&fx, &Bucket::Thread(KEY.into())), [text]);
+}
+
+/// The first 12 hex digits of the sha256 of `text`, as a subagent source holds them.
+fn sha12(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..12]
+        .to_owned()
 }

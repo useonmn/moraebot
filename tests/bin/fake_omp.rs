@@ -19,7 +19,10 @@
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
 //! echoed whole. The log keeps the full frame. With FAKE_OMP_REPLY set, an
-//! echoed prompt is answered with that text instead.
+//! echoed prompt is answered with that text instead. Without it, a summarizer
+//! child (its `--session-dir` contains `/summarizer/`) answers each numbered
+//! note line `<n>. <note>` with `<n>. echo: <note>`, like moraebot's
+//! summarizer is asked to.
 //!
 //! Host tools: `set_host_tools` is acknowledged in every mode with the tool
 //! names of the frame. Mode `send_file` answers a prompt with one
@@ -91,6 +94,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "fake-session-1";
+/// This fake is a moraebot memory summarizer child.
+static SUMMARIZER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 const DEFAULT_TOOL_TRIGGER: &str = "run-tools";
 const DEFAULT_LANE_TOOL_TRIGGER: &str = "run-lane-tools";
 
@@ -139,6 +144,9 @@ struct Fake {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let lane = is_lane(&argv);
+    SUMMARIZER
+        .set(arg_value(&argv, "--session-dir").is_some_and(|dir| dir.contains("/summarizer/")))
+        .expect("set once");
     let mode = select_mode(lane);
     let log = std::env::var_os("FAKE_OMP_LOG").map(std::path::PathBuf::from);
     if let Some(path) = &log {
@@ -675,7 +683,20 @@ fn prompt_message(frame: &Value) -> &str {
 }
 
 fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
-    let text = std::env::var("FAKE_OMP_REPLY").unwrap_or_else(|_| format!("echo: {message}"));
+    let text = std::env::var("FAKE_OMP_REPLY").unwrap_or_else(|_| {
+        if SUMMARIZER.get().copied().unwrap_or(false) {
+            message
+                .lines()
+                .map(|line| match line.split_once(". ") {
+                    Some((n, note)) => format!("{n}. echo: {note}"),
+                    None => format!("echo: {line}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            format!("echo: {message}")
+        }
+    });
     end_run(&text, json!({}), out);
     completed(id, out);
 }
