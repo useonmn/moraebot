@@ -4,7 +4,7 @@
 //! - A `group` job (a settled, failed or restart-cut lead turn) judges the owner's own
 //!   sentences of its owner rows, with `prov: owner` and its row, sentence and turn number;
 //!   jev only picks which sentence and which file, and the code checks the `core/` gates
-//!   against the picked sentence itself. The owner's words are saved freely, the omp way
+//!   against the picked sentence itself. The owner's words are saved freely, the omo way
 //!   (#63): only secrets are taken out (redacted before jev or the summarizer sees them,
 //!   and again on the summary), never an approval, URL or command word; memory is guarded
 //!   where it is read instead ([`memory::MEMORY_GUARD`]).
@@ -756,11 +756,12 @@ impl Observer {
             let Some(row) = row.filter(|row| row.origin == "owner") else {
                 continue;
             };
-            // The owner's words are kept whatever they say; only secrets are taken out.
+            // The owner's words are kept whatever they say; only secrets are taken out, and a
+            // sentence that was nothing but a secret is no candidate.
             let candidates: Vec<(u32, String)> = memory::own_sentences(&row.text)
                 .into_iter()
                 .map(|(n, s)| (n, self.redactor.redact(&s).0))
-                .filter(|(_, s)| self.candidate(s))
+                .filter(|(_, s)| self.candidate(s) && self.candidate(&without_markers(s)))
                 .collect();
             for window in candidates.chunks(self.window()).take(OWNER_WINDOWS) {
                 let Some(pick) = self.judge(Kind::Owner, window, Some(tools), work).await? else {
@@ -1447,6 +1448,20 @@ fn numbered_lines(reply: &str, count: usize) -> Option<Vec<String>> {
                 .map(|rest| rest.trim().to_owned())
         })
         .collect()
+}
+
+/// `text` without the redactor's `[redacted:...]` markers, its words joined by single spaces:
+/// what is left of a redacted sentence.
+fn without_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[redacted:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        rest = after.find(']').map_or("", |end| &after[end + 1..]);
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Where a lane or subagent entry goes for jev's `thread` and every other answer.

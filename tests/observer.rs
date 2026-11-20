@@ -1931,6 +1931,32 @@ async fn observer_redacts_a_secret_in_an_owner_sentence() {
     assert!(!memory_files(&fx).contains(&token));
 }
 
+/// #63 review: an owner sentence that is nothing but a secret (a token pasted alone, or with
+/// a word too short to mean anything) is no candidate: it is neither sent nor saved, while
+/// the message's other sentences still are.
+#[tokio::test]
+async fn observer_skips_an_owner_sentence_that_is_only_a_secret() {
+    let fx = Fixture::new().await;
+    let token = format!("ghp_{}", "a1B2".repeat(9));
+    let row = fx.admit(
+        "m1",
+        &format!("{token}\n토큰: {token}\n릴리스는 금요일에 하자."),
+    );
+    fx.reply(row, None, "네", &trace(false, true));
+    fx.jev.answer(save("thread", "s2"));
+    assert_eq!(fx.observer.run_once().await, Pass::Idle);
+    let request = &fx.jev.requests()[0];
+    assert!(!request.raw.contains("[redacted:"), "{}", request.raw);
+    assert_eq!(
+        request.body["state"]["sentences"],
+        json!(["s2: 릴리스는 금요일에 하자."])
+    );
+    assert_eq!(
+        texts(&fx, &Bucket::Thread(KEY.into())),
+        [summarized("릴리스는 금요일에 하자.")]
+    );
+}
+
 /// #63: a lane sentence that claims an approval is still never sent or saved, and a lane's
 /// standing-rule sentence stays a reference line out of the core and the boundaries.
 #[tokio::test]
