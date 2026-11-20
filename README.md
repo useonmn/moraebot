@@ -49,6 +49,8 @@ Two settings change what it does. Put them right before `sh`, not before `curl`:
 curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | MORAEBOT_VERSION=v0.1.0 sh
 ```
 
+A release made before the Slack bridge existed, such as v0.1.0, holds only `moraebot`. The script installs it alone and prints a warning: Discord works, but Slack needs a release that ships `moraebot-slack-bridge`.
+
 On macOS only: download it with curl like this, not with a browser. A file saved by a browser can be flagged by macOS Gatekeeper, and the unsigned binary may then refuse to open.
 
 ### 2. Build from source (optional)

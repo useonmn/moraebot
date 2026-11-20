@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install or upgrade moraebot and moraebot-slack-bridge from a GitHub release
-# (Apple Silicon macOS, Linux x86_64 or aarch64).
+# (Apple Silicon macOS, Linux x86_64 or aarch64). Releases made before the bridge existed
+# hold only moraebot; it is installed alone with a warning that Slack needs a newer release.
 #
 #   curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
 #
@@ -118,28 +119,46 @@ main() {
     (cd "$tmp" && printf '%s\n' "$line" | $SHA256 -c >/dev/null 2>&1) ||
         fail "$E_CHECKSUM" "checksum mismatch for $ASSET; nothing was installed"
 
-    tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot "$BRIDGE" ||
-        fail "$E_ARCHIVE" "$ASSET does not contain moraebot and $BRIDGE; nothing was installed"
+    tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot ||
+        fail "$E_ARCHIVE" "$ASSET does not contain moraebot; nothing was installed"
+    has_bridge=""
+    if tar -tzf "$tmp/$ASSET" | grep -qx "$BRIDGE"; then
+        tar -xzf "$tmp/$ASSET" -C "$tmp" "$BRIDGE" ||
+            fail "$E_ARCHIVE" "could not unpack $BRIDGE from $ASSET; nothing was installed"
+        has_bridge="yes"
+    fi
 
-    # Both new binaries are written and run before either old file is replaced.
+    # Every new binary is written and run before any old file is replaced.
     new="$install_dir/.moraebot.new.$$"
-    new_bridge="$install_dir/.$BRIDGE.new.$$"
     cp "$tmp/moraebot" "$new" || fail "$E_REPLACE" "could not write $new"
-    cp "$tmp/$BRIDGE" "$new_bridge" || fail "$E_REPLACE" "could not write $new_bridge"
-    chmod 755 "$new" "$new_bridge" || fail "$E_REPLACE" "could not make the new binaries executable"
+    chmod 755 "$new" || fail "$E_REPLACE" "could not make $new executable"
+    if [ -n "$has_bridge" ]; then
+        new_bridge="$install_dir/.$BRIDGE.new.$$"
+        cp "$tmp/$BRIDGE" "$new_bridge" || fail "$E_REPLACE" "could not write $new_bridge"
+        chmod 755 "$new_bridge" || fail "$E_REPLACE" "could not make $new_bridge executable"
+    fi
     installed="$("$new" --version </dev/null)" ||
         fail "$E_SMOKE" "the downloaded moraebot does not run; nothing was installed"
-    installed_bridge="$("$new_bridge" --version </dev/null)" ||
-        fail "$E_SMOKE" "the downloaded $BRIDGE does not run; nothing was installed"
+    if [ -n "$has_bridge" ]; then
+        installed_bridge="$("$new_bridge" --version </dev/null)" ||
+            fail "$E_SMOKE" "the downloaded $BRIDGE does not run; nothing was installed"
+    fi
     mv -f "$new" "$install_dir/moraebot" ||
         fail "$E_REPLACE" "could not replace $install_dir/moraebot"
     new=""
-    mv -f "$new_bridge" "$install_dir/$BRIDGE" ||
-        fail "$E_REPLACE" "replaced $install_dir/moraebot, but could not replace $install_dir/$BRIDGE; run the install line again"
-    new_bridge=""
+    if [ -n "$has_bridge" ]; then
+        mv -f "$new_bridge" "$install_dir/$BRIDGE" ||
+            fail "$E_REPLACE" "replaced $install_dir/moraebot, but could not replace $install_dir/$BRIDGE; run the install line again"
+        new_bridge=""
+    fi
 
     printf 'Installed %s to %s\n' "$installed" "$install_dir/moraebot"
-    printf 'Installed %s to %s\n' "$installed_bridge" "$install_dir/$BRIDGE"
+    if [ -n "$has_bridge" ]; then
+        printf 'Installed %s to %s\n' "$installed_bridge" "$install_dir/$BRIDGE"
+    else
+        printf 'moraebot install warning: %s has no %s; Discord works, Slack needs a release that ships %s\n' \
+            "$ASSET" "$BRIDGE" "$BRIDGE" >&2
+    fi
 
     case ":${PATH:-}:" in
         *":$install_dir:"*) cmd="moraebot" ;;

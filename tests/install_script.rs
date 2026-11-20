@@ -285,25 +285,23 @@ fn fresh_install_puts_both_binaries_in_place() {
 }
 
 #[test]
-fn archive_without_the_bridge_installs_nothing() {
+fn pinned_pre_bridge_release_installs_moraebot_alone_with_a_warning() {
     let sb = Sandbox::new();
-    let old = fake_moraebot("moraebot 0.9.0", 0);
-    sb.put_existing(&old);
-    publish_assets_with(
-        &sb.latest(),
-        &[(ASSET, &fake_moraebot("moraebot 1.0.0", 0))],
-        None,
-    );
+    let pinned = fake_moraebot("moraebot 0.1.0", 0);
+    publish_assets_with(&sb.pinned("v0.1.0"), &[(ASSET, &pinned)], None);
 
-    let output = sb.install(None);
+    let output = sb.install(Some("v0.1.0"));
 
-    assert_eq!(exit_code(&output), Some(1), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("moraebot install error: E_ARCHIVE:"),
-        "{output:?}"
-    );
-    assert_eq!(fs::read(sb.installed()).expect("read installed"), old);
+    assert_eq!(exit_code(&output), Some(0), "{output:?}");
+    assert_eq!(fs::read(sb.installed()).expect("read installed"), pinned);
     assert!(!sb.installed_bridge().exists());
+    let warnings: Vec<String> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.starts_with("moraebot install warning:"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{output:?}");
+    assert!(warnings[0].contains("moraebot-slack-bridge"), "{output:?}");
     assert!(sb.leftover_temp_files().is_empty());
 }
 
