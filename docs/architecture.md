@@ -435,7 +435,8 @@ moraebot은 자기 기억 저장소(`~/.moraebot/memory`, git)를 둡니다. lea
 **오버레이는 키 단위로 합쳐집니다.** omp는 `--config` 파일을 오너의 전역·프로젝트 설정 위에 키 단위로 합칩니다(우선순위: 실행 중 덮어쓰기 > `--config` > 프로젝트 > 전역). 그래서 오버레이는 두 키만 바꾸고, 오너의 모델과 provider 설정은 그대로 씁니다. omp 18.22.2의 `packages/coding-agent/src/config/settings.ts`(`#mergeOwnLayers`, `getProvenance`)에서 확인했습니다. RPC 모드가 기억을 기본 `off`로 두더라도 오너가 전역 설정에서 켜 두면(예: `memory.backend: mnemopi`) 켜지므로 오버레이가 필요합니다.
 
 **시작할 때 확인.** omp가 실제로 적용한 설정은 moraebot이 읽을 수 없습니다. `omp config`는 `--config` 오버레이를 읽지 않고, RPC `get_state`에는 설정이 없습니다. 그래서 `moraebot run`은 시작할 때 모델을 부르지 않고 두 가지를 확인합니다(#39 대안).
-- `omp config get <key> --json`으로 오버레이의 두 키를 omp가 아는지 봅니다. 모르면(omp가 키 이름을 바꾼 경우) 오버레이가 조용히 무시되어 omp 기억이 되살아나므로 `E_OMP_OVERLAY`로 시작을 거부합니다.
+- `omp config get <key> --json`으로 오버레이의 두 키를 omp가 아는지 봅니다. 모르면(omp가 키 이름을 바꾼 경우) 오버레이가 조용히 무시되어 omp 기억이 되살아나므로 `E_OMP_OVERLAY`로 시작을 거부합니다. omp가 `Unknown setting: <key>`로 답할 때만 "모른다"로 봅니다. 다른 실패(예: 읽지 못하는 설정 파일)는 omp의 오류 줄을 붙여 `E_OMP_OVERLAY`로 알립니다.
+- 이 확인은 홈 폴더(`<home>`, 서비스의 WorkingDirectory)에서 omp를 실행합니다. omp는 작업 폴더의 프로젝트 설정(`.omp/config.yml` 등)도 읽으므로, 셸의 현재 폴더에서 돌리면 `check-config`와 서비스의 답이 달라질 수 있습니다(#54).
 - `omp --version`이 합치기를 확인한 버전(`omp_overlay::CHECKED_OMP_VERSION`, 지금 18.22.2)과 다르면 `W_OMP_VERSION` 경고를 로그에 남깁니다. 시작은 합니다.
 - `moraebot check-config`도 같은 두 가지를 확인해 `OK`/`WARN`/`FAIL omp overlay` 줄로 보여 줍니다. omp를 올린 뒤 서비스를 다시 띄우기 전에 확인할 수 있습니다.
 
