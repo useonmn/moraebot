@@ -4284,13 +4284,23 @@ impl Harness {
 /// the messages posted in the conversation.
 async fn core_save_then(end: &str) -> Vec<(String, String)> {
     let dir = tempfile::tempdir().unwrap();
+    let (h, _) = core_save_turn(dir.path(), end, |_| {}).await;
+    let sends = h.sends();
+    h.close().await;
+    sends
+}
+
+/// The turn of [`core_save_then`] on a harness under `root`, after `before` set it up: the
+/// harness, still open, and the turn's row.
+async fn core_save_turn(root: &Path, end: &str, before: impl FnOnce(&Harness)) -> (Harness, i64) {
     let rule = "릴리스는 금요일에 하자";
     let write = json!({
         "tool": moraebot::memory_tools::MEMORY_WRITE_TOOL,
         "arguments": {"text": rule, "bucket_hint": "core", "why": "qa"}
     });
-    let h = Harness::open_lead_memory(dir.path(), write.to_string(), end);
-    queued(
+    let h = Harness::open_lead_memory(root, write.to_string(), end);
+    before(&h);
+    let id = queued(
         h.handle(event(
             "4441",
             OWNER,
@@ -4300,9 +4310,7 @@ async fn core_save_then(end: &str) -> Vec<(String, String)> {
         .await,
     );
     assert!(h.step().await);
-    let sends = h.sends();
-    h.close().await;
-    sends
+    (h, id)
 }
 
 /// The saved-note line of `sends`, which must be the last line posted in thread 444.
@@ -4353,4 +4361,72 @@ async fn a_core_save_in_a_replied_turn_follows_the_reply() {
         reply.starts_with("echo: ") && reply.ends_with("\n\n"),
         "{reply:?}"
     );
+}
+
+#[tokio::test]
+async fn the_core_save_of_a_failed_turn_is_resent_when_its_send_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, id) = core_save_turn(dir.path(), "error", |h| {
+        h.adapter.fail_next_send_containing("[memory] saved m-")
+    })
+    .await;
+    assert_eq!(h.row(id).state, State::Failed);
+    assert!(!h.row(id).text_sent, "the notes are still owed");
+
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 1);
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
+    assert!(h.row(id).text_sent);
+    let sends = h.sends();
+    let note = last_core_note(&sends).to_owned();
+    let failed = ("444".to_owned(), notice_text(N_FAILED).to_owned());
+    let noted = ("444".to_owned(), note);
+    assert_eq!(
+        sends,
+        [failed, noted.clone(), noted],
+        "the notice, the failed notes send, then the notes once"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn the_core_save_of_an_interrupted_turn_waits_for_its_notice_and_is_resent() {
+    let dir = tempfile::tempdir().unwrap();
+    // The interrupted notice is the first send; it fails, so the notes wait for it.
+    let (h, id) = core_save_turn(dir.path(), "hang", |h| h.adapter.fail_next_send()).await;
+    let interrupted = ("444".to_owned(), notice_text(N_INTERRUPTED).to_owned());
+    assert_eq!(h.sends(), std::slice::from_ref(&interrupted));
+
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 1);
+    assert_eq!(bounded(h.dispatcher.resend_pending()).await.unwrap(), 0);
+    let row = h.row(id);
+    assert!(row.notice_sent && row.text_sent, "{row:?}");
+    let sends = h.sends();
+    let note = last_core_note(&sends).to_owned();
+    assert_eq!(
+        sends,
+        [interrupted.clone(), interrupted, ("444".to_owned(), note)]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn the_core_save_of_a_failed_turn_is_posted_once_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, id) = core_save_turn(dir.path(), "error", |h| {
+        h.adapter.fail_next_send_containing("[memory] saved m-")
+    })
+    .await;
+    h.close().await;
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    let sends = h.sends();
+    last_core_note(&sends);
+    assert_eq!(sends.len(), 1, "only the notes: {sends:?}");
+    assert!(h.row(id).text_sent);
+    drop(h);
+
+    let h = Harness::open(dir.path(), "ok");
+    bounded(h.dispatcher.startup()).await.unwrap();
+    assert!(h.sends().is_empty(), "the notes are posted exactly once");
 }

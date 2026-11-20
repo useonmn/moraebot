@@ -82,6 +82,8 @@ pub struct FakeAdapter {
     files: Mutex<FileScript>,
     sent_count: watch::Sender<usize>,
     fail_next_send: AtomicBool,
+    /// The next send whose text contains this fails ([`FakeAdapter::fail_next_send_containing`]).
+    fail_send_containing: Mutex<Option<String>>,
     fail_next_open_dm: AtomicBool,
     fail_next_edit: AtomicBool,
     reconnects: watch::Sender<u64>,
@@ -104,6 +106,7 @@ impl FakeAdapter {
             files: Mutex::new(FileScript::default()),
             sent_count: watch::channel(0).0,
             fail_next_send: AtomicBool::new(false),
+            fail_send_containing: Mutex::new(None),
             fail_next_open_dm: AtomicBool::new(false),
             fail_next_edit: AtomicBool::new(false),
             reconnects: watch::channel(0).0,
@@ -118,6 +121,15 @@ impl FakeAdapter {
 
     pub fn fail_next_send(&self) {
         self.fail_next_send.store(true, Ordering::SeqCst);
+    }
+
+    /// The next send whose text contains `needle` fails with `E_ADAPTER_SEND` (it is still
+    /// recorded, like any failed send); later ones succeed.
+    pub fn fail_next_send_containing(&self, needle: &str) {
+        *self
+            .fail_send_containing
+            .lock()
+            .expect("fake adapter send script lock") = Some(needle.to_owned());
     }
 
     /// The next `open_dm` fails with `E_ADAPTER_DM`.
@@ -264,7 +276,16 @@ impl MessengerAdapter for FakeAdapter {
             self.sent_count.send_replace(attempt);
             attempt
         };
-        if self.fail_next_send.swap(false, Ordering::SeqCst) {
+        let scripted = {
+            let mut needle = self
+                .fail_send_containing
+                .lock()
+                .expect("fake adapter send script lock");
+            needle
+                .take_if(|needle| text.contains(needle.as_str()))
+                .is_some()
+        };
+        if self.fail_next_send.swap(false, Ordering::SeqCst) || scripted {
             return Err(AdapterError {
                 code: E_ADAPTER_SEND,
                 message: "injected send failure".to_owned(),
