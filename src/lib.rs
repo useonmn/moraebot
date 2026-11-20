@@ -16,6 +16,7 @@ pub mod launchd;
 pub mod lead;
 pub mod logging;
 pub mod memory;
+pub mod memory_commands;
 pub mod omp;
 pub mod onboarding;
 pub mod persona;
