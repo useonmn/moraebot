@@ -357,10 +357,13 @@ fn init_then_setup_slack_writes_both_configs_and_activates_the_bridge() {
         Some(socket),
         "one socket path"
     );
-    assert_eq!(
-        socket,
-        home.join("run/slack-bridge.sock").to_str().expect("utf-8")
-    );
+    // The OS default (`XDG_RUNTIME_DIR` is removed, so Linux falls back to the home).
+    let default_socket = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/moraebot/slack-bridge.sock")
+    } else {
+        home.join("run/slack-bridge.sock")
+    };
+    assert_eq!(socket, default_socket.to_str().expect("utf-8"));
     assert_eq!(bridge_file["channel_id"].as_str(), Some("C222"));
     for text in [stdout.as_ref(), config_text.as_str(), bridge_text.as_str()] {
         assert!(!text.contains("SENTINEL"), "token leaked");
