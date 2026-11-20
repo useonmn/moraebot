@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::slack_bridge::config::check_slack_id;
+
 pub const E_MESSENGER: &str = "E_MESSENGER";
 pub const E_MESSENGER_MISSING: &str = "E_MESSENGER_MISSING";
 pub const E_OWNER_MISSING: &str = "E_OWNER_MISSING";
@@ -567,6 +569,32 @@ struct BridgeSection {
     allow: Option<Vec<AllowSection<String>>>,
 }
 
+/// The pre-bridge `[slack]` section, read only by [`Config::load_legacy_slack`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySlackSection {
+    owner_id: Option<String>,
+    channel_id: Option<String>,
+    bot_token_file: Option<PathBuf>,
+    app_token_file: Option<PathBuf>,
+    max_bot_replies: Option<u32>,
+    allow: Option<Vec<AllowSection<String>>>,
+}
+
+/// What a legacy `[slack]` section held that now belongs to `slack-bridge.toml`. Token
+/// paths are expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySlack {
+    /// The old top-level `messenger` value (`None` when it was not set); the move makes
+    /// it `"bridge"`.
+    pub messenger: Option<String>,
+    /// The socket path written into `[bridge]`, for `slack-bridge.toml` too.
+    pub socket: PathBuf,
+    pub channel_id: String,
+    pub bot_token_file: PathBuf,
+    pub app_token_file: PathBuf,
+}
+
 /// On-disk `[[<messenger>.allow]]` entry. `kind` and `role` stay text so a bad value
 /// gets an `E_CONFIG_VALUE` that names the entry.
 #[derive(Debug, Deserialize, Serialize)]
@@ -986,12 +1014,20 @@ impl Config {
                 ));
             }
         };
-        if file.slack.is_some() || file.messenger.as_deref() == Some("slack") {
+        if file.slack.is_some() {
             return Err(ConfigError::new(
                 E_SLACK_MOVED,
-                "Slack now runs in the separate moraebot-slack-bridge process; move the [slack] \
-                 section by hand as docs/bridge.md, section \"Moving a Slack config by hand\", \
-                 describes",
+                "Slack now runs in the separate moraebot-slack-bridge process; run `moraebot \
+                 setup slack` once to move the [slack] section to [bridge] and slack-bridge.toml",
+            ));
+        }
+        if file.messenger.as_deref() == Some("slack") {
+            return Err(ConfigError::new(
+                E_SLACK_MOVED,
+                "messenger = \"slack\" is gone: Slack now runs in the separate \
+                 moraebot-slack-bridge process; set messenger = \"bridge\" with a [bridge] \
+                 section by hand, or set messenger = \"discord\" and run `moraebot setup slack`, \
+                 which writes both",
             ));
         }
         let messenger = match file.messenger.as_deref() {
@@ -1079,6 +1115,90 @@ impl Config {
             },
             memory,
         })
+    }
+
+    /// Reads a `config.toml` that still holds the pre-bridge `[slack]` section, for the
+    /// one-time move in `moraebot setup slack`. Returns `None` without such a section.
+    /// Otherwise the returned config has `messenger = "bridge"` and a `[bridge]` section at
+    /// the path `socket` returns (asked only when there is a section to move) with the old
+    /// owner, reply limit and allow entries, and the Slack-only values come back as
+    /// [`LegacySlack`]. Nothing is written.
+    pub fn load_legacy_slack(
+        path: &Path,
+        env: &Env,
+        socket: impl FnOnce() -> Result<PathBuf, ConfigError>,
+    ) -> Result<Option<(Config, LegacySlack)>, ConfigError> {
+        let text = fs::read_to_string(path).map_err(|e| {
+            ConfigError::io(
+                E_CONFIG_READ,
+                &format!("cannot read {}", path.display()),
+                &e,
+            )
+        })?;
+        let mut table: toml::Table = toml::from_str(&text).map_err(|e| parse_error(&text, &e))?;
+        let Some(slack) = table.remove("slack") else {
+            return Ok(None);
+        };
+        if table.contains_key("bridge") {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "config.toml holds both [slack] and [bridge]; remove one of them, then run \
+                 `moraebot setup slack` again",
+            ));
+        }
+        let section: LegacySlackSection = slack
+            .try_into()
+            .map_err(|e| ConfigError::new(E_CONFIG_PARSE, format!("[slack]: {e}")))?;
+        let owner_id = section
+            .owner_id
+            .ok_or_else(|| ConfigError::new(E_OWNER_MISSING, "slack.owner_id is required"))?;
+        let channel_id = section
+            .channel_id
+            .ok_or_else(|| ConfigError::new(E_CHANNEL_MISSING, "slack.channel_id is required"))?;
+        let bot_token_file = section
+            .bot_token_file
+            .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "slack.bot_token_file is required"))?;
+        let app_token_file = section
+            .app_token_file
+            .ok_or_else(|| ConfigError::new(E_TOKEN_MISSING, "slack.app_token_file is required"))?;
+        check_slack_id("slack.owner_id", &owner_id, &['U', 'W'])?;
+        check_slack_id("slack.channel_id", &channel_id, &['C', 'G'])?;
+
+        let socket = socket()?;
+        let bridge = BridgeSection {
+            socket: Some(socket.clone()),
+            owner_id: Some(owner_id),
+            max_bot_replies: section.max_bot_replies,
+            allow: section.allow,
+        };
+        let bridge = toml::Value::try_from(bridge)
+            .map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))?;
+        table.insert("bridge".into(), bridge);
+        let messenger = table
+            .insert("messenger".into(), Platform::Bridge.as_str().into())
+            .and_then(|old| old.as_str().map(str::to_owned));
+        let moved =
+            toml::to_string(&table).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))?;
+        let config = Self::from_toml(&moved, env)?;
+        // The bridge section only checks that ids are text; the old section knew they
+        // are Slack ids. A bot is matched by its user id or its `B...` bot id.
+        if let Some(bridge) = &config.bridge {
+            for (index, entry) in bridge.access.allow.iter().enumerate() {
+                let prefixes: &[char] = match entry.kind {
+                    SenderKind::User => &['U', 'W'],
+                    SenderKind::Bot => &['U', 'W', 'B'],
+                };
+                check_slack_id(&format!("slack.allow[{index}].id"), &entry.id, prefixes)?;
+            }
+        }
+        let legacy = LegacySlack {
+            messenger,
+            socket,
+            channel_id,
+            bot_token_file: env.expand_tilde(&bot_token_file)?,
+            app_token_file: env.expand_tilde(&app_token_file)?,
+        };
+        Ok(Some((config, legacy)))
     }
 
     /// Serializes to `config.toml` text, including the resolved `home`.
@@ -2424,6 +2544,112 @@ mod tests {
         ];
         for text in cases {
             assert_eq!(code(fx.load(&text)), E_SLACK_MOVED, "{text}");
+        }
+    }
+
+    const LEGACY_SLACK: &str = "[slack]\nowner_id = \"U111\"\nchannel_id = \"C222\"\n\
+         bot_token_file = \"~/secrets/slack-bot.token\"\n\
+         app_token_file = \"~/secrets/slack-app.token\"\n";
+
+    fn legacy(fx: &Fixture, text: &str) -> Result<Option<(Config, LegacySlack)>, ConfigError> {
+        let path = fx.dir.path().join("config.toml");
+        fs::write(&path, text).expect("write config");
+        Config::load_legacy_slack(&path, &fx.env, || {
+            Ok(PathBuf::from("/h/u/run/slack-bridge.sock"))
+        })
+    }
+
+    #[test]
+    fn legacy_slack_section_moves_to_bridge() {
+        let fx = Fixture::new();
+        let text = format!(
+            "messenger = \"slack\"\naccess_mode = \"allowlist\"\nomp_path = {}\n{LEGACY_SLACK}\
+             max_bot_replies = 4\n[[slack.allow]]\nid = \"B0BOT\"\nkind = \"bot\"\n",
+            quoted(&fx.omp)
+        );
+        let (config, slack) = legacy(&fx, &text).expect("reads").expect("legacy section");
+        assert_eq!(config.messenger, Platform::Bridge);
+        let bridge = config.bridge.as_ref().expect("bridge");
+        assert_eq!(bridge.socket, Path::new("/h/u/run/slack-bridge.sock"));
+        assert_eq!(bridge.owner_id, "U111");
+        assert_eq!(bridge.access.max_bot_replies, Some(4));
+        assert_eq!(bridge.access.allow.len(), 1);
+        assert_eq!(bridge.access.allow[0].id, "B0BOT");
+        assert_eq!(bridge.access.allow[0].kind, SenderKind::Bot);
+        assert_eq!(
+            slack,
+            LegacySlack {
+                messenger: Some("slack".into()),
+                socket: PathBuf::from("/h/u/run/slack-bridge.sock"),
+                channel_id: "C222".into(),
+                bot_token_file: fx.dir.path().join("secrets/slack-bot.token"),
+                app_token_file: fx.dir.path().join("secrets/slack-app.token"),
+            }
+        );
+        let written = Config::from_toml(&config.to_toml().expect("toml"), &fx.env);
+        assert!(
+            written.is_ok(),
+            "the moved config loads with the normal loader"
+        );
+        let discord = text.replace("messenger = \"slack\"", "messenger = \"discord\"");
+        let (config, slack) = legacy(&fx, &discord)
+            .expect("reads")
+            .expect("legacy section");
+        assert_eq!(config.messenger, Platform::Bridge);
+        assert_eq!(slack.messenger.as_deref(), Some("discord"));
+    }
+
+    #[test]
+    fn no_legacy_slack_section_reads_as_none() {
+        let fx = Fixture::new();
+        let path = fx.dir.path().join("config.toml");
+        let slack_messenger = format!("messenger = \"slack\"\n{}", fx.valid_toml());
+        for text in [fx.valid_toml(), slack_messenger] {
+            fs::write(&path, &text).expect("write config");
+            // The socket is only asked for when there is a section to move.
+            let unused = || Err(ConfigError::new(E_CONFIG_VALUE, "socket asked for"));
+            let read = Config::load_legacy_slack(&path, &fx.env, unused).expect("reads");
+            assert!(read.is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn bad_legacy_slack_sections_are_refused() {
+        let fx = Fixture::new();
+        let omp = format!("omp_path = {}\n", quoted(&fx.omp));
+        let cases = [
+            (
+                format!(
+                    "{omp}{LEGACY_SLACK}[bridge]\nsocket = \"/h/u/s.sock\"\nowner_id = \"U1\"\n"
+                ),
+                E_CONFIG_VALUE,
+            ),
+            (
+                format!("{omp}{}", LEGACY_SLACK.replace("U111", "111")),
+                E_CONFIG_VALUE,
+            ),
+            (
+                format!("{omp}{}", LEGACY_SLACK.replace("C222", "X222")),
+                E_CONFIG_VALUE,
+            ),
+            (
+                format!(
+                    "{omp}{}",
+                    LEGACY_SLACK.replace("channel_id = \"C222\"\n", "")
+                ),
+                E_CHANNEL_MISSING,
+            ),
+            (format!("{omp}{LEGACY_SLACK}extra = 1\n"), E_CONFIG_PARSE),
+            (
+                format!(
+                    "access_mode = \"allowlist\"\n{omp}{LEGACY_SLACK}\
+                     [[slack.allow]]\nid = \"B0BOT\"\nkind = \"user\"\n"
+                ),
+                E_CONFIG_VALUE,
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(code(legacy(&fx, &text)), expected, "{text}");
         }
     }
 

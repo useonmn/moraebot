@@ -7,6 +7,9 @@
     "description": "moraebot, a personal assistant bot (Socket Mode, owner-only)"
   },
   "features": {
+    "agent_view": {
+      "agent_description": "Talk to the coding agent on your own machine. Each DM thread is its own conversation."
+    },
     "app_home": {
       "home_tab_enabled": false,
       "messages_tab_enabled": true,
@@ -20,6 +23,7 @@
   "oauth_config": {
     "scopes": {
       "bot": [
+        "assistant:write",
         "channels:history",
         "chat:write",
         "files:read",

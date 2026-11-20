@@ -1,13 +1,16 @@
 #!/bin/sh
-# Install or upgrade moraebot from a GitHub release (Apple Silicon macOS, Linux x86_64 or aarch64).
+# Install or upgrade moraebot and moraebot-slack-bridge from a GitHub release
+# (Apple Silicon macOS, Linux x86_64 or aarch64). Releases made before the bridge existed
+# hold only moraebot; it is installed alone with a warning that Slack needs a newer release.
 #
 #   curl -fsSL https://github.com/useonmn/moraebot/releases/latest/download/install.sh | sh
 #
 # MORAEBOT_VERSION      release tag such as v0.1.0 (default: latest)
-# MORAEBOT_INSTALL_DIR  where the binary goes (default: $HOME/.local/bin)
+# MORAEBOT_INSTALL_DIR  where the binaries go (default: $HOME/.local/bin)
 # MORAEBOT_DOWNLOAD_BASE  release base URL (default: the GitHub releases page)
 #
-# Exit codes: 0 installed, 1 any failure (nothing is replaced on failure).
+# Exit codes: 0 installed, 1 any failure. Nothing is replaced on failure, except when the
+# last rename fails after the first one worked; the error then names the file replaced.
 set -eu
 
 SUMS="SHA256SUMS.txt"
@@ -24,8 +27,11 @@ E_ARCHIVE="E_ARCHIVE"
 E_SMOKE="E_SMOKE"
 E_REPLACE="E_REPLACE"
 
+BRIDGE="moraebot-slack-bridge"
+
 tmp=""
 new=""
+new_bridge=""
 
 fail() {
     printf 'moraebot install error: %s: %s\n' "$1" "$2" >&2
@@ -35,6 +41,9 @@ fail() {
 cleanup() {
     if [ -n "$new" ]; then
         rm -f "$new"
+    fi
+    if [ -n "$new_bridge" ]; then
+        rm -f "$new_bridge"
     fi
     if [ -n "$tmp" ]; then
         rm -rf "$tmp"
@@ -111,18 +120,45 @@ main() {
         fail "$E_CHECKSUM" "checksum mismatch for $ASSET; nothing was installed"
 
     tar -xzf "$tmp/$ASSET" -C "$tmp" moraebot ||
-        fail "$E_ARCHIVE" "$ASSET does not contain moraebot"
+        fail "$E_ARCHIVE" "$ASSET does not contain moraebot; nothing was installed"
+    has_bridge=""
+    if tar -tzf "$tmp/$ASSET" | grep -qx "$BRIDGE"; then
+        tar -xzf "$tmp/$ASSET" -C "$tmp" "$BRIDGE" ||
+            fail "$E_ARCHIVE" "could not unpack $BRIDGE from $ASSET; nothing was installed"
+        has_bridge="yes"
+    fi
 
+    # Every new binary is written and run before any old file is replaced.
     new="$install_dir/.moraebot.new.$$"
     cp "$tmp/moraebot" "$new" || fail "$E_REPLACE" "could not write $new"
     chmod 755 "$new" || fail "$E_REPLACE" "could not make $new executable"
+    if [ -n "$has_bridge" ]; then
+        new_bridge="$install_dir/.$BRIDGE.new.$$"
+        cp "$tmp/$BRIDGE" "$new_bridge" || fail "$E_REPLACE" "could not write $new_bridge"
+        chmod 755 "$new_bridge" || fail "$E_REPLACE" "could not make $new_bridge executable"
+    fi
     installed="$("$new" --version </dev/null)" ||
         fail "$E_SMOKE" "the downloaded moraebot does not run; nothing was installed"
+    if [ -n "$has_bridge" ]; then
+        installed_bridge="$("$new_bridge" --version </dev/null)" ||
+            fail "$E_SMOKE" "the downloaded $BRIDGE does not run; nothing was installed"
+    fi
     mv -f "$new" "$install_dir/moraebot" ||
         fail "$E_REPLACE" "could not replace $install_dir/moraebot"
     new=""
+    if [ -n "$has_bridge" ]; then
+        mv -f "$new_bridge" "$install_dir/$BRIDGE" ||
+            fail "$E_REPLACE" "replaced $install_dir/moraebot, but could not replace $install_dir/$BRIDGE; run the install line again"
+        new_bridge=""
+    fi
 
     printf 'Installed %s to %s\n' "$installed" "$install_dir/moraebot"
+    if [ -n "$has_bridge" ]; then
+        printf 'Installed %s to %s\n' "$installed_bridge" "$install_dir/$BRIDGE"
+    else
+        printf 'moraebot install warning: %s has no %s; Discord works, Slack needs a release that ships %s\n' \
+            "$ASSET" "$BRIDGE" "$BRIDGE" >&2
+    fi
 
     case ":${PATH:-}:" in
         *":$install_dir:"*) cmd="moraebot" ;;
@@ -138,11 +174,17 @@ main() {
             ;;
     esac
 
-    if [ -e "${MORAEBOT_HOME:-$HOME/.moraebot}/bin/moraebot" ]; then
-        printf 'A background copy exists: run "moraebot %s" to update it.\n' "$SERVICE"
+    moraebot_home="${MORAEBOT_HOME:-$HOME/.moraebot}"
+    if [ -e "$moraebot_home/bin/moraebot" ]; then
+        # A pre-bridge config makes the install command fail until setup slack moved it.
+        if grep -q '^\[slack\]' "$moraebot_home/config.toml" 2>/dev/null; then
+            printf 'A background copy exists and config.toml still has a [slack] section: run "moraebot setup slack", then "moraebot %s".\n' "$SERVICE"
+        else
+            printf 'A background copy exists: run "moraebot %s" to update it.\n' "$SERVICE"
+        fi
     fi
 
-    if [ ! -e "${MORAEBOT_HOME:-$HOME/.moraebot}/config.toml" ]; then
+    if [ ! -e "$moraebot_home/config.toml" ]; then
         printf 'Next steps:\n  %s init\n  %s check-config\n  %s %s\nThen send the bot a message in its channel or a DM.\n' \
             "$cmd" "$cmd" "$cmd" "$SERVICE"
     fi
