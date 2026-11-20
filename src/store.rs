@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use rusqlite::{
@@ -264,6 +264,23 @@ pub struct Store {
     conn: Connection,
     /// Called after every commit that inserted a memory job ([`Store::set_memory_wake`]).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Dropped after `conn` (fields drop in order), so [`StoreClosed`] resolves only once the
+    /// connection and its exclusive lock are gone.
+    closed: Option<mpsc::Sender<()>>,
+}
+
+/// Resolves when the [`Store`] it came from was dropped and released the database.
+pub struct StoreClosed(mpsc::Receiver<()>);
+
+impl StoreClosed {
+    /// Blocks until the store was dropped, at most `limit`. Returns `false` when it is still
+    /// open after `limit`.
+    pub fn wait(self, limit: Duration) -> bool {
+        !matches!(
+            self.0.recv_timeout(limit),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        )
+    }
 }
 
 /// Most distinct tools one [`TurnTrace`] keeps.
@@ -900,12 +917,23 @@ impl Store {
         conn.execute_batch(SCHEMA).map_err(classify)?;
         let mut conn = conn;
         migrate(&mut conn).map_err(classify)?;
-        Ok(Self { conn, wake: None })
+        Ok(Self {
+            conn,
+            wake: None,
+            closed: None,
+        })
     }
 
     /// Sets the call made after every commit that inserted a memory job (the observer's wake).
     pub fn set_memory_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.wake = Some(wake);
+    }
+
+    /// A [`StoreClosed`] that resolves once this store is dropped; a later call replaces it.
+    pub fn closed(&mut self) -> StoreClosed {
+        let (tx, rx) = mpsc::channel();
+        self.closed = Some(tx);
+        StoreClosed(rx)
     }
 
     /// Calls the memory wake when a job was inserted; call only after the commit.
@@ -2308,6 +2336,26 @@ mod tests {
         let err = Store::open(&path).err().expect("second open must fail");
         assert!(matches!(err, StoreError::AlreadyRunning));
         assert_eq!(err.code(), E_ALREADY_RUNNING);
+    }
+
+    #[test]
+    fn closed_resolves_once_the_store_released_the_database() {
+        let (_d, path, mut s) = open_tmp();
+        let closed = s.closed();
+        let reopen = std::thread::spawn(move || {
+            let released = closed.wait(Duration::from_secs(30));
+            (released, Store::open(&path).map(drop))
+        });
+        drop(s);
+        let (released, reopened) = reopen.join().unwrap();
+        assert!(released);
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+    }
+
+    #[test]
+    fn closed_times_out_while_the_store_is_open() {
+        let (_d, _path, mut s) = open_tmp();
+        assert!(!s.closed().wait(Duration::from_millis(10)));
     }
 
     #[test]
