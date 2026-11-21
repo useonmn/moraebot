@@ -60,6 +60,10 @@
 //! Reply gate: with FAKE_OMP_REPLY_GATE=<path> set, a prompt answered like `ok` writes its
 //! reply only once `<path>` exists (`agent_start` comes at once).
 //!
+//! Usage: with FAKE_OMP_USAGE set (a JSON object such as
+//! `{"input":10,"output":5,"cacheRead":900,"cacheWrite":0}`), every assistant message a run ends
+//! with carries it as its `usage`, in `message_end` and `agent_end` alike.
+//!
 //! Refused prompt: a prompt whose message contains FAKE_OMP_REJECT_TRIGGER (unset
 //! or empty: none) gets an error `response` (code `E_PROMPT_REFUSED`) in every
 //! mode, and no run.
@@ -788,14 +792,20 @@ fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
 }
 
 /// Writes `message_end` and `agent_end` for one assistant `text`; `extra`
-/// fields are added to the `agent_end` frame.
+/// fields are added to the `agent_end` frame. The message carries FAKE_OMP_USAGE as its usage.
 fn end_run(text: &str, extra: Value, out: &mut impl Write) {
-    let assistant = json!({
+    let mut assistant = json!({
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
         "stopReason": "stop",
         "timestamp": 0,
     });
+    if let Some(usage) = std::env::var("FAKE_OMP_USAGE")
+        .ok()
+        .and_then(|usage| serde_json::from_str::<Value>(&usage).ok())
+    {
+        assistant["usage"] = usage;
+    }
     send(out, &json!({"type": "message_end", "message": assistant}));
     let mut end = json!({"type": "agent_end", "messages": [assistant]});
     if let (Some(end), Value::Object(extra)) = (end.as_object_mut(), extra) {

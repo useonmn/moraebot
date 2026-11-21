@@ -360,7 +360,7 @@ fn place(bucket: &Bucket) -> String {
         Bucket::Thread(key) => format!("conversation {key}"),
         Bucket::Owner => "core rules".to_owned(),
         Bucket::Boundaries => "core boundaries".to_owned(),
-        Bucket::SelfObs | Bucket::SelfModel => "self".to_owned(),
+        Bucket::SelfObs => "self".to_owned(),
     }
 }
 
@@ -1499,7 +1499,6 @@ impl Advisor {
             code,
             job_id: None,
             omp_version: None,
-            jev_model: None,
             detail: Some(detail),
         };
         if let Err(err) = lock(&self.store).memory_log(&row) {

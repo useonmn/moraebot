@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use crate::omp::LeadStatus;
+use crate::omp::{LeadCache, LeadStatus};
 
 /// The language a status question was asked in; the answer uses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +71,14 @@ pub struct LaneLine<'a> {
 
 /// The status answer for conversation `key`: the lead's turn (`lead`, its intent already
 /// cleaned), the running lanes of this conversation (`lanes`, each task's first line cleaned by
-/// `clean`, which scrubs secrets and paths like a lane note) and the number of running lanes of
-/// other conversations.
+/// `clean`, which scrubs secrets and paths like a lane note), the number of running lanes of
+/// other conversations, and one last line from `cache`: the lead's prompt cache hit rate over
+/// its recent turns and whether a memory change waits for the next lead restart.
 pub fn reply(
     lang: Lang,
     key: &str,
     lead: Option<&LeadStatus>,
+    cache: &LeadCache,
     lanes: &[LaneLine],
     others: usize,
     clean: &dyn Fn(&str) -> String,
@@ -147,7 +149,30 @@ pub fn reply(
             .to_owned(),
         );
     }
+    lines.push(cache_line(lang, cache));
     lines.join("\n")
+}
+
+/// The prompt cache line of a status answer.
+fn cache_line(lang: Lang, cache: &LeadCache) -> String {
+    let mut line = match (lang, cache.recent.hit_percent()) {
+        (Lang::Korean, Some(percent)) => {
+            format!("프롬프트 캐시 적중률: 최근 {}턴 {percent}%", cache.turns)
+        }
+        (Lang::English, Some(percent)) => format!(
+            "Prompt cache hit rate: {percent}% over the last {} turns.",
+            cache.turns
+        ),
+        (Lang::Korean, None) => "프롬프트 캐시: 아직 잰 사용량이 없어요".to_owned(),
+        (Lang::English, None) => "Prompt cache: no usage measured yet.".to_owned(),
+    };
+    if cache.memory_waiting {
+        line.push_str(match lang {
+            Lang::Korean => " (바뀐 기억은 다음 lead 재시작 때 시스템 프롬프트에 반영돼요)",
+            Lang::English => " A memory change waits for the next lead restart.",
+        });
+    }
+    line
 }
 
 /// Whole minutes, at least one.
@@ -222,30 +247,80 @@ mod tests {
             running: Some(Duration::from_secs(30)),
             task: "\nfix the build in /qa/work/src\nmore detail",
         }];
+        let none = LeadCache::default();
         assert_eq!(
-            reply(Lang::English, "p:th:1", Some(&lead), &lanes, 2, &clean),
+            reply(
+                Lang::English,
+                "p:th:1",
+                Some(&lead),
+                &none,
+                &lanes,
+                2,
+                &clean
+            ),
             "Working on this conversation for 7 min.\nCurrent step: running the tests\n\
              Background lanes of this conversation: 1\n- lane 4 (1 min): fix the build in ./src\n\
-             2 more lanes run for other conversations."
+             2 more lanes run for other conversations.\nPrompt cache: no usage measured yet."
         );
         let no_intent = turn("p:th:1", Some(("read", None)));
         assert_eq!(
-            reply(Lang::Korean, "p:th:1", Some(&no_intent), &[], 0, &clean),
-            "이 대화 일을 7분째 하고 있어요\n지금 단계: read\n돌고 있는 백그라운드 작업은 없어요"
+            reply(
+                Lang::Korean,
+                "p:th:1",
+                Some(&no_intent),
+                &none,
+                &[],
+                0,
+                &clean
+            ),
+            "이 대화 일을 7분째 하고 있어요\n지금 단계: read\n돌고 있는 백그라운드 작업은 없어요\n\
+             프롬프트 캐시: 아직 잰 사용량이 없어요"
         );
     }
 
     #[test]
     fn another_conversations_turn_is_named_without_details() {
         let lead = turn("p:th:2", Some(("bash", Some("secret plan"))));
-        let text = reply(Lang::English, "p:th:1", Some(&lead), &[], 0, &clean);
+        let none = LeadCache::default();
+        let text = reply(Lang::English, "p:th:1", Some(&lead), &none, &[], 0, &clean);
         assert_eq!(
             text,
-            "Working on another conversation for 7 min.\nNo background lanes are running."
+            "Working on another conversation for 7 min.\nNo background lanes are running.\n\
+             Prompt cache: no usage measured yet."
         );
         assert_eq!(
-            reply(Lang::Korean, "p:th:1", None, &[], 1, &clean),
-            "지금 하고 있는 일은 없어요\n다른 대화의 백그라운드 작업도 1개 돌고 있어요"
+            reply(Lang::Korean, "p:th:1", None, &none, &[], 1, &clean),
+            "지금 하고 있는 일은 없어요\n다른 대화의 백그라운드 작업도 1개 돌고 있어요\n\
+             프롬프트 캐시: 아직 잰 사용량이 없어요"
+        );
+    }
+
+    #[test]
+    fn the_answer_ends_with_the_cache_hit_rate_and_a_waiting_memory_change() {
+        let cache = LeadCache {
+            turns: 3,
+            recent: crate::omp::TokenUsage {
+                input: 10,
+                output: 50,
+                cache_read: 970,
+                cache_write: 20,
+            },
+            last_restart: None,
+            memory_waiting: true,
+        };
+        let english = reply(Lang::English, "p:th:1", None, &cache, &[], 0, &clean);
+        assert_eq!(
+            english.lines().last(),
+            Some(
+                "Prompt cache hit rate: 97% over the last 3 turns. A memory change waits for the next lead restart."
+            )
+        );
+        let korean = reply(Lang::Korean, "p:th:1", None, &cache, &[], 0, &clean);
+        assert_eq!(
+            korean.lines().last(),
+            Some(
+                "프롬프트 캐시 적중률: 최근 3턴 97% (바뀐 기억은 다음 lead 재시작 때 시스템 프롬프트에 반영돼요)"
+            )
         );
     }
 

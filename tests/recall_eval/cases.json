@@ -164,7 +164,6 @@
     "conversation": "slack:C0EVAL:1401",
     "entries": [
       {"key": "s1", "bucket": "self_obs", "day": "2026-11-12", "text": "I said the deploy finished before checking; the owner wants checked facts only."},
-      {"key": "s2", "bucket": "self", "day": "2026-11-14", "text": "I tend to report a deploy as done before checking its log."},
       {"key": "g1", "bucket": "thread:slack:C0EVAL:1402", "day": "2026-10-25", "text": "The deploy job posts its result in the #deploy-log channel; check the deploy there before answering."},
       {"key": "d1", "bucket": "thread:slack:C0EVAL:1402", "day": "2026-10-26", "text": "The staging banner is orange."}
     ],

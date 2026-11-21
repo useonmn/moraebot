@@ -377,7 +377,8 @@ fn save_sora(h: &Harness) {
 async fn persona_change_restarts_the_lead_before_the_next_turn() {
     let h = Harness::new();
     save_sora(&h);
-    let m = h.manager("ok");
+    // `lead.cache_minutes = 0`: any change restarts the lead before the next turn.
+    let m = h.manager("ok").with_cache_window(None);
     let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
         .await
         .main
@@ -444,7 +445,10 @@ async fn removed_persona_restarts_without_it() {
     let h = Harness::new();
     save_sora(&h);
     let first = persona::append("H", persona::load(&h.config.home).unwrap().as_deref());
-    let m = h.manager("ok").with_hints("H".into());
+    let m = h
+        .manager("ok")
+        .with_hints("H".into())
+        .with_cache_window(None);
     bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     std::fs::remove_file(persona::path(&h.config.home)).unwrap();
     bounded(m.prompt(KEY_B, 2, Sender::Owner, "again")).await;
@@ -458,7 +462,10 @@ async fn removed_persona_restarts_without_it() {
 async fn refused_persona_change_restarts_without_it() {
     let h = Harness::new();
     save_sora(&h);
-    let m = h.manager("ok").with_hints("H".into());
+    let m = h
+        .manager("ok")
+        .with_hints("H".into())
+        .with_cache_window(None);
     bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
     let secret = ["gl", "pat-"].concat() + &"c".repeat(20);
     std::fs::write(
@@ -483,7 +490,7 @@ async fn onboarding_finish_applies_from_the_next_turn() {
     let h = Harness::new();
     h.store.lock().unwrap().start_onboarding().unwrap();
     let r1 = owner_row(&h, "m-on-1", "run-tools");
-    let m = onboarding_manager(&h, &[finish_done_call()]);
+    let m = onboarding_manager(&h, &[finish_done_call()]).with_cache_window(None);
     bounded(m.prompt(
         KEY_A,
         r1,
@@ -526,7 +533,7 @@ async fn unsettled_session_defers_the_restart_until_settled() {
     let mut h = Harness::new();
     h.config.omp_path = unsettled_once_wrapper(h.dir.path());
     save_sora(&h);
-    let m = h.manager("ok");
+    let m = h.manager("ok").with_cache_window(None);
     let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
         .await
         .main
@@ -546,7 +553,14 @@ async fn unsettled_session_defers_the_restart_until_settled() {
     bounded(m.shutdown_all()).await;
 
     assert_eq!(r1, Outcome::Reply("echo: hi".into()));
-    assert_eq!(r2, Outcome::Reply("echo: again".into()));
+    // Not settled: no restart, so the change goes in as an update block.
+    let Outcome::Reply(r2) = r2 else {
+        panic!("{r2:?}")
+    };
+    assert!(
+        r2.starts_with("echo: again") && r2.contains(moraebot::pin::UPDATE_OPEN),
+        "{r2}"
+    );
     assert_eq!(r3, Outcome::Reply("echo: more".into()));
     assert_eq!(after_second, 1);
     assert_eq!(pids.len(), 2);
@@ -563,7 +577,7 @@ async fn failed_restart_reports_the_start_failure_then_starts_again() {
     let marker = h.dir.path().join("refuse-start");
     h.config.omp_path = refusing_wrapper(h.dir.path(), &marker);
     save_sora(&h);
-    let m = h.manager("ok");
+    let m = h.manager("ok").with_cache_window(None);
     let r1 = bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi"))
         .await
         .main
@@ -2412,7 +2426,10 @@ async fn a_shadow_pick_is_offered_again_only_to_a_new_lead_generation() {
     let reply = format!(r#"{{"pick":["{id}"]}}"#);
     let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())]);
     let mut progress = advisor.progress();
-    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let m = h
+        .manager("ok")
+        .with_recall(Arc::clone(&advisor))
+        .with_cache_window(None);
     let ask = |row: i64, text: &str| lead::owner_input(KEY_A, row, text);
 
     bounded(m.prompt(KEY_A, 1, Sender::Owner, &ask(1, "first"))).await;
@@ -2779,7 +2796,10 @@ async fn late_picks_of_an_earlier_lead_generation_are_dropped() {
     let advisor = gated_advisor(&h, &id, 50);
     let mut progress = advisor.progress();
     let mut asked = advisor.asked();
-    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let m = h
+        .manager("ok")
+        .with_recall(Arc::clone(&advisor))
+        .with_cache_window(None);
     let first = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
     bounded(m.prompt(KEY_A, 1, Sender::Owner, &first)).await;
     bounded(asked.wait_for(|n| *n >= 1)).await.expect("asked");
@@ -3014,7 +3034,11 @@ async fn a_note_joins_the_running_turn_without_taking_the_owners_steer_slot() {
 #[tokio::test]
 async fn a_note_never_reaches_the_turn_of_a_restarted_lead() {
     let h = Harness::new();
-    let manager = h.steer_manager("merged");
+    let manager = Arc::new(
+        h.manager("steer")
+            .with_extra_env([("FAKE_OMP_STEER_CASE", "merged")])
+            .with_cache_window(None),
+    );
     let notes = manager.notes();
     let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
     turn_running(&manager, KEY_STEER).await;
@@ -3563,4 +3587,267 @@ async fn a_mid_wakes_reject_never_hides_the_entry_from_the_next_owner_wake() {
     want.sort();
     assert_eq!(delivered, want);
     m.shutdown_all().await;
+}
+
+// --- Prompt-cache pinning ---
+
+/// Why the lead child was last closed to be started again, if it was.
+fn last_restart(m: &OmpManager) -> Option<&'static str> {
+    m.lead_cache().last_restart.map(|(_, reason)| reason)
+}
+
+#[tokio::test]
+async fn a_warm_lead_takes_a_persona_change_as_one_update_block() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let pid = m.child_pid().await;
+    save_persona(&h, "Kai", "", "");
+    assert!(
+        m.lead_cache().memory_waiting,
+        "the change waits for a restart"
+    );
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "again")).await;
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "more")).await;
+    let same = m.child_pid().await;
+    let waiting = m.lead_cache().memory_waiting;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(same, pid, "the warm lead keeps its child and its prompt");
+    assert_eq!(h.start_pids().len(), 1);
+    assert!(waiting);
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 3);
+    assert!(!messages[0].contains(moraebot::pin::UPDATE_OPEN));
+    assert!(
+        messages[1].starts_with("again")
+            && messages[1].contains(moraebot::pin::UPDATE_OPEN)
+            && messages[1].contains("Name: Kai")
+            && messages[1].contains("Name: Sora"),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        !messages[2].contains(moraebot::pin::UPDATE_OPEN),
+        "the update goes in once: {}",
+        messages[2]
+    );
+    assert_eq!(last_restart(&m), None);
+}
+
+#[tokio::test]
+async fn a_change_back_to_the_pinned_prompt_says_so_once() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "one")).await;
+    save_persona(&h, "Kai", "", "");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "two")).await;
+    save_sora(&h);
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "three")).await;
+    bounded(m.prompt(KEY_A, 4, Sender::Owner, "four")).await;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(h.start_pids().len(), 1);
+    let messages = prompt_messages(&h);
+    assert!(messages[1].contains(moraebot::pin::UPDATE_OPEN));
+    assert!(
+        messages[2].contains(moraebot::pin::REVERT_HEADER)
+            && !messages[2].contains(moraebot::pin::UPDATE_HEADER),
+        "{}",
+        messages[2]
+    );
+    assert!(
+        !messages[3].contains(moraebot::pin::REVERT_HEADER)
+            && !messages[3].contains(moraebot::pin::UPDATE_OPEN),
+        "{}",
+        messages[3]
+    );
+}
+
+#[tokio::test]
+async fn a_lead_idle_past_the_cache_window_restarts_with_the_new_prompt() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok").with_cache_window(Some(Duration::ZERO));
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "unchanged")).await;
+    let before = h.start_pids().len();
+    save_persona(&h, "Kai", "", "");
+    let r = bounded(m.prompt(KEY_A, 3, Sender::Owner, "again")).await;
+    let reason = last_restart(&m);
+    let waiting = m.lead_cache().memory_waiting;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(before, 1, "no change, no restart");
+    assert_eq!(r.main.outcome, Outcome::Reply("echo: again".into()));
+    assert_eq!(h.start_pids().len(), 2);
+    let appends = appends(&h);
+    assert!(appends[1].contains("Name: Kai") && !appends[1].contains("Name: Sora"));
+    let messages = prompt_messages(&h);
+    assert!(!messages[2].contains(moraebot::pin::UPDATE_OPEN));
+    assert_eq!(reason, Some("memory_idle"));
+    assert!(!waiting);
+}
+
+#[tokio::test]
+async fn a_compacted_lead_restarts_at_the_next_prompt_after_a_change() {
+    let h = Harness::new();
+    save_sora(&h);
+    let compaction = serde_json::json!({"frame": {
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    }});
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", compaction.to_string())]);
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "run-tools")).await;
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "unchanged")).await;
+    let before = h.start_pids().len();
+    save_persona(&h, "Kai", "", "");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "again")).await;
+    let reason = last_restart(&m);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(before, 1, "a compaction alone never restarts the lead");
+    assert_eq!(h.start_pids().len(), 2);
+    assert!(appends(&h)[1].contains("Name: Kai"));
+    assert_eq!(reason, Some("memory_compacted"));
+}
+
+#[tokio::test]
+async fn the_refresh_command_restarts_a_warm_lead_once() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m = h.manager("ok");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    m.refresh_memory();
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "same prompt")).await;
+    let unchanged = h.start_pids().len();
+    save_persona(&h, "Kai", "", "");
+    m.refresh_memory();
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "again")).await;
+    let reason = last_restart(&m);
+    save_persona(&h, "Mia", "", "");
+    bounded(m.prompt(KEY_A, 4, Sender::Owner, "later")).await;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(unchanged, 1, "nothing to set again: no restart");
+    assert_eq!(h.start_pids().len(), 2, "the request is used up");
+    assert!(appends(&h)[1].contains("Name: Kai"));
+    assert_eq!(reason, Some("memory_requested"));
+    let messages = prompt_messages(&h);
+    assert!(!messages[2].contains(moraebot::pin::UPDATE_OPEN));
+    assert!(messages[3].contains(moraebot::pin::UPDATE_OPEN) && messages[3].contains("Name: Mia"));
+}
+
+#[tokio::test]
+async fn cache_minutes_zero_restarts_on_any_change() {
+    let mut h = Harness::new();
+    h.config.lead.cache_minutes = Some(0);
+    save_sora(&h);
+    let m = h.manager("ok");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    save_persona(&h, "Kai", "", "");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "again")).await;
+    let reason = last_restart(&m);
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(h.start_pids().len(), 2);
+    assert!(appends(&h)[1].contains("Name: Kai"));
+    assert!(!prompt_messages(&h)[1].contains(moraebot::pin::UPDATE_OPEN));
+    assert_eq!(reason, Some("unpinned"));
+}
+
+#[tokio::test]
+async fn outside_text_provenance_survives_a_restart_until_a_new_session() {
+    use moraebot::memory::MemoryHandle;
+    use moraebot::memory_tools::MEMORY_WRITE_TOOL;
+
+    let h = Harness::new();
+    save_sora(&h);
+    let memory = MemoryHandle::spawn(qa_memory_store(&h)).expect("memory worker");
+    let write = serde_json::json!({
+        "tool": MEMORY_WRITE_TOOL,
+        "arguments": {"text": "rusqlite 0.43 needs Rust 1.89", "bucket_hint": "thread", "why": "qa"}
+    });
+    // Each tool turn saves first, then omp reports a web search the lead ran.
+    let web = serde_json::json!({"frame": {
+        "type": "tool_execution_start",
+        "toolCallId": "web-1",
+        "toolName": "web_search",
+        "args": {"query": "rusqlite msrv"}
+    }});
+    let script = [write, web].map(|v| v.to_string()).join("\n");
+    let today = moraebot::memory::Day::parse("2026-11-20").unwrap();
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", script)])
+        .with_memory_clock(Arc::new(move || today))
+        .with_memory(memory.clone())
+        .with_cache_window(None);
+    let turn = |n: i64| {
+        let row = owner_row(&h, &format!("m-pin-{n}"), "run-tools");
+        (row, lead::owner_input(KEY_A, row, "run-tools"))
+    };
+    let (row, input) = turn(1);
+    bounded(m.prompt(KEY_A, row, Sender::Owner, &input)).await;
+    // A persona change restarts the lead: a new child of the same session.
+    save_persona(&h, "Kai", "", "");
+    let (row, input) = turn(2);
+    bounded(m.prompt(KEY_A, row, Sender::Owner, &input)).await;
+    let restarted = h.start_pids().len();
+    bounded(m.new_session()).await.expect("new session");
+    let (row, input) = turn(3);
+    bounded(m.prompt(KEY_A, row, Sender::Owner, &input)).await;
+    let results = h.tool_results();
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(restarted, 2);
+    assert_eq!(results.len(), 3, "{results:?}");
+    let prov: Vec<String> = results
+        .iter()
+        .map(|(_, text)| {
+            let saved: Value = serde_json::from_str(text).expect("write json");
+            saved["provenance"].as_str().expect("provenance").to_owned()
+        })
+        .collect();
+    assert_ne!(prov[0], "tool", "nothing outside was read yet");
+    assert_eq!(
+        prov[1], "tool",
+        "the session read outside text before the restart"
+    );
+    assert_eq!(prov[2], prov[0], "a new session starts clean");
+}
+
+#[tokio::test]
+async fn usage_of_lead_turns_is_summed_for_the_cache_hit_rate() {
+    let h = Harness::new();
+    let usage = r#"{"input":10,"output":5,"cacheRead":970,"cacheWrite":20}"#;
+    let m = h
+        .manager("ok")
+        .with_extra_env([("FAKE_OMP_USAGE", usage.to_owned())]);
+    let empty = m.lead_cache();
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "one")).await;
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "two")).await;
+    let cache = m.lead_cache();
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(empty.turns, 0);
+    assert_eq!(empty.recent.hit_percent(), None);
+    assert_eq!(cache.turns, 2);
+    assert_eq!(
+        cache.recent,
+        omp::TokenUsage {
+            input: 20,
+            output: 10,
+            cache_read: 1940,
+            cache_write: 40,
+        }
+    );
+    assert_eq!(cache.recent.hit_percent(), Some(97));
 }

@@ -14,7 +14,7 @@
 //! - otherwise `lane` when the text is one whole sentence of the lane's own words in a lane
 //!   result row of the group (a plain or `done` result) and the excerpt filter
 //!   ([`ExcerptFilter`]) accepts it; the entry then names the lane, its result and the
-//!   sentence, the same source the observer gives that sentence's summary, so only one entry
+//!   sentence, so only one entry
 //!   is kept whichever comes first ([`MemoryHandle::queue_add`], [`memory::Op::AddUnique`]);
 //! - otherwise `tool` when the lead child has used a tool that may read outside text
 //!   ([`reads_outside`]) since it started, or when the group holds a lane result row (its
@@ -328,7 +328,7 @@ pub fn plan_write(
 
 /// The whole sentence `text` of lane result row `row` (a plain or `done` result), with the
 /// lane's source (`lane=<id> seq=<n> s=<sentence>`, from the tag, the row's message id and
-/// the sentence's number, as the observer numbers it).
+/// the sentence's number, as [`memory::own_sentences`] numbers it).
 fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
     let tag = lead::parse_tag(&row.text)?;
     let lane = tag

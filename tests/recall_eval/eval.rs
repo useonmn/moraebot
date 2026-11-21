@@ -52,7 +52,7 @@ pub struct Case {
 #[serde(deny_unknown_fields)]
 pub struct Seed {
     pub key: String,
-    /// `thread:<key>`, `project:<repo>`, `general`, `owner`, `boundaries`, `self_obs` or `self`.
+    /// `thread:<key>`, `project:<repo>`, `general`, `owner`, `boundaries` or `self_obs`.
     pub bucket: String,
     #[serde(default = "owner_prov")]
     pub prov: String,
@@ -152,7 +152,6 @@ fn bucket(text: &str) -> Bucket {
         "owner" => Bucket::Owner,
         "boundaries" => Bucket::Boundaries,
         "self_obs" => Bucket::SelfObs,
-        "self" => Bucket::SelfModel,
         _ => match text.split_once(':') {
             Some(("thread", key)) => Bucket::Thread(key.to_owned()),
             Some(("project", repo)) => Bucket::Project(repo.to_owned()),
@@ -175,8 +174,6 @@ fn prov(text: &str) -> Prov {
 
 fn source(prov: Prov, bucket: &Bucket, n: i64) -> Source {
     match (bucket, prov) {
-        (Bucket::SelfObs, _) => Source::observation(n, 0, n, false),
-        (Bucket::SelfModel, _) => Source::reading(&[format!("m-{n:06x}")]).expect("source"),
         (_, Prov::Owner) => Source::row(n),
         _ => Source::lane(n, 1),
     }
@@ -245,7 +242,7 @@ pub fn seed(case: &Case) -> Seeded {
     for (n, seed) in case.entries.iter().enumerate() {
         set(&seed.day);
         let bucket = bucket(&seed.bucket);
-        let is_self = matches!(bucket, Bucket::SelfObs | Bucket::SelfModel);
+        let is_self = bucket == Bucket::SelfObs;
         let added = store
             .add(new_entry(
                 &seed.text,

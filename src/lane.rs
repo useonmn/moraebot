@@ -403,6 +403,17 @@ pub struct LaneManager {
     pub(crate) extra_env: Vec<(OsString, OsString)>,
     /// Today's date for a job's memory block (expired entries are left out).
     pub(crate) memory_clock: memory::Clock,
+    /// Per lane id: the memory block its child was first started with in this process (kept
+    /// in memory only, never read back from `append.md`) and the notice last put in a job
+    /// prompt about a later difference, so the lane's system prompt and cache stay stable.
+    pins: Mutex<HashMap<i64, LanePin>>,
+}
+
+/// The memory block a lane is pinned to and what the lane was last told about it.
+struct LanePin {
+    block: String,
+    /// The current block the last update notice described; `None` if none is outstanding.
+    told: Option<String>,
 }
 
 fn refused(code: &str, reason: &str) -> HostToolError {
@@ -505,6 +516,7 @@ impl LaneManager {
             ticks: watch::channel(None).0,
             extra_env: Vec::new(),
             memory_clock: memory::system_clock(),
+            pins: Mutex::default(),
         }
     }
 
@@ -1303,7 +1315,10 @@ impl LaneManager {
                 .close_lane(id, reason)
                 .map_err(|e| refused(e.code(), &e.to_string()))?
             {
-                LaneClose::Closed { repo } => repo,
+                LaneClose::Closed { repo } => {
+                    lock(&self.pins).remove(&id);
+                    repo
+                }
                 LaneClose::Unknown => return Err(refused(E_LANE_UNKNOWN, "no lane has this id")),
                 LaneClose::Busy => return Err(busy()),
             }
@@ -1653,9 +1668,35 @@ impl LaneManager {
         Ok(json!({"recorded": true}).to_string().into())
     }
 
+    /// Returns the block to start lane `id` with (pinned on its first job in this process) and
+    /// the notice for this job's prompt when `current` differs from it in a way not yet told.
+    fn pin_memory(&self, id: i64, current: String) -> (String, Option<String>) {
+        let mut pins = lock(&self.pins);
+        let Some(pin) = pins.get_mut(&id) else {
+            pins.insert(
+                id,
+                LanePin {
+                    block: current.clone(),
+                    told: None,
+                },
+            );
+            return (current, None);
+        };
+        let notice = if current == pin.block {
+            pin.told.take().map(|_| crate::pin::revert_notice())
+        } else if pin.told.as_deref() == Some(current.as_str()) {
+            None
+        } else {
+            let notice = crate::pin::update_notice(&pin.block, &current);
+            pin.told = Some(current);
+            Some(notice)
+        };
+        (pin.block.clone(), notice)
+    }
+
     /// `Err` is a failure before the prompt was sent (the child did not open). The child's
-    /// system prompt gets the job's memory block ([`memory::lane_block`]), read now and passed
-    /// as the private file `<home>/lanes/<id>/append.md`.
+    /// system prompt gets the lane's pinned memory block ([`Self::pin_memory`]), passed as the
+    /// private file `<home>/lanes/<id>/append.md`; a later change goes in the job prompt.
     fn run_prompt(
         self: &Arc<Self>,
         job: &Job,
@@ -1673,7 +1714,8 @@ impl LaneManager {
             .as_deref()
             .map(|repo| memory::lane_projects(&memory_dir, repo))
             .unwrap_or_default();
-        let memory = memory::lane_block(&memory_dir, &projects, (self.memory_clock)());
+        let current = memory::lane_block(&memory_dir, &projects, (self.memory_clock)());
+        let (memory, notice) = self.pin_memory(job.id, current);
         // Written again before every start: another lane's shell may have edited it.
         crate::omp_overlay::write_overlay(&self.config.home).map_err(|e| Outcome::Failed {
             code: crate::omp_overlay::E_OMP_OVERLAY,
@@ -1753,6 +1795,10 @@ impl LaneManager {
             );
         }
         let mut message = job.text.clone();
+        if let Some(notice) = notice {
+            message += "\n\n";
+            message += &notice;
+        }
         if let Some(line) = &job.done {
             message += &done::lane_footer(line);
         }
