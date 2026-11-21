@@ -23,7 +23,7 @@ moraebot은 Discord로 받은 메시지를 이 컴퓨터의 코딩 에이전트 
      |  전체 대기열 하나 (먼저 온 순서)
      v
  omp --mode rpc --session-dir <홈>/lead/session   (모든 대화에 lead omp 하나)
-     |  긴 일은 lane_start로 lane omp에게 (최대 3개)
+     |  가벼운 일은 lead가 직접, 큰 일은 lane_start로 lane omp에게 (최대 3개)
      |
      |  prompt_result 도착
      v
@@ -80,7 +80,7 @@ moraebot은 세 부분으로 이루어집니다.
 
 1. **게이트웨이**: Rust로 만든 프로그램 하나입니다. Discord와 계속 연결되어 메시지를 받고, 저장하고, omp에 넘기고, 답장을 보냅니다.
 2. **SQLite**: 파일 하나로 된 작은 데이터베이스입니다. 별도 서버가 필요 없습니다. 받은 메시지, 대화 목록, 허용 사용자 같은 상태를 저장합니다.
-3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 모든 대화를 맡는 lead omp 하나와, lead가 긴 일을 맡기는 lane omp가 최대 3개 돕니다(3.7절).
+3. **omp 자식 프로세스들**: 자식 프로세스는 게이트웨이가 직접 실행하고 관리하는 프로그램입니다. 모든 대화를 맡는 lead omp 하나와, lead가 일을 맡기는 lane omp가 최대 3개 돕니다(3.7절).
 
 > **slice 2 메모.** 이제 Slack도 붙습니다. Slack은 Socket Mode(WebSocket)로 연결합니다. #40부터 Slack 연결은 코어 밖의 별도 프로세스 `moraebot-slack-bridge`(코드는 `src/slack_bridge/`)가 맡고, 코어는 로컬 unix socket으로 브리지와 이야기합니다(`messenger = "bridge"`, 형식은 `docs/bridge.md`). Discord는 지금도 코어 안 어댑터입니다. 메신저는 한 번에 하나만 켜집니다(`config.toml`의 `messenger`). 앱 설정 방법은 `docs/guides/`의 메신저별 안내서에 있습니다. 아래 그림의 Discord 자리에 Slack이 들어가도 흐름은 같습니다.
 
@@ -256,6 +256,8 @@ lead omp는 하나만 띄웁니다(3.7절). lane도 같은 모양의 명령으�
 omp --mode rpc --session-dir <홈>/lead/session --cwd <작업 폴더> --approval-mode yolo
 ```
 
+`[lead] tools`가 있으면 lead에 `--tools=<목록>`이 더 붙고, 빈 목록이면 `--no-tools`가 붙습니다. 없으면 아무것도 붙지 않아 lead는 omp 기본 도구를 그대로 씁니다. lane에는 붙지 않습니다(3.7절 "lead 도구 범위").
+
 `--cwd`는 omp가 일하는 폴더입니다. yolo에도 예외가 하나 있습니다. omp 설정의 "제한 폴더" 안에서 하는 작업은 yolo여도 승인을 요청하고, 화면이 없으면 거부됩니다.
 
 ### 3.3 흐름
@@ -333,11 +335,13 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 **역할 안내문.** 기본 안내문 `lead::DEFAULT_GUIDANCE`(영어)를 메신저 안내문과 함께 `--append-system-prompt=` 하나로 넘깁니다. 모양은 `<안내문>\n\n<메신저 안내문>`이고, 둘 다 비면 그 인자를 넣지 않습니다. `<홈>/hints/lead.md`가 있으면 기본 안내문을 바꿉니다. 규칙은 메신저 안내문과 같습니다(8192바이트까지, 빈 파일은 끄기, 너무 크면 `E_HINTS_FILE`).
 
+**lead 도구 범위.** lead는 기본으로 omp 기본 도구를 그대로 씁니다. 가벼운 일(몇 번의 도구 호출로 끝나는 짧은 명령이나 파일 한두 개 수정)은 lead가 직접 하기 때문입니다. `[lead] tools`를 두면 그 목록의 omp 기본 도구만 씁니다(빈 목록이면 `--no-tools`로 기본 도구가 하나도 없음). moraebot이 등록하는 호스트 도구(lane, memory, `send_file`)는 모두 `essential`이라 이 목록과 상관없이 남습니다. 이 목록은 omp 기본 도구에만 적용됩니다. 주인의 omp 설정에 있는 MCP 서버와 확장 도구는 lead에게 그대로 남습니다(omp 19.0.1에서 확인: 목록이 있으면 `xd://` 장치로, 빈 목록이면 보통 도구로 붙음). 그런 장치가 있을 때만 omp가 장치용 `write`를 보여 주는데, 이 `write`는 장치를 부르거나 local:// 임시 파일만 쓰고 작업 폴더에는 쓰지 못합니다. omp는 줄 수 없는 도구(모르는 이름, 주인의 omp 설정에서 꺼진 도구, moraebot이 끈 omp 기억 도구)가 있으면 `ready` 전에 끝나므로, 목록이 있을 때 `run`과 `check-config`는 먼저 `omp_overlay::check_tools`로 lead와 같은 작업 폴더와 설정으로 omp에 물어보고, 줄 수 없으면 `E_LEAD_TOOLS`로 멈춥니다. 도구 목록과 역할 안내문은 따로입니다. 목록으로 도구를 줄이면, 안내문은 필요한 도구가 없는 가벼운 일도 lane에 넘기라고 합니다.
+
 **lane 도구 다섯 개.** lead는 게이트웨이가 `send_file` 옆에 등록한 호스트 도구로만 lane을 다룹니다.
 
 | 도구 | 하는 일 |
 |---|---|
-| `lane_start {task, done}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
+| `lane_start {task, done?, repo?}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
 | `lane_message {lane_id, text}` | 일하는 lane이면 지금 턴에 `prompt{streamingBehavior:"steer"}`로 끼워 넣고, 일하지 않는 lane이면 저장된 세션을 다시 열어 일을 더 줍니다 |
 | `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다. 닫힌 lane은 `closed`와 `close_reason`으로 보입니다 |
 | `lane_close {lane_id, reason}` | 일하지 않는 lane을 닫고, `repo` lane이면 폴더 정리를 해 봅니다(3.13) |
@@ -382,7 +386,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 ### 3.8 완료 확인 (slice 5)
 
-**done 줄.** `lane_start`는 `done` 문자열을 꼭 받습니다(Dori mode 문법). 확인 방법은 여섯 가지입니다. `command ["program","arg"]`는 그 프로그램이 종료 코드 0으로 끝나면 통과하고, 뒤에 `contains "글자"`를 붙이면 일반 출력(stdout)에 그 글자도 그대로 있어야 통과합니다. `file <경로>`는 그 경로가 있으면 통과하고, 뒤에 `contains "글자"`를 붙이면 파일 안에 그 글자도 그대로 있어야 통과합니다. `url <주소>`는 그 주소가 200번대로 답하면 통과합니다. `merged <주인>/<저장소>#<번호>`(예: `merged acme/app#12`)는 GitHub에 그 PR이 합쳐졌는지 물어 합쳐졌을 때만 통과합니다. 글자는 늘 JSON 문자열로 적습니다. 주소는 `http`, `https`만 받고, 아이디나 비밀번호가 든 주소, 뒤에 무엇이 더 붙은 주소는 받지 않습니다. 잘못된 `contains` 부분은 `BadText`, 잘못된 주소는 `BadUrl`, 잘못된 PR 표기는 `BadPr`로 밝힙니다. `closed`, `published`는 아직 받지 않습니다. 여러 개는 `;`로 잇습니다. `done`이 없거나 비면 `E_LANE_ARGS`, 확인할 수 없는 줄이면 잘못된 부분을 밝혀 `E_DONE_SYNTAX`로 거절합니다. 거절된 호출은 lane을 저장하지도, 자식을 띄우지도 않습니다. 받아들인 줄은 정리된 모양(canonical)으로 `lanes.done` 열에 저장하고 `lane_status`에도 보여 줍니다. 이 열이 없던 slice 4 저장소는 열 때 열이 더해지고, 예전 lane은 done 줄이 없는 lane으로 남습니다(도구도, 안내 꼬리말도 없고 결과는 `result` 표시).
+**done 줄.** `lane_start`는 `done` 문자열을 받을 수 있습니다(Dori mode 문법). 확인 방법은 여섯 가지입니다. `command ["program","arg"]`는 그 프로그램이 종료 코드 0으로 끝나면 통과하고, 뒤에 `contains "글자"`를 붙이면 일반 출력(stdout)에 그 글자도 그대로 있어야 통과합니다. `file <경로>`는 그 경로가 있으면 통과하고, 뒤에 `contains "글자"`를 붙이면 파일 안에 그 글자도 그대로 있어야 통과합니다. `url <주소>`는 그 주소가 200번대로 답하면 통과합니다. `merged <주인>/<저장소>#<번호>`(예: `merged acme/app#12`)는 GitHub에 그 PR이 합쳐졌는지 물어 합쳐졌을 때만 통과합니다. 글자는 늘 JSON 문자열로 적습니다. 주소는 `http`, `https`만 받고, 아이디나 비밀번호가 든 주소, 뒤에 무엇이 더 붙은 주소는 받지 않습니다. 잘못된 `contains` 부분은 `BadText`, 잘못된 주소는 `BadUrl`, 잘못된 PR 표기는 `BadPr`로 밝힙니다. `closed`, `published`는 아직 받지 않습니다. 여러 개는 `;`로 잇습니다. `done`이 없거나 `null`이면 확인 없는 lane이 되고(`lane_done` 도구가 없고 결과는 `result` 표시), 비어 있는 문자열은 `E_LANE_ARGS`입니다. `repo`가 있으면 `done`은 필수이고, 없으면 `E_LANE_ARGS`입니다. 확인할 수 없는 줄이면 잘못된 부분을 밝혀 `E_DONE_SYNTAX`로 거절합니다. 거절된 호출은 lane을 저장하지도, 자식을 띄우지도 않습니다. 받아들인 줄은 정리된 모양(canonical)으로 `lanes.done` 열에 저장하고 `lane_status`에도 보여 줍니다. 이 열이 없던 slice 4 저장소는 열 때 열이 더해지고, 예전 lane은 done 줄이 없는 lane으로 남습니다(도구도, 안내 꼬리말도 없고 결과는 `result` 표시).
 
 **`lane_done` 도구.** done 줄이 있는 lane은 호스트 도구 `lane_done {evidence}` 하나를 받고, 보내는 프롬프트마다 끝에 done 줄과 완료를 주장하는 방법을 적은 꼬리말이 붙습니다. lane이 일이 끝났다고 보면 증거(한 일과 확인한 방법)를 담아 `lane_done`을 부릅니다. 그러면 moraebot이 그 도구 호출 안에서 모든 확인을 차례로 돌립니다. 확인은 이 호출 안에서만 돕니다.
 
@@ -667,9 +671,9 @@ The lane is still running and moraebot does not stop it; its result comes later 
 
 ### 3.18 바쁜 lead와 상태 질문 (#68)
 
-**긴 일은 lane으로.** lead의 기본 역할 글은 몇 분 넘게 걸릴 일(길거나 여러 단계거나 병렬인 일, lane 결과를 오래 검사하는 일 포함)을 자기 turn에서 하지 말고 `lane_start`로 넘긴 뒤, 무엇을 넘겼는지 한 줄로 답하고 turn을 끝내라고 안내합니다.
+**가벼운 일은 lead, 큰 일은 lane.** lead의 기본 역할 글은 일을 종류로 나눕니다. 질문, 조회, 몇 번의 도구 호출로 끝나는 작은 변경(짧은 명령, 파일 한두 개 수정, 빌드·테스트·커밋·push 없음)은 lead가 직접 합니다. 길거나 여러 단계인 일, 여러 파일을 바꾸는 일, 빌드와 테스트, 커밋·push·PR로 끝나는 일, 병렬 일은 `lane_start`로 넘긴 뒤 무엇을 넘겼는지 한 줄로 답하고 turn을 끝냅니다. lead 자신의 subagent는 이런 일에 쓰지 않습니다(lane이 lead의 subagent입니다). 시작한 일이 생각보다 커지면 남은 일을 lane에 넘깁니다.
 
-**바쁜 lead 메모.** 30초 점검마다 dispatcher가 `OmpManager::lead_busy`를 부릅니다. lead turn이 `lead.handoff_after_minutes`(빠지면 5분, 0이면 끔) 넘게 돌았고, 그 turn의 대화에서 주인 줄이 기다리고 있으면(그 turn에 steer로 들어간 줄, 또는 `queued`인 주인 줄. lane 줄은 세지 않음) `[moraebot lead busy]` 메모 하나를 #71의 줄 없는 메모 길로 넣습니다. 남은 일을 lane에 넘기고, 주인에게 답하고, turn을 끝내라는 내용입니다. 주인의 steer 자리는 그대로 비어 있습니다. 다른 대화의 줄은 이 turn이 답할 수 없으므로 세지 않습니다. 메모는 turn마다 한 번이고, 보내면 warn `W_LEAD_BUSY` 한 줄을 남깁니다(`W_TURN_STALLED`와 따로). turn 시간 제한이 기준 이하이면 끕니다. turn을 멈추거나 죽이지 않습니다. 시작 시각은 `LeadWatch::begin`이 적고, 점검은 tick 시각과 비교합니다.
+**바쁜 lead 메모.** 30초 점검마다 dispatcher가 `OmpManager::lead_busy`를 부릅니다. lead turn이 `lead.handoff_after_minutes`(빠지면 5분, 0이면 끔) 넘게 돌면, 가벼운 일보다 오래 걸린 것이므로 `[moraebot lead busy]` 메모 하나를 #71의 줄 없는 메모 길로 넣습니다. 남은 일을 lane에 넘기고, 주인에게 답하고, turn을 끝내라는 내용입니다. 그 turn의 대화에서 주인 줄이 기다리고 있으면(그 turn에 steer로 들어간 줄, 또는 `queued`인 주인 줄. lane 줄은 세지 않음) 메모가 그 사실도 말합니다(`lead::busy_note`). 주인의 steer 자리는 그대로 비어 있습니다. 메모는 turn마다 한 번이고, 보내면 warn `W_LEAD_BUSY` 한 줄을 남깁니다(`W_TURN_STALLED`와 따로). turn 시간 제한이 기준 이하이면 끕니다. turn을 멈추거나 죽이지 않습니다. 시작 시각은 `LeadWatch::begin`이 적고, 점검은 tick 시각과 비교합니다.
 
 **상태 질문.** `lead.direct_status`(빠지면 `true`)가 켜져 있고 주인 줄이 첨부 없이 상태 질문 하나뿐이면(`status::request`: 앞뒤 빈칸과 끝 문장부호를 떼고 대소문자를 무시한 전체 글이 고정 목록, 예: `뭐 하고 있어`, `뭐해`, `상태`, `status`, `what are you doing`과 같을 때) 메모리 명령 바로 뒤, steer 전에 줄을 가져가 moraebot이 직접 답합니다(`Store::finish_direct`, 메모리 명령과 같은 길). 답은 `LeadWatch`의 turn 대화, 시작 시각, 가장 최근 도구와 그 intent(lane 소식처럼 다듬음), 그리고 돌고 있는 lane에서 만듭니다. lead turn이 이 대화의 것이면 지금 단계까지, 다른 대화의 것이면 바쁘다는 사실만 말합니다. lane도 이 대화의 것만 번호, 시간, 일의 첫 줄을 보이고 다른 대화의 것은 개수만 셉니다. lead는 이 메시지를 보지 않습니다. 경합이나 재시작으로 확인 없이 큐에 들어간 상태 질문은 worker가 같은 방식으로 답합니다. 목록에 없는 글(`status of PR 12?` 등)과, `direct_status = false`일 때의 상태 질문은 원래대로 lead에게 갑니다. 일의 첫 줄과 도구 intent는 `lane::clean_note`로 다듬습니다. `lane_report`와 같은 경로 목록(lane 뿌리, 작업 폴더, 실제와 정규화한 `$HOME`)을 써서 절대 경로가 `.`와 `~`로 바뀝니다.
 
@@ -728,6 +732,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 | 허용 목록 | `allowlist` 모드에서 메신저별로 허용할 id, kind(`user`/`bot`), role(`chat`) | 빈 목록 | 불가 |
 | 봇 답장 상한 | `max_bot_replies`: 스레드 하나에서 10분 동안 봇에게 답하는 최대 횟수 | 없음 (제한 없음) | 불가 |
 | 작업 폴더 | omp가 일하는 폴더 (`--cwd`) | 없음 (필수) | 불가 (열린 질문 11) |
+| lead 도구 | `[lead] tools`: lead가 직접 쓸 omp 기본 도구를 이 목록으로 줄임. 빈 목록이면 moraebot 도구만 (3.7절) | 없음 (omp 기본 도구) | 불가 |
 | 모델 | omp가 쓸 AI 모델 | omp 기본값 | 주인만 가능 (열린 질문 12) |
 | jev (memory observer) | `[memory.jev]` and `[memory.filter]`; the key only from `TYPESAFE_API_KEY` or `api_key_file`; `enabled = true` and a key turn it on (docs/memory.md) | off | 불가 |
 

@@ -832,13 +832,14 @@ async fn duplicate_tool_call_starts_one_lane() {
 }
 
 #[tokio::test]
-async fn lane_start_requires_a_checkable_done_line() {
+async fn lane_start_refuses_bad_or_missing_required_done_line() {
     let h = Harness::new();
     let start = |args: Value| json!({"tool": lane::LANE_START_TOOL, "arguments": args});
+    let repo = h.dir.path().to_string_lossy().into_owned();
     let omp = h.manager(
         "ok",
         &[
-            start(json!({"task": "t1"})),
+            start(json!({"task": "t1", "repo": repo})),
             start(json!({"task": "t1", "done": "  "})),
             start(json!({"task": "t1", "done": "published p@1"})),
         ],
@@ -851,6 +852,41 @@ async fn lane_start_requires_a_checkable_done_line() {
     assert_refused(&results[2], E_DONE_SYNTAX);
     assert!(h.store.lock().unwrap().lanes().unwrap().is_empty());
     assert!(h.lane_starts().is_empty());
+    bounded(omp.shutdown_all()).await;
+}
+
+#[tokio::test]
+async fn lane_started_without_done_returns_plain_result() {
+    let h = Harness::new();
+    let omp = h.manager(
+        "ok",
+        &[json!({"tool": lane::LANE_START_TOOL, "arguments": {"task": "t1"}})],
+    );
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let tools = h.frames_after_start(0, "set_host_tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    let names: Vec<&Value> = tools[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["name"])
+        .collect();
+    assert_eq!(names, [LANE_REPORT_TOOL, MEMORY_SEARCH_TOOL]);
+    let prompts = h.frames_after_start(0, "prompt");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        !prompts[0]["message"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("[moraebot] Done =")),
+        "{prompts:?}"
+    );
+    let row = queued_row(&h, 1);
+    assert_eq!(row.message_id, "1:1");
+    let tag = lead::parse_tag(&row.text).expect("tagged result");
+    assert!(!tag.done);
+    assert_eq!(tag.failed, None);
     bounded(omp.shutdown_all()).await;
 }
 

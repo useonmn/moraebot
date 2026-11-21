@@ -125,7 +125,24 @@ fn alive(pid: u32) -> bool {
         .success()
 }
 
+/// The lead argv with `extra` (hints, cost limit) before the lead's tool flag, which comes
+/// last when `[lead] tools` is set.
+fn expected_argv_with(config: &Config, extra: &[String]) -> Vec<String> {
+    let mut argv = expected_argv_base(config);
+    argv.extend_from_slice(extra);
+    match config.lead.tools() {
+        None => {}
+        Some([]) => argv.push("--no-tools".to_owned()),
+        Some(tools) => argv.push(format!("--tools={}", tools.join(","))),
+    }
+    argv
+}
+
 fn expected_argv(config: &Config) -> Vec<String> {
+    expected_argv_with(config, &[])
+}
+
+fn expected_argv_base(config: &Config) -> Vec<String> {
     let session = omp::lead_session_dir(config).to_string_lossy().into_owned();
     let work = config.work_dir.to_string_lossy().into_owned();
     let overlay = moraebot::omp_overlay::overlay_path(&config.home)
@@ -222,8 +239,7 @@ async fn max_cost_adds_flag_only_when_set() {
         .into_iter()
         .find(|l| l.starts_with("START pid="))
         .unwrap();
-    let mut expected = expected_argv(&h.config);
-    expected.extend(["--max-cost".to_owned(), "2.5".to_owned()]);
+    let expected = expected_argv_with(&h.config, &["--max-cost".to_owned(), "2.5".to_owned()]);
     assert_eq!(start_argv(&start), expected);
     manager.shutdown_all().await;
 }
@@ -242,12 +258,14 @@ async fn flag_present_when_hints_set() {
         .into_iter()
         .find(|l| l.starts_with("START pid="))
         .unwrap();
-    let mut expected = expected_argv(&h.config);
     let flag = format!(
         "--append-system-prompt={}",
         omp::lead_append_path(&h.config).display()
     );
-    expected.extend([flag, "--max-cost".to_owned(), "2.5".to_owned()]);
+    let expected = expected_argv_with(
+        &h.config,
+        &[flag, "--max-cost".to_owned(), "2.5".to_owned()],
+    );
     assert_eq!(start_argv(&start), expected);
     assert_eq!(appended(&start), "probe hints");
     manager.shutdown_all().await;
@@ -1222,6 +1240,61 @@ async fn argv_unchanged_by_host_tools() {
         "the tool is registered once, right after startup"
     );
     assert_eq!(tools[0]["tools"][0]["name"], omp::SEND_FILE_TOOL);
+    manager.shutdown_all().await;
+}
+
+fn lead_start_argv(h: &Harness) -> Vec<String> {
+    let start = h
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("START line");
+    start_argv(&start)
+}
+
+#[tokio::test]
+async fn lead_has_omp_default_tools_without_a_list() {
+    let h = Harness::new();
+    let manager = h.manager("ok");
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let argv = lead_start_argv(&h);
+    assert_eq!(argv, expected_argv(&h.config));
+    assert!(
+        !argv
+            .iter()
+            .any(|a| a.starts_with("--tools") || a == "--no-tools"),
+        "{argv:?}"
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn empty_lead_tools_give_no_tools() {
+    let mut h = Harness::new();
+    h.config.lead.tools = Some(Vec::new());
+    let manager = h.manager("ok");
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let argv = lead_start_argv(&h);
+    assert_eq!(argv, expected_argv(&h.config));
+    assert_eq!(argv.last().map(String::as_str), Some("--no-tools"));
+    assert!(!argv.iter().any(|a| a.starts_with("--tools")), "{argv:?}");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn custom_lead_tools_are_passed_exactly() {
+    let mut h = Harness::new();
+    h.config.lead.tools = Some(vec!["read".into(), "bash".into()]);
+    let manager = h.manager("ok");
+    bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi")).await;
+    let argv = lead_start_argv(&h);
+    assert_eq!(argv, expected_argv(&h.config));
+    assert_eq!(
+        argv.iter()
+            .filter(|a| a.starts_with("--tools"))
+            .collect::<Vec<_>>(),
+        ["--tools=read,bash"]
+    );
     manager.shutdown_all().await;
 }
 

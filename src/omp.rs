@@ -441,6 +441,18 @@ pub fn omp_args(
     args
 }
 
+/// The lead's built-in tool flag, appended after [`omp_args`] for the lead only: nothing when
+/// `[lead] tools` is left out (omp's own default tools), `--tools=a,b` for a list, or
+/// `--no-tools` for an empty list. moraebot's own host tools stay available either way; lanes
+/// and chat children never get this flag.
+pub fn lead_tool_args(tools: Option<&[String]>) -> Vec<OsString> {
+    match tools {
+        None => Vec::new(),
+        Some([]) => vec!["--no-tools".into()],
+        Some(tools) => vec![format!("--tools={}", tools.join(",")).into()],
+    }
+}
+
 /// Filesystem-safe form of a conversation key (`discord:th:1` -> `discord-th-1`).
 pub fn key_slug(key: &str) -> String {
     key.chars()
@@ -1409,11 +1421,12 @@ impl OmpManager {
     }
 
     /// One busy check of the running lead turn at watchdog tick time `now`: when the turn has
-    /// run for `lead.handoff_after_minutes` and an owner message of its conversation waits
-    /// (the turn's steered row, or a row `queued` reports for the conversation key), sends one
-    /// [`NoteKind::Busy`] note into the turn and logs [`W_LEAD_BUSY`]. At most one note per
-    /// turn; the turn is never stopped. Off when the setting is `0` or not below the turn
-    /// limit. Returns whether a note was sent.
+    /// run for `lead.handoff_after_minutes` (longer than light work takes), sends one
+    /// [`NoteKind::Busy`] note into the turn and logs [`W_LEAD_BUSY`]. The note also says when
+    /// an owner message of the turn's conversation waits (the turn's steered row, or a row
+    /// `queued` reports for the conversation key). At most one note per turn; the turn is never
+    /// stopped. Off when the setting is `0` or not below the turn limit. Returns whether a note
+    /// was sent.
     pub fn lead_busy(&self, now: Instant, queued: impl FnOnce(&str) -> bool) -> bool {
         let Some(after) = self
             .handoff_after
@@ -1438,14 +1451,14 @@ impl OmpManager {
         else {
             return false;
         };
-        if !steered && !queued(&key) {
-            return false;
-        }
+        let waiting = steered || queued(&key);
         let minutes = now.saturating_duration_since(began).as_secs() / 60;
-        if !self
-            .notes()
-            .send(turn, NoteKind::Busy, &lead::busy_note(minutes), None)
-        {
+        if !self.notes().send(
+            turn,
+            NoteKind::Busy,
+            &lead::busy_note(minutes, waiting),
+            None,
+        ) {
             return false;
         }
         let mut watch = lock(&self.lead_watch);
@@ -1456,7 +1469,8 @@ impl OmpManager {
             code = W_LEAD_BUSY,
             conversation = %key,
             minutes,
-            "lead turn keeps an owner message waiting; busy note sent"
+            waiting,
+            "lead turn runs long; busy note sent"
         );
         true
     }
@@ -1875,12 +1889,16 @@ impl OmpManager {
             .and_then(|append_file| {
                 child_command(
                     &self.config,
-                    omp_args(
-                        &self.config,
-                        &self.config.work_dir,
-                        &session_dir,
-                        append_file.as_deref(),
-                    ),
+                    {
+                        let mut args = omp_args(
+                            &self.config,
+                            &self.config.work_dir,
+                            &session_dir,
+                            append_file.as_deref(),
+                        );
+                        args.extend(lead_tool_args(self.config.lead.tools()));
+                        args
+                    },
                     &stderr_log_path(&self.config, lead::LEAD_SESSION),
                     &self.extra_env,
                 )

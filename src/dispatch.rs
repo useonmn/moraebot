@@ -104,9 +104,10 @@
 //! that could not be handed on is tried again on the next tick.
 //!
 //! Busy lead turn: after every lane watchdog tick, a lead turn that has run for
-//! `lead.handoff_after_minutes` while an owner row of its conversation waits (steered into it
-//! or queued) gets one [`NoteKind::Busy`] note asking it to hand off and answer
-//! ([`OmpManager::lead_busy`], log code `W_LEAD_BUSY`). Nothing is killed.
+//! `lead.handoff_after_minutes` (longer than light work takes) gets one [`NoteKind::Busy`]
+//! note asking it to hand the rest to a lane and answer; the note says when an owner row of
+//! its conversation waits (steered into it or queued) ([`OmpManager::lead_busy`], log code
+//! `W_LEAD_BUSY`). Nothing is killed.
 //!
 //! Stalled lead turn: after every lane watchdog tick, a lead turn that sent no omp agent event
 //! for `omp.stall_after_minutes` gets one [`N_TURN_STALLED`] notice in its conversation
@@ -1850,8 +1851,8 @@ impl Dispatcher {
     }
 
     /// One busy check at tick time `now` ([`OmpManager::lead_busy`]): an owner row of the
-    /// running turn's conversation that is still `queued` counts as waiting. Returns whether a
-    /// note was sent.
+    /// running turn's conversation that is still `queued` counts as waiting, which the note
+    /// then says. Returns whether a note was sent.
     pub fn post_busy_note(&self, now: Instant) -> bool {
         self.omp.lead_busy(now, |key| {
             self.store()

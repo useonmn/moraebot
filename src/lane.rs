@@ -783,8 +783,8 @@ impl LaneManager {
                 "Start a lane: a separate agent that works on `task` in the background, in \
                  the shared work folder, or with `repo` in its own git worktree. `task` must \
                  be self-contained; the lane does not see \
-                 the conversation. `done` is the Done line moraebot checks when the lane \
-                 claims it is done. Returns the lane id at once; the lane's result comes \
+                 the conversation. Optional `done` is the Done line moraebot checks when the \
+                 lane claims it is done. Returns the lane id at once; the lane's result comes \
                  back to you later as a new message.",
                 schema(json!({
                     "type": "object",
@@ -792,14 +792,14 @@ impl LaneManager {
                         "task": {"type": "string", "description": "The self-contained task."},
                         "done": {
                             "type": "string",
-                            "description": "Done line: `command [...]` and/or `file <path>`, joined with `;`."
+                            "description": "Optional Done line; required with `repo`. Kinds, joined with `;`: `command [...]` (optional `contains \"...\"`), `file <path>` (optional `contains \"...\"`), `url <http(s) address>`, `merged <owner>/<repo>#<n>`. Without it the result comes back unchecked as `result`."
                         },
                         "repo": {
                             "type": "string",
                             "description": "Optional: a git checkout (absolute, ~/..., or relative to the work folder). The lane then works in its own worktree of it."
                         }
                     },
-                    "required": ["task", "done"],
+                    "required": ["task"],
                     "additionalProperties": false
                 })),
                 move |arguments, ctx| start.lane_start(&arguments, ctx.tool_call_id()),
@@ -889,15 +889,26 @@ impl LaneManager {
             .and_then(Value::as_str)
             .filter(|task| !task.trim().is_empty())
             .ok_or_else(|| refused(E_LANE_ARGS, "task must be a non-empty string"))?;
-        let line = arguments
-            .get("done")
-            .and_then(Value::as_str)
-            .filter(|line| !line.trim().is_empty())
-            .ok_or_else(|| refused(E_LANE_ARGS, "done must be a non-empty string"))?;
-        let line = DoneLine::parse(line)
-            .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
-        let canonical = line.to_string();
+        let line = match arguments.get("done") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let text = value
+                    .as_str()
+                    .filter(|line| !line.trim().is_empty())
+                    .ok_or_else(|| {
+                        refused(E_LANE_ARGS, "done must be a non-empty string when given")
+                    })?;
+                Some(
+                    DoneLine::parse(text)
+                        .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?,
+                )
+            }
+        };
+        let canonical = line.as_ref().map(ToString::to_string);
         let repo = self.repo_arg(arguments)?;
+        if repo.is_some() && line.is_none() {
+            return Err(refused(E_LANE_ARGS, "done is required with repo"));
+        }
         let repo_text = repo
             .as_deref()
             .map(|repo| repo.to_string_lossy().into_owned());
@@ -914,7 +925,7 @@ impl LaneManager {
                 tool_call_id,
                 &conversation_key,
                 task,
-                Some(&canonical),
+                canonical.as_deref(),
                 repo_text.as_deref(),
                 MAX_RUNNING_LANES,
             )
@@ -929,7 +940,7 @@ impl LaneManager {
                         conversation_key,
                         text: task.to_owned(),
                         previous_session: None,
-                        done: Some(line),
+                        done: line,
                         repo,
                     },
                 );
