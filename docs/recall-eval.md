@@ -107,7 +107,7 @@ MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider>/claude-haiku-5-5 \
   cargo test --test recall_eval live_advisor_meets_the_bar -- --ignored --nocapture
 ```
 
-The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the wake for your message and the mid-task wakes: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot. `mid_task = "on"` is gated the same way, on the same Haiku run.
+The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the wake for your message and the mid-task wakes: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot. `mid_task` is off by default; turning `"on"` on by default is gated the same way, on the same Haiku run.
 
 ## Adding a case
 

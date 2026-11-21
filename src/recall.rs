@@ -21,8 +21,9 @@
 //!   lead's tool events become short redacted lines ([`event_start_line`], [`event_end_line`]),
 //!   and a finished tool call may wake the advisor again with the owner's message and the
 //!   newest lines (`phase=mid`), at most `mid_max_wakes_per_turn` times a turn and
-//!   `mid_min_interval_seconds` apart, within the hourly cap. In shadow the picks are only
-//!   logged; on (`mode = "on"` only) they are steered into the running turn as a rowless note
+//!   `mid_min_interval_seconds` apart, within the hourly cap. Off unless set. In shadow the
+//!   picks are only logged (beside on mode without a ledger row, so they never hide an entry
+//!   from an owner wake); on (`mode = "on"` only) they are steered into the running turn as a rowless note
 //!   ([`crate::omp::LeadNotes`]) holding the same recalled block, and recorded as delivered once
 //!   the lead took it. A note for a turn that has ended is dropped ([`I_RECALL_DROPPED`]).
 //!
@@ -33,7 +34,9 @@
 //!   `memory.recall.model`. In shadow mode it runs beside the lead turn, so the turn starts at
 //!   once; in on mode before it, for at most `wait_ms`, while the steer gate is still closed.
 //!   Either way a slow, failing or crashed advisor changes nothing else the lead gets. At most
-//!   one call runs at a time; a wake while one runs is skipped.
+//!   one owner call runs at a time, and an owner wake while one runs is skipped. A mid wake
+//!   has its own slot: it starts only while no call runs, and one still running never makes an
+//!   owner wake wait or skip.
 //! - **What it sees.** The owner's message (redacted, at most [`MAX_MESSAGE_CHARS`]) and the
 //!   candidates moraebot chose in code ([`rank`]), each redacted and escaped, non-owner lines
 //!   quoted as unverified, replaced ones labelled as not in force. Never the reply, a tool's
@@ -798,7 +801,11 @@ pub struct Advisor {
     caller: Summarizer,
     clock: memory::Clock,
     gate: Mutex<Gate>,
+    /// The call of a wake for an owner message.
     running: Mutex<Option<JoinHandle<()>>>,
+    /// The call of a mid wake. Its own slot: one still running after its turn never makes the
+    /// next owner wake busy; it runs on and its picks are dropped with the turn.
+    mid_running: Mutex<Option<JoinHandle<()>>>,
     progress: watch::Sender<u64>,
     /// Calls that reached the advisor child.
     asked: watch::Sender<u64>,
@@ -826,6 +833,7 @@ impl Advisor {
             clock: memory::system_clock(),
             gate: Mutex::default(),
             running: Mutex::default(),
+            mid_running: Mutex::default(),
             progress: watch::channel(0).0,
             asked: watch::channel(0).0,
             late: Mutex::default(),
@@ -919,8 +927,9 @@ impl Advisor {
     }
 
     /// Starts one mid wake on `runtime` and returns at once. In shadow the picks are only logged
-    /// (`phase=mid`); on, they are steered into lead turn `turn` through `notes`. A wake while a
-    /// call still runs is skipped ([`Skip::Busy`]); a failing advisor only means no note.
+    /// (`phase=mid`); on, they are steered into lead turn `turn` through `notes`. A mid wake
+    /// while any call still runs is skipped ([`Skip::Busy`]); it never holds up an owner wake,
+    /// which has its own slot. A failing advisor only means no note.
     pub fn mid_wake(
         self: &Arc<Self>,
         runtime: &Handle,
@@ -928,8 +937,11 @@ impl Advisor {
         turn: TurnId,
         notes: LeadNotes,
     ) {
-        let mut running = lock(&self.running);
-        if running.as_ref().is_some_and(|task| !task.is_finished()) {
+        let owner_busy = lock(&self.running)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        let mut running = lock(&self.mid_running);
+        if owner_busy || running.as_ref().is_some_and(|task| !task.is_finished()) {
             self.skipped(&mid.wake, Skip::Busy);
             self.progress.send_modify(|n| *n += 1);
             return;
@@ -940,8 +952,13 @@ impl Advisor {
             let picks = this.answer(&mid.wake, !on).await;
             if on {
                 this.steer_picks(&mid, picks, turn, &notes);
+            } else {
+                // Shadow picks are not offered again in this turn (with mode on they write no
+                // ledger row, see `answer`).
+                lock(&mid.shown).extend(picks.into_iter().map(|p| p.entry.id));
             }
-            this.finish();
+            lock(&this.mid_running).take();
+            this.progress.send_modify(|n| *n += 1);
         }));
     }
 
@@ -1238,10 +1255,12 @@ impl Advisor {
         }
     }
 
-    /// Stops a running wake; dropping its call kills the advisor child.
+    /// Stops the running wakes; dropping a call kills its advisor child.
     pub fn stop(&self) {
-        if let Some(task) = lock(&self.running).take() {
-            task.abort();
+        for slot in [&self.running, &self.mid_running] {
+            if let Some(task) = lock(slot).take() {
+                task.abort();
+            }
         }
     }
 
@@ -1336,9 +1355,12 @@ impl Advisor {
                 .find(|c| &c.entry.id == id)
                 .map_or(0, |c| c.score)
         };
+        // A shadow mid wake beside on mode writes no row: what it picked or rejected was never
+        // given to the lead, and on-mode owner wakes must still be offered those entries.
+        let records = !(shadow && !wake.events.is_empty() && self.injects());
         let rows: Vec<RecallRow> = ledger_rows(wake, &answer, candidates, now)
             .into_iter()
-            .filter(|row| shadow || row.state == RecallState::Rejected)
+            .filter(|row| records && (shadow || row.state == RecallState::Rejected))
             .collect();
         if let Err(err) = lock(&self.store).record_recall(&rows) {
             tracing::warn!(code = err.code(), "recall ledger not written");

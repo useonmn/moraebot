@@ -2938,6 +2938,21 @@ fn flag() -> (Arc<std::sync::atomic::AtomicBool>, moraebot::omp::OnTaken) {
     )
 }
 
+/// The lead's steer messages, sorted (concurrent steers reach omp in no fixed order).
+fn steer_messages(h: &Harness) -> Vec<String> {
+    sorted(
+        h.steer_frames()
+            .iter()
+            .map(|f| f["message"].as_str().unwrap_or_default().to_owned())
+            .collect(),
+    )
+}
+
+fn sorted(mut items: Vec<String>) -> Vec<String> {
+    items.sort();
+    items
+}
+
 fn is_set(taken: &std::sync::atomic::AtomicBool) -> bool {
     taken.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -2967,16 +2982,16 @@ async fn a_note_joins_the_running_turn_without_taking_the_owners_steer_slot() {
         Some((2, Outcome::Reply("echo: m1 + m2".into()))),
         "the note has no row and no reply of its own"
     );
-    let steers = h.steer_frames();
-    assert_eq!(steers.len(), 2);
+    // Each prompt frame is written by its own wait thread, so the two steers may arrive in
+    // either order.
+    let note = format!("{}\nqa note body", moraebot::omp::RECALL_NOTE_TAG);
     assert_eq!(
-        steers[0]["message"],
-        format!("{}\nqa note body", moraebot::omp::RECALL_NOTE_TAG)
+        steer_messages(&h),
+        sorted(vec![note.clone(), "m2".to_owned()])
     );
-    assert_eq!(steers[1]["message"], "m2");
     assert!(is_set(&taken), "the lead took the note");
     assert_eq!(
-        lead::parse_tag(steers[0]["message"].as_str().unwrap()),
+        lead::parse_tag(&note),
         None,
         "a note never reads as an owner or lane input"
     );
@@ -3021,19 +3036,15 @@ async fn a_note_never_reaches_the_turn_of_a_restarted_lead() {
         report.steered,
         Some((4, Outcome::Reply("echo: m3 + m4".into())))
     );
-    let messages: Vec<Value> = h
-        .steer_frames()
-        .iter()
-        .map(|f| f["message"].clone())
-        .collect();
     let tag = moraebot::omp::RECALL_NOTE_TAG;
     assert_eq!(
-        messages,
-        [
-            Value::from("m2"),
-            Value::from(format!("{tag}\nnew")),
-            Value::from("m4")
-        ]
+        steer_messages(&h),
+        sorted(vec![
+            "m2".to_owned(),
+            format!("{tag}\nnew"),
+            "m4".to_owned()
+        ]),
+        "the old turn's note never went out"
     );
     manager.shutdown_all().await;
 }
@@ -3134,6 +3145,7 @@ fn mid_advisor(
             r.wait_ms = moraebot::config::MAX_RECALL_WAIT_MS;
         } else {
             r.mode = Some(RecallMode::Shadow);
+            r.mid_task = Some(MidTask::Shadow);
         }
         adjust(c);
     })
@@ -3402,5 +3414,112 @@ async fn a_failing_advisor_mid_turn_never_affects_the_turn() {
     assert_eq!(lead_messages(&h)[0], input, "no block, no note");
     assert_eq!(h.steer_frames().len(), 1);
     assert!(delivered_rows(&h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+/// moraedang's blocking point on #71: beside on mode, a shadow mid pick was never given to the
+/// lead, so it must not hide that entry from the next owner wake.
+#[tokio::test]
+async fn a_shadow_mid_pick_beside_on_mode_never_hides_the_entry_from_the_next_owner_wake() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let advisor = mid_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())], true, |c| {
+        c.memory.recall.mid_task = Some(moraebot::config::MidTask::Shadow);
+    });
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "merged", &advisor);
+    let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    wakes_done(&mut progress, 2).await;
+    end_with_owner_steer(&m, turn).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={x}:2 rejected=0 unoffered=1 blocked=0 phase=mid"
+        )
+    ));
+    assert_eq!(h.steer_frames().len(), 1, "shadow sends no note");
+    assert_eq!(delivered_rows(&h, 1), [(y.clone(), Some(1))]);
+    assert!(
+        ledger_rows(&h, 1).iter().all(|(id, _)| id != &x),
+        "the shadow mid pick wrote no ledger row: {:?}",
+        ledger_rows(&h, 1)
+    );
+
+    // The next owner message of the same lead context still gets X.
+    let next = lead::owner_input(KEY_A, 3, "and now?");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
+    wakes_done(&mut progress, 3).await;
+    let last = lead_messages(&h).last().cloned().unwrap_or_default();
+    assert!(last.contains(&format!("- {x} [")), "{last}");
+    let mut delivered = delivered_rows(&h, 1);
+    delivered.sort();
+    let mut want = vec![(x, Some(3)), (y, Some(1))];
+    want.sort();
+    assert_eq!(delivered, want);
+    m.shutdown_all().await;
+}
+
+/// moraedang on #71: a mid wake still running after its turn never makes the next owner wake
+/// busy; its own picks are dropped with the turn.
+#[tokio::test]
+async fn a_mid_wake_still_running_never_makes_the_next_owner_wake_busy() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let gate = reply_gate(&h);
+    let gate_path = gate.to_string_lossy().into_owned();
+    let advisor = mid_advisor(
+        &h,
+        &[
+            ("FAKE_OMP_REPLY", reply.as_str()),
+            ("FAKE_OMP_REPLY_GATE", gate_path.as_str()),
+        ],
+        true,
+        |c| c.memory.recall.wait_ms = 50,
+    );
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let m = mid_lead(&h, "merged", &advisor);
+    std::fs::write(&gate, "").expect("the first turn's wake answers at once");
+    let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::remove_file(&gate).expect("hold the mid wake's answer");
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    bounded(asked.wait_for(|n| *n >= 2))
+        .await
+        .expect("mid wake asked");
+    end_with_owner_steer(&m, turn).await;
+
+    // The mid call still runs: the next owner wake calls the advisor anyway.
+    let next = lead::owner_input(KEY_A, 3, "and now?");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
+    bounded(asked.wait_for(|n| *n >= 3))
+        .await
+        .expect("the owner wake reached the advisor");
+    assert!(!logged(
+        &h,
+        moraebot::recall::W_RECALL_CAP,
+        "reason=busy gen=1 epoch=0 row=3"
+    ));
+    std::fs::write(&gate, "").expect("release both answers");
+    wakes_done(&mut progress, 3).await;
+    // The mid pick is X, or Y when the first turn's wait ran out before Y came.
+    let dropped = |id: &str| {
+        logged(
+            &h,
+            moraebot::recall::I_RECALL_DROPPED,
+            &format!("gen=1 epoch=0 row=1 ids={id} phase=mid"),
+        )
+    };
+    assert!(
+        dropped(&x) || dropped(&y),
+        "the mid pick was dropped with its turn"
+    );
     m.shutdown_all().await;
 }

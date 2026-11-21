@@ -309,12 +309,13 @@ impl MemoryConfig {
     }
 
     /// What the advisor does while a lead turn runs: `memory.recall.mid_task` when set, else
-    /// `shadow`; always `off` when the advisor itself is off. `on` loads only with `mode = "on"`.
+    /// `off`, so no install gains mid-task advisor calls without a config edit; always `off`
+    /// when the advisor itself is off. `on` loads only with `mode = "on"`.
     pub fn recall_mid_task(&self) -> MidTask {
         if self.recall_mode() == RecallMode::Off {
             return MidTask::Off;
         }
-        self.recall.mid_task.unwrap_or(MidTask::Shadow)
+        self.recall.mid_task.unwrap_or(MidTask::Off)
     }
 
     /// `memory.recall.model`, or `None` when it is empty (omp's default model then).
@@ -426,7 +427,7 @@ pub struct RecallConfig {
     /// without the picks (they then go with the conversation's next owner message). At most
     /// [`MAX_RECALL_WAIT_MS`]; 0 never waits.
     pub wait_ms: u64,
-    /// `None`: `shadow` while the advisor runs ([`MemoryConfig::recall_mid_task`]).
+    /// `None`: `off` ([`MemoryConfig::recall_mid_task`]); shadow and on are only ever explicit.
     pub mid_task: Option<MidTask>,
     /// The most wakes on tool events in one lead turn.
     pub mid_max_wakes_per_turn: u32,
@@ -2482,14 +2483,14 @@ mod tests {
         let model = format!("{jev}[memory.recall]\nmodel = \"qa-small\"\n");
         assert_eq!(
             check(&model),
-            Ok("shadow, model qa-small, mid-task shadow".to_owned())
+            Ok("shadow, model qa-small, mid-task off".to_owned())
         );
         let on = format!("{jev}[memory.recall]\nmode = \"on\"\n");
         assert_eq!(check(&on), Err(E_CONFIG_VALUE), "on on the default model");
         let on = format!("{jev}[memory.recall]\nmode = \"on\"\nmodel = \"qa-small\"\n");
         assert_eq!(
             check(&on),
-            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task shadow".to_owned())
+            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task off".to_owned())
         );
         let mid_on = format!("{on}mid_task = \"on\"\n");
         assert_eq!(
@@ -2499,7 +2500,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_task_recall_is_shadow_by_default_and_on_only_with_mode_on() {
+    fn mid_task_recall_is_off_by_default_and_on_only_with_mode_on() {
         let fx = Fixture::new();
         let with = |body: &str| format!("{}[memory.recall]\n{body}\n", fx.valid_toml());
         let mid = |body: &str| {
@@ -2514,11 +2515,24 @@ mod tests {
             "no advisor, no mid wakes"
         );
         assert_eq!(mid("mode = \"off\"\nmid_task = \"shadow\""), MidTask::Off);
-        assert_eq!(mid("mode = \"shadow\""), MidTask::Shadow);
+        // Maintainer decision on #71: no install gains mid-task calls without a config edit.
+        assert_eq!(mid("mode = \"shadow\""), MidTask::Off);
+        assert_eq!(mid("mode = \"on\""), MidTask::Off);
         assert_eq!(
-            mid("mode = \"on\""),
-            MidTask::Shadow,
-            "on mode keeps mid in shadow"
+            mid("mode = \"shadow\"\nmid_task = \"shadow\""),
+            MidTask::Shadow
+        );
+        assert_eq!(mid("mode = \"on\"\nmid_task = \"shadow\""), MidTask::Shadow);
+        let jev = format!(
+            "{}[memory.jev]\nenabled = true\n[memory.recall]\nmodel = \"qa-small\"\n",
+            fx.valid_toml()
+        );
+        let upgraded = fx.load(&jev).expect("loads").memory;
+        assert_eq!(upgraded.recall_mode(), RecallMode::Shadow);
+        assert_eq!(
+            upgraded.recall_mid_task(),
+            MidTask::Off,
+            "an upgraded install"
         );
         assert_eq!(mid("mode = \"shadow\"\nmid_task = \"off\""), MidTask::Off);
         assert_eq!(mid("mode = \"on\"\nmid_task = \"on\""), MidTask::On);

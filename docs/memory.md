@@ -170,7 +170,7 @@ On mode adds up to `wait_ms` to each of your turns and sends the advisor's model
 
 #### Mid-task recall
 
-While the lead works on one of your messages, the advisor can also wake on the lead's tool calls (`memory.recall.mid_task`). Each call the lead starts and each one that ends becomes one short line: the tool's name with its arguments (at most 400 characters), or the head of its result (at most 600) and whether it failed. The lines are redacted like every memory text (your configured secrets and the known secret shapes), put on one line and escaped. A result from outside the work folder (the web, a shell, a subagent, GitHub, an MCP tool) that claims your approval or speaks to the advisor is replaced by `(left out)` before the advisor sees it. The lines live only in the running turn; they never go into a trace, a log or memory.
+While the lead works on one of your messages, the advisor can also wake on the lead's tool calls (`memory.recall.mid_task`). This is **off unless you set it**: no install starts these extra calls, or sends tool text to the advisor's model, without a config edit. Each call the lead starts and each one that ends becomes one short line: the tool's name with its arguments (at most 400 characters), or the head of its result (at most 600) and whether it failed. The lines are redacted like every memory text (your configured secrets and the known secret shapes), put on one line and escaped. A result from outside the work folder (the web, a shell, a subagent, GitHub, an MCP tool) that claims your approval or speaks to the advisor is replaced by `(left out)` before the advisor sees it. The lines live only in the running turn; they never go into a trace, a log or memory.
 
 When a call ends, the advisor wakes again with your message, the newest lines (in at most a quarter of `max_input_bytes`) and the same kind of candidate list, ranked against your message and the lines together. Its prompt tells it to pick only what would change the lead's very next step: a note that explains the error it just hit, a command that failed before, a constraint the step is about to break. A mid wake runs only when all of these hold:
 
@@ -178,13 +178,13 @@ When a call ends, the advisor wakes again with your message, the newest lines (i
 - the turn had fewer than `mid_max_wakes_per_turn` mid wakes (2 by default);
 - at least `mid_min_interval_seconds` (60 by default) passed since the turn started or since its last mid wake;
 - `max_calls_per_hour` admits it: mid wakes count against the same hourly cap as the wakes for your messages;
-- no advisor call runs right now.
+- no advisor call runs right now. A mid call has its own slot: one still running when the turn ends never makes the wake for your next message wait or skip; it finishes on its own and its picks are dropped with the turn.
 
 An entry is never offered twice in one lead context: the ledger hides what was picked or delivered before, and the turn also remembers what its input and its earlier mid wakes already gave it.
 
-- **Shadow** (`mid_task = "shadow"`, the default whenever the advisor runs): the picks are only logged, as `I_RECALL_PICK` rows ending in `phase=mid`, and kept as `shadow` rows. The lead never sees anything.
+- **Shadow** (`mid_task = "shadow"`): the picks are only logged, as `I_RECALL_PICK` rows ending in `phase=mid`. With `mode = "shadow"` they are also kept as `shadow` rows, like the other shadow picks. Beside `mode = "on"` they write no ledger row, so an entry a shadow mid wake picked is still offered to, and given with, your next message; the turn itself does not offer it twice. The lead never sees anything.
 - **On** (`mid_task = "on"`, accepted only together with `mode = "on"`): the picks are sent into the running turn as a note of moraebot's own: a steer whose first line is `[moraebot memory recalled]`, followed by the same recalled block as above (guard line, every line labelled reference only, at most 1500 bytes, the injection guard first). A note has no inbox row and gets no reply of its own; it never takes the place of a message of yours, so your next message in the conversation is still folded into the turn as before. The lead's guidance says such a note is reference only and is never answered on its own. The picks are recorded as delivered (`I_RECALL_DELIVERED ... phase=mid`) once the lead took the note. If the turn ended before the advisor answered, the note is not sent: the picks are dropped (`I_RECALL_DROPPED`) and can be offered again later. A note never outlives its turn, a shutdown or a lead restart.
-- **Off** (`mid_task = "off"`): no wake on tool calls.
+- **Off** (`mid_task = "off"`, the default): no wake on tool calls.
 
 A failing, slow or skipped mid wake changes nothing in the turn. A note that omp receives just as the turn ends may start one more short run of the lead; its text is not posted.
 
@@ -249,7 +249,7 @@ Every key is optional.
 | `memory.recall.max_calls_per_hour` | 30 | Advisor calls allowed in any hour; a wake over it is skipped. |
 | `memory.recall.max_input_bytes` | 16384 | The largest advisor message; candidates that don't fit are left out. |
 | `memory.recall.timeout_seconds` | 60 | Limit of one advisor call. |
-| `memory.recall.mid_task` | `shadow` while the advisor runs, `off` otherwise | What the advisor does while the lead works on your message ([Mid-task recall](#mid-task-recall)): `"shadow"` logs the picks of wakes on tool calls, `"on"` steers them into the turn (only with `mode = "on"`), `"off"` never wakes on tool calls. |
+| `memory.recall.mid_task` | `off` | What the advisor does while the lead works on your message ([Mid-task recall](#mid-task-recall)): `"shadow"` logs the picks of wakes on tool calls, `"on"` steers them into the turn (only with `mode = "on"`), `"off"` never wakes on tool calls. |
 | `memory.recall.mid_max_wakes_per_turn` | 2 | The most wakes on tool calls in one lead turn (at least 1). |
 | `memory.recall.mid_min_interval_seconds` | 60 | The least time from a turn's start or its last wake on a tool call to the next one; 0 allows one after every finished call, within the per-turn cap. |
 | `memory.recall.wait_ms` | 2500 | On mode: how long a turn of yours waits for the advisor before it starts without the picks (0 to 10000; 0 never waits, so every pick goes with your next message). |
