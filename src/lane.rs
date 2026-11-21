@@ -3,7 +3,21 @@
 //! The lead calls `lane_start`, `lane_message` and `lane_status` (registered on the lead
 //! child next to `send_file`). A lane is its own omp RPC child whose appended system prompt
 //! is only its memory block, passed as a private file (`omp::write_append_file`); it runs one
-//! prompt on a worker thread and closes. A lane with a done line gets
+//! prompt on a worker thread and closes.
+//!
+//! `lane_message` on a running lane steers instead of waiting: the text goes into the job's
+//! steer inbox, and the job's own thread forwards it as `prompt{streamingBehavior:"steer"}`
+//! into the turn already in progress, the way the lead's own steer works. A steer only goes out
+//! after the turn's first `agent_start` (omp admits a steer into a run that is already
+//! streaming); texts that arrive earlier wait for it. omp answers a steer inside the main
+//! prompt's run (or, when it reached omp as that run ended, in a run of its own); the job waits
+//! for every steer it sent, so the child never outlives the job, and the newest reply is the
+//! result. The lane still writes one result row and `prompts` does not grow. A text the turn
+//! never took (it came before the turn could take a steer, or after the turn ended) is not
+//! dropped: the inbox lives until the job's child is removed under `inner`, and what is left
+//! in it then runs as the lane's next prompt, the way `lane_message` starts one on an idle
+//! lane. A steer carries the bare text, without the
+//! lane's footers (`lane_done`, `lane_report`, git). A lane with a done line gets
 //! exactly one host tool, `lane_done`: the lane claims its work is done, moraebot runs
 //! the Done checks inside that call and refuses a claim that fails them. Its result is
 //! stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same transaction as
@@ -56,7 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -121,6 +135,10 @@ pub const E_LANE_IDLE: &str = "E_LANE_IDLE";
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;
 
+/// How often a running lane job looks for a text `lane_message` steered into its live turn.
+/// Short enough that a steer joins the turn promptly, long enough not to spin.
+const STEER_POLL: Duration = Duration::from_millis(200);
+
 /// A lane progress note is cut to this many characters.
 pub const REPORT_CHARS: usize = 200;
 
@@ -155,6 +173,27 @@ struct LaneChild {
     activity: Arc<Mutex<Activity>>,
     /// Set once by `stop`: the cleaned reason. A stopped job starts no child or check.
     stop: Option<String>,
+    /// The job's steer inbox. It goes away with this entry, which the worker removes under
+    /// `inner` after the result is written; what the turn never took is then still in the
+    /// worker's receiver and runs as the lane's next prompt.
+    steer: SteerSender,
+}
+
+/// The running job's steer inbox: `lane_message` sends here while the lane is running, and
+/// the job's own thread forwards each text into the live omp turn as a steer.
+type SteerSender = mpsc::Sender<SteerText>;
+
+/// One mid-run text handed to the running job.
+struct SteerText {
+    text: String,
+}
+
+/// Whether the turn's first `agent_start` has arrived. A steer may only go out after it: omp
+/// admits a steer into a run that is already streaming, and the lead's own steer gate waits
+/// for the same signal ([`crate::omp`]'s `note_agent_start`). Set by the job's event callback.
+#[derive(Default)]
+struct SteerGate {
+    started: bool,
 }
 
 /// What a running job's omp agent events showed. The event callback only counts;
@@ -513,10 +552,18 @@ impl LaneManager {
     }
 
     /// Counts `event` of a lane child in its job's `activity`.
-    fn note_event(&self, activity: &Mutex<Activity>, event: &Event) {
+    fn note_event(&self, activity: &Mutex<Activity>, gate: &Mutex<SteerGate>, event: &Event) {
         let agent = lock(activity).note(event);
         if agent {
             self.events.send_modify(|n| *n += 1);
+        }
+        // A steer may only join a run that is already streaming, so the gate opens on the
+        // turn's first `agent_start`, exactly as the lead's steer gate does.
+        if matches!(
+            event,
+            Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
+        ) {
+            lock(gate).started = true;
         }
     }
 
@@ -730,8 +777,11 @@ impl LaneManager {
             .load_mode(ToolLoadMode::Essential),
             HostTool::new(
                 LANE_MESSAGE_TOOL,
-                "Send more work to a lane whose result already arrived. A running lane \
-                 refuses. The result comes back to you later as a new message.",
+                "Send more work to a lane. A running lane takes the text as a steer: omp folds it \
+                 into the turn already in progress and the lane answers it in that same result; a \
+                 text that turn can no longer take runs as the lane's next prompt. An idle, failed \
+                 or stopped lane starts a new prompt instead. Either way the answer comes back to \
+                 you later as a new message.",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -913,56 +963,68 @@ impl LaneManager {
         if set.stopping {
             return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
         }
-        let job = {
-            let mut store = lock(&self.store);
-            let store_err = |e: crate::store::StoreError| refused(e.code(), &e.to_string());
-            let lane = store
-                .lane(id)
-                .map_err(store_err)?
-                .ok_or_else(|| refused(E_LANE_UNKNOWN, "no lane has this id"))?;
-            let line = lane
-                .done
-                .as_deref()
-                .map(DoneLine::parse)
-                .transpose()
-                .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
-            match store
-                .message_lane(id, MAX_RUNNING_LANES)
-                .map_err(store_err)?
-            {
-                LaneMessage::Seq(seq) => Job {
-                    id,
-                    seq,
-                    conversation_key: lane.conversation_key,
+        // A running lane takes the text into its steer inbox. The worker holds the receiver
+        // until it removes this entry under `inner`, so the text either joins the live turn or
+        // runs as the lane's next prompt; it is never dropped and never runs twice.
+        if let Some(child) = set.children.get(&id).filter(|child| child.stop.is_none())
+            && child
+                .steer
+                .send(SteerText {
                     text: text.to_owned(),
-                    previous_session: lane.omp_session_id,
-                    done: line,
-                    repo: lane.repo.map(PathBuf::from),
-                },
-                LaneMessage::Unknown => {
-                    return Err(refused(E_LANE_UNKNOWN, "no lane has this id"));
-                }
-                LaneMessage::Busy => {
-                    return Err(refused(
-                        E_LANE_BUSY,
-                        "the lane is still running; wait for its result",
-                    ));
-                }
-                LaneMessage::Limit => {
-                    return Err(refused(
-                        E_LANE_LIMIT,
-                        &format!("{MAX_RUNNING_LANES} lanes are already running"),
-                    ));
-                }
-                LaneMessage::Closed => {
-                    return Err(refused(E_LANE_CLOSED, "the lane is closed"));
-                }
-            }
-        };
+                })
+                .is_ok()
+        {
+            tracing::info!(lane = id, "steered into the running lane");
+            return Ok(json!({ "lane_id": id, "accepted": true, "steered": true })
+                .to_string()
+                .into());
+        }
+        let job = self.next_job(id, text)?;
         self.spawn_worker(&mut set, job);
         Ok(json!({ "lane_id": id, "accepted": true })
             .to_string()
             .into())
+    }
+
+    /// The next prompt of lane `id` with `text`, numbered in the store, under the caller's
+    /// hold of `inner` (lock order inner -> store). Refuses like `lane_message`.
+    fn next_job(&self, id: i64, text: &str) -> Result<Job, HostToolError> {
+        let mut store = lock(&self.store);
+        let store_err = |e: crate::store::StoreError| refused(e.code(), &e.to_string());
+        let lane = store
+            .lane(id)
+            .map_err(store_err)?
+            .ok_or_else(|| refused(E_LANE_UNKNOWN, "no lane has this id"))?;
+        let line = lane
+            .done
+            .as_deref()
+            .map(DoneLine::parse)
+            .transpose()
+            .map_err(|error| refused(done::E_DONE_SYNTAX, &error.to_string()))?;
+        match store
+            .message_lane(id, MAX_RUNNING_LANES)
+            .map_err(store_err)?
+        {
+            LaneMessage::Seq(seq) => Ok(Job {
+                id,
+                seq,
+                conversation_key: lane.conversation_key,
+                text: text.to_owned(),
+                previous_session: lane.omp_session_id,
+                done: line,
+                repo: lane.repo.map(PathBuf::from),
+            }),
+            LaneMessage::Unknown => Err(refused(E_LANE_UNKNOWN, "no lane has this id")),
+            LaneMessage::Busy => Err(refused(
+                E_LANE_BUSY,
+                "the lane is still running; wait for its result",
+            )),
+            LaneMessage::Limit => Err(refused(
+                E_LANE_LIMIT,
+                &format!("{MAX_RUNNING_LANES} lanes are already running"),
+            )),
+            LaneMessage::Closed => Err(refused(E_LANE_CLOSED, "the lane is closed")),
+        }
     }
 
     fn lane_status(
@@ -1012,9 +1074,12 @@ impl LaneManager {
         let manager = Arc::clone(self);
         let activity = Arc::new(Mutex::new(Activity::default()));
         let worker_activity = Arc::clone(&activity);
+        // `lane_message` sends a mid-run text here; the worker forwards it into the live turn,
+        // or runs what the turn never took as the lane's next prompt.
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerText>();
         match std::thread::Builder::new()
             .name(format!("omp-lane-{id}"))
-            .spawn(move || manager.run_worker(job, worker_activity))
+            .spawn(move || manager.run_worker(job, worker_activity, steer_rx))
         {
             Ok(worker) => {
                 set.children.insert(
@@ -1026,6 +1091,7 @@ impl LaneManager {
                         conversation_key: key.clone(),
                         activity,
                         stop: None,
+                        steer: steer_tx,
                     },
                 );
                 tracing::info!(lane = id, seq, "lane started");
@@ -1045,9 +1111,15 @@ impl LaneManager {
 
     /// One lane prompt: open the child, send the prompt, map the result, close the
     /// child; then the final section under `inner`.
-    fn run_worker(self: Arc<Self>, job: Job, activity: Arc<Mutex<Activity>>) {
+    fn run_worker(
+        self: Arc<Self>,
+        job: Job,
+        activity: Arc<Mutex<Activity>>,
+        steer_rx: mpsc::Receiver<SteerText>,
+    ) {
         let mut pid = None;
-        let outcome = self.run_prompt(&job, &mut pid, &activity);
+        let mut untaken = Vec::new();
+        let outcome = self.run_prompt(&job, &mut pid, &activity, &steer_rx, &mut untaken);
         let written = {
             let mut set = lock(&self.inner);
             let written = self.write_result(&set, job.id, job.seq, &job.conversation_key, outcome);
@@ -1057,19 +1129,67 @@ impl LaneManager {
                     omp::kill_group(*check);
                 }
             }
-            if let Some(mut child) = set.children.remove(&job.id)
-                && let Some(group) = child.kill.as_mut()
-            {
-                // The child was reaped by `close` above.
-                group.disarm();
+            let mut stopped = false;
+            if let Some(mut child) = set.children.remove(&job.id) {
+                stopped = child.stop.is_some();
+                if let Some(group) = child.kill.as_mut() {
+                    // The child was reaped by `close` above.
+                    group.disarm();
+                }
             }
             if let Some(pid) = pid {
                 self.pids.send_modify(|pids| pids.retain(|p| *p != pid));
+            }
+            // The inbox went with the entry and `lane_message` sends only under `inner`, so
+            // nothing more can arrive: these are all the texts the turn never took.
+            untaken.extend(steer_rx.try_iter().map(|steer| steer.text));
+            if !untaken.is_empty() {
+                self.run_untaken(&mut set, job.id, untaken, written && !stopped);
             }
             written
         };
         if written {
             self.wake.notify_one();
+        }
+    }
+
+    /// Runs the `lane_message` texts lane `id`'s finished job never took (they came before its
+    /// turn could take a steer, or after it ended), joined in arrival order, as the lane's next
+    /// prompt, the way `lane_message` starts one on an idle lane. A job the lead stopped, one
+    /// the shutdown ended (`settled` false) or a refused next prompt starts nothing; the texts
+    /// are then logged by count and size only.
+    fn run_untaken(
+        self: &Arc<Self>,
+        set: &mut LaneSet,
+        id: i64,
+        texts: Vec<String>,
+        settled: bool,
+    ) {
+        let (count, chars) = (
+            texts.len(),
+            texts.iter().map(|t| t.chars().count()).sum::<usize>(),
+        );
+        if !settled || set.stopping {
+            tracing::warn!(
+                lane = id,
+                count,
+                chars,
+                "lane_message texts not run: the job was stopped"
+            );
+            return;
+        }
+        match self.next_job(id, &texts.join("\n\n")) {
+            Ok(job) => {
+                tracing::info!(
+                    lane = id,
+                    count,
+                    "lane_message texts the turn never took run as the next prompt"
+                );
+                self.spawn_worker(set, job);
+            }
+            Err(error) => {
+                tracing::warn!(lane = id, count, chars, %error, "lane_message texts not run");
+            }
         }
     }
 
@@ -1520,6 +1640,8 @@ impl LaneManager {
         job: &Job,
         pid: &mut Option<u32>,
         activity: &Arc<Mutex<Activity>>,
+        steer_rx: &mpsc::Receiver<SteerText>,
+        untaken: &mut Vec<String>,
     ) -> Result<LaneOutcome, Outcome> {
         let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
@@ -1553,6 +1675,8 @@ impl LaneManager {
                 detail: e.to_string(),
             })?;
         let claim = Arc::new(Mutex::new(Claim::None));
+        // Opens on the turn's first `agent_start`: a steer may only join a streaming run.
+        let gate = Arc::new(Mutex::new(SteerGate::default()));
         let mut tools = match &job.done {
             Some(line) => vec![self.lane_done_tool(job, line, &claim, &cwd)],
             None => Vec::new(),
@@ -1596,7 +1720,8 @@ impl LaneManager {
             {
                 let watcher = Arc::clone(self);
                 let activity = Arc::clone(activity);
-                move |event: &Event| watcher.note_event(&activity, event)
+                let gate = Arc::clone(&gate);
+                move |event: &Event| watcher.note_event(&activity, &gate, event)
             },
         )?;
         if let Err(e) = lock(&self.store).set_lane_session_id(job.id, &session_id) {
@@ -1619,7 +1744,34 @@ impl LaneManager {
             images: None,
             streaming_behavior: None,
         };
-        let outcome = omp::map_result(client.prompt_and_wait(&prompt, self.turn_timeout));
+        // The main prompt runs on its own thread so a steer can join the turn already in
+        // progress, exactly as `serve_lead` does for the lead's turn: concurrent waits on one
+        // client are allowed, and a steer prompt is answered inside the main prompt's result.
+        let client = Arc::new(client);
+        let main_client = Arc::clone(&client);
+        let turn_timeout = self.turn_timeout;
+        let (main_tx, main_rx) = mpsc::channel();
+        let started = std::thread::Builder::new()
+            .name(format!("omp-lane-main-{}", job.id))
+            .spawn(move || {
+                let turn = main_client.prompt_and_wait(&prompt, turn_timeout);
+                // Released before the result is sent: once every wait answered, the job alone
+                // holds the client and can close it.
+                drop(main_client);
+                let _ = main_tx.send(turn);
+            });
+        let outcome = match started {
+            Ok(_) => {
+                let (outcome, mut left) =
+                    self.drain_steers(&client, steer_rx, &main_rx, &gate, *pid, job.id);
+                untaken.append(&mut left);
+                outcome
+            }
+            Err(e) => Outcome::Failed {
+                code: E_OMP_SPAWN,
+                detail: e.to_string(),
+            },
+        };
         let replied = match (&outcome, &job.done) {
             (Outcome::Reply(text), Some(_)) => Some(text.clone()),
             (Outcome::NoAgent, Some(_)) => Some(EMPTY_REPLY.to_owned()),
@@ -1643,8 +1795,110 @@ impl LaneManager {
                 }),
             },
         };
-        omp::close(&name, client);
+        match Arc::try_unwrap(client) {
+            Ok(client) => omp::close(&name, client),
+            // Not expected: every wait drops its clone before it reports, and all were waited for.
+            Err(_) => tracing::warn!(lane = job.id, "lane client still shared at close"),
+        }
         Ok(outcome)
+    }
+
+    /// Waits for the main prompt, forwarding every text `lane_message` sent meanwhile into the
+    /// live turn as an omp steer, then waits for each forwarded steer's own result, and returns
+    /// the turn's outcome.
+    ///
+    /// A steer only goes out once the turn's first `agent_start` opened the gate: omp admits a
+    /// steer into a run that is already streaming. omp answers a steer inside the main run, or
+    /// in a run of its own when it reached omp as that run ended; either way its wait ends with
+    /// that run, so every steer is waited for (at most the turn limit after the main prompt,
+    /// then the child is killed) and the child never outlives the job. A newer reply replaces
+    /// the main one. Texts that never went out (the gate never opened, or no thread could be
+    /// started for them) are returned next to it; the worker runs them as the lane's next prompt.
+    fn drain_steers(
+        &self,
+        client: &Arc<omp_rpc::Client>,
+        steer_rx: &mpsc::Receiver<SteerText>,
+        main_rx: &mpsc::Receiver<Result<omp_rpc::PromptTurn, omp_rpc::Error>>,
+        gate: &Mutex<SteerGate>,
+        pid: Option<u32>,
+        id: i64,
+    ) -> (Outcome, Vec<String>) {
+        let turn_timeout = self.turn_timeout;
+        let mut untaken = Vec::new();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut held: Vec<String> = Vec::new();
+        let main = loop {
+            if lock(gate).started {
+                held.extend(steer_rx.try_iter().map(|steer| steer.text));
+                for text in std::mem::take(&mut held) {
+                    let steer = PromptCommand {
+                        message: text.clone(),
+                        images: None,
+                        streaming_behavior: Some(omp_rpc::StreamingBehavior::Steer),
+                    };
+                    let steer_client = Arc::clone(client);
+                    let done = done_tx.clone();
+                    let started = std::thread::Builder::new()
+                        .name(format!("omp-lane-steer-{id}"))
+                        .spawn(move || {
+                            let turn = steer_client.prompt_and_wait(&steer, turn_timeout);
+                            drop(steer_client);
+                            let _ = done.send(turn);
+                        });
+                    if let Err(e) = started {
+                        tracing::warn!(lane = id, error = %e, "could not start a lane steer");
+                        untaken.push(text);
+                    }
+                }
+            }
+            match main_rx.recv_timeout(STEER_POLL) {
+                Ok(turn) => break turn,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Err(omp_rpc::Error::Closed),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+        untaken.append(&mut held);
+        // Only the steer threads hold a sender now: the channel closes when the last one reports.
+        drop(done_tx);
+        let main_timed_out = matches!(main, Err(omp_rpc::Error::Timeout { .. }));
+        let mut outcome = omp::map_result(main);
+        let kill = |pid: Option<u32>| {
+            tracing::warn!(
+                lane = id,
+                "a lane steer outlived the turn limit; killing the lane child"
+            );
+            if let Some(pid) = pid {
+                omp::kill_group(pid);
+            }
+        };
+        if main_timed_out {
+            // Never let the child outlive the turn limit by waiting for a steer.
+            kill(pid);
+        }
+        let deadline = Instant::now() + turn_timeout;
+        loop {
+            match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(turn) => {
+                    let steered = omp::map_result(turn);
+                    if matches!(outcome, Outcome::Reply(_)) && matches!(steered, Outcome::Reply(_))
+                    {
+                        outcome = steered;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    kill(pid);
+                    // The kill ends every wait still open.
+                    done_rx.iter().for_each(drop);
+                    outcome = Outcome::NeedsCheck {
+                        code: omp::E_TURN_TIMEOUT,
+                        detail: "a steer outlived the turn time limit".to_owned(),
+                    };
+                    break;
+                }
+            }
+        }
+        (outcome, untaken)
     }
 
     /// Stores the lane prompt's result row and the lane's new state, unless the shutdown
@@ -1939,6 +2193,7 @@ mod tests {
         ));
         let activity = Arc::new(Mutex::new(Activity::default()));
         lock(&activity).note(&agent_start());
+        let (steer, _steer_rx) = mpsc::channel();
         lock(&manager.inner).children.insert(
             1,
             LaneChild {
@@ -1948,6 +2203,7 @@ mod tests {
                 conversation_key: "discord:th:111".into(),
                 activity,
                 stop: None,
+                steer,
             },
         );
         let wake = manager.wake();
@@ -2065,6 +2321,7 @@ mod tests {
     /// Registers a dummy running job for lane `id` in conversation `key`; returns its activity.
     fn qa_child(manager: &LaneManager, id: i64, key: &str) -> Arc<Mutex<Activity>> {
         let activity = Arc::new(Mutex::new(Activity::default()));
+        let (steer, _steer_rx) = mpsc::channel();
         lock(&manager.inner).children.insert(
             id,
             LaneChild {
@@ -2074,6 +2331,7 @@ mod tests {
                 conversation_key: key.into(),
                 activity: Arc::clone(&activity),
                 stop: None,
+                steer,
             },
         );
         activity

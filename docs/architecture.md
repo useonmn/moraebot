@@ -338,12 +338,12 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 | 도구 | 하는 일 |
 |---|---|
 | `lane_start {task, done}` | lane을 저장하고 따로 omp 자식을 띄운 뒤 `lane_id`를 바로 돌려줍니다. 같은 `toolCallId`로 두 번 불려도 lane은 하나입니다 |
-| `lane_message {lane_id, text}` | 일하지 않는 lane의 저장된 세션을 다시 열어 일을 더 줍니다 |
+| `lane_message {lane_id, text}` | 일하는 lane이면 지금 턴에 `prompt{streamingBehavior:"steer"}`로 끼워 넣고, 일하지 않는 lane이면 저장된 세션을 다시 열어 일을 더 줍니다 |
 | `lane_status {lane_id?}` | 저장소에 있는 lane 목록과 상태를 돌려줍니다. 닫힌 lane은 `closed`와 `close_reason`으로 보입니다 |
 | `lane_close {lane_id, reason}` | 일하지 않는 lane을 닫고, `repo` lane이면 폴더 정리를 해 봅니다(3.13) |
 | `lane_stop {lane_id, reason}` | 일하는 lane의 지금 일을 바로 끊습니다. lane은 열린 채로 남습니다(3.16) |
 
-거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 `E_LANE_BUSY`, 일하는 중인 lane을 닫으려 하면 `E_LANE_BUSY`, 닫힌 lane에 `lane_message`는 `E_LANE_CLOSED`, 모르는 id는 `E_LANE_UNKNOWN`, 일하지 않는 lane을 끊으려 하면 `E_LANE_IDLE`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
+거절은 도구 오류 `"<CODE>: <이유>"`로 돌아갑니다. 동시에 일하는 lane이 `MAX_RUNNING_LANES`(3)개면 `E_LANE_LIMIT`, 일하는 중인 lane에 `lane_message`는 그 턴에 steer로 들어가고(거절 아님), 일하는 중인 lane을 닫으려 하면 `E_LANE_BUSY`, 닫힌 lane에 `lane_message`는 `E_LANE_CLOSED`, 모르는 id는 `E_LANE_UNKNOWN`, 일하지 않는 lane을 끊으려 하면 `E_LANE_IDLE`, 잘못된 인자는 `E_LANE_ARGS`, 게이트웨이가 꺼지는 중이면 `E_LANE_STOPPING`(lane 자식을 띄우지 않음)입니다. 도구 처리기는 lane 일을 기다리지 않습니다. lane 자식은 `repo` 없이 시작했으면 lead와 같은 작업 폴더에서, 있으면 자기 git worktree에서 돌고(3.11), 세션 폴더는 `<홈>/lanes/<id>/session`이고, done 줄이 있는 lane은 호스트 도구 `lane_done` 하나만 받으며(3.8), done 줄이 없는 lane은 호스트 도구가 없습니다. lane은 메신저와 직접 말하지 않습니다. 답을 낸 lane은 자식을 끄고 기록만 남깁니다.
 
 **결과 줄(result row).** lane이 끝나면 `finish_lane`이 한 트랜잭션에서 inbox에 줄 하나(`platform = 'lane'`, `message_id = "<lane id>:<순번>"`, `origin = 'lane'`, `queued`)를 넣고 lane 상태를 바꿉니다. `UNIQUE(platform, message_id)` 덕분에 결과는 한 번만 들어갑니다. 결과 줄은 주인 확인 없이 전체 대기열을 따라 lead에게 갑니다.
 
@@ -352,6 +352,15 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 - 파일 저장이 끝났고, lead가 그 턴의 `agent_start`를 보낸 뒤입니다.
 - 그 줄이 턴의 주 메시지보다 새것이고, 같은 대화에 더 오래된 `queued` 줄이 없습니다(`steer_into`의 조건부 UPDATE). 그래서 끼워 넣은 메시지가 먼저 보낸 메시지를 앞지르지 않습니다.
 - 한 턴에 하나까지입니다. 그 뒤에 온 같은 대화 메시지는 다음 턴에 갑니다.
+
+**lane steer 규칙.** lead가 일하는 lane에 `lane_message`를 보내면 그 글은 새 프롬프트가 아니라 지금 도는 턴에 `prompt{streamingBehavior:"steer"}`로 들어갑니다. lead 턴의 steer와 같은 omp 경로이고, 조건은 이것입니다.
+
+- lane 자식이 살아 있고, 그 job의 `stop`이 아직 없습니다(끊는 중이면 steer하지 않습니다).
+- job의 steer 우편함은 워커가 결과를 쓰고 `inner` 아래에서 job 항목을 지울 때 함께 사라집니다. `lane_message`도 `inner` 아래에서만 보내므로, 우편함에 들어간 글은 턴에 steer로 들어가거나 아래처럼 다음 프롬프트로 돕니다. 잃어버리지도, 두 번 돌지도 않습니다.
+- steer는 그 턴의 첫 `agent_start` 뒤에만 나갑니다. omp는 이미 스트리밍 중인 run에만 steer를 받으므로, 그 전에 도착한 글은 게이트가 열릴 때까지 기다립니다(lead의 steer 게이트와 같은 신호).
+- 순서는 `lane_message`가 도착한 순서입니다. omp는 steer를 주 run 안에서 답하고, run이 끝나는 순간에 닿은 steer는 따로 run을 열어 답합니다. job은 보낸 steer마다 그 결과를 기다리고(주 프롬프트 뒤 최대 턴 제한까지, 넘으면 lane 자식을 죽임) 더 새 답을 결과로 씁니다. 그래서 자식이 job보다 오래 살지 않고, 결과 줄은 여전히 하나(`<lane id>:<순번>`)이며 `prompts`도 늘지 않습니다.
+- 턴이 받지 못한 글(게이트가 열리기 전에 턴이 끝났거나, 턴이 끝난 뒤 결과 저장 전에 도착한 글)은 job 항목을 지운 직후 도착 순서대로 이어 붙여 lane의 다음 프롬프트로 돌립니다. 일하지 않는 lane에 `lane_message`를 보낸 것과 같습니다. lead가 끊은 job이나 종료로 끊긴 job이면 돌리지 않고 개수와 길이만 로그에 남깁니다.
+- steer 글에는 lane의 꼬리말(`lane_done` 안내, `lane_report` 안내, git 안내)을 붙이지 않습니다. 그건 주 프롬프트에만 들어갑니다.
 
 다른 대화의 메시지와 lane 결과는 끼워 넣지 않고 다음 턴을 기다립니다. 워커와 steer 경로는 모두 `claim`/`steer_into`로 줄을 차지하므로 한 줄은 한 경로에서만 돕니다. 묶음의 답은 하나로 합쳐 주 메시지 줄에 저장하고(`finish_group`, 끼워 넣은 줄은 `done`), 한 번 보냅니다. 묶음 중 하나라도 실패하거나 끊기면 묶음 전체가 `failed`(`fail_group`) 또는 `needs_check`(`interrupt_group`)가 됩니다.
 

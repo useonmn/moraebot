@@ -428,7 +428,7 @@ async fn fourth_running_lane_is_refused() {
 }
 
 #[tokio::test]
-async fn lane_message_refused_while_running() {
+async fn lane_message_steers_a_running_lane() {
     let h = Harness::new();
     let omp = h.manager(
         "hang",
@@ -441,10 +441,174 @@ async fn lane_message_refused_while_running() {
     let results = h.tool_results();
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(!results[0].0, "{results:?}");
-    assert_refused(&results[1], E_LANE_BUSY);
-    assert_eq!(h.lane(1).prompts, 1);
+    // The lane is still running, so the text was folded into the turn instead of refused.
+    assert!(!results[1].0, "{results:?}");
+    let accepted: Value = serde_json::from_str(&results[1].1).expect("json result");
+    assert_eq!(accepted["steered"], true, "{results:?}");
+    assert_eq!(h.lane(1).prompts, 1, "a steer starts no new prompt");
     bounded(omp.shutdown_all()).await;
     assert!(h.lane_starts().len() <= 1, "no second lane child");
+}
+
+/// The text really crosses into the running turn: the lane child receives its own `prompt`
+/// frame with `streamingBehavior: steer` carrying the `lane_message` text, while the main
+/// prompt's frame carries none, and `prompts` never grows. Polls the child's frame log instead
+/// of waiting for the turn to end, so the assertion does not depend on scheduler timing.
+#[tokio::test]
+async fn lane_message_text_reaches_the_lane_child_as_a_steer() {
+    let h = Harness::new();
+    let omp = h.manager(
+        "steer",
+        &[
+            lane_start("t1"),
+            json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+        ],
+    );
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+
+    /// The child's `prompt` frames, read from the shared fake-omp log from the lane's start.
+    fn prompts(h: &Harness) -> Vec<Value> {
+        let Some(start) = h.lane_starts().first().copied() else {
+            return Vec::new();
+        };
+        h.log_lines()[start..]
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|f| f["type"] == "prompt")
+            .collect()
+    }
+
+    // Bounded poll: the steer exists only once the lane child received it.
+    let deadline = Instant::now() + BOUND;
+    let mut steered = Vec::new();
+    while Instant::now() < deadline {
+        steered = prompts(&h);
+        if steered.iter().any(|f| f["streamingBehavior"] == "steer") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        steered.len(),
+        2,
+        "one main prompt and one steer: {steered:?}"
+    );
+    assert_eq!(steered[0]["streamingBehavior"], Value::Null, "{steered:?}");
+    assert!(
+        steered[0]["message"].as_str().unwrap().contains("t1"),
+        "{steered:?}"
+    );
+    // The steer carries the lane_message text and nothing of the main prompt's footers.
+    assert_eq!(steered[1]["streamingBehavior"], "steer", "{steered:?}");
+    let steer_message = steered[1]["message"].as_str().expect("steer message");
+    assert!(steer_message.contains("t2"), "{steer_message:?}");
+    assert!(
+        !steer_message.contains("[moraebot] At each big step"),
+        "the steer is the bare text, not a second full lane prompt: {steer_message:?}"
+    );
+
+    let lane = h.lane(1);
+    assert_eq!(lane.prompts, 1, "the steer was not a new prompt");
+    assert_eq!(h.lane_starts().len(), 1, "no second lane child");
+    bounded(omp.shutdown_all()).await;
+}
+
+/// A `lane_message` for a lane whose job already ended is not a steer: the idle lane starts a
+/// real second prompt in a new child.
+#[tokio::test]
+async fn lane_message_after_the_turn_ended_is_not_a_steer() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    // The lane is idle now: the text starts a real second prompt, not a steer.
+    let m2 = h.manager(
+        "ok",
+        &[json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}})],
+    );
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    let results = h.tool_results();
+    let accepted: Value =
+        serde_json::from_str(&results.last().expect("lane_message result").1).expect("json");
+    let lane = h.lane(1);
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    bounded(m2.shutdown_all()).await;
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["steered"], Value::Null, "{accepted:?}");
+    assert_eq!(lane.prompts, 2);
+    assert_eq!(starts.len(), 2);
+}
+
+/// A steer that omp answers in a run of its own (it reached omp as the main run ended) is part
+/// of the lane's result: the job waits for it and stores its newer reply, not the main one.
+#[tokio::test]
+async fn a_steer_answered_in_its_own_run_is_the_lane_result() {
+    let h = Harness::new();
+    let omp = h
+        .manager(
+            "steer",
+            &[
+                lane_start("t1"),
+                json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+            ],
+        )
+        .with_extra_env([("FAKE_OMP_STEER_CASE", "separate".to_owned())]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let lane = h.lane(1);
+    let row = queued_row(&h, 1);
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    assert_eq!(lane.state, LaneState::Idle);
+    assert_eq!(lane.prompts, 1, "the steer was not a new prompt");
+    assert_eq!(starts.len(), 1, "no second lane child");
+    let reply = row.text.split_once('\n').expect("tag line").1;
+    assert!(reply.starts_with("echo: t2"), "{reply:?}");
+}
+
+/// A `lane_message` the running turn never took (here the main prompt was refused before any
+/// `agent_start`, so no steer could join it) is not dropped: it runs as the lane's next prompt.
+/// Whether the text arrives while the job runs or after it ended, the outcome is the same.
+#[tokio::test]
+async fn a_lane_message_the_turn_never_took_runs_as_the_next_prompt() {
+    let h = Harness::new();
+    let omp = h
+        .manager(
+            "ok",
+            &[
+                lane_start("reject-me t1"),
+                json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+            ],
+        )
+        .with_extra_env([("FAKE_OMP_REJECT_TRIGGER", "reject-me".to_owned())]);
+    let wake = omp.lane_wake();
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+    bounded(async {
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let lane = h.lane(1);
+            if lane.prompts == 2 && lane.state != LaneState::Running {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await;
+    let second = h.frames_after_start(1, "prompt");
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    assert_eq!(starts.len(), 2, "the text ran in the lane's next child");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0]["streamingBehavior"], Value::Null, "{second:?}");
+    assert!(
+        second[0]["message"].as_str().unwrap().starts_with("t2"),
+        "{second:?}"
+    );
+    let row = queued_row(&h, 2);
+    let reply = row.text.split_once('\n').expect("tag line").1;
+    assert!(reply.starts_with("echo: t2"), "{reply:?}");
 }
 
 #[tokio::test]
