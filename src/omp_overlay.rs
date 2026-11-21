@@ -272,7 +272,10 @@ mod tests {
             let omp = fake_omp(dir.path(), CHECKED_OMP_VERSION, key);
             let err = check(&omp, dir.path()).expect_err("refused");
             assert_eq!(err.code, E_OMP_OVERLAY, "{key}");
-            assert!(err.to_string().contains("does not know the setting"), "{err}");
+            assert!(
+                err.to_string().contains("does not know the setting"),
+                "{err}"
+            );
         }
     }
 
@@ -300,7 +303,12 @@ mod tests {
         std::fs::write(&path, script).expect("write fake omp");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        assert!(check(&path, &home).expect("passes in home").warning.is_none());
+        assert!(
+            check(&path, &home)
+                .expect("passes in home")
+                .warning
+                .is_none()
+        );
 
         std::fs::write(home.join(".omp/config.yml"), "memory: [oops\n").expect("broken");
         let err = check(&path, &home).expect_err("refused");
