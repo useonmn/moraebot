@@ -123,7 +123,7 @@ impl Gateway {
             redactor.clone(),
             memory::system_clock(),
         )?)?;
-        let advisor = (config.memory.recall_mode() == RecallMode::Shadow)
+        let advisor = (config.memory.recall_mode() != RecallMode::Off)
             .then(|| Arc::new(Advisor::new(config, Arc::clone(&store), redactor.clone())));
         let observer = Observer::new(
             config,

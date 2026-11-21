@@ -2507,17 +2507,33 @@ async fn an_advisor_that_lists_tools_is_refused_and_logged() {
 
 #[tokio::test]
 async fn lane_results_and_untagged_inputs_never_wake_the_advisor() {
-    let h = Harness::new();
-    seed_other_thread(&h);
-    let advisor = qa_advisor(&h, &[]);
-    let progress = advisor.progress();
-    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
-    let lane = lead::lane_result(KEY_A, 7, &lead::LaneResult::Text("done"));
-    bounded(m.prompt(KEY_A, 1, Sender::Owner, &lane)).await;
-    bounded(m.prompt(KEY_A, 1, Sender::Owner, "untagged")).await;
-    m.shutdown_all().await;
-    assert_eq!(*progress.borrow(), 0);
-    assert!(advisor_lines(&h).is_empty());
+    for on in [false, true] {
+        let h = Harness::new();
+        seed_other_thread(&h);
+        let advisor = if on {
+            on_advisor(&h, &[], moraebot::config::MAX_RECALL_WAIT_MS)
+        } else {
+            qa_advisor(&h, &[])
+        };
+        let progress = advisor.progress();
+        let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+        let lane = lead::lane_result(KEY_A, 7, &lead::LaneResult::Text("done"));
+        bounded(m.prompt(KEY_A, 1, Sender::Owner, &lane)).await;
+        bounded(m.prompt(KEY_A, 1, Sender::Owner, "untagged")).await;
+        m.shutdown_all().await;
+        assert_eq!(*progress.borrow(), 0, "on={on}");
+        assert!(advisor_lines(&h).is_empty(), "on={on}");
+        let messages: Vec<Value> = h
+            .frames("prompt")
+            .iter()
+            .map(|f| f["message"].clone())
+            .collect();
+        assert_eq!(
+            messages,
+            [Value::from(lane), Value::from("untagged")],
+            "on={on}"
+        );
+    }
 }
 
 /// A turn with an advisor that fails is the same turn as without one; the failure is logged.
@@ -2571,4 +2587,270 @@ async fn an_advisor_answer_without_json_is_logged_and_the_turn_is_unaffected() {
         moraebot::recall::I_RECALL_PICK,
         "gen=1 epoch=0 row=1 offered=1 picks= rejected=0 unoffered=0 blocked=0"
     ));
+}
+
+// ---- Recall advisor in on mode (#59, PR 3) ----
+
+const KEY_C: &str = "discord:th:1300000000000000003";
+
+/// An advisor in on mode that waits at most `wait_ms` per owner turn.
+fn on_advisor(h: &Harness, vars: &[(&str, &str)], wait_ms: u64) -> Arc<moraebot::recall::Advisor> {
+    qa_advisor_with(h, vars, |c| {
+        c.memory.recall.mode = Some(moraebot::config::RecallMode::On);
+        c.memory.recall.wait_ms = wait_ms;
+    })
+}
+
+/// The file whose existence lets the gated advisor answer (FAKE_OMP_REPLY_GATE).
+fn reply_gate(h: &Harness) -> PathBuf {
+    h.dir.path().join("advisor.gate")
+}
+
+/// One owner note in conversation KEY_C: a candidate no KEY_A or KEY_B input gives the lead.
+fn seed_key_c(h: &Harness) -> String {
+    qa_memory_store(h)
+        .add(qa_note(
+            "Releases go out on Fridays only",
+            moraebot::memory::Bucket::Thread(KEY_C.into()),
+        ))
+        .expect("note")
+        .id
+}
+
+/// The lead's prompt messages, in order.
+fn lead_messages(h: &Harness) -> Vec<String> {
+    h.frames("prompt")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// The delivered ledger rows of lead context `(generation, 0)` as (id, inbox row).
+fn delivered_rows(h: &Harness, generation: i64) -> Vec<(String, Option<i64>)> {
+    h.store
+        .lock()
+        .unwrap()
+        .recall_seen(KEY_A, generation, 0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.state == moraebot::store::RecallState::Delivered)
+        .map(|r| (r.entry_id, r.row_id))
+        .collect()
+}
+
+/// The recalled block for the KEY_C owner note `id` as a lead input carries it.
+fn recalled_for(id: &str) -> String {
+    use moraebot::recall::{RECALLED_CLOSE, RECALLED_LABEL, RECALLED_OPEN};
+    format!(
+        "{RECALLED_OPEN}\n{}\n- {id} [2026-11-20, conversation {KEY_C}, owner; {RECALLED_LABEL}] Releases go out on Fridays only\n{RECALLED_CLOSE}",
+        moraebot::memory::MEMORY_GUARD
+    )
+}
+
+/// An on-mode advisor answering `pick` for `id`, its reply held back until [`reply_gate`] exists.
+fn gated_advisor(h: &Harness, id: &str, wait_ms: u64) -> Arc<moraebot::recall::Advisor> {
+    let reply = format!(r#"{{"pick":["{id}"]}}"#);
+    let gate = reply_gate(h).to_string_lossy().into_owned();
+    on_advisor(
+        h,
+        &[
+            ("FAKE_OMP_REPLY", reply.as_str()),
+            ("FAKE_OMP_REPLY_GATE", gate.as_str()),
+        ],
+        wait_ms,
+    )
+}
+
+#[tokio::test]
+async fn on_mode_appends_the_picks_as_a_guarded_block_and_records_the_delivery() {
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let reply = format!(r#"{{"pick":["{id}"],"reject":[]}}"#);
+    let advisor = on_advisor(
+        &h,
+        &[("FAKE_OMP_REPLY", reply.as_str())],
+        moraebot::config::MAX_RECALL_WAIT_MS,
+    );
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    let report = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input)).await;
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+    wakes_done(&mut progress, 1).await;
+    assert_eq!(
+        lead_messages(&h),
+        [format!("{input}\n\n{}", recalled_for(&id))],
+        "the block follows the owner's input, before the turn started"
+    );
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=0 blocked=0 mode=on"
+        )
+    ));
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DELIVERED,
+        &format!("gen=1 epoch=0 row=1 ids={id}")
+    ));
+    assert_eq!(ledger_rows(&h, 1), [(id.clone(), "delivered".to_owned())]);
+    assert_eq!(delivered_rows(&h, 1), [(id.clone(), Some(1))]);
+
+    // The same lead context never gets it again: nothing left to offer, no call, no block.
+    let again = lead::owner_input(KEY_A, 2, "And the release notes?");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, &again)).await;
+    wakes_done(&mut progress, 2).await;
+    assert_eq!(lead_messages(&h)[1], again);
+    assert_eq!(advisor_prompts(&h).len(), 1);
+    assert_eq!(delivered_rows(&h, 1).len(), 1);
+    m.shutdown_all().await;
+}
+
+/// The wait cap and late picks: a turn waits at most `wait_ms` and starts without the picks;
+/// they go with that conversation's next owner input, never with another conversation's.
+#[tokio::test]
+async fn late_picks_go_with_the_conversations_next_owner_message_only() {
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let gate = reply_gate(&h);
+    let advisor = gated_advisor(&h, &id, 50);
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+
+    // The advisor cannot answer yet: the turn runs after the wait, without a block.
+    let first = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &first))
+        .await
+        .main
+        .outcome;
+    assert_eq!(
+        outcome,
+        Outcome::Reply("echo: Can we ship the release today?".into())
+    );
+    assert_eq!(lead_messages(&h), [first.as_str()]);
+    bounded(asked.wait_for(|n| *n >= 1)).await.expect("asked");
+    assert!(delivered_rows(&h, 1).is_empty());
+
+    // It answers after the turn: the picks are kept.
+    std::fs::write(&gate, "").expect("open the gate");
+    wakes_done(&mut progress, 1).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=0 blocked=0 mode=on"
+        )
+    ));
+
+    // Another conversation's turn never gets them (its own call waits: the gate is shut again).
+    std::fs::remove_file(&gate).expect("shut the gate");
+    let other = lead::owner_input(KEY_B, 2, "hello from b");
+    bounded(m.prompt(KEY_B, 2, Sender::Owner, &other)).await;
+    assert_eq!(lead_messages(&h)[1], other);
+
+    // The conversation's next owner message carries them, recorded with its row.
+    let next = lead::owner_input(KEY_A, 3, "ok, go on");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
+    assert_eq!(
+        lead_messages(&h)[2],
+        format!("{next}\n\n{}", recalled_for(&id))
+    );
+    assert_eq!(delivered_rows(&h, 1), [(id.clone(), Some(3))]);
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DELIVERED,
+        &format!("gen=1 epoch=0 row=3 ids={id}")
+    ));
+    m.shutdown_all().await;
+}
+
+/// Late picks chosen for a lead context that is gone (a restart) are dropped.
+#[tokio::test]
+async fn late_picks_of_an_earlier_lead_generation_are_dropped() {
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let gate = reply_gate(&h);
+    let advisor = gated_advisor(&h, &id, 50);
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let first = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &first)).await;
+    bounded(asked.wait_for(|n| *n >= 1)).await.expect("asked");
+    std::fs::write(&gate, "").expect("open the gate");
+    wakes_done(&mut progress, 1).await;
+    std::fs::remove_file(&gate).expect("shut the gate");
+
+    // A persona change restarts the lead between turns: generation 2.
+    save_persona(&h, "Kai", "", "");
+    let next = lead::owner_input(KEY_A, 2, "ok, go on");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, &next)).await;
+    assert_eq!(
+        lead_messages(&h)[1],
+        next,
+        "the old lead's late picks never reach the new one"
+    );
+    assert!(delivered_rows(&h, 1).is_empty());
+    assert!(delivered_rows(&h, 2).is_empty());
+    m.shutdown_all().await;
+}
+
+/// moraedang's point 7 on #59: during the wait the steer gate is closed, so a second owner
+/// message of the conversation is not steered into a turn that has not started (the
+/// dispatcher queues it as usual).
+#[tokio::test]
+async fn no_steer_joins_a_turn_while_it_waits_for_the_advisor() {
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let gate = reply_gate(&h);
+    let advisor = gated_advisor(&h, &id, moraebot::config::MAX_RECALL_WAIT_MS);
+    let mut asked = advisor.asked();
+    let m = Arc::new(h.manager("ok").with_recall(Arc::clone(&advisor)));
+    let input = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    let turn = {
+        let (m, input) = (Arc::clone(&m), input.clone());
+        tokio::spawn(async move { m.prompt(KEY_A, 1, Sender::Owner, &input).await })
+    };
+    bounded(asked.wait_for(|n| *n >= 1)).await.expect("asked");
+    let mut claimed = false;
+    let steer = lead::owner_input(KEY_A, 2, "also the notes");
+    assert!(!m.try_steer(KEY_A, 2, Sender::Owner, &steer, |_| {
+        claimed = true;
+        true
+    }));
+    assert!(!claimed, "nothing was claimed: the row stays queued");
+    assert_eq!(*m.running_turn().borrow(), None);
+    assert!(h.frames("prompt").is_empty(), "the lead has no input yet");
+
+    std::fs::write(&gate, "").expect("open the gate");
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(report.steered, None);
+    assert_eq!(
+        lead_messages(&h),
+        [format!("{input}\n\n{}", recalled_for(&id))]
+    );
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_failing_advisor_in_on_mode_leaves_the_input_unchanged() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = on_advisor(
+        &h,
+        &[("FAKE_OMP_REPLY", "I would pick the first entry.")],
+        moraebot::config::MAX_RECALL_WAIT_MS,
+    );
+    turn_with_failing_advisor(&h, advisor).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_OUTPUT,
+        "gen=1 epoch=0 row=1"
+    ));
+    assert!(delivered_rows(&h, 1).is_empty());
 }

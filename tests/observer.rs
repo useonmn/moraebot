@@ -1486,15 +1486,23 @@ fn dm(message_id: &str, text: &str) -> InboundEvent {
     }
 }
 
-/// #59, PR 2: the gateway wakes a recall advisor only in shadow mode: the default with jev on and
-/// `memory.recall.model` set, or asked for with `mode = "shadow"`. An upgraded jev install
-/// without a model, jev off (the default install) or `mode = "off"` starts none (moraedang on
-/// #66).
+/// #59, PR 2 and 3: the gateway runs a recall advisor in shadow mode (the default with jev on and
+/// `memory.recall.model` set, or asked for with `mode = "shadow"`) and in on mode (only asked
+/// for). An upgraded jev install without a model, jev off (the default install) or
+/// `mode = "off"` starts none (moraedang on #66).
 #[tokio::test]
-async fn gateway_runs_the_recall_advisor_only_in_shadow_mode() {
+async fn gateway_runs_the_recall_advisor_only_when_its_mode_is_not_off() {
     let jev = FakeJev::start().await;
     type Case = (&'static str, fn(&mut Config), bool);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
+        (
+            "mode on, model set",
+            |c| {
+                c.memory.recall.model = "qa-small".into();
+                c.memory.recall.mode = Some(moraebot::config::RecallMode::On);
+            },
+            true,
+        ),
         ("jev on, no model, mode unset", |_| {}, false),
         (
             "jev on, model set",
