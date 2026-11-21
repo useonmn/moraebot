@@ -193,6 +193,7 @@ impl Rig {
                 access: Default::default(),
             }),
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
         let tap = LogTap::create(&root.join("fake-omp.log"));

@@ -1061,8 +1061,12 @@ impl Advisor {
         let this = Arc::clone(self);
         let wake = mid.wake.clone();
         let taken = shown.clone();
-        let on_taken = Box::new(move || this.delivered(&wake, &taken));
-        if notes.send(turn, NoteKind::Recall, &block, Some(on_taken)) {
+        let on_settled = Box::new(move |took: bool| {
+            if took {
+                this.delivered(&wake, &taken);
+            }
+        });
+        if notes.send(turn, NoteKind::Recall, &block, Some(on_settled)) {
             lock(&mid.shown).extend(ids);
             return;
         }

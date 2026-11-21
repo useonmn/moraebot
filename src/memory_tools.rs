@@ -331,7 +331,9 @@ pub fn plan_write(
 /// the sentence's number, as the observer numbers it).
 fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
     let tag = lead::parse_tag(&row.text)?;
-    let lane = tag.lane.filter(|_| tag.failed.is_none() && !tag.stalled)?;
+    let lane = tag
+        .lane
+        .filter(|_| tag.failed.is_none() && !tag.stalled && !tag.news)?;
     let (id, seq) = row.message_id.split_once(':')?;
     let seq: i64 = seq.parse().ok().filter(|_| id == lane.to_string())?;
     lead::lane_own_sentences(lead::lane_result_text(&row.text))

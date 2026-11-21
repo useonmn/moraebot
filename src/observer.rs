@@ -967,8 +967,9 @@ impl Observer {
         let Some(row) = row.filter(|row| row.origin == "lane") else {
             return Ok(());
         };
-        let plain = lead::parse_tag(&row.text)
-            .is_some_and(|tag| tag.lane == Some(job.lane) && tag.failed.is_none() && !tag.stalled);
+        let plain = lead::parse_tag(&row.text).is_some_and(|tag| {
+            tag.lane == Some(job.lane) && tag.failed.is_none() && !tag.stalled && !tag.news
+        });
         let lane = lock(&self.store).lane(job.lane)?;
         let (true, Some(lane)) = (plain, lane) else {
             return Ok(());

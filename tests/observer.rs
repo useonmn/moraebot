@@ -64,6 +64,7 @@ fn test_config(root: &Path, omp_path: PathBuf, jev_url: &str) -> Config {
         }),
         bridge: None,
         omp: OmpConfig::default(),
+        lead: Default::default(),
         memory,
     }
 }

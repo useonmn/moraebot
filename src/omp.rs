@@ -93,6 +93,9 @@ pub const E_COST_CAP: &str = "E_COST_CAP";
 pub const E_TURN_TIMEOUT: &str = "E_TURN_TIMEOUT";
 /// The child went away (or its transport broke) during the turn.
 pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
+/// Warn log code: a lead turn ran past `lead.handoff_after_minutes` while an owner message of
+/// its conversation waits; moraebot sent it one busy note.
+pub const W_LEAD_BUSY: &str = "W_LEAD_BUSY";
 /// Warn log code: a running lead or lane turn showed no progress for `omp.stall_after_minutes`.
 /// Only a notice follows; the turn keeps running.
 pub const W_TURN_STALLED: &str = "W_TURN_STALLED";
@@ -742,6 +745,10 @@ fn disarm(kill: &LeadKill) {
 
 /// The tag line of a note holding the recall advisor's mid-task picks.
 pub const RECALL_NOTE_TAG: &str = "[moraebot memory recalled]";
+/// The tag line of the note that asks a long lead turn to hand off and answer (#68).
+pub const BUSY_NOTE_TAG: &str = "[moraebot lead busy]";
+/// The tag line of a note holding a lane's progress note for the running turn's conversation.
+pub const NEWS_NOTE_TAG: &str = "[moraebot lane news]";
 
 /// What a moraebot note is. Its tag line tells the lead it is not an owner message: it has no
 /// `conversation=` or `message=` field, so `lead::parse_tag` reads it as untagged.
@@ -749,12 +756,18 @@ pub const RECALL_NOTE_TAG: &str = "[moraebot memory recalled]";
 pub enum NoteKind {
     /// Saved entries the recall advisor chose while the turn runs (#59), as a recalled block.
     Recall,
+    /// The turn ran past `lead.handoff_after_minutes` while an owner message waits (#68).
+    Busy,
+    /// A running lane's progress note for the running turn's conversation (#68).
+    News,
 }
 
 impl NoteKind {
     pub fn tag(self) -> &'static str {
         match self {
             Self::Recall => RECALL_NOTE_TAG,
+            Self::Busy => BUSY_NOTE_TAG,
+            Self::News => NEWS_NOTE_TAG,
         }
     }
 }
@@ -764,16 +777,18 @@ impl NoteKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TurnId(u64);
 
-/// Runs once the lead took a note: its steer was sent and not refused (the same rule as an
-/// input's memory sections). It runs when the turn ends, never if the note was not sent.
-pub type OnTaken = Box<dyn FnOnce() + Send>;
+/// Runs when the turn of a sent note ends, with whether the lead took it: `true` when its steer
+/// was answered and not refused (the same rule as an input's memory sections), `false` when omp
+/// refused it or the turn was cut (killed, timed out, child lost) before its result came. It
+/// never runs for a note that was not sent.
+pub type OnSettled = Box<dyn FnOnce(bool) + Send>;
 
 /// A note sent into the open turn: the receiver of its result (waited for when the turn ends,
-/// its text dropped) and what to run once the lead took it.
+/// its text dropped) and what to run once it settled.
 struct SentNote {
     kind: NoteKind,
     result: oneshot::Receiver<Result<PromptTurn, RpcError>>,
-    on_taken: Option<OnTaken>,
+    on_settled: Option<OnSettled>,
 }
 
 /// Sends moraebot's own notes into a running lead turn ([`OmpManager::notes`]). A note is a
@@ -790,13 +805,13 @@ pub struct LeadNotes {
 
 impl LeadNotes {
     /// Sends `body` under `kind`'s tag line into lead turn `turn` while it runs (the lead
-    /// reported `agent_start`). Returns whether it was sent; `on_taken` runs only then.
+    /// reported `agent_start`). Returns whether it was sent; `on_settled` runs only then.
     pub fn send(
         &self,
         turn: TurnId,
         kind: NoteKind,
         body: &str,
-        on_taken: Option<OnTaken>,
+        on_settled: Option<OnSettled>,
     ) -> bool {
         let mut gate = lock(&self.gate);
         let Some(open) = gate.as_mut().filter(|open| open.id == turn && open.started) else {
@@ -816,7 +831,7 @@ impl LeadNotes {
         open.notes.push(SentNote {
             kind,
             result,
-            on_taken,
+            on_settled,
         });
         tracing::info!(?kind, conversation = %open.key, main = open.main_row_id, "note sent into the running turn");
         true
@@ -984,38 +999,62 @@ fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, e
     }
 }
 
-/// Progress of the running lead turn, for the stall notice. The lead's event callback only
-/// counts agent events (any of them is progress); `stalled`, called with each watchdog tick's
-/// time, keeps the times, like a lane's `Activity`.
+/// Progress of the running lead turn, for the stall notice, the busy note and the status
+/// answer. The lead's event callback counts agent events (any of them is progress) and keeps
+/// the newest tool start; `stalled`, called with each watchdog tick's time, keeps the times,
+/// like a lane's `Activity`.
 #[derive(Default)]
 struct LeadWatch {
     /// The running turn's conversation; `None` between turns.
     key: Option<String>,
+    /// When the running turn began.
+    began: Option<Instant>,
+    /// The newest tool the running turn started: its name and its intent as omp sent it.
+    tool: Option<(String, Option<String>)>,
     events: u64,
     /// The event count as of the last check that saw it change, and when.
     seen: Option<(u64, Instant)>,
     /// The current stretch without progress was already reported.
     reported: bool,
+    /// The running turn already got its busy note.
+    busy_noted: bool,
+}
+
+/// What the lead is doing now, for a status answer ([`OmpManager::lead_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeadStatus {
+    /// The running turn's conversation.
+    pub conversation: String,
+    /// How long the turn has run.
+    pub running: Duration,
+    /// The newest tool the turn started, and its intent cleaned like a lane note.
+    pub tool: Option<(String, Option<String>)>,
 }
 
 impl LeadWatch {
-    fn begin(&mut self, key: &str) {
+    fn begin(&mut self, key: &str, now: Instant) {
         self.key = Some(key.to_owned());
+        self.began = Some(now);
+        self.tool = None;
         self.seen = None;
         self.reported = false;
+        self.busy_noted = false;
     }
 
     fn end(&mut self) {
         self.key = None;
+        self.began = None;
+        self.tool = None;
         self.seen = None;
     }
 
     fn note(&mut self, event: &Event) {
-        if matches!(
-            event,
-            Event::Notification(RpcNotification::RpcAgentEvent(_))
-        ) {
-            self.events += 1;
+        let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
+            return;
+        };
+        self.events += 1;
+        if let RpcAgentEvent::ToolExecutionStart(start) = agent {
+            self.tool = Some((start.tool_name.clone(), start.intent.clone()));
         }
     }
 
@@ -1098,7 +1137,12 @@ pub struct OmpManager {
     turn_timeout: Duration,
     /// How long a lead turn may show no progress before `lead_stalled` reports it.
     stall_after: Duration,
+    /// How long a lead turn may keep an owner message waiting before its busy note; `None`
+    /// when `lead.handoff_after_minutes = 0`.
+    handoff_after: Option<Duration>,
     lead_watch: Arc<Mutex<LeadWatch>>,
+    /// The last attempt to start the lead child failed and none has succeeded since.
+    lead_down: AtomicBool,
     /// The lead's tool call starts its event drain handled, for `memory_write`.
     tool_starts: Arc<ToolStarts>,
     extra_env: Vec<(OsString, OsString)>,
@@ -1144,6 +1188,8 @@ impl OmpManager {
         ));
         Self {
             stall_after: config.omp.stall_after(),
+            handoff_after: config.lead.handoff_after(),
+            lead_down: AtomicBool::new(false),
             config,
             store,
             turn_timeout,
@@ -1281,10 +1327,48 @@ impl OmpManager {
 
     /// The running lead turn, once the lead reported `agent_start` for it; `None` between turns.
     pub fn turn_id(&self) -> Option<TurnId> {
+        self.open_turn().map(|(id, _)| id)
+    }
+
+    /// The running lead turn and its conversation, once the lead reported `agent_start` for
+    /// it; `None` between turns.
+    pub fn open_turn(&self) -> Option<(TurnId, String)> {
         lock(&self.gate)
             .as_ref()
             .filter(|turn| turn.started)
-            .map(|turn| turn.id)
+            .map(|turn| (turn.id, turn.key.clone()))
+    }
+
+    /// Whether the last attempt to start the lead child failed and none has succeeded since:
+    /// a row queued for the lead would then only fail.
+    pub fn lead_down(&self) -> bool {
+        self.lead_down.load(Ordering::Relaxed)
+    }
+
+    /// What the running lead turn is doing at `now`, its tool intent cleaned by
+    /// [`Self::clean_note`]; `None` between turns.
+    pub fn lead_status(&self, now: Instant) -> Option<LeadStatus> {
+        let (conversation, began, tool) = {
+            let watch = lock(&self.lead_watch);
+            (watch.key.clone()?, watch.began?, watch.tool.clone())
+        };
+        let tool = tool.map(|(name, intent)| {
+            let intent = intent
+                .map(|intent| self.clean_note(&intent))
+                .filter(|intent| !intent.is_empty());
+            (name, intent)
+        });
+        Some(LeadStatus {
+            conversation,
+            running: now.saturating_duration_since(began),
+            tool,
+        })
+    }
+
+    /// `raw` cleaned like a lane progress note ([`crate::lane::clean_note`]): secrets, mentions,
+    /// and the work folder and `$HOME` paths are scrubbed.
+    pub fn clean_note(&self, raw: &str) -> String {
+        crate::lane::clean_note(raw, &self.config)
     }
 
     /// Notified after a lane result row was stored; the dispatcher then looks for work.
@@ -1319,6 +1403,59 @@ impl OmpManager {
         Some(key)
     }
 
+    /// One busy check of the running lead turn at watchdog tick time `now`: when the turn has
+    /// run for `lead.handoff_after_minutes` and an owner message of its conversation waits
+    /// (the turn's steered row, or a row `queued` reports for the conversation key), sends one
+    /// [`NoteKind::Busy`] note into the turn and logs [`W_LEAD_BUSY`]. At most one note per
+    /// turn; the turn is never stopped. Off when the setting is `0` or not below the turn
+    /// limit. Returns whether a note was sent.
+    pub fn lead_busy(&self, now: Instant, queued: impl FnOnce(&str) -> bool) -> bool {
+        let Some(after) = self
+            .handoff_after
+            .filter(|after| *after < self.turn_timeout)
+        else {
+            return false;
+        };
+        let (key, began) = {
+            let watch = lock(&self.lead_watch);
+            let (Some(key), Some(began)) = (watch.key.clone(), watch.began) else {
+                return false;
+            };
+            if watch.busy_noted || now.saturating_duration_since(began) < after {
+                return false;
+            }
+            (key, began)
+        };
+        let Some((turn, steered)) = lock(&self.gate)
+            .as_ref()
+            .filter(|open| open.started && open.key == key)
+            .map(|open| (open.id, open.steer.is_some()))
+        else {
+            return false;
+        };
+        if !steered && !queued(&key) {
+            return false;
+        }
+        let minutes = now.saturating_duration_since(began).as_secs() / 60;
+        if !self
+            .notes()
+            .send(turn, NoteKind::Busy, &lead::busy_note(minutes), None)
+        {
+            return false;
+        }
+        let mut watch = lock(&self.lead_watch);
+        if watch.began == Some(began) {
+            watch.busy_noted = true;
+        }
+        tracing::warn!(
+            code = W_LEAD_BUSY,
+            conversation = %key,
+            minutes,
+            "lead turn keeps an owner message waiting; busy note sent"
+        );
+        true
+    }
+
     /// The chat role's runtime: tool-less children, never the lead.
     pub fn chat(&self) -> Arc<ChatManager> {
         Arc::clone(&self.chat)
@@ -1349,8 +1486,12 @@ impl OmpManager {
                 tracing::warn!(code, "persona file not used");
             }
             match self.start(append).await {
-                Ok(started) => *live = Some(started),
+                Ok(started) => {
+                    self.lead_down.store(false, Ordering::Relaxed);
+                    *live = Some(started);
+                }
                 Err(outcome) => {
+                    self.lead_down.store(true, Ordering::Relaxed);
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
                         steered: None,
@@ -1369,7 +1510,7 @@ impl OmpManager {
             outside_tools: current.outside.load(Ordering::Relaxed),
             ..TurnContext::new(row_id, key, sender)
         });
-        lock(&self.lead_watch).begin(key);
+        lock(&self.lead_watch).begin(key, Instant::now());
         self.tool_starts.clear();
         let (input, fresh, epoch, held) = {
             let given = lock(&current.given);
@@ -1507,7 +1648,7 @@ impl OmpManager {
         for SentNote {
             kind,
             mut result,
-            on_taken,
+            on_settled,
         } in notes
         {
             let outcome = if killed || main_timed_out {
@@ -1531,10 +1672,12 @@ impl OmpManager {
                     }
                 }
             };
-            if rejected(&outcome) {
-                tracing::warn!(?kind, "omp refused a note; not delivered");
-            } else if let Some(on_taken) = on_taken {
-                on_taken();
+            let taken = !rejected(&outcome) && !matches!(outcome, Outcome::NeedsCheck { .. });
+            if !taken {
+                tracing::warn!(?kind, code = ?outcome.code(), "note not delivered");
+            }
+            if let Some(on_settled) = on_settled {
+                on_settled(taken);
             }
         }
         let files = take_sent(&current.sent_files);
@@ -2194,7 +2337,7 @@ mod tests {
             None,
             "no turn, no stall"
         );
-        w.begin("discord:th:1");
+        w.begin("discord:th:1", Instant::now());
         w.note(&agent_event());
         assert_eq!(
             w.stalled(base, AFTER),
@@ -2218,7 +2361,7 @@ mod tests {
     fn lead_watch_progress_starts_a_new_stretch() {
         let base = Instant::now();
         let mut w = LeadWatch::default();
-        w.begin("discord:th:1");
+        w.begin("discord:th:1", Instant::now());
         assert_eq!(w.stalled(base, AFTER), None);
         // Progress just before the limit moves the clock.
         w.note(&agent_event());
@@ -2263,6 +2406,7 @@ mod tests {
                 turn_timeout_minutes,
                 ..OmpConfig::default()
             },
+            lead: Default::default(),
             memory: crate::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
@@ -2287,7 +2431,7 @@ mod tests {
         assert_eq!(manager.lanes().turn_timeout, five);
         assert_eq!(manager.chat().turn_timeout, five);
         // A limit at or below the stall time ends the turn first: no stall check.
-        lock(&manager.lead_watch).begin("discord:th:1");
+        lock(&manager.lead_watch).begin("discord:th:1", Instant::now());
         let base = Instant::now();
         assert_eq!(manager.lead_stalled(base), None);
         assert_eq!(manager.lead_stalled(base + 2 * AFTER), None);
@@ -2542,10 +2686,73 @@ mod tests {
     }
 
     #[test]
+    fn lead_watch_keeps_the_newest_tool_and_its_intent_per_turn() {
+        let mut w = LeadWatch::default();
+        let t0 = Instant::now();
+        w.begin("discord:th:1", t0);
+        let start = |intent: Option<&str>| {
+            Event::Notification(RpcNotification::RpcAgentEvent(
+                RpcAgentEvent::ToolExecutionStart(omp_rpc::ToolExecutionStartEvent {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "bash".into(),
+                    args: None,
+                    intent: intent.map(str::to_owned),
+                }),
+            ))
+        };
+        w.note(&start(Some("ping @here")));
+        assert_eq!(
+            w.tool,
+            Some(("bash".to_owned(), Some("ping @here".to_owned())))
+        );
+        w.note(&start(None));
+        assert_eq!(w.tool, Some(("bash".to_owned(), None)));
+        w.begin("discord:th:2", t0);
+        assert_eq!(w.tool, None);
+        w.end();
+        assert_eq!((w.key.as_deref(), w.began), (None, None));
+    }
+
+    #[test]
+    fn lead_status_shows_the_intent_with_home_paths_scrubbed() {
+        let (_dir, manager) = manager_with(None);
+        let home = std::env::var("HOME").expect("HOME is set");
+        assert!(
+            manager.lead_status(Instant::now()).is_none(),
+            "no turn runs"
+        );
+        let t0 = Instant::now();
+        {
+            let mut watch = lock(&manager.lead_watch);
+            watch.begin("discord:th:1", t0);
+            watch.note(&Event::Notification(RpcNotification::RpcAgentEvent(
+                RpcAgentEvent::ToolExecutionStart(omp_rpc::ToolExecutionStartEvent {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "read".into(),
+                    args: None,
+                    intent: Some(format!("reading {home}/qa/x.rs  @here")),
+                }),
+            )));
+        }
+        let status = manager
+            .lead_status(t0 + Duration::from_secs(120))
+            .expect("the turn runs");
+        assert_eq!(status.conversation, "discord:th:1");
+        assert_eq!(status.running, Duration::from_secs(120));
+        assert_eq!(
+            status.tool,
+            Some((
+                "read".to_owned(),
+                Some("reading ~/qa/x.rs \u{ff20}here".to_owned())
+            ))
+        );
+    }
+
+    #[test]
     fn lead_watch_starts_over_for_each_turn() {
         let base = Instant::now();
         let mut w = LeadWatch::default();
-        w.begin("discord:th:1");
+        w.begin("discord:th:1", Instant::now());
         assert_eq!(w.stalled(base, AFTER), None);
         assert!(w.stalled(base + AFTER, AFTER).is_some());
         w.end();
@@ -2554,7 +2761,7 @@ mod tests {
             None,
             "idle between turns"
         );
-        w.begin("discord:th:2");
+        w.begin("discord:th:2", Instant::now());
         assert_eq!(w.stalled(base + 2 * AFTER, AFTER), None);
         assert_eq!(
             w.stalled(base + 3 * AFTER, AFTER).as_deref(),

@@ -13,11 +13,11 @@ use moraebot::adapter::{
     InboundAttachment, InboundEvent, MessengerAdapter, SendResult, TypingHandle,
 };
 use moraebot::chat;
-use moraebot::config::DEFAULT_STALL_AFTER;
 use moraebot::config::{
     AccessMode, AllowEntry, Config, DiscordConfig, JevConfig, MemoryConfig, OmpConfig, Platform,
     Role, SenderKind,
 };
+use moraebot::config::{DEFAULT_HANDOFF_AFTER, DEFAULT_STALL_AFTER};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
     N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_OMP_VERSION,
@@ -82,6 +82,7 @@ fn test_config(root: &Path, omp_path: PathBuf) -> Config {
         }),
         bridge: None,
         omp: OmpConfig::default(),
+        lead: Default::default(),
         memory: moraebot::config::MemoryConfig::default(),
     }
 }
@@ -329,21 +330,6 @@ impl Harness {
             .into_iter()
             .filter_map(|call| match call {
                 Call::Send { channel, text } => Some((channel, text)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn edits(&self) -> Vec<(String, String, String)> {
-        self.adapter
-            .calls()
-            .into_iter()
-            .filter_map(|call| match call {
-                Call::Edit {
-                    channel,
-                    message_id,
-                    text,
-                } => Some((channel, message_id, text)),
                 _ => None,
             })
             .collect()
@@ -3608,15 +3594,46 @@ async fn finished_onboarding_marks_nothing() {
 
 const NEWS_KEY: &str = "fake:th:444";
 
-/// Lane news items: (lane id, conversation key, text).
+/// Lane news items of job 1: (lane id, conversation key, text).
 fn news(items: &[(i64, &str, &str)]) -> Vec<LaneNews> {
     items
         .iter()
         .map(|&(lane_id, key, text)| LaneNews {
             lane_id,
+            seq: 1,
             conversation_key: key.to_owned(),
             text: text.to_owned(),
         })
+        .collect()
+}
+
+/// Starts a running lane of conversation `key` in the store and returns its id.
+fn running_lane(h: &Harness, call: &str, key: &str) -> i64 {
+    match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane(
+            call,
+            key,
+            "t1\nmore",
+            Some("file ."),
+            None,
+            MAX_RUNNING_LANES,
+        )
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    }
+}
+
+/// The lane news rows in the store: (message id, text, state).
+fn news_rows(h: &Harness) -> Vec<(String, String, State)> {
+    (1..=h.count())
+        .map(|id| h.row(id))
+        .filter(|row| row.origin == "lane" && row.message_id.contains(":news:"))
+        .map(|row| (row.message_id, row.text, row.state))
         .collect()
 }
 
@@ -3624,9 +3641,10 @@ fn news(items: &[(i64, &str, &str)]) -> Vec<LaneNews> {
 async fn lane_news_waits_for_a_quiet_conversation() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
     let t0 = Instant::now();
     queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
-    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let n = news(&[(lane, NEWS_KEY, "qa step 1")]);
     let mut posted = Vec::new();
     for at in [
         t0,
@@ -3636,20 +3654,30 @@ async fn lane_news_waits_for_a_quiet_conversation() {
     ] {
         posted.push(h.dispatcher.post_news(n.clone(), at).await);
     }
+    let rows = news_rows(&h);
     let sends = h.sends();
     h.close().await;
 
     assert_eq!(posted, [0, 0, 1, 0]);
-    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+    assert_eq!(
+        rows,
+        [(
+            n[0].message_id(),
+            lead::lane_news(NEWS_KEY, lane, "qa step 1"),
+            State::Queued
+        )]
+    );
+    assert!(sends.is_empty(), "nothing is posted in the chat: {sends:?}");
 }
 
 #[tokio::test]
 async fn lane_news_counts_quiet_time_before_the_report() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
     let t0 = Instant::now();
     queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
-    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let n = news(&[(lane, NEWS_KEY, "qa step 1")]);
     let a = h.dispatcher.post_news(Vec::new(), t0).await;
     let b = h.dispatcher.post_news(n, t0 + NEWS_AFTER).await;
     h.close().await;
@@ -3661,9 +3689,10 @@ async fn lane_news_counts_quiet_time_before_the_report() {
 async fn lane_news_clock_restarts_on_owner_message() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
     let t0 = Instant::now();
     queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
-    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let n = news(&[(lane, NEWS_KEY, "qa step 1")]);
     let a = h.dispatcher.post_news(n.clone(), t0).await;
     queued(h.handle(event("4442", OWNER, Some("444"), "more")).await);
     let b = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
@@ -3678,200 +3707,279 @@ async fn lane_news_clock_restarts_on_a_reply() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
     let t0 = Instant::now();
-    let started = h
-        .store
-        .lock()
-        .unwrap()
-        .start_lane(
-            "call-1",
-            NEWS_KEY,
-            "t1",
-            Some("file ."),
-            None,
-            MAX_RUNNING_LANES,
-        )
-        .unwrap();
-    let input = lead::lane_result(NEWS_KEY, 1, &LaneResult::Text("r"));
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
+    let input = lead::lane_result(NEWS_KEY, lane, &LaneResult::Text("r"));
     let finished = h
         .store
         .lock()
         .unwrap()
-        .finish_lane(1, 1, &input, LaneState::Idle, None)
+        .finish_lane(lane, 1, &input, LaneState::Idle, None)
         .unwrap();
     let stepped = h.step().await;
-    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let n = news(&[(lane, NEWS_KEY, "qa step 1")]);
     let a = h.dispatcher.post_news(n.clone(), t0).await;
     let b = h.dispatcher.post_news(n, t0 + NEWS_AFTER).await;
     let sends = h.sends();
     h.close().await;
 
-    assert_eq!(started, LaneStart::New(1));
     assert!(finished);
     assert!(stepped);
     assert_eq!([a, b], [0, 1]);
-    assert_eq!(sends.len(), 2);
-    assert_eq!(sends[0].0, "444");
+    assert_eq!(sends.len(), 1, "only the reply; no raw news: {sends:?}");
     assert!(sends[0].1.starts_with("echo: "));
-    assert_eq!(sends[1], ("444".to_owned(), news_line(1, "qa step 1")));
 }
 
 #[tokio::test]
-async fn lane_news_is_one_message_per_lane() {
+async fn lane_news_reaches_the_lead_as_one_row_per_note() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
+    let other = running_lane(&h, "call-2", "fake:th:555");
     let t0 = Instant::now();
-    let a = h
-        .dispatcher
-        .post_news(
-            news(&[
-                (1, NEWS_KEY, "a1"),
-                (2, "fake:th:555", "b1"),
-                (3, NEWS_KEY, "a3"),
-            ]),
-            t0,
-        )
-        .await;
+    let both = news(&[(lane, NEWS_KEY, "a1"), (other, "fake:th:555", "b1")]);
+    let a = h.dispatcher.post_news(both.clone(), t0).await;
+    // The same note again, once the conversations are quiet: its row exists already.
     let b = h.dispatcher.post_news(Vec::new(), t0 + WATCH_TICK).await;
     let c = h
         .dispatcher
-        .post_news(
-            news(&[(1, NEWS_KEY, "a1b"), (3, NEWS_KEY, "a3b")]),
-            t0 + WATCH_TICK + NEWS_AFTER,
-        )
+        .post_news(both[..1].to_vec(), t0 + WATCH_TICK + NEWS_AFTER)
         .await;
+    let rows = news_rows(&h);
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
     let sends = h.sends();
-    let edits = h.edits();
     h.close().await;
 
-    assert_eq!([a, b, c], [3, 0, 2]);
+    assert_eq!([a, b, c], [2, 0, 1]);
+    assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(
-        sends,
+        messages,
         [
-            ("444".to_owned(), news_line(1, "a1")),
-            ("555".to_owned(), news_line(2, "b1")),
-            ("444".to_owned(), news_line(3, "a3")),
+            lead::lane_news(NEWS_KEY, lane, "a1"),
+            lead::lane_news("fake:th:555", other, "b1"),
         ]
     );
+    assert_eq!(sends.len(), 2, "one lead reply per note: {sends:?}");
+    assert!(sends.iter().all(|(_, text)| text.starts_with("echo: ")));
+}
+
+#[tokio::test]
+async fn lane_news_is_steered_into_a_running_turn_of_its_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000980", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", &key);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let t0 = Instant::now();
+    let n = news(&[(lane, &key, "qa step 1")]);
+    let first = h.dispatcher.post_news(Vec::new(), t0).await;
+    let sent = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    // In flight: the same note is not offered again before it settles.
+    let again = h.dispatcher.post_news(n.clone(), t0 + 2 * NEWS_AFTER).await;
+    steered(
+        h.handle(in_thread("1300000000000000981", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    // The turn ended and the lead took the note: the next step marks it handed on.
+    let settled = h.dispatcher.post_news(n, t0 + 3 * NEWS_AFTER).await;
+    let rows = news_rows(&h);
+    let messages = raw_prompt_messages(&h);
+    h.close().await;
+
+    assert_eq!([first, sent, again, settled], [0, 0, 0, 1]);
+    assert!(
+        rows.is_empty(),
+        "no news row: the turn took the note: {rows:?}"
+    );
     assert_eq!(
-        edits,
+        messages,
         [
-            (
-                "444".to_owned(),
-                "fake-msg-1".to_owned(),
-                news_line(1, "a1b")
+            lead::owner_input(&key, a, "A"),
+            format!(
+                "{}\n{}",
+                omp::NEWS_NOTE_TAG,
+                lead::lane_news_note(lane, "qa step 1")
             ),
-            (
-                "444".to_owned(),
-                "fake-msg-3".to_owned(),
-                news_line(3, "a3b")
-            ),
+            lead::owner_input(&key, a + 1, "B"),
         ]
     );
 }
 
 #[tokio::test]
-async fn lane_news_edits_the_lane_message() {
+async fn lane_news_omp_refuses_waits_as_a_row() {
     let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open(dir.path(), "ok");
+    let h = Harness::build(
+        dir.path(),
+        "steer",
+        PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+        false,
+        vec![
+            ("FAKE_OMP_STEER_CASE", "merged".to_owned()),
+            ("FAKE_OMP_REJECT_TRIGGER", "qa-refuse".to_owned()),
+        ],
+    );
+    let a = queued(
+        h.handle(in_thread("1300000000000000984", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", &key);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
     let t0 = Instant::now();
-    let a = h
+    let n = news(&[(lane, &key, "qa-refuse step 1")]);
+    let quiet = h.dispatcher.post_news(Vec::new(), t0).await;
+    let sent = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    let rows_during = news_rows(&h);
+    steered(
+        h.handle(in_thread("1300000000000000985", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let settled = h
         .dispatcher
-        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0)
+        .post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK)
         .await;
-    let step2 = news(&[(1, NEWS_KEY, "qa step 2")]);
-    let b = h.dispatcher.post_news(step2.clone(), t0 + WATCH_TICK).await;
-    let c = h
-        .dispatcher
-        .post_news(step2, t0 + WATCH_TICK + NEWS_AFTER)
-        .await;
-    let d = h
-        .dispatcher
-        .post_news(
-            news(&[(1, NEWS_KEY, "qa step 3")]),
-            t0 + 2 * WATCH_TICK + NEWS_AFTER,
-        )
-        .await;
-    let sends = h.sends();
-    let edits = h.edits();
+    let rows = news_rows(&h);
     h.close().await;
 
-    assert_eq!([a, b, c, d], [1, 0, 1, 0]);
-    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+    assert_eq!([quiet, sent, settled], [0, 0, 1]);
+    assert!(rows_during.is_empty(), "{rows_during:?}");
     assert_eq!(
-        edits,
+        rows,
         [(
-            "444".to_owned(),
-            "fake-msg-1".to_owned(),
-            news_line(1, "qa step 2")
+            n[0].message_id(),
+            lead::lane_news(&key, lane, "qa-refuse step 1"),
+            State::Queued
         )]
     );
 }
 
 #[tokio::test]
-async fn lane_news_posts_again_when_the_edit_fails() {
+async fn lane_news_in_a_cut_turn_waits_as_a_row() {
     let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open(dir.path(), "ok");
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000986", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", &key);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
     let t0 = Instant::now();
-    let a = h
+    let quiet = h.dispatcher.post_news(Vec::new(), t0).await;
+    let sent = h
         .dispatcher
-        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0)
+        .post_news(news(&[(lane, &key, "qa step 1")]), t0 + NEWS_AFTER)
         .await;
-    let b = h.dispatcher.post_news(Vec::new(), t0 + WATCH_TICK).await;
-    h.adapter.fail_next_edit();
-    let c = h
+    // The turn ends without an answer to the held note: a shutdown kills the lead.
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+    let settled = h
         .dispatcher
-        .post_news(
-            news(&[(1, NEWS_KEY, "qa step 2")]),
-            t0 + WATCH_TICK + NEWS_AFTER,
-        )
+        .post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK)
         .await;
-    let d = h
+    let rows = news_rows(&h);
+
+    assert_eq!([quiet, sent, settled], [0, 0, 1]);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, lead::lane_news(&key, lane, "qa step 1"));
+    assert_eq!(rows[0].2, State::Queued);
+}
+
+#[tokio::test]
+async fn lane_news_waits_as_a_row_while_the_lead_works_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000982", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let handed = h
         .dispatcher
-        .post_news(Vec::new(), t0 + 2 * WATCH_TICK + NEWS_AFTER)
+        .post_news(news(&[(lane, NEWS_KEY, "qa step 1")]), Instant::now())
         .await;
-    let e = h
-        .dispatcher
-        .post_news(
-            news(&[(1, NEWS_KEY, "qa step 3")]),
-            t0 + 2 * WATCH_TICK + 2 * NEWS_AFTER,
-        )
-        .await;
-    let sends = h.sends();
-    let edits = h.edits();
+    let rows = news_rows(&h);
+    steered(
+        h.handle(in_thread("1300000000000000983", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let during = raw_prompt_messages(&h).len();
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
     h.close().await;
 
-    assert_eq!([a, b, c, d, e], [1, 0, 1, 0, 1]);
+    assert_eq!(handed, 1);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, State::Queued);
     assert_eq!(
-        sends,
-        [
-            ("444".to_owned(), news_line(1, "qa step 1")),
-            ("444".to_owned(), news_line(1, "qa step 2")),
-        ]
+        during, 2,
+        "the note never joined the other conversation's turn"
     );
     assert_eq!(
-        edits,
-        [
-            (
-                "444".to_owned(),
-                "fake-msg-1".to_owned(),
-                news_line(1, "qa step 2")
-            ),
-            (
-                "444".to_owned(),
-                "fake-msg-2".to_owned(),
-                news_line(1, "qa step 3")
-            ),
-        ]
+        messages.last(),
+        Some(&lead::lane_news(NEWS_KEY, lane, "qa step 1"))
     );
 }
 
 #[tokio::test]
-async fn lane_news_failed_send_is_retried_next_tick() {
+async fn stale_lane_news_is_dropped_at_its_turn() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    let t0 = Instant::now();
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
+    let handed = h
+        .dispatcher
+        .post_news(news(&[(lane, NEWS_KEY, "qa step 1")]), Instant::now())
+        .await;
+    let input = lead::lane_result(NEWS_KEY, lane, &LaneResult::Text("r"));
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, &input, LaneState::Idle, None)
+            .unwrap()
+    );
+    let dropped = h.step().await;
+    let after_drop = raw_prompt_messages(&h);
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let rows = news_rows(&h);
+    let news_row = h.row(1);
+    h.close().await;
+
+    assert_eq!(handed, 1);
+    assert!(dropped);
+    assert!(after_drop.is_empty(), "{after_drop:?}");
+    assert_eq!(messages, [input]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].2, State::Failed);
+    assert_eq!(
+        news_row.error.as_deref(),
+        Some(moraebot::dispatch::E_LANE_NEWS_STALE)
+    );
+}
+
+#[tokio::test]
+async fn lane_news_is_posted_raw_while_the_lead_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_with(dir.path(), "ok", dir.path().join("no-such-omp"));
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
     queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
-    let n = news(&[(1, NEWS_KEY, "qa step 1")]);
+    let failed = h.step().await;
+    let t0 = Instant::now();
+    let n = news(&[(lane, NEWS_KEY, "qa step 1")]);
     let a = h.dispatcher.post_news(n.clone(), t0).await;
     h.adapter.fail_next_send();
     let b = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
@@ -3879,12 +3987,15 @@ async fn lane_news_failed_send_is_retried_next_tick() {
         .dispatcher
         .post_news(n, t0 + NEWS_AFTER + WATCH_TICK)
         .await;
-    let sends = h.sends();
+    let line = ("444".to_owned(), news_line(lane, "qa step 1"));
+    let raw = h.sends().into_iter().filter(|s| *s == line).count();
+    let rows = news_rows(&h);
     h.close().await;
 
+    assert!(failed);
     assert_eq!([a, b, c], [0, 0, 1]);
-    let line = ("444".to_owned(), news_line(1, "qa step 1"));
-    assert_eq!(sends, [line.clone(), line]);
+    assert_eq!(raw, 2, "the refused send is tried again");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 #[tokio::test]
@@ -3903,7 +4014,7 @@ async fn lane_news_skips_a_key_without_a_target() {
 }
 
 #[tokio::test]
-async fn lane_news_posts_a_running_lane_report_once() {
+async fn lane_news_hands_a_running_lane_report_on_once() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::build(
         dir.path(),
@@ -3942,22 +4053,25 @@ async fn lane_news_posts_a_running_lane_report_once() {
         .post_news(h.dispatcher.lanes().news(), t0 + NEWS_AFTER)
         .await;
     let left = h.dispatcher.lanes().news();
+    let rows = news_rows(&h);
     let sends = h.sends();
     bounded(h.dispatcher.shutdown()).await;
 
-    let line = ("444".to_owned(), news_line(1, "qa step 1"));
     assert!(stepped);
     assert!(reported);
     assert_eq!([a, b], [0, 1]);
     assert!(left.is_empty());
-    assert_eq!(sends.last(), Some(&line));
-    assert_eq!(sends.iter().filter(|s| **s == line).count(), 1);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, lead::lane_news(NEWS_KEY, 1, "qa step 1"));
+    let raw = ("444".to_owned(), news_line(1, "qa step 1"));
+    assert!(!sends.contains(&raw), "{sends:?}");
 }
 
 #[tokio::test]
 async fn lane_news_forgets_quiet_conversations() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
+    let lane = running_lane(&h, "call-1", NEWS_KEY);
     let t0 = Instant::now();
     queued(h.handle(event("4441", OWNER, Some("444"), "hi")).await);
     queued(h.handle(event("4442", OWNER, Some("555"), "hi")).await);
@@ -3966,7 +4080,7 @@ async fn lane_news_forgets_quiet_conversations() {
     let p1 = d.post_news(Vec::new(), t0).await;
     let b = d.talk_len();
     let p2 = d
-        .post_news(news(&[(1, NEWS_KEY, "qa step 1")]), t0 + NEWS_AFTER)
+        .post_news(news(&[(lane, NEWS_KEY, "qa step 1")]), t0 + NEWS_AFTER)
         .await;
     let c = d.talk_len();
     let p3 = d.post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK).await;
@@ -3975,12 +4089,252 @@ async fn lane_news_forgets_quiet_conversations() {
         .post_news(Vec::new(), t0 + 2 * NEWS_AFTER + WATCH_TICK)
         .await;
     let e = d.talk_len();
-    let sends = h.sends();
+    let rows = news_rows(&h);
     h.close().await;
 
     assert_eq!([a, b, c, dd, e], [2, 2, 1, 1, 0]);
     assert_eq!([p1, p2, p3, p4], [0, 1, 0, 0]);
-    assert_eq!(sends, [("444".to_owned(), news_line(1, "qa step 1"))]);
+    assert_eq!(rows.len(), 1);
+}
+
+// --- Busy lead turns and status questions (#68) ---
+
+/// Stores an owner row of conversation `key` that stays `queued` (no steer is tried).
+fn queue_owner_row(h: &Harness, message_id: &str, key: &str, text: &str) -> i64 {
+    match h
+        .store
+        .lock()
+        .unwrap()
+        .admit("fake", message_id, key, CHANNEL, OWNER, text)
+        .unwrap()
+    {
+        Admitted::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn busy_lead_gets_one_note_while_an_owner_row_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    // `note`: the first moraebot note ends the run.
+    let h = Harness::open_steer(dir.path(), "note");
+    let a = queued(
+        h.handle(in_thread("1300000000000000990", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let t0 = Instant::now();
+    let empty = h.dispatcher.post_busy_note(t0 + DEFAULT_HANDOFF_AFTER);
+    let later = queue_owner_row(&h, "1300000000000000991", &key, "later");
+    let early = h.dispatcher.post_busy_note(t0);
+    let sent = h.dispatcher.post_busy_note(t0 + DEFAULT_HANDOFF_AFTER);
+    let again = h.dispatcher.post_busy_note(t0 + 3 * DEFAULT_HANDOFF_AFTER);
+    assert!(bounded(step).await.unwrap());
+    let reply = h.sends();
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let later_row = h.row(later);
+    h.close().await;
+
+    assert!(!empty, "nothing waits: no note");
+    assert!(!early, "the turn is younger than the threshold");
+    assert!(sent);
+    assert!(!again, "one note per turn");
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert!(
+        messages[1].starts_with(&format!("{}\n", omp::BUSY_NOTE_TAG)),
+        "{}",
+        messages[1]
+    );
+    assert_eq!(messages[2], lead::owner_input(&key, later, "later"));
+    assert_eq!(reply.len(), 1);
+    assert_eq!(
+        later_row.state,
+        State::Done,
+        "the waiting row got its own turn"
+    );
+}
+
+#[tokio::test]
+async fn busy_lead_with_a_steered_owner_row_gets_one_note() {
+    let dir = tempfile::tempdir().unwrap();
+    // `hold`: the steer is taken and the turn never ends by itself.
+    let h = Harness::open_steer(dir.path(), "hold");
+    let mut tap = LogTap::create(&dir.path().join("fake-omp.log"));
+    let a = queued(
+        h.handle(in_thread("1300000000000000992", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    assert_eq!(tap.next_prompt().await["message"], "A");
+    steered(
+        h.handle(in_thread("1300000000000000993", THREAD_A, "B"))
+            .await,
+    );
+    assert_eq!(tap.next_prompt().await["message"], "B");
+    let sent = h
+        .dispatcher
+        .post_busy_note(Instant::now() + DEFAULT_HANDOFF_AFTER);
+    let note = loop {
+        let line = tap.next_line().await;
+        if let Ok(frame) = serde_json::from_str::<Value>(&line)
+            && frame["type"] == "prompt"
+        {
+            break frame;
+        }
+    };
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+
+    assert!(sent);
+    assert_eq!(behavior(&note), "steer");
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(omp::BUSY_NOTE_TAG)
+    );
+}
+
+#[tokio::test]
+async fn busy_note_is_off_when_the_turn_limit_is_not_longer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    config.omp.turn_timeout_minutes = Some(DEFAULT_HANDOFF_AFTER.as_secs() / 60);
+    let h = Harness::with_config(
+        dir.path(),
+        config,
+        "steer",
+        false,
+        vec![("FAKE_OMP_STEER_CASE", "note".to_owned())],
+    );
+    let a = queued(
+        h.handle(in_thread("1300000000000000997", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    queue_owner_row(&h, "1300000000000000998", &key, "later");
+    let sent = h
+        .dispatcher
+        .post_busy_note(Instant::now() + 2 * DEFAULT_HANDOFF_AFTER);
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+
+    assert!(!sent, "the turn limit ends the turn first");
+}
+
+#[tokio::test]
+async fn status_question_is_answered_while_a_turn_runs_and_never_reaches_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000994", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let asked = h
+        .handle(in_thread("1300000000000000995", THREAD_A, "뭐 하고 있어?"))
+        .await;
+    let status_sends = h.sends();
+    // The owner's steer slot is still free.
+    steered(
+        h.handle(in_thread("1300000000000000996", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let messages = raw_prompt_messages(&h);
+    let id = match asked {
+        Handled::Status(id) => id,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    let status_row = h.row(id);
+    h.close().await;
+
+    assert_eq!(status_row.state, State::Done);
+    assert_eq!(status_sends.len(), 1);
+    assert_eq!(status_sends[0].0, THREAD_A);
+    assert!(
+        status_sends[0]
+            .1
+            .starts_with("이 대화 일을 1분째 하고 있어요"),
+        "{}",
+        status_sends[0].1
+    );
+    assert_eq!(
+        messages,
+        [
+            lead::owner_input(&key, a, "A"),
+            lead::owner_input(&key, a + 2, "B"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn status_questions_go_to_the_lead_when_direct_status_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    config.lead.direct_status = Some(false);
+    let h = Harness::with_config(dir.path(), config, "ok", false, Vec::new());
+    let id = queued(h.handle(event("4444", OWNER, Some("444"), "status")).await);
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let sends = h.sends();
+    let row = h.row(id);
+    h.close().await;
+
+    assert_eq!(messages, [lead::owner_input(NEWS_KEY, id, "status")]);
+    assert_eq!(sends, [("444".to_owned(), "echo: status".to_owned())]);
+    assert_eq!(row.state, State::Done);
+}
+
+#[tokio::test]
+async fn queued_status_question_is_answered_by_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let task = format!("fix {}/src\nmore", h.config.work_dir.display());
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane(
+            "call-1",
+            NEWS_KEY,
+            &task,
+            Some("file ."),
+            None,
+            MAX_RUNNING_LANES,
+        )
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    };
+    let id = queue_owner_row(&h, "4443", NEWS_KEY, "status");
+    let stepped = h.step().await;
+    let sends = h.sends();
+    let starts = h.starts();
+    let row = h.row(id);
+    h.close().await;
+
+    assert!(stepped);
+    assert_eq!(row.state, State::Done);
+    assert_eq!(starts, 0, "the lead never started");
+    assert_eq!(
+        sends,
+        [(
+            "444".to_owned(),
+            format!(
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src"
+            )
+        )]
+    );
 }
 
 // --- Owner memory commands (#39 P1a) ---

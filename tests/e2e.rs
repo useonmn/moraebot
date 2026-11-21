@@ -184,6 +184,7 @@ impl Rig {
             }),
             bridge: None,
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
         Self {
