@@ -182,7 +182,7 @@ dinobot의 Discord와 Slack은 전체에 큐 하나(동시 처리 1개)를 씁�
 `/stop`(지금 작업 멈추기)과 `/new`(새 대화 시작)는 큐에 넣지 않고 **바로 실행**합니다. hermes가 이렇게 합니다. 큐에 넣으면 작업이 끝날 때까지 `/stop`이 기다려야 하므로 멈출 수가 없습니다.
 
 - `/stop`: 그 대화의 omp에 `abort`를 보냅니다.
-- `/new`: 지금 대화를 보관하고, 같은 키에 새 세션 폴더를 연결합니다. dinobot도 옛 대화를 `<키>#n`으로 보관합니다.
+- `/new`: 지금 대화를 보관하고, 같은 키에 새 세션 폴더를 연결합니다. dinobot도 옛 대화를 `<키>#n`으로 보관합니다. (Implemented in #74 as the owner's new-session command for the one lead; it waits for the running turn instead of skipping the queue. See 3.19.)
 
 제어 명령도 접근 제어는 똑같이 거칩니다.
 
@@ -673,6 +673,18 @@ The lane is still running and moraebot does not stop it; its result comes later 
 
 **상태 질문.** `lead.direct_status`(빠지면 `true`)가 켜져 있고 주인 줄이 첨부 없이 상태 질문 하나뿐이면(`status::request`: 앞뒤 빈칸과 끝 문장부호를 떼고 대소문자를 무시한 전체 글이 고정 목록, 예: `뭐 하고 있어`, `뭐해`, `상태`, `status`, `what are you doing`과 같을 때) 메모리 명령 바로 뒤, steer 전에 줄을 가져가 moraebot이 직접 답합니다(`Store::finish_direct`, 메모리 명령과 같은 길). 답은 `LeadWatch`의 turn 대화, 시작 시각, 가장 최근 도구와 그 intent(lane 소식처럼 다듬음), 그리고 돌고 있는 lane에서 만듭니다. lead turn이 이 대화의 것이면 지금 단계까지, 다른 대화의 것이면 바쁘다는 사실만 말합니다. lane도 이 대화의 것만 번호, 시간, 일의 첫 줄을 보이고 다른 대화의 것은 개수만 셉니다. lead는 이 메시지를 보지 않습니다. 경합이나 재시작으로 확인 없이 큐에 들어간 상태 질문은 worker가 같은 방식으로 답합니다. 목록에 없는 글(`status of PR 12?` 등)과, `direct_status = false`일 때의 상태 질문은 원래대로 lead에게 갑니다. 일의 첫 줄과 도구 intent는 `lane::clean_note`로 다듬습니다. `lane_report`와 같은 경로 목록(lane 뿌리, 작업 폴더, 실제와 정규화한 `$HOME`)을 써서 절대 경로가 `.`와 `~`로 바뀝니다.
 
+### 3.19 New session (#74)
+
+**Why.** Asked for a fresh session, the lead once wrote a script that stopped its own service (the script died with the service's cgroup, so nothing started it again) and cleared the `sessions` row, which changes nothing: `open_session` resumes whatever is in `<home>/lead/session` (3.3). So moraebot owns the switch, and the lead guidance forbids touching the service or session state.
+
+**Matching.** `new_session::request`: the whole owner message, trimmed (whitespace and a closing `.` or `!`), case ignored, equal to `새 세션`, `새 세션 시작`, `새 세션으로 시작`, `new session` or `/new`; `새 세션 확인` / `new session confirm` confirm. It runs first in the owner-command slot, before the memory commands (no jev `classify` call) and the status questions. The owner's `/new` passes the `/` filter; anyone else's `/new` gets `N_UNSUPPORTED_INPUT`, and chat senders never reach the slot. The command with attachments gets `N_NEW_SESSION_FILES` before admission (nothing stored or fetched), so the `/` filter and the worker, which only matches rows without attachments, agree.
+
+**Worker only.** On arrival the row is only queued: never steered, never claimed. It waits in the FIFO behind the running turn (moraedang's choice 1 on #74: wait, don't kill), and `Store::steer_into` refuses to steer later rows of its conversation past an older queued row, so they queue behind it. The worker then answers it without the lead (`Store::finish_direct`, like the memory commands).
+
+**Lanes.** With a running lane the answer names their count and asks for the confirmation within `new_session::CONFIRM_WINDOW` (10 minutes); nothing changes. The question is kept in memory per conversation (`session_asked`) and, like the forget question, the owner's next message in that conversation closes it. A confirmation is judged on arrival: one that finds the question open marks its row (`session_confirmed`) for the worker; any other confirmation counts as a plain command and asks again while lanes run. Lanes keep running and their results reach the new lead as ordinary lane rows.
+
+**Switch.** `OmpManager::new_session` takes the `live` mutex, closes the child with `Live::close` (the child is reaped before it returns, so omp no longer writes), renames `<home>/lead/session` to a free `<home>/lead/session-backup-<UTC YYYYMMDDTHHMMSSZ>` (`-2`, `-3`, ... on a collision) and calls `Store::clear_session_id("lead")`, which deletes the row and clears any `conversations.omp_session_id` naming it (nothing writes that column today). `live` stays empty, so the next `prompt` runs `start()` as after any restart: a new empty session folder, no lease check, and a new lead generation (`Store::next_lead_generation`), so recall state of the old child is not reused. The gateway, lanes, chat children, the recall advisor and the memory are untouched. Info `I_LEAD_NEW_SESSION` logs the backup folder. A rename that fails is `E_LEAD_NEW_SESSION`: the owner is told, and the next child resumes the old folder.
+
 ## 4. 상태, 설정, 운영
 
 ### 4.1 moraebot 홈 폴더
@@ -691,6 +703,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
   inbox.sqlite             받은 메시지 보관함
   state.sqlite             대화 목록
   lead/session/            lead omp 세션 기록 (--session-dir로 넘김)
+  lead/session-backup-*/   old lead sessions moved aside by the new-session command (3.19), never deleted
   lead/append.md           the lead's appended system prompt, 0600 (--append-system-prompt=<path>)
   lanes/<id>/session/      lane마다 omp 세션 기록
   lanes/<id>/append.md     a lane's memory block, 0600

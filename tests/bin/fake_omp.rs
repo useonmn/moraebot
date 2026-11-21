@@ -11,7 +11,9 @@
 //! text itself, `null` without the option), a line with the environment variable NAMES
 //! only (`ENV <names>`), a line with the number of entries in the `--cwd`
 //! folder at startup (`CWD_ENTRIES <pid> <n>`; `-1` when it cannot be read or
-//! there is no `--cwd`), and then every received stdin line.
+//! there is no `--cwd`), and then every received stdin line. An answered `open_session`
+//! also logs `SESSION_ENTRIES <pid> <n>`, the entries in its `sessionDir` (`-1` when it
+//! cannot be read).
 //!
 //! `get_state` answers a full session state whose `dumpTools` lists one tool
 //! per comma-separated name in FAKE_OMP_DUMP_TOOLS (unset or empty: none).
@@ -317,17 +319,20 @@ impl Fake {
                 "E_OPEN_REFUSED",
             ),
             "open_session" if mode == "hold_open" => self.hold(out, command),
-            "open_session" => respond_ok(
-                out,
-                &id,
-                command,
-                json!({
-                    "cancelled": false,
-                    "resumed": false,
-                    "sessionId": SESSION_ID,
-                    "sessionFile": "fake-session.jsonl",
-                }),
-            ),
+            "open_session" => {
+                log_session_entries(frame);
+                respond_ok(
+                    out,
+                    &id,
+                    command,
+                    json!({
+                        "cancelled": false,
+                        "resumed": false,
+                        "sessionId": SESSION_ID,
+                        "sessionFile": "fake-session.jsonl",
+                    }),
+                )
+            }
             "get_state" => respond_ok(out, &id, command, session_state()),
             "get_session_lease" => {
                 let requested = frame
@@ -856,6 +861,23 @@ fn send(out: &mut impl Write, frame: &Value) {
 /// Appends `line` and its newline in one `write` call: a lead and its lanes share the
 /// log, and `writeln!` on a `File` writes the text and the newline separately, so
 /// another child's line could land between them and merge two lines into one.
+/// With FAKE_OMP_LOG set, logs `SESSION_ENTRIES <pid> <n>`: the entries in the `open_session`
+/// frame's `sessionDir` (`-1` when it cannot be read).
+fn log_session_entries(frame: &Value) {
+    let Some(path) = std::env::var_os("FAKE_OMP_LOG") else {
+        return;
+    };
+    let entries = frame
+        .get("sessionDir")
+        .and_then(Value::as_str)
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map_or(-1, |dir| dir.count() as i64);
+    log_line(
+        Path::new(&path),
+        &format!("SESSION_ENTRIES {} {entries}", std::process::id()),
+    );
+}
+
 fn log_line(path: &Path, line: &str) {
     let mut file = OpenOptions::new()
         .create(true)

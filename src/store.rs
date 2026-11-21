@@ -1863,6 +1863,28 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets the omp session id stored under `name`, and in the same transaction clears every
+    /// `conversations.omp_session_id` that names it, so nothing points at the old session.
+    pub fn clear_session_id(&mut self, name: &str) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT omp_session_id FROM sessions WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(old) = old {
+            tx.execute(
+                "UPDATE conversations SET omp_session_id = NULL WHERE omp_session_id = ?1",
+                [&old],
+            )?;
+            tx.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Stores a new running lane for a `lane_start` tool call, in one transaction. A
     /// repeated `tool_call_id` returns the lane it already started; at `max_running`
     /// running lanes nothing is stored.
@@ -3186,6 +3208,39 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(s.session_id("lead").unwrap().as_deref(), Some("sess-2"));
         assert_eq!(s.session_id("other").unwrap(), None);
+    }
+
+    #[test]
+    fn clear_session_id_forgets_the_row_and_the_conversations_pointing_at_it() {
+        let (_d, _p, mut s) = open_tmp();
+        admit(&mut s, "m1", K1);
+        admit(&mut s, "m2", K2);
+        s.set_session_id("lead", "sess-1").unwrap();
+        s.set_session_id("other", "sess-2").unwrap();
+        s.conn
+            .execute(
+                "UPDATE conversations SET omp_session_id = CASE conversation_key WHEN ?1 THEN 'sess-1' ELSE 'sess-2' END",
+                [K1],
+            )
+            .unwrap();
+        s.clear_session_id("lead").unwrap();
+        let pointers: Vec<Option<String>> = [K1, K2]
+            .iter()
+            .map(|key| {
+                s.conn
+                    .query_row(
+                        "SELECT omp_session_id FROM conversations WHERE conversation_key = ?1",
+                        [key],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(s.session_id("lead").unwrap(), None);
+        assert_eq!(s.session_id("other").unwrap().as_deref(), Some("sess-2"));
+        assert_eq!(pointers, [None, Some("sess-2".to_owned())]);
+        s.clear_session_id("lead").unwrap();
     }
 
     #[test]

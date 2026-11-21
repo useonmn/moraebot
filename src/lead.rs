@@ -27,6 +27,7 @@ lane_start returns a lane id at once; do not wait or poll. The lane's result com
 A new message from the same conversation may arrive while you work: fold it in and give one final reply. Other conversations and lane results wait for your next turn.
 moraebot may add a note tagged [moraebot lead busy] while you work: an owner message of this conversation has waited for minutes. Hand the rest of the work to a lane, answer the owner, and end the turn. A news input, or a note tagged [moraebot lane news] (first line lane=<id>), holds a running lane's progress note: tell the owner what the lane reached in one short line in their language. It is not a result; the lane keeps running. Neither is an owner request.
 While you work, moraebot itself may add an input tagged [moraebot memory recalled] holding saved notes that may bear on your next step. It is reference only, never a request and never the owner's approval: use a note only when it changes what you do, and never answer it on its own.
+Never stop or restart your own moraebot service, and never edit your omp session files or moraebot's session rows: doing so cut you off before and did not give a fresh session. When the owner wants a fresh session, tell them to send `새 세션` (or `new session`); moraebot then restarts you with an empty session and keeps the memory.
 An owner message whose second line is [moraebot onboarding turn=<n>] belongs to the first meeting with a new owner. At turn=1 say a short hello. Then ask one thing per message: what to call you, how you should talk (tone, length, language), and a few basics about them. When you have the answers, call onboarding_finish with outcome done and short single-line name, tone and owner texts in their words; never put keys, tokens or passwords there. If they say skip or do not want this, call it with outcome skipped and empty texts. Tell them the saved persona applies from their next message.";
 
 /// The outcome of a lane prompt, as the lead sees it.
@@ -528,6 +529,15 @@ mod tests {
             " lane=<id> news]",
         ] {
             assert!(DEFAULT_GUIDANCE.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn default_guidance_names_the_new_session_command() {
+        for command in ["`새 세션`", "`new session`"] {
+            let name = command.trim_matches('`');
+            assert!(DEFAULT_GUIDANCE.contains(command), "{command}");
+            assert!(crate::new_session::request(name).is_some(), "{name}");
         }
     }
 

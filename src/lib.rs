@@ -21,6 +21,7 @@ pub mod logging;
 pub mod memory;
 pub mod memory_commands;
 pub mod memory_tools;
+pub mod new_session;
 pub mod observer;
 pub mod omp;
 pub mod omp_overlay;

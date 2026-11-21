@@ -4,8 +4,8 @@
 //! active messenger's `allow` list (nothing stored); drop a listed bot's message once its
 //! conversation reached `max_bot_replies` in the window (no limit when unset; bot
 //! messages posted directly in the channel count per channel); answer `/`
-//! messages and empty messages without attachments with one fixed notice (never stored,
-//! never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing stored,
+//! messages (except the owner's `/new`, see below) and empty messages without attachments with
+//! one fixed notice (never stored, never forwarded), refuse more than [`files::MAX_FILES`] attachments (nothing stored,
 //! nothing fetched); hand a listed `chat` sender's message to the chat runtime
 //! ([`crate::chat`]: never stored, never steered, never seen by the lead or its tools);
 //! pick the conversation key, store the row FIRST (a duplicate stops here), and only then
@@ -33,6 +33,21 @@
 //! [`lead::owner_input`] (a tag line naming its conversation and row, then the text with
 //! the saved-files block); a lane-result row (`origin = 'lane'`) carries its stored text
 //! and skips the owner check. Every reply goes to `reply_target(row.conversation_key)`.
+//!
+//! Owner new-session command ([`crate::new_session`]): an owner row without attachments whose
+//! whole text is `새 세션`, `새 세션 시작`, `새 세션으로 시작`, `new session` or `/new` is checked first in
+//! that slot, before the memory commands, so it never costs a jev call. With attachments it gets
+//! one fixed notice ([`N_NEW_SESSION_FILES`]) and nothing is stored, the same shape as the
+//! `/` notice. On arrival it is only queued, never steered
+//! and never claimed: it waits in the FIFO, so a running turn ends first, and the store refuses
+//! to steer later rows of its conversation past it. The worker answers it without the lead:
+//! while lanes run it asks for `새 세션 확인` / `new session confirm` within
+//! [`new_session::CONFIRM_WINDOW`] and changes nothing (the question lives in memory only, and
+//! the owner's next message in that conversation closes it: only a confirmation arriving while
+//! it is open counts, judged on arrival);
+//! otherwise [`OmpManager::new_session`] closes the lead child, moves its session folder
+//! aside and clears its session row, and the reply names the backup. Rows queued behind it run
+//! on the new lead.
 //!
 //! Owner memory commands ([`crate::memory_commands`]): once a memory store is attached
 //! ([`Dispatcher::with_memory`]), an owner row without attachments is checked right after
@@ -120,9 +135,11 @@ use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
 use crate::memory::MemoryHandle;
 use crate::memory_commands::{self, Command};
+use crate::new_session;
 use crate::observer::Observer;
 use crate::omp::{
-    ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, NoteKind, OmpManager, Outcome, key_slug, lock,
+    ABORT_JOIN_BOUND, E_COST_CAP, E_LEAD_NEW_SESSION, GroupReport, NoteKind, OmpManager, Outcome,
+    key_slug, lock,
 };
 use crate::omp_overlay::{OverlayCheck, W_OMP_VERSION};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
@@ -160,6 +177,8 @@ pub const N_TURN_STALLED: &str = "N_TURN_STALLED";
 /// omp is not the version moraebot's memory settings were checked against; sent to the owner
 /// once per omp version.
 pub const N_OMP_VERSION: &str = "N_OMP_VERSION";
+/// The owner's new-session command came with attachments; nothing was stored or run.
+pub const N_NEW_SESSION_FILES: &str = "N_NEW_SESSION_FILES";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
@@ -207,6 +226,9 @@ pub fn notice_text(code: &str) -> &'static str {
         N_LANE_INTERRUPTED => {
             "A background task was interrupted by a restart and was not resumed. Ask again if it \
              is still needed."
+        }
+        N_NEW_SESSION_FILES => {
+            "The new session command takes no attachments, so nothing was done. Send it alone."
         }
         N_ONBOARDING_HELLO => {
             "Hi! I'm your moraebot agent, and this is our first chat. When you reply, I'll ask \
@@ -437,6 +459,10 @@ pub struct Dispatcher {
     memory: Option<MemoryHandle>,
     /// The id each conversation was last asked to confirm forgetting.
     forget_asked: Mutex<HashMap<String, String>>,
+    /// When each conversation was last asked to confirm a new session while lanes ran.
+    session_asked: Mutex<HashMap<String, Instant>>,
+    /// Command rows that confirmed their conversation's open new-session question on arrival.
+    session_confirmed: Mutex<std::collections::HashSet<i64>>,
     /// The memory observer: its jev classifies plain-language memory requests the rules did
     /// not match, and its state heads the memory listing. Without it only the rules run.
     observer: Option<Arc<Observer>>,
@@ -472,6 +498,8 @@ impl Dispatcher {
             direct_status: config.lead.direct_status(),
             memory: None,
             forget_asked: Mutex::default(),
+            session_asked: Mutex::default(),
+            session_confirmed: Mutex::default(),
             observer: None,
             omp_check: None,
         }
@@ -842,10 +870,18 @@ impl Dispatcher {
 
         let here = event.thread_id.as_deref().unwrap_or(&event.channel_id);
         let text = event.text.trim();
-        if text.starts_with('/') || (text.is_empty() && event.attachments.is_empty()) {
+        let owner_command = sender == Sender::Owner && new_session::request(text).is_some();
+        if (text.starts_with('/') && !owner_command)
+            || (text.is_empty() && event.attachments.is_empty())
+        {
             tracing::info!(message_id = %event.message_id, code = N_UNSUPPORTED_INPUT, "input not forwarded");
             self.notify(here, N_UNSUPPORTED_INPUT).await;
             return Ok(Handled::Notice(N_UNSUPPORTED_INPUT));
+        }
+        if owner_command && !event.attachments.is_empty() {
+            tracing::info!(message_id = %event.message_id, code = N_NEW_SESSION_FILES, "new session with attachments not stored");
+            self.notify(here, N_NEW_SESSION_FILES).await;
+            return Ok(Handled::Notice(N_NEW_SESSION_FILES));
         }
         if event.attachments.len() > files::MAX_FILES {
             tracing::info!(
@@ -913,6 +949,22 @@ impl Dispatcher {
         };
 
         if sender == Sender::Owner {
+            // Any owner message closes this conversation's new-session question; only a
+            // confirmation that arrives while it is open counts.
+            let question = lock(&self.session_asked).remove(key.as_str());
+            if let Some(asked) = new_session::request(&event.text) {
+                // Queued for the worker, never steered: a running turn ends first.
+                lock(&self.forget_asked).remove(key.as_str());
+                let open = question.is_some_and(|at| {
+                    Instant::now().saturating_duration_since(at) < new_session::CONFIRM_WINDOW
+                });
+                if asked.confirm && open {
+                    lock(&self.session_confirmed).insert(id);
+                }
+                tracing::info!(row = id, conversation = key.as_str(), "new session queued");
+                self.wake.notify_one();
+                return Ok(Handled::Queued(id));
+            }
             if event.attachments.is_empty() {
                 if let Some(handled) = self
                     .memory_command(id, key.as_str(), &event.text, true)
@@ -1058,6 +1110,9 @@ impl Dispatcher {
         }
 
         if from_owner && row.attachments.is_none() {
+            if self.new_session_command(row.id, key, &row.text).await? {
+                return Ok(true);
+            }
             if self
                 .memory_command(row.id, key, &row.text, false)
                 .await?
@@ -1188,6 +1243,54 @@ impl Dispatcher {
         self.store().finish_direct(id, &reply)?;
         self.send_reply(id).await?;
         Ok(Some(Handled::Memory(id)))
+    }
+
+    /// Answers the worker's claimed owner row `id` of conversation `key` when its whole `text` is
+    /// the new-session command ([`new_session::request`]): while lanes run and the row did not
+    /// confirm an open question on arrival (`session_confirmed`), it asks and changes nothing
+    /// (a row queued without that check, after a restart, asks again); otherwise the
+    /// lead gets a new session ([`OmpManager::new_session`]). The answer is stored and sent like a
+    /// lead reply and the row ends `done`. Returns whether the row was the command.
+    async fn new_session_command(
+        &self,
+        id: i64,
+        key: &str,
+        text: &str,
+    ) -> Result<bool, StoreError> {
+        let Some(asked) = new_session::request(text) else {
+            return Ok(false);
+        };
+        let confirmed = lock(&self.session_confirmed).remove(&id);
+        let lanes = self
+            .store()
+            .lanes()?
+            .iter()
+            .filter(|lane| lane.state == LaneState::Running)
+            .count();
+        let reply = if lanes > 0 && !confirmed {
+            lock(&self.session_asked).insert(key.to_owned(), Instant::now());
+            tracing::info!(
+                row = id,
+                conversation = key,
+                lanes,
+                "new session needs a confirmation"
+            );
+            new_session::confirm_text(asked.lang, lanes)
+        } else {
+            match self.omp.new_session().await {
+                Ok(backup) => {
+                    let shown = backup.map(|path| self.omp.clean_note(&path.to_string_lossy()));
+                    new_session::opened_text(asked.lang, shown.as_deref())
+                }
+                Err(err) => {
+                    tracing::error!(code = E_LEAD_NEW_SESSION, error = %err, "lead session folder not moved");
+                    new_session::failed_text(asked.lang, E_LEAD_NEW_SESSION)
+                }
+            }
+        };
+        self.store().finish_direct(id, &reply)?;
+        self.send_reply(id).await?;
+        Ok(true)
     }
 
     /// Answers owner row `id` of conversation `key` when its whole `text` is a status question
