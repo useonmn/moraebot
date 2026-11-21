@@ -3117,18 +3117,12 @@ mod tests {
     #[test]
     fn a_new_entry_is_logged_with_its_id_file_and_bucket_never_its_text() {
         use tracing_subscriber::fmt::format::FmtSpan;
-        // While just one dispatcher exists, tracing-core caches a new callsite's interest from
-        // the subscriber of whichever thread hits it first: a save on another test's thread
-        // would mark the save event unwanted for this one too. A second live dispatcher makes
-        // it ask every dispatcher, and the rebuild drops what was cached before.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let capture = crate::logging::Capture::default();
         let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
             Some("info"),
             FmtSpan::NONE,
             capture.clone(),
         ));
-        tracing::callsite::rebuild_interest_cache();
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut store, _) = open(dir.path(), "2026-11-20");
         let text = "Always write PR titles in English, LOGPROBE-7f3.";
