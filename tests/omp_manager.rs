@@ -3480,7 +3480,8 @@ async fn a_mid_wake_still_running_never_makes_the_next_owner_wake_busy() {
             ("FAKE_OMP_REPLY_GATE", gate_path.as_str()),
         ],
         true,
-        |c| c.memory.recall.wait_ms = 50,
+        // 0 never waits: no turn depends on how fast the fake advisor answers.
+        |c| c.memory.recall.wait_ms = 0,
     );
     let mut progress = advisor.progress();
     let mut asked = advisor.asked();
