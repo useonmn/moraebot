@@ -272,7 +272,7 @@ pub fn recent_recalls_request(text: &str) -> Option<crate::status::Lang> {
 pub fn recent_recalls(
     memory: &MemoryHandle,
     lang: crate::status::Lang,
-    rows: &[crate::store::RecentRecall],
+    rows: &[crate::store::RecallRow],
     now: i64,
 ) -> String {
     use crate::status::Lang;
@@ -286,14 +286,13 @@ pub fn recent_recalls(
         Lang::Korean => format!("최근 떠올린 기억 {}개 (최신순):", rows.len()),
         Lang::English => format!("Last {} recalls, newest first:", rows.len()),
     }];
-    for recall in rows {
-        let row = &recall.row;
+    for row in rows {
         let text = match memory.show(&row.entry_id) {
             Ok(Some(found)) if !found.archived => found.entry.text,
             Ok(_) => "(gone)".to_owned(),
             Err(err) => failure(&row.entry_id, &err),
         };
-        let phase = if recall.mid { "mid" } else { "owner" };
+        let phase = row.phase.as_str();
         out.push(format!(
             "- {} {phase} {} {} {text}",
             crate::status::ago(lang, now - row.at),
@@ -507,9 +506,9 @@ pub fn bucket_for(target: &Target, key: &str) -> Bucket {
 
 fn place(bucket: &Bucket) -> String {
     match bucket {
-        Bucket::Owner => "always (core rules; the lead restarts before its next turn)".into(),
+        Bucket::Owner => "always (core rules; the lead gets it with its next message)".into(),
         Bucket::Boundaries => {
-            "always, as something not to do (core; the lead restarts before its next turn)".into()
+            "always, as something not to do (core; the lead gets it with its next message)".into()
         }
         Bucket::Project(repo) => format!("project {repo}"),
         Bucket::General => "general notes".into(),
@@ -947,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn recent_recalls_lists_ledger_rows_with_entry_text() {
         use crate::status::Lang;
-        use crate::store::{LogLevel, LogRow, RecallRow, RecallState, Store};
+        use crate::store::{RecallPhase, RecallRow, RecallState, Store};
 
         assert_eq!(
             recent_recalls_request("Recent recalls?"),
@@ -980,7 +979,7 @@ mod tests {
             .await
             .expect("add");
         let mut ledger = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
-        let row = |id: &str, state, at| RecallRow {
+        let row = |id: &str, state, at, phase| RecallRow {
             conversation: "k".into(),
             entry_id: id.into(),
             entry_hash: String::new(),
@@ -989,23 +988,14 @@ mod tests {
             lead_epoch: 0,
             row_id: Some(9),
             at,
+            phase,
         };
         ledger
             .record_recall(&[
-                row(&added.id, RecallState::Delivered, 1000),
-                row("m-abcdef", RecallState::Shadow, 1600),
+                row(&added.id, RecallState::Delivered, 1000, RecallPhase::Owner),
+                row("m-abcdef", RecallState::Shadow, 1600, RecallPhase::Mid),
             ])
             .expect("ledger");
-        ledger
-            .memory_log(&LogRow {
-                at: 1600,
-                level: LogLevel::Info,
-                code: crate::recall::I_RECALL_PICK,
-                job_id: None,
-                omp_version: None,
-                detail: Some("gen=2 epoch=0 row=9 offered=3 picks=m-abcdef:1 phase=mid".into()),
-            })
-            .expect("log");
         let rows = ledger.recent_recalls(RECENT_RECALLS).expect("rows");
         let text = recent_recalls(&memory, Lang::English, &rows, 1660);
         assert_eq!(

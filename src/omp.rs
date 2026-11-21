@@ -856,8 +856,9 @@ impl LeadNotes {
     }
 }
 
-/// Feeds the running owner turn's tool events to the recall advisor's mid-task state (in the
-/// open turn) from the lead's event drain, and starts the mid wakes it decides on.
+/// Feeds the running owner turn's lead events (tool calls, assistant text) to the recall
+/// advisor's mid-task state (in the open turn) from the lead's event drain, and starts the mid
+/// wakes it decides on, in the lead context of that moment.
 struct MidTap {
     advisor: Arc<Advisor>,
     runtime: tokio::runtime::Handle,
@@ -869,6 +870,7 @@ impl MidTap {
         let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
             return;
         };
+        let said: String;
         let tool = match agent {
             RpcAgentEvent::ToolExecutionStart(start) => ToolEvent::Start {
                 call: &start.tool_call_id,
@@ -881,9 +883,25 @@ impl MidTap {
                 result: end.result.as_ref(),
                 error: end.is_error == Some(true),
             },
+            RpcAgentEvent::MessageEnd(end) => {
+                let omp_rpc::AgentMessage::Assistant(message) = &end.message else {
+                    return;
+                };
+                said = message
+                    .content
+                    .iter()
+                    .flatten()
+                    .filter_map(|part| match part {
+                        omp_rpc::AssistantContent::Text(text) => text.text.as_deref(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ToolEvent::Said { text: &said }
+            }
             _ => return,
         };
-        let wake = {
+        let (wake, turn) = {
             let mut gate = lock(gate);
             let Some(turn) = gate.as_mut() else {
                 return;
@@ -892,14 +910,27 @@ impl MidTap {
             let Some(mid) = turn.mid.as_mut() else {
                 return;
             };
-            self.advisor
-                .mid_event(mid, tool, Instant::now())
-                .map(|wake| (wake, id))
+            let Some(mut wake) = self.advisor.mid_event(mid, tool, Instant::now()) else {
+                return;
+            };
+            // The lead context now: a compaction since the turn started changes what it holds.
+            let given = lock(&turn.given);
+            let mut held: HashSet<String> = given
+                .sections
+                .values()
+                .flat_map(|sections| sections.keys().cloned())
+                .collect();
+            if given.epoch == turn.main_epoch
+                && let Some((_, sections)) = &turn.main_fresh
+            {
+                held.extend(sections.iter().map(|(label, _)| label.clone()));
+            }
+            wake.wake.epoch = given.epoch;
+            wake.wake.given = held;
+            (wake, id)
         };
-        if let Some((wake, turn)) = wake {
-            self.advisor
-                .mid_wake(&self.runtime, wake, turn, self.notes.clone());
-        }
+        self.advisor
+            .mid_wake(&self.runtime, wake, turn, self.notes.clone());
     }
 }
 
@@ -1012,11 +1043,9 @@ pub struct LeadCache {
     pub memory_waiting: bool,
 }
 
-/// Usage counts and restarts of the lead, shared with its event callback.
+/// Usage counts and restarts of the lead.
 #[derive(Debug, Default)]
 struct LeadMetrics {
-    /// The running turn's sum so far.
-    turn: TokenUsage,
     /// The sums of the last [`USAGE_TURNS`] turns, oldest first.
     recent: std::collections::VecDeque<TokenUsage>,
     last_restart: Option<(std::time::SystemTime, &'static str)>,
@@ -1024,17 +1053,20 @@ struct LeadMetrics {
     pinned: Option<String>,
 }
 
-/// Adds the usage of an assistant `message_end` to the running turn's sum.
-fn note_usage(metrics: &Mutex<LeadMetrics>, event: &Event) {
-    let Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::MessageEnd(end))) = event
-    else {
-        return;
-    };
-    if let omp_rpc::AgentMessage::Assistant(message) = &end.message
-        && let Some(usage) = &message.usage
-    {
-        lock(metrics).turn.add_usage(usage);
+/// The usage of every assistant `message_end` the turn's main prompt saw, from submission to
+/// its `prompt_result` (the client collects them in order, so none is missed or counted for
+/// the next turn); nothing for a turn that failed before its result.
+fn turn_usage(turn: &Result<PromptTurn, RpcError>) -> TokenUsage {
+    let mut sum = TokenUsage::default();
+    for event in turn.iter().flat_map(|turn| &turn.events) {
+        if let RpcAgentEvent::MessageEnd(end) = event
+            && let omp_rpc::AgentMessage::Assistant(message) = &end.message
+            && let Some(usage) = &message.usage
+        {
+            sum.add_usage(usage);
+        }
     }
+    sum
 }
 
 /// Forgets what the lead child was given when omp reports a compaction of its context
@@ -1667,7 +1699,6 @@ impl OmpManager {
         });
         lock(&self.lead_watch).begin(key, Instant::now());
         self.tool_starts.clear();
-        lock(&self.metrics).turn = TokenUsage::default();
         let (input, fresh, epoch, held, update) = {
             let given = lock(&current.given);
             let (input, fresh) = thread_memory(
@@ -1721,7 +1752,7 @@ impl OmpManager {
         };
         let mid = recalled
             .as_ref()
-            .and_then(|(advisor, wake, shown)| advisor.mid_turn(wake, shown, Instant::now()));
+            .and_then(|(advisor, wake, shown)| advisor.mid_turn(wake, shown));
         let _gate_close = GateClose(&self.gate);
         let sent = {
             let mut gate = lock(&self.gate);
@@ -1759,6 +1790,7 @@ impl OmpManager {
             .map(|turn| (turn.steer, turn.notes))
             .unwrap_or_default();
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
+        let usage = turn_usage(&main);
         let mut settled = turn_settled(&main);
         let main = map_result(main);
         // Only an input the child took is given: a rejected prompt never reached it.
@@ -1845,7 +1877,7 @@ impl OmpManager {
             }
         }
         let files = take_sent(&current.sent_files);
-        self.end_usage();
+        self.end_usage(usage);
 
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
@@ -2085,10 +2117,9 @@ impl OmpManager {
         metrics.pinned = None;
     }
 
-    /// Ends the running turn's usage sum: logs it and keeps it among the recent turns.
-    fn end_usage(&self) {
+    /// Logs a finished turn's usage and keeps it among the recent turns.
+    fn end_usage(&self, turn: TokenUsage) {
         let mut metrics = lock(&self.metrics);
-        let turn = std::mem::take(&mut metrics.turn);
         tracing::info!(
             code = I_LEAD_USAGE,
             input = turn.input,
@@ -2208,7 +2239,6 @@ impl OmpManager {
         });
         let outside = Arc::new(AtomicBool::new(outside_before));
         let seen = Arc::clone(&outside);
-        let metrics = Arc::clone(&self.metrics);
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
         let running = Arc::clone(&self.running);
@@ -2242,7 +2272,6 @@ impl OmpManager {
                         note_agent_start(&gate, &running, event);
                         note_tool(&turn, &seen, event);
                         note_compaction(&compacted, event);
-                        note_usage(&metrics, event);
                         if let Some(tap) = &tap {
                             tap.note(&gate, event);
                         }
@@ -2493,6 +2522,7 @@ fn recall_wake(
         generation,
         epoch,
         given: held,
+        plan: String::new(),
         events: Vec::new(),
         exclude: HashSet::new(),
     })

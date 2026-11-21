@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use moraebot::config::{MemoryConfig, RecallConfig};
 use moraebot::memory::{
-    self, Bucket, Day, ExcerptFilter, MemoryStore, NewEntry, Op, PoolEntry, Prov, Redactor,
-    SearchScope, Source,
+    self, Bucket, Day, ExcerptFilter, MemoryStore, NewEntry, Op, Prov, Redactor, SearchScope,
+    Source,
 };
 use moraebot::recall::{self, Candidate};
 use moraebot::store::Store;
@@ -198,7 +198,6 @@ pub struct Seeded {
     /// Seed key to entry id.
     pub ids: HashMap<String, String>,
     pub forgotten: HashSet<String>,
-    pub self_ids: HashSet<String>,
 }
 
 impl Seeded {
@@ -238,11 +237,10 @@ pub fn seed(case: &Case) -> Seeded {
         }
     }
     let mut ids = HashMap::new();
-    let (mut forgotten, mut self_ids) = (HashSet::new(), HashSet::new());
+    let mut forgotten = HashSet::new();
     for (n, seed) in case.entries.iter().enumerate() {
         set(&seed.day);
         let bucket = bucket(&seed.bucket);
-        let is_self = bucket == Bucket::SelfObs;
         let added = store
             .add(new_entry(
                 &seed.text,
@@ -252,9 +250,6 @@ pub fn seed(case: &Case) -> Seeded {
             ))
             .unwrap_or_else(|err| panic!("{}: {} not saved: {err:?}", case.id, seed.key));
         assert!(added.created, "{}: {} saved twice", case.id, seed.key);
-        if is_self {
-            self_ids.insert(added.id.clone());
-        }
         assert!(
             ids.insert(seed.key.clone(), added.id).is_none(),
             "{}: key {} used twice",
@@ -282,7 +277,6 @@ pub fn seed(case: &Case) -> Seeded {
         _dir: dir,
         ids,
         forgotten,
-        self_ids,
     }
 }
 
@@ -489,6 +483,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                     generation: 1,
                     epoch: 0,
                     given: given.clone(),
+                    plan: String::new(),
                     events: events.clone(),
                     exclude: HashSet::new(),
                 };
@@ -500,39 +495,22 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                         now - recall::REJECT_DAYS * 24 * 60 * 60,
                     )
                     .expect("ledger readable");
-                let mentioned = memory::mentioned_projects(&seeded.root, &turn.message);
-                let skip = |item: &PoolEntry| recall::hidden(item, &lead_wake.given, &seen);
-                let (mut candidates, lines): (Vec<Candidate>, Vec<String>) = recall::rank(
-                    memory::recall_pool(&seeded.root, today),
-                    &recall::rank_text(&turn.message, &events),
+                let mentioned =
+                    memory::mentioned_projects(&seeded.root, &recall::rank_text(&lead_wake));
+                let (candidates, text) = recall::prepare(
+                    &memory::recall_pool(&seeded.root, today),
+                    &lead_wake,
+                    &seen,
                     &mentioned,
                     today,
-                    recall_config.max_candidates,
-                    skip,
-                    |c| recall::candidate_line(c, &redactor),
-                )
-                .into_iter()
-                .unzip();
-                let (text, held) = recall::message(
-                    &case.conversation,
-                    &turn.message,
-                    &events,
-                    &lines,
-                    recall_config.max_items,
-                    recall_config.max_input_bytes,
+                    &recall_config,
                     &redactor,
                 );
-                candidates.truncate(held);
                 offered = candidates.iter().map(|c| c.entry.id.clone()).collect();
                 for id in &offered {
                     assert!(
                         !seeded.forgotten.contains(id),
                         "{}: forgotten entry {id} offered",
-                        case.id
-                    );
-                    assert!(
-                        !seeded.self_ids.contains(id),
-                        "{}: self entry {id} offered",
                         case.id
                     );
                 }

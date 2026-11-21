@@ -351,21 +351,22 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// The recall advisor's mode: `memory.recall.mode` when set, else `off`. So an upgraded
-    /// install never starts an advisor child unasked (moraedang on #66); an explicit
-    /// `mode = "shadow"` without a model runs on omp's default model.
+    /// The recall advisor's mode: `memory.recall.mode` when set, else `on` (the Kibitzer
+    /// default: an install runs the advisor on `memory.recall.model`, `@smol` unless set).
     pub fn recall_mode(&self) -> RecallMode {
-        self.recall.mode.unwrap_or(RecallMode::Off)
+        self.recall.mode.unwrap_or(RecallMode::On)
     }
 
     /// What the advisor does while a lead turn runs: `memory.recall.mid_task` when set, else
-    /// `off`, so no install gains mid-task advisor calls without a config edit; always `off`
-    /// when the advisor itself is off. `on` loads only with `mode = "on"`.
+    /// the advisor's own mode (`on` with `mode = "on"`, `shadow` with `mode = "shadow"`);
+    /// always `off` when the advisor itself is off. `on` loads only with `mode = "on"`.
     pub fn recall_mid_task(&self) -> MidTask {
-        if self.recall_mode() == RecallMode::Off {
-            return MidTask::Off;
+        match (self.recall_mode(), self.recall.mid_task) {
+            (RecallMode::Off, _) => MidTask::Off,
+            (_, Some(mid)) => mid,
+            (RecallMode::On, None) => MidTask::On,
+            (RecallMode::Shadow, None) => MidTask::Shadow,
         }
-        self.recall.mid_task.unwrap_or(MidTask::Off)
     }
 
     /// `memory.recall.model`, or `None` when it is empty (omp's default model then).
@@ -390,7 +391,7 @@ pub enum RecallMode {
     Shadow,
     /// The advisor runs before each owner turn, which waits for it at most `wait_ms`; its picks
     /// go into the lead's input as a guarded memory block (late ones with the conversation's
-    /// next owner message). Never the default: only an explicit `mode = "on"`.
+    /// next owner message). The default.
     On,
 }
 
@@ -454,9 +455,10 @@ impl MidTask {
 /// The `[memory.recall]` settings: the recall advisor (#59).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallConfig {
-    /// `None`: `off` ([`MemoryConfig::recall_mode`]).
+    /// `None`: `on` ([`MemoryConfig::recall_mode`]).
     pub mode: Option<RecallMode>,
-    /// The omp model of the advisor (`--model`); empty is omp's default model.
+    /// The omp model of the advisor (`--model`); an omp model role such as `@smol` (the
+    /// default) or a model name; empty is omp's default model.
     pub model: String,
     /// The most entries one advisor answer may pick.
     pub max_items: usize,
@@ -472,14 +474,25 @@ pub struct RecallConfig {
     /// without the picks (they then go with the conversation's next owner message). At most
     /// [`MAX_RECALL_WAIT_MS`]; 0 never waits.
     pub wait_ms: u64,
-    /// `None`: `off` ([`MemoryConfig::recall_mid_task`]); shadow and on are only ever explicit.
+    /// `None`: the advisor's mode ([`MemoryConfig::recall_mid_task`]).
     pub mid_task: Option<MidTask>,
-    /// The most wakes on tool events in one lead turn.
-    pub mid_max_wakes_per_turn: u32,
-    /// The least time between a turn's start or its last wake on a tool event and the next one;
-    /// 0 allows a wake on every finished tool call (within the per-turn cap).
-    pub mid_min_interval_seconds: u64,
+    /// The most mid-task notes delivered to one conversation within `mid_cooldown_minutes`;
+    /// a wake on a tool event while that many were delivered is not started. Wakes that
+    /// deliver nothing never count.
+    pub mid_max_delivered: u32,
+    /// The window of `mid_max_delivered`, in minutes.
+    pub mid_cooldown_minutes: u64,
 }
+
+/// The default omp model of the recall advisor: omp's small fast model role.
+pub const DEFAULT_RECALL_MODEL: &str = "@smol";
+
+/// `[memory.recall]` keys moraebot no longer reads; each is ignored with a
+/// [`W_CONFIG_IGNORED`] naming it.
+const OLD_RECALL_KEYS: [&str; 2] = [
+    "memory.recall.mid_max_wakes_per_turn",
+    "memory.recall.mid_min_interval_seconds",
+];
 
 /// The longest `memory.recall.wait_ms`: an owner turn never waits longer for recalled notes.
 pub const MAX_RECALL_WAIT_MS: u64 = 10_000;
@@ -488,7 +501,7 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             mode: None,
-            model: String::new(),
+            model: DEFAULT_RECALL_MODEL.to_owned(),
             max_items: 3,
             max_candidates: 32,
             max_calls_per_hour: 30,
@@ -496,8 +509,8 @@ impl Default for RecallConfig {
             timeout_seconds: 60,
             wait_ms: 2500,
             mid_task: None,
-            mid_max_wakes_per_turn: 2,
-            mid_min_interval_seconds: 60,
+            mid_max_delivered: 2,
+            mid_cooldown_minutes: 10,
         }
     }
 }
@@ -795,9 +808,15 @@ struct RecallSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     mid_task: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mid_max_wakes_per_turn: Option<u32>,
+    mid_max_delivered: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mid_min_interval_seconds: Option<u64>,
+    mid_cooldown_minutes: Option<u64>,
+    /// No longer read ([`OLD_RECALL_KEYS`]); never written.
+    #[serde(default, skip_serializing)]
+    mid_max_wakes_per_turn: Option<toml::Value>,
+    /// No longer read ([`OLD_RECALL_KEYS`]); never written.
+    #[serde(default, skip_serializing)]
+    mid_min_interval_seconds: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -850,6 +869,11 @@ impl MemoryConfig {
             take!(self_file, section, [enabled, correction_patterns]);
         }
         let mut recall = RecallConfig::default();
+        let mut ignored: Vec<String> = section
+            .jev
+            .map(|_| JEV_TABLE.to_owned())
+            .into_iter()
+            .collect();
         if let Some(section) = section.recall {
             recall.mode = section.mode.as_deref().map(RecallMode::parse).transpose()?;
             recall.mid_task = section
@@ -857,6 +881,17 @@ impl MemoryConfig {
                 .as_deref()
                 .map(MidTask::parse)
                 .transpose()?;
+            for (old, key) in [
+                section.mid_max_wakes_per_turn.is_some(),
+                section.mid_min_interval_seconds.is_some(),
+            ]
+            .into_iter()
+            .zip(OLD_RECALL_KEYS)
+            {
+                if old {
+                    ignored.push(key.to_owned());
+                }
+            }
             take!(
                 recall,
                 section,
@@ -868,17 +903,13 @@ impl MemoryConfig {
                     max_input_bytes,
                     timeout_seconds,
                     wait_ms,
-                    mid_max_wakes_per_turn,
-                    mid_min_interval_seconds
+                    mid_max_delivered,
+                    mid_cooldown_minutes
                 ]
             );
         }
         let memory = Self {
-            ignored: section
-                .jev
-                .map(|_| JEV_TABLE.to_owned())
-                .into_iter()
-                .collect(),
+            ignored,
             filter,
             self_file,
             recall,
@@ -916,10 +947,8 @@ impl MemoryConfig {
             ("max_calls_per_hour", u64::from(r.max_calls_per_hour)),
             ("max_input_bytes", r.max_input_bytes as u64),
             ("timeout_seconds", r.timeout_seconds),
-            (
-                "mid_max_wakes_per_turn",
-                u64::from(r.mid_max_wakes_per_turn),
-            ),
+            ("mid_max_delivered", u64::from(r.mid_max_delivered)),
+            ("mid_cooldown_minutes", r.mid_cooldown_minutes),
         ] {
             if value == 0 {
                 return bad(format!("memory.recall.{name} must be greater than zero"));
@@ -968,11 +997,10 @@ impl MemoryConfig {
             timeout_seconds: changed(&r.timeout_seconds, &dr.timeout_seconds),
             wait_ms: changed(&r.wait_ms, &dr.wait_ms),
             mid_task: r.mid_task.map(|mid| mid.as_str().to_owned()),
-            mid_max_wakes_per_turn: changed(&r.mid_max_wakes_per_turn, &dr.mid_max_wakes_per_turn),
-            mid_min_interval_seconds: changed(
-                &r.mid_min_interval_seconds,
-                &dr.mid_min_interval_seconds,
-            ),
+            mid_max_delivered: changed(&r.mid_max_delivered, &dr.mid_max_delivered),
+            mid_cooldown_minutes: changed(&r.mid_cooldown_minutes, &dr.mid_cooldown_minutes),
+            mid_max_wakes_per_turn: None,
+            mid_min_interval_seconds: None,
         };
         let section = MemorySection {
             jev: None,
@@ -983,8 +1011,8 @@ impl MemoryConfig {
         (!is_empty_section(&section)).then_some(section)
     }
 
-    /// The `check-config` line for the recall advisor. Advisory: a missing model only means
-    /// an explicit shadow mode runs on omp's default model.
+    /// The `check-config` line for the recall advisor. Advisory: an empty model only means
+    /// the advisor runs on omp's default model.
     fn recall_check(&self) -> Check {
         let mode = self.recall_mode();
         let mid = format!(", mid-task {}", self.recall_mid_task().as_str());
@@ -1954,7 +1982,7 @@ mod tests {
         let cfg = fx.load(&text).expect("loads");
         assert_eq!(cfg.memory.ignored, ["[memory.jev]"]);
         assert!(cfg.memory.self_file_on());
-        assert_eq!(cfg.memory.recall_mode(), RecallMode::Off);
+        assert_eq!(cfg.memory.recall_mode(), RecallMode::On);
         let checks = cfg.checks();
         let warn = checks
             .iter()
@@ -2022,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_is_off_unless_asked() {
+    fn memory_recall_is_on_by_default_on_the_smol_model() {
         let fx = Fixture::new();
         let mode = |extra: &str| {
             let cfg = fx
@@ -2032,27 +2060,29 @@ mod tests {
         };
         let plain = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(plain.memory.recall, RecallConfig::default());
-        assert_eq!(plain.memory.recall_model(), None);
+        assert_eq!(plain.memory.recall_mode(), RecallMode::On);
+        assert_eq!(plain.memory.recall_mid_task(), MidTask::On);
+        assert_eq!(plain.memory.recall_model(), Some("@smol"));
         let model = "[memory.recall]\nmodel = \"qa-small\"\n";
-        // moraedang on #66: no install starts an advisor unasked.
         for (extra, want) in [
-            (String::new(), RecallMode::Off),
-            (model.to_owned(), RecallMode::Off),
+            (String::new(), RecallMode::On),
+            (model.to_owned(), RecallMode::On),
             (format!("{model}mode = \"off\"\n"), RecallMode::Off),
             (
                 "[memory.recall]\nmode = \"shadow\"\n".to_owned(),
                 RecallMode::Shadow,
             ),
-            (format!("{model}mode = \"shadow\"\n"), RecallMode::Shadow),
-            // PR 3: injection is never a default, only an explicit `on`.
             (format!("{model}mode = \"on\"\n"), RecallMode::On),
-            (
-                "[memory.recall]\nmode = \"on\"\n".to_owned(),
-                RecallMode::On,
-            ),
         ] {
             assert_eq!(mode(&extra), want, "{extra}");
         }
+        let empty = fx
+            .load(&format!(
+                "{}[memory.recall]\nmodel = \"\"\n",
+                fx.valid_toml()
+            ))
+            .expect("loads");
+        assert_eq!(empty.memory.recall_model(), None, "omp's default model");
         let model_only = fx
             .load(&format!("{}{model}", fx.valid_toml()))
             .expect("loads");
@@ -2068,6 +2098,7 @@ mod tests {
         );
         let cfg = fx.load(&text).expect("loads");
         assert_eq!(cfg.memory.recall_mode(), RecallMode::Off);
+        assert_eq!(cfg.memory.recall_mid_task(), MidTask::Off);
         assert_eq!(cfg.memory.recall_model(), Some("claude-haiku-5-5"));
         assert_eq!(cfg.memory.recall.max_calls_per_hour, 5);
         assert_eq!(cfg.memory.recall.wait_ms, 2500);
@@ -2103,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn check_config_warns_about_a_shadow_advisor_without_a_model() {
+    fn check_config_names_the_advisor_mode_and_warns_without_a_model() {
         let fx = Fixture::new();
         let check = |text: &str| {
             let cfg = fx.load(text).expect("loads");
@@ -2115,39 +2146,35 @@ mod tests {
             assert!(check.advisory);
             check.result.map_err(|e| e.code)
         };
-        assert_eq!(check(&fx.valid_toml()), Ok("off".to_owned()));
         let plain = fx.valid_toml();
+        assert_eq!(
+            check(&plain),
+            Ok("on, model @smol, owner turns wait up to 2500 ms, mid-task on".to_owned())
+        );
         let off = format!("{plain}[memory.recall]\nmode = \"off\"\n");
         assert_eq!(check(&off), Ok("off".to_owned()), "turned off on purpose");
-        let asked = format!("{plain}[memory.recall]\nmode = \"shadow\"\n");
-        assert_eq!(
-            check(&asked),
-            Err(E_CONFIG_VALUE),
-            "shadow on the default model"
-        );
-        let model = format!("{plain}[memory.recall]\nmodel = \"qa-small\"\n");
-        assert_eq!(check(&model), Ok("off".to_owned()), "a model alone is off");
         let shadow = format!("{plain}[memory.recall]\nmode = \"shadow\"\nmodel = \"qa-small\"\n");
         assert_eq!(
             check(&shadow),
-            Ok("shadow, model qa-small, mid-task off".to_owned())
+            Ok("shadow, model qa-small, mid-task shadow".to_owned())
         );
-        let on = format!("{plain}[memory.recall]\nmode = \"on\"\n");
-        assert_eq!(check(&on), Err(E_CONFIG_VALUE), "on on the default model");
-        let on = format!("{plain}[memory.recall]\nmode = \"on\"\nmodel = \"qa-small\"\n");
+        for mode in ["shadow", "on"] {
+            let empty = format!("{plain}[memory.recall]\nmode = \"{mode}\"\nmodel = \"\"\n");
+            assert_eq!(
+                check(&empty),
+                Err(E_CONFIG_VALUE),
+                "{mode} on omp's default model"
+            );
+        }
+        let mid_off = format!("{plain}[memory.recall]\nmid_task = \"off\"\n");
         assert_eq!(
-            check(&on),
-            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task off".to_owned())
-        );
-        let mid_on = format!("{on}mid_task = \"on\"\n");
-        assert_eq!(
-            check(&mid_on),
-            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task on".to_owned())
+            check(&mid_off),
+            Ok("on, model @smol, owner turns wait up to 2500 ms, mid-task off".to_owned())
         );
     }
 
     #[test]
-    fn mid_task_recall_is_off_by_default_and_on_only_with_mode_on() {
+    fn mid_task_recall_follows_the_mode_unless_set_and_is_on_only_with_mode_on() {
         let fx = Fixture::new();
         let with = |body: &str| format!("{}[memory.recall]\n{body}\n", fx.valid_toml());
         let mid = |body: &str| {
@@ -2162,36 +2189,24 @@ mod tests {
             "no advisor, no mid wakes"
         );
         assert_eq!(mid("mode = \"off\"\nmid_task = \"shadow\""), MidTask::Off);
-        // Maintainer decision on #71: no install gains mid-task calls without a config edit.
-        assert_eq!(mid("mode = \"shadow\""), MidTask::Off);
-        assert_eq!(mid("mode = \"on\""), MidTask::Off);
-        assert_eq!(
-            mid("mode = \"shadow\"\nmid_task = \"shadow\""),
-            MidTask::Shadow
-        );
+        assert_eq!(mid("mode = \"shadow\""), MidTask::Shadow);
+        assert_eq!(mid("mode = \"on\""), MidTask::On);
+        assert_eq!(mid("mid_task = \"on\""), MidTask::On);
         assert_eq!(mid("mode = \"on\"\nmid_task = \"shadow\""), MidTask::Shadow);
-        let model_only = format!("{}[memory.recall]\nmodel = \"qa-small\"\n", fx.valid_toml());
-        let upgraded = fx.load(&model_only).expect("loads").memory;
-        assert_eq!(upgraded.recall_mode(), RecallMode::Off);
-        assert_eq!(
-            upgraded.recall_mid_task(),
-            MidTask::Off,
-            "an upgraded install"
-        );
         assert_eq!(mid("mode = \"shadow\"\nmid_task = \"off\""), MidTask::Off);
-        assert_eq!(mid("mode = \"on\"\nmid_task = \"on\""), MidTask::On);
+        assert_eq!(mid("mid_task = \"off\""), MidTask::Off);
         let plain = fx.load(&fx.valid_toml()).expect("loads");
-        assert_eq!(plain.memory.recall_mid_task(), MidTask::Off);
-        assert_eq!(plain.memory.recall.mid_max_wakes_per_turn, 2);
-        assert_eq!(plain.memory.recall.mid_min_interval_seconds, 60);
+        assert_eq!(plain.memory.recall.mid_max_delivered, 2);
+        assert_eq!(plain.memory.recall.mid_cooldown_minutes, 10);
 
         let set = fx
             .load(&with(
-                "mode = \"on\"\nmid_task = \"on\"\nmid_max_wakes_per_turn = 4\nmid_min_interval_seconds = 0",
+                "mode = \"on\"\nmid_task = \"on\"\nmid_max_delivered = 4\nmid_cooldown_minutes = 5",
             ))
             .expect("loads");
         let written = set.to_toml().expect("serializes");
         assert!(written.contains("mid_task = \"on\""), "{written}");
+        assert!(written.contains("mid_max_delivered = 4"), "{written}");
         assert_eq!(fx.load(&written).expect("reloads").memory, set.memory);
         let default = fx.load(&with("mode = \"shadow\"")).expect("loads");
         let written = default.to_toml().expect("serializes");
@@ -2201,14 +2216,41 @@ mod tests {
         );
 
         for bad in [
-            "mid_task = \"on\"",
             "mode = \"shadow\"\nmid_task = \"on\"",
             "mode = \"off\"\nmid_task = \"on\"",
             "mode = \"on\"\nmid_task = \"live\"",
-            "mode = \"on\"\nmid_max_wakes_per_turn = 0",
+            "mid_max_delivered = 0",
+            "mid_cooldown_minutes = 0",
         ] {
             assert_eq!(code(fx.load(&with(bad))), E_CONFIG_VALUE, "{bad}");
         }
+    }
+
+    /// The per-turn cap and the interval of earlier versions are gone: their keys still load,
+    /// with one advisory `W_CONFIG_IGNORED` naming them, and are never written again.
+    #[test]
+    fn the_old_mid_wake_keys_are_ignored_with_a_warning() {
+        let fx = Fixture::new();
+        let text = format!(
+            "{}[memory.recall]\nmid_max_wakes_per_turn = 4\nmid_min_interval_seconds = 0\n",
+            fx.valid_toml()
+        );
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.memory.ignored, OLD_RECALL_KEYS);
+        let checks = cfg.checks();
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("ignored check");
+        let err = warn.result.as_ref().expect_err("warns");
+        assert_eq!(err.code, W_CONFIG_IGNORED);
+        assert!(
+            err.message.contains("mid_max_wakes_per_turn"),
+            "{}",
+            err.message
+        );
+        let written = cfg.to_toml().expect("serializes");
+        assert!(!written.contains("mid_m"), "{written}");
     }
 
     /// moraedang on #46: toml's parse error quotes the offending line, so a key written into

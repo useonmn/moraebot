@@ -395,6 +395,33 @@ impl RecallState {
     }
 }
 
+/// Which advisor wake wrote a `recall_ledger` row: the wake for an owner input, or a mid wake
+/// on the lead's tool events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallPhase {
+    Owner,
+    Mid,
+}
+
+impl RecallPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Mid => "mid",
+        }
+    }
+
+    /// The phase stored as `text`; anything but `mid` reads as `owner` (rows written before
+    /// the column existed).
+    pub fn parse(text: &str) -> Self {
+        if text == "mid" {
+            Self::Mid
+        } else {
+            Self::Owner
+        }
+    }
+}
+
 /// One `recall_ledger` row. `lead_generation` counts lead starts ([`Store::next_lead_generation`],
 /// persisted, so it never repeats after a restart) and `lead_epoch` the compactions of that
 /// lead child; together they name one lead context. `at` is unix seconds.
@@ -408,14 +435,7 @@ pub struct RecallRow {
     pub lead_epoch: i64,
     pub row_id: Option<i64>,
     pub at: i64,
-}
-
-/// One recall ledger row for the owner's "recent recalls" command; `mid` when a mid wake (on
-/// tool events) wrote it, else the wake before an owner turn did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecentRecall {
-    pub row: RecallRow,
-    pub mid: bool,
+    pub phase: RecallPhase,
 }
 
 const SCHEMA: &str = "
@@ -518,7 +538,7 @@ const DROPPED_TABLES: [&str; 3] = ["memory_notices", "memory_jobs", "memory_curs
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 12] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
@@ -530,6 +550,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
     ("lanes", "repo", "TEXT"),
     ("lanes", "closed_at", "TEXT"),
     ("lanes", "close_reason", "TEXT"),
+    ("recall_ledger", "phase", "TEXT NOT NULL DEFAULT 'owner'"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -763,8 +784,8 @@ impl Store {
         for row in rows {
             tx.execute(
                 "INSERT INTO recall_ledger(conversation, entry_id, entry_hash, state,
-                     lead_generation, lead_epoch, row_id, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     lead_generation, lead_epoch, row_id, at, phase)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     row.conversation,
                     row.entry_id,
@@ -773,7 +794,8 @@ impl Store {
                     row.lead_generation,
                     row.lead_epoch,
                     row.row_id,
-                    row.at
+                    row.at,
+                    row.phase.as_str()
                 ],
             )?;
         }
@@ -794,7 +816,7 @@ impl Store {
     ) -> Result<Vec<RecallRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT conversation, entry_id, entry_hash, state, lead_generation, lead_epoch,
-                    row_id, at
+                    row_id, at, phase
              FROM recall_ledger
              WHERE (state IN ('delivered', 'shadow') AND lead_generation = ?2
                     AND lead_epoch = ?3)
@@ -814,60 +836,38 @@ impl Store {
                 lead_epoch: r.get(5)?,
                 row_id: r.get(6)?,
                 at: r.get(7)?,
+                phase: RecallPhase::parse(&r.get::<_, String>(8)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The newest `limit` recall ledger rows, newest first, each with whether it came from a
-    /// mid wake: a mid wake's ledger rows share their lead context, row and second with an
-    /// [`I_RECALL_PICK`](crate::recall::I_RECALL_PICK) (shadow, rejected) or
-    /// [`I_RECALL_DELIVERED`](crate::recall::I_RECALL_DELIVERED) (delivered) log row whose
-    /// detail says `phase=mid`.
-    pub fn recent_recalls(&self, limit: usize) -> Result<Vec<RecentRecall>, StoreError> {
+    /// The newest `limit` recall ledger rows, newest first, for the owner's "recent recalls"
+    /// command.
+    pub fn recent_recalls(&self, limit: usize) -> Result<Vec<RecallRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.conversation, l.entry_id, l.entry_hash, l.state, l.lead_generation,
-                    l.lead_epoch, l.row_id, l.at,
-                    EXISTS(SELECT 1 FROM memory_log m
-                           WHERE m.at = l.at
-                             AND m.code = CASE l.state WHEN 'delivered' THEN ?2 ELSE ?3 END
-                             AND m.detail LIKE 'gen=' || l.lead_generation || ' epoch='
-                                 || l.lead_epoch || ' row=' || l.row_id || ' %'
-                             AND m.detail LIKE '% ' || ?4 || '%')
-             FROM recall_ledger l
-             ORDER BY l.id DESC
+            "SELECT conversation, entry_id, entry_hash, state, lead_generation, lead_epoch,
+                    row_id, at, phase
+             FROM recall_ledger
+             ORDER BY id DESC
              LIMIT ?1",
         )?;
-        let rows = stmt.query_map(
-            params![
-                i64::try_from(limit).unwrap_or(i64::MAX),
-                crate::recall::I_RECALL_DELIVERED,
-                crate::recall::I_RECALL_PICK,
-                crate::recall::MID_PHASE
-            ],
-            |r| {
-                let state: String = r.get(3)?;
-                Ok(RecentRecall {
-                    row: RecallRow {
-                        conversation: r.get(0)?,
-                        entry_id: r.get(1)?,
-                        entry_hash: r.get(2)?,
-                        state: RecallState::parse(&state).ok_or_else(|| {
-                            rusqlite::Error::InvalidColumnType(
-                                3,
-                                state,
-                                rusqlite::types::Type::Text,
-                            )
-                        })?,
-                        lead_generation: r.get(4)?,
-                        lead_epoch: r.get(5)?,
-                        row_id: r.get(6)?,
-                        at: r.get(7)?,
-                    },
-                    mid: r.get(8)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+            let state: String = r.get(3)?;
+            Ok(RecallRow {
+                conversation: r.get(0)?,
+                entry_id: r.get(1)?,
+                entry_hash: r.get(2)?,
+                state: RecallState::parse(&state).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(3, state, rusqlite::types::Type::Text)
+                })?,
+                lead_generation: r.get(4)?,
+                lead_epoch: r.get(5)?,
+                row_id: r.get(6)?,
+                at: r.get(7)?,
+                phase: RecallPhase::parse(&r.get::<_, String>(8)?),
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -3493,6 +3493,7 @@ mod tests {
             lead_epoch: epoch,
             row_id: Some(1),
             at,
+            phase: RecallPhase::Owner,
         };
         store
             .record_recall(&[

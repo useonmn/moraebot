@@ -4329,7 +4329,7 @@ async fn queued_status_question_is_answered_by_the_worker() {
         [(
             "444".to_owned(),
             format!(
-                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: off (mid-task off), 0 calls in the last hour, last delivered pick never."
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: on (mid-task on), 0 calls in the last hour, last delivered pick never."
             )
         )]
     );
@@ -5113,7 +5113,7 @@ async fn a_dm_in_a_thread_is_keyed_and_answered_in_that_thread() {
 
     assert_eq!(h.row(id).conversation_key, "fake:th:444:100");
     assert_eq!(h.row(plain).conversation_key, "fake:dm:444");
-    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(h.row(id).state, State::Done, "{:?}", h.row(id).error);
     assert_eq!(
         h.sends(),
         vec![

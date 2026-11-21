@@ -304,7 +304,8 @@ pub enum Bucket {
     /// `threads/<conversation key>.md`.
     Thread(String),
     /// `self/observations.md`: the owner's corrections of the bot in their own words, one per
-    /// line ([`crate::lessons`]); never in a prompt block or the recall pool, shown on request.
+    /// line ([`crate::lessons`]); never in a prompt block or a lane's search, offered only to
+    /// the lead's recall advisor ([`recall_pool`]) and shown on request.
     SelfObs,
 }
 
@@ -1834,17 +1835,17 @@ pub struct PoolEntry {
 }
 
 /// Every entry the recall advisor (#59) may be offered as of `today`: the live entries of
-/// `projects/` and `threads/` (every conversation's, moraedang's point 8 on #59), and the
-/// archived entries of `core/`, `projects/` and `threads/` the owner replaced. Never the core
-/// files (the lead has them in its system prompt), never `self/` (the owner's corrections),
-/// never an entry the owner forgot (archived without `superseded_by`), never an expired one.
-/// Owner lines moraebot did not commit, and non-owner lines in `core/`, are skipped as in
-/// every read block.
+/// `projects/` and `threads/` (every conversation's; the advisor keeps only the current
+/// conversation's thread), the owner's corrections in `self/observations.md`, and the
+/// archived entries of those the owner replaced. Never the core files (the lead has them in
+/// its system prompt), never an entry the owner forgot (archived without `superseded_by`),
+/// never an expired one. Owner lines moraebot did not commit, and non-owner lines in
+/// `self/`, are skipped as in every read block.
 pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
-    let live = ["projects", "threads"]
+    let live = ["projects", "threads", "self"]
         .iter()
         .flat_map(|dir| md_files(root, dir));
-    let archived = ["core", "projects", "threads"]
+    let archived = ["projects", "threads", "self"]
         .iter()
         .flat_map(|dir| md_files(root, &format!("{ARCHIVE}{dir}")));
     let rels: Vec<String> = live.chain(archived).collect();
@@ -1866,6 +1867,13 @@ pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
         }
     }
     pool
+}
+
+/// The commit trusted reads of the memory folder `root` take owner lines from (moraebot's
+/// last own commit), when one is recorded: while it stays the same, so does
+/// [`recall_pool`] for a day.
+pub fn trusted_head(root: &Path) -> Option<String> {
+    recorded_head(root)
 }
 
 /// What one successful op adds to the batch commit message.
@@ -2933,13 +2941,14 @@ fn run_git(root: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, 
         Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A git killed by a signal or failing silently still says how it ended.
+        let why = stderr
+            .lines()
+            .next()
+            .map_or_else(|| output.status.to_string(), str::to_owned);
         Err(MemoryError::new(
             E_MEMORY_GIT,
-            format!(
-                "git {}: {}",
-                args.first().copied().unwrap_or_default(),
-                stderr.lines().next().unwrap_or("failed")
-            ),
+            format!("git {}: {why}", args.first().copied().unwrap_or_default()),
         ))
     }
 }
@@ -4916,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recall_pool_holds_live_notes_and_replaced_ones_never_forgotten_core_or_self() {
+    fn the_recall_pool_holds_live_notes_corrections_and_replaced_ones_never_forgotten_or_core() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut store, _) = open(dir.path(), "2026-11-21");
         let project = Bucket::Project("usunmn/moraebot".into());
@@ -4948,7 +4957,7 @@ mod tests {
         store
             .add(owner("core rule", Bucket::Owner, 8))
             .expect("add");
-        store
+        let correction = store
             .add(owner("a correction", Bucket::SelfObs, 9))
             .expect("add");
 
@@ -4964,6 +4973,7 @@ mod tests {
             (new.new.id, false),
             (old.id.clone(), true),
             (lane.id, false),
+            (correction.id, false),
         ];
         want.sort();
         assert_eq!(seen, want);
