@@ -330,6 +330,10 @@ pub enum RecallMode {
     /// The advisor runs after each owner input and its picks are only logged, never given to
     /// the lead.
     Shadow,
+    /// The advisor runs before each owner turn, which waits for it at most `wait_ms`; its picks
+    /// go into the lead's input as a guarded memory block (late ones with the conversation's
+    /// next owner message). Never the default: only an explicit `mode = "on"`.
+    On,
 }
 
 impl RecallMode {
@@ -337,6 +341,7 @@ impl RecallMode {
         match self {
             Self::Off => "off",
             Self::Shadow => "shadow",
+            Self::On => "on",
         }
     }
 
@@ -344,14 +349,10 @@ impl RecallMode {
         match text {
             "off" => Ok(Self::Off),
             "shadow" => Ok(Self::Shadow),
-            "on" => Err(ConfigError::new(
-                E_CONFIG_VALUE,
-                "memory.recall.mode = \"on\" is not available yet: recalled notes reach the lead \
-                 in a later release; use \"shadow\" or \"off\"",
-            )),
+            "on" => Ok(Self::On),
             other => Err(ConfigError::new(
                 E_CONFIG_VALUE,
-                format!("memory.recall.mode '{other}' must be \"off\" or \"shadow\""),
+                format!("memory.recall.mode '{other}' must be \"off\", \"shadow\" or \"on\""),
             )),
         }
     }
@@ -377,7 +378,14 @@ pub struct RecallConfig {
     pub max_input_bytes: usize,
     /// How long one advisor call may take.
     pub timeout_seconds: u64,
+    /// With `mode = "on"`: how long an owner turn waits for the advisor before it starts
+    /// without the picks (they then go with the conversation's next owner message). At most
+    /// [`MAX_RECALL_WAIT_MS`]; 0 never waits.
+    pub wait_ms: u64,
 }
+
+/// The longest `memory.recall.wait_ms`: an owner turn never waits longer for recalled notes.
+pub const MAX_RECALL_WAIT_MS: u64 = 10_000;
 
 impl Default for RecallConfig {
     fn default() -> Self {
@@ -389,6 +397,7 @@ impl Default for RecallConfig {
             max_calls_per_hour: 30,
             max_input_bytes: 16 * 1024,
             timeout_seconds: 60,
+            wait_ms: 2500,
         }
     }
 }
@@ -798,6 +807,8 @@ struct RecallSection {
     max_input_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -965,7 +976,8 @@ impl MemoryConfig {
                     max_candidates,
                     max_calls_per_hour,
                     max_input_bytes,
-                    timeout_seconds
+                    timeout_seconds,
+                    wait_ms
                 ]
             );
         }
@@ -1067,6 +1079,11 @@ impl MemoryConfig {
         if r.max_items > r.max_candidates {
             return bad("memory.recall.max_items must not exceed max_candidates".into());
         }
+        if r.wait_ms > MAX_RECALL_WAIT_MS {
+            return bad(format!(
+                "memory.recall.wait_ms must not exceed {MAX_RECALL_WAIT_MS}"
+            ));
+        }
         Ok(())
     }
 
@@ -1128,6 +1145,7 @@ impl MemoryConfig {
             max_calls_per_hour: changed(&r.max_calls_per_hour, &dr.max_calls_per_hour),
             max_input_bytes: changed(&r.max_input_bytes, &dr.max_input_bytes),
             timeout_seconds: changed(&r.timeout_seconds, &dr.timeout_seconds),
+            wait_ms: changed(&r.wait_ms, &dr.wait_ms),
         };
         let section = MemorySection {
             jev: (!is_empty_section(&jev_section)).then_some(jev_section),
@@ -1155,6 +1173,15 @@ impl MemoryConfig {
                 E_CONFIG_VALUE,
                 "shadow without memory.recall.model: the advisor runs on omp's default model; \
                  set a small fast model there",
+            )),
+            (RecallMode::On, Some(model)) => Ok(format!(
+                "on, model {model}, owner turns wait up to {} ms",
+                self.recall.wait_ms
+            )),
+            (RecallMode::On, None) => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                "on without memory.recall.model: the advisor runs on omp's default model before \
+                 every owner turn; set a small fast model there",
             )),
         };
         Check {
@@ -2251,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_is_shadow_only_with_jev_and_a_model_or_when_asked_and_refuses_on() {
+    fn memory_recall_is_shadow_only_with_jev_and_a_model_and_on_only_when_asked() {
         let fx = Fixture::new();
         let mode = |extra: &str| {
             let cfg = fx
@@ -2279,6 +2306,12 @@ mod tests {
                 format!("{jev}[memory.recall]\nmode = \"shadow\"\n"),
                 RecallMode::Shadow,
             ),
+            // PR 3: injection is never a default, only an explicit `on`.
+            (format!("{jev}{model}mode = \"on\"\n"), RecallMode::On),
+            (
+                "[memory.recall]\nmode = \"on\"\n".to_owned(),
+                RecallMode::On,
+            ),
         ] {
             assert_eq!(mode(&extra), want, "{extra}");
         }
@@ -2299,13 +2332,29 @@ mod tests {
         assert_eq!(cfg.memory.recall_mode(), RecallMode::Off);
         assert_eq!(cfg.memory.recall_model(), Some("claude-haiku-5-5"));
         assert_eq!(cfg.memory.recall.max_calls_per_hour, 5);
+        assert_eq!(cfg.memory.recall.wait_ms, 2500);
         let written = cfg.to_toml().expect("serializes");
         assert!(written.contains("[memory.recall]"), "{written}");
+        assert!(
+            !written.contains("wait_ms"),
+            "defaults stay implicit: {written}"
+        );
         assert_eq!(fx.load(&written).expect("reloads").memory, cfg.memory);
 
         let with = |body: &str| format!("{}[memory.recall]\n{body}\n", fx.valid_toml());
+        let on = fx
+            .load(&with("mode = \"on\"\nwait_ms = 0"))
+            .expect("on with no wait loads");
+        assert_eq!(on.memory.recall_mode(), RecallMode::On);
+        assert_eq!(on.memory.recall.wait_ms, 0);
+        let written = on.to_toml().expect("serializes");
+        assert!(written.contains("mode = \"on\""), "{written}");
+        assert_eq!(fx.load(&written).expect("reloads").memory, on.memory);
+        let longest = format!("wait_ms = {MAX_RECALL_WAIT_MS}");
+        assert!(fx.load(&with(&longest)).is_ok());
+        let too_long = format!("wait_ms = {}", MAX_RECALL_WAIT_MS + 1);
         for bad in [
-            "mode = \"on\"",
+            too_long.as_str(),
             "mode = \"live\"",
             "max_items = 0",
             "timeout_seconds = 0",
@@ -2349,6 +2398,13 @@ mod tests {
         );
         let model = format!("{jev}[memory.recall]\nmodel = \"qa-small\"\n");
         assert_eq!(check(&model), Ok("shadow, model qa-small".to_owned()));
+        let on = format!("{jev}[memory.recall]\nmode = \"on\"\n");
+        assert_eq!(check(&on), Err(E_CONFIG_VALUE), "on on the default model");
+        let on = format!("{jev}[memory.recall]\nmode = \"on\"\nmodel = \"qa-small\"\n");
+        assert_eq!(
+            check(&on),
+            Ok("on, model qa-small, owner turns wait up to 2500 ms".to_owned())
+        );
     }
 
     #[test]

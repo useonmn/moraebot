@@ -530,7 +530,7 @@ pub struct LogRow {
 /// What the recall advisor's answer did with one entry (#59).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallState {
-    /// Given to the lead (live mode, a later release).
+    /// Given to the lead in a recalled block (`memory.recall.mode = "on"`).
     Delivered,
     /// Turned down by the advisor for this conversation.
     Rejected,

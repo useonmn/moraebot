@@ -5,7 +5,9 @@
 //! stays with the row that asked. Before every turn `persona.md`, the core memory
 //! (`memory::core_block`) and the self readings (`memory::self_block`) are read again; when the lead's appended system prompt changed, the idle child is closed and started again on
 //! the same session. An owner row's input gets its conversation's memory sections appended
-//! after the body when they changed since this child last got them (`thread_memory`).
+//! after the body when they changed since this child last got them (`thread_memory`); with
+//! `memory.recall.mode = "on"` the recall advisor's picks follow as one guarded block
+//! (`recall::recalled_block`), after a wait of at most `memory.recall.wait_ms`.
 //! Its session folder is `<home>/lead/session` and its
 //! omp session id is stored under `lead::LEAD_SESSION`. Lane children are owned by
 //! `lane.rs` and chat children by `chat.rs`, built with the same plumbing
@@ -1092,8 +1094,10 @@ impl OmpManager {
         self
     }
 
-    /// Wakes `advisor` beside every lead turn an owner input starts (shadow mode: it never
-    /// changes the input).
+    /// Runs `advisor` for every lead turn an owner input starts: beside the turn in shadow mode
+    /// (the input never changes), or before it in on mode, waiting at most
+    /// `memory.recall.wait_ms`, with its picks appended to the input as the recalled block
+    /// (never to a steer or a lane result).
     pub fn with_recall(mut self, advisor: Arc<Advisor>) -> Self {
         self.recall = Some(advisor);
         self
@@ -1225,6 +1229,20 @@ impl OmpManager {
                         recall_wake(text, row_id, generation, epoch, held, &fresh)?,
                     ))
                 });
+        // On mode: before the turn, waiting at most `wait_ms`; the steer gate is still closed,
+        // so a second owner message meanwhile queues as usual (moraedang's point 7 on #59).
+        let (input, recalled) = match wake {
+            Some((advisor, wake)) if advisor.injects() => {
+                let picks = advisor.recall(wake.clone(), advisor.wait()).await;
+                let (block, shown) = advisor.render(&picks);
+                (append_block(input, &block), Some((advisor, wake, shown)))
+            }
+            wake => {
+                // Shadow mode wakes after the send below.
+                let shadow = wake.map(|(advisor, wake)| (advisor, wake, Vec::new()));
+                (input, shadow)
+            }
+        };
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
             text: input,
@@ -1248,9 +1266,12 @@ impl OmpManager {
             });
             current.requests.send(request).is_ok()
         };
-        // Beside the turn, never before it: the advisor's picks are only logged (shadow).
-        if sent && let Some((advisor, wake)) = wake {
-            advisor.wake(wake);
+        // Shadow mode: beside the turn, never before it; the picks are only logged.
+        if sent
+            && let Some((advisor, wake, _)) = &recalled
+            && !advisor.injects()
+        {
+            advisor.wake(wake.clone());
         }
         let main = if sent {
             result.await.unwrap_or(Err(RpcError::Closed))
@@ -1265,6 +1286,9 @@ impl OmpManager {
         // Only an input the child took is given: a rejected prompt never reached it.
         if sent && !rejected(&main) {
             record_given(&current.given, fresh, epoch);
+            if let Some((advisor, wake, shown)) = &recalled {
+                advisor.delivered(wake, shown);
+            }
         }
 
         let mut killed = false;

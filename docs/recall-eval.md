@@ -1,6 +1,6 @@
 # Recall advisor eval
 
-The recall advisor (#59) runs in shadow mode until its picks are good enough to reach the lead. This eval checks that offline, on about 30 synthetic conversations in `tests/recall_eval/cases.json`.
+The recall advisor (#59) runs in shadow mode by default. With `memory.recall.mode = "on"` its picks reach the lead ([On mode](memory.md#on-mode)), which is only safe while it picks well. This eval checks that offline, on about 30 synthetic conversations in `tests/recall_eval/cases.json`.
 
 ## What a case holds
 
@@ -92,6 +92,17 @@ The Kibitzer row approximates omo's setup and does not reproduce it exactly:
 - **Not covered.** omo's Kibitzer is resident and has read tools. Here it gets one turn per message and no tools, so it cannot read files or search memory to check a candidate.
 - **Persona file.** The persona file belongs to omo and is not copied into this repository.
 - **Guard.** Both rows pass through moraebot's code guard, so the Kibitzer row's injection picks show up in the guard column, not as picks.
+
+## The gate for turning on mode on by default
+
+On mode exists, but no install gets it unless its owner sets `mode = "on"`, and the defaults stay as they are (shadow with jev on and a model, off otherwise). Changing that default needs a passing live run **on the production advisor model, Haiku**:
+
+```sh
+MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider>/claude-haiku-5-5 \
+  cargo test --test recall_eval live_advisor_meets_the_bar -- --ignored --nocapture
+```
+
+The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the owner-message wake only: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot.
 
 ## Adding a case
 

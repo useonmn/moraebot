@@ -54,6 +54,9 @@
 //! (after its last scripted call) with `agent_end` and an error `prompt_result`;
 //! `hang` writes nothing more, like `hang`. Unset or anything else: the echo reply.
 //!
+//! Reply gate: with FAKE_OMP_REPLY_GATE=<path> set, a prompt answered like `ok` writes its
+//! reply only once `<path>` exists (`agent_start` comes at once).
+//!
 //! Refused prompt: a prompt whose message contains FAKE_OMP_REJECT_TRIGGER (unset
 //! or empty: none) gets an error `response` (code `E_PROMPT_REFUSED`) in every
 //! mode, and no run.
@@ -650,7 +653,21 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
             send(out, &json!({"type": "agent_end", "messages": []}));
             prompt_error(id, out);
         }
-        _ => finish_echo(id, prompt_message(frame), out),
+        _ => {
+            await_reply_gate();
+            finish_echo(id, prompt_message(frame), out)
+        }
+    }
+}
+
+/// FAKE_OMP_REPLY_GATE=<path>: a plain prompt's reply is written only once `<path>` exists, so a
+/// test decides when an answer comes (the recall advisor's late picks) instead of a timer.
+fn await_reply_gate() {
+    let Some(gate) = std::env::var_os("FAKE_OMP_REPLY_GATE") else {
+        return;
+    };
+    while !std::path::Path::new(&gate).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
