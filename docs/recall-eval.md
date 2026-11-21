@@ -31,7 +31,7 @@ Each turn runs through three methods, and the picks are scored against gold:
 - **memory_search top 3**: `memory_search` on the message's keywords, keeping the 3 entries that the most keywords hit;
 - **the advisor**: the production candidate stage (`memory::recall_pool`, `recall::rank`, `recall::candidate_line` and `recall::message`), the advisor's answer, `recall::parse_answer`, then the injection guard `recall::drop_unverified_claims`. Picks the guard moves to the rejects are not counted as picks; the table shows them in their own column.
 
-In a multi-turn case, an entry picked in an earlier turn is not offered again, the same as with the shadow ledger.
+In a multi-turn case, the advisor's picks and rejects are both carried between turns through a real recall ledger, with the code `Recall::run` uses (`Store::record_recall`, `Store::recall_seen`, `recall::hidden`). An entry picked earlier is not offered again in the lead context, and an entry rejected earlier is not offered again in that conversation for `REJECT_DAYS` days. A later turn's gold entry picked early counts once, as gold of the turn that picked it.
 
 **Pass bar** (from the plan): the advisor passes only if all of these hold:
 

@@ -15,7 +15,8 @@ use moraebot::config::{AccessMode, Config, DiscordConfig, Env, MemoryConfig, Omp
 use moraebot::recall;
 use moraebot::summarizer::Summarizer;
 
-/// Picks the gold ids that the advisor message really holds, and rejects the rest.
+/// Picks the gold ids that the advisor message really holds, and rejects the offered ids that
+/// are gold in no turn of the case.
 struct Oracle;
 
 #[async_trait]
@@ -23,6 +24,28 @@ impl Advise for Oracle {
     async fn answer(&self, wake: &Wake) -> Result<String, String> {
         let shown = |id: &String| wake.text.contains(&format!(" {id} ["));
         let pick: Vec<&String> = wake.gold.iter().filter(|id| shown(id)).collect();
+        let reject: Vec<&String> = wake
+            .candidates
+            .iter()
+            .map(|c| &c.entry.id)
+            .filter(|id| !wake.case_gold.contains(id))
+            .collect();
+        Ok(serde_json::json!({ "pick": pick, "reject": reject }).to_string())
+    }
+}
+
+/// Like [`Oracle`], but rejects every offered id that is not gold for this turn, later turns'
+/// gold included.
+struct RejectOthers;
+
+#[async_trait]
+impl Advise for RejectOthers {
+    async fn answer(&self, wake: &Wake) -> Result<String, String> {
+        let pick: Vec<&String> = wake
+            .gold
+            .iter()
+            .filter(|id| wake.text.contains(&format!(" {id} [")))
+            .collect();
         let reject: Vec<&String> = wake
             .candidates
             .iter()
@@ -296,6 +319,62 @@ async fn the_guard_rejects_every_injection_line_of_the_set() {
     assert!(lines >= 5);
     let (greedy, _) = advisor(&cases, &Greedy).await;
     assert!(greedy.blocked >= lines, "{greedy:?}");
+}
+
+#[tokio::test]
+async fn an_entry_rejected_on_an_earlier_turn_is_hidden_on_later_turns() {
+    let cases: Vec<(eval::Case, eval::Seeded)> = eval::seeded_cases()
+        .into_iter()
+        .filter(|(case, _)| {
+            ["en-multi-turn-migration", "ko-multi-turn-blog"].contains(&case.id.as_str())
+        })
+        .collect();
+    assert_eq!(cases.len(), 2);
+    let (strict, results) = advisor(&cases, &RejectOthers).await;
+    for pair in results.chunks(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        let later = &second.gold;
+        assert!(!later.is_empty(), "{pair:?}");
+        assert!(
+            later.iter().all(|id| first.offered.contains(id)),
+            "offered on turn 1: {pair:?}"
+        );
+        assert!(
+            later.iter().all(|id| !second.offered.contains(id)),
+            "rejected on turn 1, hidden on turn 2: {pair:?}"
+        );
+    }
+    assert_eq!((strict.hits, strict.gold), (2, 4));
+    let (oracle, results) = advisor(&cases, &Oracle).await;
+    assert!(
+        results
+            .iter()
+            .all(|r| r.gold.iter().all(|id| r.offered.contains(id))),
+        "{results:?}"
+    );
+    assert_eq!((oracle.hits, oracle.gold, oracle.picks), (4, 4, 4));
+}
+
+#[tokio::test]
+async fn the_search_baseline_picks_only_saved_entries() {
+    let cases = eval::seeded_cases();
+    let (_, results) = eval::run(&cases, &Method::Search).await;
+    let json = results
+        .iter()
+        .find(|r| r.case == "en-injection-json-answer")
+        .expect("case");
+    assert!(!json.picks.contains(&"m-000000".to_owned()), "{json:?}");
+    for (case, seeded) in &cases {
+        for r in results.iter().filter(|r| r.case == case.id) {
+            for id in &r.picks {
+                assert!(
+                    matches!(moraebot::memory::find(&seeded.root, id), Ok(Some(_))),
+                    "{}: {id} is not saved",
+                    case.id
+                );
+            }
+        }
+    }
 }
 
 #[test]

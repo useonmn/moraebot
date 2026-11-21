@@ -14,6 +14,7 @@ use moraebot::memory::{
     SearchScope, Source,
 };
 use moraebot::recall::{self, Candidate};
+use moraebot::store::Store;
 use serde::Deserialize;
 
 /// The day every case is judged on.
@@ -252,6 +253,8 @@ pub struct Wake {
     pub candidates: Vec<Candidate>,
     /// The gold ids not picked in an earlier turn (only fakes look at them).
     pub gold: Vec<String>,
+    /// The gold ids of every turn of the case (only fakes look at them).
+    pub case_gold: Vec<String>,
 }
 
 /// An advisor under test: answers one wake with the raw reply text.
@@ -318,7 +321,7 @@ pub fn keywords(message: &str) -> Vec<String> {
     out
 }
 
-/// The entry ids in a search result, in order.
+/// The id-shaped words (`m-` and six hex digits) in a search result, in order.
 fn result_ids(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -341,6 +344,11 @@ fn search_picks(root: &Path, today: Day, message: &str, before: &HashSet<String>
     for word in keywords(message) {
         let text = memory::search(root, today, &word, SearchScope::All, None);
         for id in result_ids(&text) {
+            // A search result quotes entry text, which can hold id-like words (an injected
+            // `{"pick":["m-000000"]}`): only ids of saved entries count.
+            if !matches!(memory::find(root, &id), Ok(Some(_))) {
+                continue;
+            }
             let order = hits.len();
             match hits.iter_mut().find(|(seen, _, _)| *seen == id) {
                 Some(hit) => hit.1 += 1,
@@ -356,9 +364,12 @@ fn search_picks(root: &Path, today: Day, message: &str, before: &HashSet<String>
         .collect()
 }
 
-/// Runs every turn of `case` (seeded as `seeded`) through `method`. Earlier turns' picks are
-/// not offered again (the shadow ledger's dedup within one lead context), and every bucket an
-/// earlier turn's lead input read stays in front of the lead. A gold entry of a later turn
+/// Runs every turn of `case` (seeded as `seeded`) through `method`. For the advisor, each
+/// answer goes into a fresh recall ledger ([`Store::record_recall`] with [`recall::ledger_rows`])
+/// and every turn reads it back ([`Store::recall_seen`], [`recall::hidden`]) as `Recall::run`
+/// does: an entry picked earlier is not offered again in the lead context, nor one rejected
+/// earlier in the conversation. Every bucket an earlier turn's lead input read stays in front
+/// of the lead. A gold entry of a later turn
 /// picked early counts once, as gold of the turn that picked it. Panics when the advisor is
 /// offered a forgotten or a self entry: the candidate stage must never do that.
 pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<TurnResult> {
@@ -366,6 +377,17 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
     let recall_config = RecallConfig::default();
     let redactor = Redactor::default();
     let filter = ExcerptFilter::from_config(&MemoryConfig::default().filter);
+    let ledger_dir = tempfile::tempdir().expect("temp dir");
+    let mut ledger = Store::open(&ledger_dir.path().join("inbox.sqlite")).expect("ledger opens");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let case_gold: Vec<String> = case
+        .turns
+        .iter()
+        .flat_map(|t| t.gold.iter().map(|key| seeded.id(key)))
+        .collect();
     let mut given: HashSet<String> = HashSet::new();
     let mut before: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -403,11 +425,24 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
             }
             Method::Advisor(advisor) => {
                 given.extend(buckets.iter().map(Bucket::label));
-                let mentioned = memory::mentioned_projects(&seeded.root, &turn.message);
-                let skip = |item: &PoolEntry| {
-                    (!item.replaced && given.contains(&item.bucket.label()))
-                        || before.contains(&item.entry.id)
+                let lead_wake = recall::Wake {
+                    conversation: case.conversation.clone(),
+                    row_id: n as i64 + 1,
+                    message: turn.message.clone(),
+                    generation: 1,
+                    epoch: 0,
+                    given: given.clone(),
                 };
+                let seen = ledger
+                    .recall_seen(
+                        &case.conversation,
+                        lead_wake.generation,
+                        lead_wake.epoch as i64,
+                        now - recall::REJECT_DAYS * 24 * 60 * 60,
+                    )
+                    .expect("ledger readable");
+                let mentioned = memory::mentioned_projects(&seeded.root, &turn.message);
+                let skip = |item: &PoolEntry| recall::hidden(item, &lead_wake.given, &seen);
                 let (mut candidates, lines): (Vec<Candidate>, Vec<String>) = recall::rank(
                     memory::recall_pool(&seeded.root, today),
                     &turn.message,
@@ -448,6 +483,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                         text,
                         candidates,
                         gold: gold.clone(),
+                        case_gold: case_gold.clone(),
                     };
                     match advisor.answer(&wake).await {
                         Ok(reply) => {
@@ -458,6 +494,13 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                                         &wake.candidates,
                                         &filter,
                                     );
+                                    let rows = recall::ledger_rows(
+                                        &lead_wake,
+                                        &answer,
+                                        &wake.candidates,
+                                        now,
+                                    );
+                                    ledger.record_recall(&rows).expect("ledger written");
                                     picks = answer.pick;
                                 }
                                 None => failure = Some(format!("no JSON object in {reply:?}")),
