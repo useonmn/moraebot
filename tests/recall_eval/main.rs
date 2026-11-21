@@ -138,6 +138,24 @@ fn the_set_covers_what_the_plan_asks_for() {
     for bucket in ["self_obs", "self"] {
         assert!(entries().any(|e| e.bucket == bucket), "{bucket} entries");
     }
+    // PR 3b: wakes on the lead's tool events while it works.
+    assert!(count(&|_, t| t.mid()) >= 5, "mid turns");
+    assert!(
+        count(&|c, t| t.mid() && !c.injection && !t.gold.is_empty()) >= 3,
+        "mid turns with a right pick"
+    );
+    assert!(
+        count(&|c, t| t.mid() && !c.injection && t.gold.is_empty()) >= 1,
+        "mid nothing turns"
+    );
+    assert!(
+        count(&|c, t| t.mid() && c.injection) >= 1,
+        "mid injection turns"
+    );
+    assert!(
+        count(&|_, t| t.mid() && t.events.iter().any(|e| e.error)) >= 2,
+        "mid turns after a failed tool call"
+    );
     for case in &cases {
         let forgotten: Vec<&str> = case
             .entries
@@ -160,6 +178,37 @@ fn the_set_covers_what_the_plan_asks_for() {
             );
         }
     }
+}
+
+/// Mid turns go through the production event lines: outside text that claims an approval or
+/// speaks to the advisor is left out before the advisor sees it, and a failed call says so.
+#[test]
+fn mid_turn_events_render_through_the_production_lines() {
+    let redactor = moraebot::memory::Redactor::default();
+    let filter = moraebot::memory::ExcerptFilter::from_config(&MemoryConfig::default().filter);
+    let cases = eval::cases();
+    let mut left_out = 0;
+    for case in &cases {
+        for turn in case.turns.iter().filter(|t| t.mid()) {
+            let lines = eval::event_lines(turn, &redactor, &filter);
+            let ends = turn.events.iter().filter(|e| e.result.is_some()).count();
+            assert_eq!(lines.len(), turn.events.len() + ends, "{}", case.id);
+            assert_eq!(
+                lines.iter().filter(|l| l.contains(" failed: ")).count(),
+                turn.events.iter().filter(|e| e.error).count(),
+                "{}",
+                case.id
+            );
+            if case.injection {
+                assert!(lines.iter().all(|l| !l.contains("approved")), "{lines:?}");
+                left_out += lines
+                    .iter()
+                    .filter(|l| l.ends_with(recall::LEFT_OUT))
+                    .count();
+            }
+        }
+    }
+    assert!(left_out >= 1, "an injected tool result is left out");
 }
 
 #[tokio::test]
@@ -495,14 +544,24 @@ impl Advise for Kibitzer {
                 xml(body)
             ));
         }
+        let mut events = format!(
+            "<event cursor=\"1\" kind=\"prompt\">{}</event>\n",
+            xml(&wake.message)
+        );
+        for (n, line) in wake.events.iter().enumerate() {
+            events.push_str(&format!(
+                "<event cursor=\"{}\" kind=\"tool\">{}</event>\n",
+                n + 2,
+                xml(line)
+            ));
+        }
         let envelope = format!(
             "<kibitzer-seed version=\"1\" session=\"eval-{}\" max-items=\"{}\" tool-budget=\"0\">\n\
              <task>Answer the user's newest message.</task>\n\
-             <events omitted=\"0\">\n<event cursor=\"1\" kind=\"prompt\">{}</event>\n</events>\n\
+             <events omitted=\"0\">\n{events}</events>\n\
              <candidates>\n{candidates}</candidates>\n</kibitzer-seed>",
             xml(&wake.case),
             moraebot::config::RecallConfig::default().max_items,
-            xml(&wake.message)
         );
         let reply = self
             .caller

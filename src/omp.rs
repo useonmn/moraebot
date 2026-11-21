@@ -20,6 +20,12 @@
 //! Message text reaches omp only as a JSON line on the child's stdin, never as an
 //! argument or through a shell.
 //!
+//! moraebot itself can add a note to a running turn (`LeadNotes`): a steer with its own tag
+//! line, no inbox row and no reply of its own. It never takes the owner's steer slot; a note
+//! for a turn that has ended is not sent. The recall advisor's mid-task picks use it
+//! (`memory.recall.mid_task = "on"`), and its tool-event wakes are fed from the lead's event
+//! drain (`MidTap`).
+//!
 //! While a lead turn runs, its omp agent events are counted in a `LeadWatch`; on each lane
 //! watchdog tick `lead_stalled` reports a turn with no event for `omp.stall_after_minutes`
 //! once per stretch, and the dispatcher posts one notice in its conversation. moraebot never
@@ -54,7 +60,7 @@ use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory;
 use crate::persona;
-use crate::recall::{Advisor, Wake};
+use crate::recall::{Advisor, MidTurn, ToolEvent, Wake};
 use crate::store::{MAX_TRACE_TOOLS, Store, ToolSource, ToolUse, TurnTrace};
 
 /// The line above the core memory block in the lead's system prompt.
@@ -734,6 +740,136 @@ fn disarm(kill: &LeadKill) {
     }
 }
 
+/// The tag line of a note holding the recall advisor's mid-task picks.
+pub const RECALL_NOTE_TAG: &str = "[moraebot memory recalled]";
+
+/// What a moraebot note is. Its tag line tells the lead it is not an owner message: it has no
+/// `conversation=` or `message=` field, so `lead::parse_tag` reads it as untagged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteKind {
+    /// Saved entries the recall advisor chose while the turn runs (#59), as a recalled block.
+    Recall,
+}
+
+impl NoteKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Recall => RECALL_NOTE_TAG,
+        }
+    }
+}
+
+/// One lead turn of this manager, counted from 1; a note names the turn it is for, so it never
+/// lands in a later one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TurnId(u64);
+
+/// Runs once the lead took a note: its steer was sent and not refused (the same rule as an
+/// input's memory sections). It runs when the turn ends, never if the note was not sent.
+pub type OnTaken = Box<dyn FnOnce() + Send>;
+
+/// A note sent into the open turn: the receiver of its result (waited for when the turn ends,
+/// its text dropped) and what to run once the lead took it.
+struct SentNote {
+    kind: NoteKind,
+    result: oneshot::Receiver<Result<PromptTurn, RpcError>>,
+    on_taken: Option<OnTaken>,
+}
+
+/// Sends moraebot's own notes into a running lead turn ([`OmpManager::notes`]). A note is a
+/// steer of its own: it needs no inbox row, gets no reply, and never takes or blocks the owner's
+/// steer slot, so a later owner message of the conversation is still steered in. A note for a
+/// turn that has ended (or not started yet) is not sent: the caller drops it. Notes live only
+/// in the open turn, so none outlives the turn, a shutdown or a lead restart.
+#[derive(Clone)]
+pub struct LeadNotes {
+    gate: SteerGate,
+    /// A backstop for the note's wait; `prompt` always ends it first.
+    timeout: Duration,
+}
+
+impl LeadNotes {
+    /// Sends `body` under `kind`'s tag line into lead turn `turn` while it runs (the lead
+    /// reported `agent_start`). Returns whether it was sent; `on_taken` runs only then.
+    pub fn send(
+        &self,
+        turn: TurnId,
+        kind: NoteKind,
+        body: &str,
+        on_taken: Option<OnTaken>,
+    ) -> bool {
+        let mut gate = lock(&self.gate);
+        let Some(open) = gate.as_mut().filter(|open| open.id == turn && open.started) else {
+            tracing::debug!(?kind, "note not sent: its lead turn is not running");
+            return false;
+        };
+        let (done, result) = oneshot::channel();
+        let request = PromptRequest {
+            text: format!("{}\n{body}", kind.tag()),
+            timeout: self.timeout,
+            behavior: StreamingBehavior::Steer,
+            done,
+        };
+        if open.requests.send(request).is_err() {
+            return false;
+        }
+        open.notes.push(SentNote {
+            kind,
+            result,
+            on_taken,
+        });
+        tracing::info!(?kind, conversation = %open.key, main = open.main_row_id, "note sent into the running turn");
+        true
+    }
+}
+
+/// Feeds the running owner turn's tool events to the recall advisor's mid-task state (in the
+/// open turn) from the lead's event drain, and starts the mid wakes it decides on.
+struct MidTap {
+    advisor: Arc<Advisor>,
+    runtime: tokio::runtime::Handle,
+    notes: LeadNotes,
+}
+
+impl MidTap {
+    fn note(&self, gate: &SteerGate, event: &Event) {
+        let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
+            return;
+        };
+        let tool = match agent {
+            RpcAgentEvent::ToolExecutionStart(start) => ToolEvent::Start {
+                call: &start.tool_call_id,
+                name: &start.tool_name,
+                args: start.args.as_ref(),
+            },
+            RpcAgentEvent::ToolExecutionEnd(end) => ToolEvent::End {
+                call: &end.tool_call_id,
+                name: &end.tool_name,
+                result: end.result.as_ref(),
+                error: end.is_error == Some(true),
+            },
+            _ => return,
+        };
+        let wake = {
+            let mut gate = lock(gate);
+            let Some(turn) = gate.as_mut() else {
+                return;
+            };
+            let id = turn.id;
+            let Some(mid) = turn.mid.as_mut() else {
+                return;
+            };
+            self.advisor
+                .mid_event(mid, tool, Instant::now())
+                .map(|wake| (wake, id))
+        };
+        if let Some((wake, turn)) = wake {
+            self.advisor
+                .mid_wake(&self.runtime, wake, turn, self.notes.clone());
+        }
+    }
+}
+
 /// The steer sent into the open turn: its row, the receiver of its result, and what its
 /// input gave its conversation (recorded in [`Given`] once the steer was not rejected).
 struct Steer {
@@ -746,6 +882,7 @@ struct Steer {
 /// The lead turn that accepts a steer: set by `prompt` before the main frame is sent,
 /// taken when the main prompt's wait returns (no steer joins afterwards).
 struct OpenTurn {
+    id: TurnId,
     key: String,
     main_row_id: i64,
     sender: Sender,
@@ -761,6 +898,10 @@ struct OpenTurn {
     /// compaction the steer no longer counts `main_fresh` as given.
     main_epoch: u64,
     steer: Option<Steer>,
+    /// moraebot's notes sent into this turn ([`LeadNotes`]); never an owner steer.
+    notes: Vec<SentNote>,
+    /// The recall advisor's mid-task state of an owner turn ([`MidTap`]).
+    mid: Option<MidTurn>,
 }
 
 impl OpenTurn {
@@ -820,12 +961,19 @@ impl Drop for GateClose<'_> {
     }
 }
 
-/// Opens the steer gate on the first `agent_start` of the open turn.
-fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, event: &Event) {
-    if !matches!(
+/// Whether `event` is the `agent_start` that opens a turn's steer gate. omp admits a steer only
+/// into a run that is already streaming, so every steer (an owner message or a moraebot note in
+/// the lead, a `lane_message` in a lane) waits for it.
+pub(crate) fn opens_steer_gate(event: &Event) -> bool {
+    matches!(
         event,
         Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
-    ) {
+    )
+}
+
+/// Opens the steer gate on the first `agent_start` of the open turn.
+fn note_agent_start(gate: &SteerGate, running: &watch::Sender<Option<String>>, event: &Event) {
+    if !opens_steer_gate(event) {
         return;
     }
     if let Some(turn) = lock(gate).as_mut()
@@ -965,6 +1113,8 @@ pub struct OmpManager {
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
     gate: SteerGate,
+    /// The last [`TurnId`] given out.
+    turns: AtomicU64,
     running: Arc<watch::Sender<Option<String>>>,
     turn: Arc<Mutex<Option<TurnContext>>>,
     lanes: Arc<LaneManager>,
@@ -1008,6 +1158,7 @@ impl OmpManager {
             live: Default::default(),
             lead_kill: Default::default(),
             gate: Default::default(),
+            turns: AtomicU64::new(0),
             running: Arc::new(watch::channel(None).0),
             turn,
             lanes,
@@ -1118,6 +1269,22 @@ impl OmpManager {
     /// turn's group ends; a same-conversation message can be steered in meanwhile.
     pub fn running_turn(&self) -> watch::Receiver<Option<String>> {
         self.running.subscribe()
+    }
+
+    /// Sends moraebot's own notes into the running lead turn; see [`LeadNotes`].
+    pub fn notes(&self) -> LeadNotes {
+        LeadNotes {
+            gate: Arc::clone(&self.gate),
+            timeout: self.turn_timeout.saturating_mul(2),
+        }
+    }
+
+    /// The running lead turn, once the lead reported `agent_start` for it; `None` between turns.
+    pub fn turn_id(&self) -> Option<TurnId> {
+        lock(&self.gate)
+            .as_ref()
+            .filter(|turn| turn.started)
+            .map(|turn| turn.id)
     }
 
     /// Notified after a lane result row was stored; the dispatcher then looks for work.
@@ -1250,10 +1417,14 @@ impl OmpManager {
             behavior: StreamingBehavior::FollowUp,
             done,
         };
+        let mid = recalled
+            .as_ref()
+            .and_then(|(advisor, wake, shown)| advisor.mid_turn(wake, shown, Instant::now()));
         let _gate_close = GateClose(&self.gate);
         let sent = {
             let mut gate = lock(&self.gate);
             *gate = Some(OpenTurn {
+                id: TurnId(self.turns.fetch_add(1, Ordering::Relaxed) + 1),
                 key: key.to_owned(),
                 main_row_id: row_id,
                 sender,
@@ -1263,6 +1434,8 @@ impl OmpManager {
                 main_fresh: fresh.clone(),
                 main_epoch: epoch,
                 steer: None,
+                notes: Vec::new(),
+                mid,
             });
             current.requests.send(request).is_ok()
         };
@@ -1278,8 +1451,11 @@ impl OmpManager {
         } else {
             Err(RpcError::Closed)
         };
-        // Close the gate: no steer joins this turn from here on.
-        let steer = lock(&self.gate).take().and_then(|turn| turn.steer);
+        // Close the gate: no steer or note joins this turn from here on.
+        let (steer, notes) = lock(&self.gate)
+            .take()
+            .map(|turn| (turn.steer, turn.notes))
+            .unwrap_or_default();
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
         let mut settled = turn_settled(&main);
         let main = map_result(main);
@@ -1326,6 +1502,41 @@ impl OmpManager {
                 Some((steer_row, outcome))
             }
         };
+        // Notes get no reply of their own: their results are only waited for, within the same
+        // limit, so the child never outlives the turn with a note still running.
+        for SentNote {
+            kind,
+            mut result,
+            on_taken,
+        } in notes
+        {
+            let outcome = if killed || main_timed_out {
+                if !killed {
+                    self.kill_lead();
+                    killed = true;
+                }
+                map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+            } else {
+                match tokio::time::timeout(self.turn_timeout, &mut result).await {
+                    Ok(turn) => {
+                        let turn = turn.unwrap_or(Err(RpcError::Closed));
+                        settled &= turn_settled(&turn);
+                        map_result(turn)
+                    }
+                    Err(_) => {
+                        self.kill_lead();
+                        killed = true;
+                        let _ = result.await;
+                        Outcome::needs_check(E_TURN_TIMEOUT, "the turn time limit expired")
+                    }
+                }
+            };
+            if rejected(&outcome) {
+                tracing::warn!(?kind, "omp refused a note; not delivered");
+            } else if let Some(on_taken) = on_taken {
+                on_taken();
+            }
+        }
         let files = take_sent(&current.sent_files);
 
         let lost = killed
@@ -1528,6 +1739,15 @@ impl OmpManager {
         let running = Arc::clone(&self.running);
         let lead_watch = Arc::clone(&self.lead_watch);
         let tool_starts = Arc::clone(&self.tool_starts);
+        let tap = self
+            .recall
+            .as_ref()
+            .filter(|advisor| advisor.mid_task() != crate::config::MidTask::Off)
+            .map(|advisor| MidTap {
+                advisor: Arc::clone(advisor),
+                runtime: tokio::runtime::Handle::current(),
+                notes: self.notes(),
+            });
         let worker = std::thread::Builder::new()
             .name("omp-lead".to_owned())
             .spawn(move || {
@@ -1547,6 +1767,9 @@ impl OmpManager {
                         note_agent_start(&gate, &running, event);
                         note_tool(&turn, &seen, event);
                         note_compaction(&compacted, event);
+                        if let Some(tap) = &tap {
+                            tap.note(&gate, event);
+                        }
                         // Last: a host tool waiting on its own start sees every effect above.
                         tool_starts.note(event);
                     },
@@ -1807,6 +2030,8 @@ fn recall_wake(
         generation,
         epoch,
         given: held,
+        events: Vec::new(),
+        exclude: HashSet::new(),
     })
 }
 

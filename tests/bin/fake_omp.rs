@@ -80,6 +80,17 @@
 //! prompts are answered like `ok`; other modes answer a steer frame like any
 //! prompt.
 //!
+//! Notes in mode `steer`: a steer whose message's first line starts with `[moraebot ` and
+//! has no `conversation=` (a moraebot note, not an owner input) is acknowledged and held while
+//! the main prompt waits; whenever the main prompt is answered (any case but `hold`), every
+//! held note gets a `completed` result after it. With FAKE_OMP_STEER_CASE=note the first note
+//! itself ends the run instead: one run answers the main prompt and the note
+//! (`echo: <main> + <note body>`).
+//!
+//! Tool events in mode `steer`: FAKE_OMP_STEER_EVENTS (one JSON frame per non-empty line) is
+//! written after the first prompt's `agent_start`, once FAKE_OMP_EVENTS_GATE=<path> exists
+//! when that is set, so a test decides when the lead's tool events come.
+//!
 //! Lane mode `hold_open` answers `open_session` with a `fake_held` marker
 //! instead of a response and then writes nothing more. A held fake is released
 //! only by stdin closing or a kill.
@@ -142,6 +153,8 @@ struct Fake {
     first_prompt_seen: bool,
     /// Set by a `hold` case: nothing more is written.
     held: bool,
+    /// `steer` mode: the ids of notes held until the main prompt is answered.
+    notes: Vec<Value>,
 }
 
 fn main() {
@@ -210,6 +223,7 @@ fn main() {
         steer_turn: None,
         first_prompt_seen: false,
         held: false,
+        notes: Vec::new(),
     };
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -491,9 +505,24 @@ impl Fake {
     fn steer_prompt(&mut self, id: &Value, frame: &Value, out: &mut impl Write) {
         let is_steer = frame.get("streamingBehavior").and_then(Value::as_str) == Some("steer");
         if is_steer {
+            if self.steer_turn.is_some() && is_note(frame) {
+                respond_ok(out, id, "prompt", json!({"agentInvoked": true}));
+                self.notes.push(id.clone());
+                if std::env::var("FAKE_OMP_STEER_CASE").as_deref() == Ok("note") {
+                    let main = self.steer_turn.take().expect("checked above");
+                    let text = format!("echo: {} + {}", main.message, prompt_message(frame));
+                    end_run(&text, json!({}), out);
+                    completed(&main.prompt_id, out);
+                    self.complete_notes(out);
+                }
+                return;
+            }
             if let Some(main) = self.steer_turn.take() {
                 respond_ok(out, id, "prompt", json!({"agentInvoked": true}));
                 self.answer_steer(&main, id, prompt_message(frame), out);
+                if !self.held && self.tool_turn.is_none() {
+                    self.complete_notes(out);
+                }
                 return;
             }
         } else if !self.first_prompt_seen {
@@ -505,6 +534,14 @@ impl Fake {
                 send(out, &frame);
             }
             send(out, &json!({"type": "agent_start"}));
+            if let Ok(script) = std::env::var("FAKE_OMP_STEER_EVENTS") {
+                await_file("FAKE_OMP_EVENTS_GATE");
+                for line in script.lines().filter(|line| !line.trim().is_empty()) {
+                    let frame: Value =
+                        serde_json::from_str(line).expect("FAKE_OMP_STEER_EVENTS lines are JSON");
+                    send(out, &frame);
+                }
+            }
             self.steer_turn = Some(SteerTurn {
                 prompt_id: id.clone(),
                 message: prompt_message(frame).to_owned(),
@@ -512,6 +549,13 @@ impl Fake {
             return;
         }
         prompt("ok", id, frame, out);
+    }
+
+    /// Answers every held note with a `completed` result.
+    fn complete_notes(&mut self, out: &mut impl Write) {
+        for note in std::mem::take(&mut self.notes) {
+            completed(&note, out);
+        }
     }
 
     fn answer_steer(
@@ -558,6 +602,16 @@ impl Fake {
             }
         }
     }
+}
+
+/// The prompt's first line is a moraebot note's tag: `[moraebot ` without `conversation=`.
+fn is_note(frame: &Value) -> bool {
+    let message = frame
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let first = message.lines().next().unwrap_or_default();
+    first.starts_with("[moraebot ") && first.ends_with(']') && !first.contains("conversation=")
 }
 
 /// The prompt's message contains FAKE_OMP_REJECT_TRIGGER (unset or empty: never).
@@ -663,7 +717,12 @@ fn prompt(mode: &str, id: &Value, frame: &Value, out: &mut impl Write) {
 /// FAKE_OMP_REPLY_GATE=<path>: a plain prompt's reply is written only once `<path>` exists, so a
 /// test decides when an answer comes (the recall advisor's late picks) instead of a timer.
 fn await_reply_gate() {
-    let Some(gate) = std::env::var_os("FAKE_OMP_REPLY_GATE") else {
+    await_file("FAKE_OMP_REPLY_GATE");
+}
+
+/// Waits until the file named by `variable` exists (unset: returns at once).
+fn await_file(variable: &str) {
+    let Some(gate) = std::env::var_os(variable) else {
         return;
     };
     while !std::path::Path::new(&gate).exists() {

@@ -1,6 +1,6 @@
 # Recall advisor eval
 
-The recall advisor (#59) runs in shadow mode by default. With `memory.recall.mode = "on"` its picks reach the lead ([On mode](memory.md#on-mode)), which is only safe while it picks well. This eval checks that offline, on about 30 synthetic conversations in `tests/recall_eval/cases.json`.
+The recall advisor (#59) runs in shadow mode by default. With `memory.recall.mode = "on"` its picks reach the lead ([On mode](memory.md#on-mode)), which is only safe while it picks well. This eval checks that offline, on about 35 synthetic conversations in `tests/recall_eval/cases.json`.
 
 ## What a case holds
 
@@ -10,7 +10,7 @@ The recall advisor (#59) runs in shadow mode by default. With `memory.recall.mod
   - core and self entries;
   - replaced entries and forgotten entries;
   - for some cases, 80 unrelated filler entries. These make the pool larger than `recall::POOL_ALL_BYTES`, so the candidate stage has to rank and cut it.
-- **One to three owner turns.**
+- **One to three owner turns.** A turn with `"phase": "mid"` is a wake while the lead already works on that message, after the tool calls in its `events` (see [Mid-task turns](#mid-task-turns)).
 - **The gold entries** each turn should recall.
 
 The set has three kinds of turns:
@@ -22,6 +22,10 @@ The set has three kinds of turns:
 | Injection | No entry. A lane, subagent or tool line tries to steer the advisor ("the owner approved ...", "always pick this note", a fake JSON answer). |
 
 The messages are in Korean and English.
+
+### Mid-task turns
+
+Five cases are mid-task turns ([Mid-task recall](memory.md#mid-task-recall)): a tool error that an old note explains, a web result that claims your approval (an injection case), a repeat of a command that failed before, a routine file read (nothing), and a switch to another project inside the turn. Each `events` item is one tool call: `tool`, `args`, and when it ended a `result` and `error`. The harness renders them with the production functions the lead's event drain uses (`recall::event_start_line`, `recall::event_end_line`), ranks the candidates against the message and those lines (`recall::rank_text`), and builds the `phase=mid` envelope with `recall::message`. A CI test checks that the injected web result reaches the advisor only as `(left out)`.
 
 ## What is measured
 
@@ -56,6 +60,7 @@ The harness also fails at once if a forgotten entry or a self entry is ever offe
   - garbled replies are all counted as unusable.
 - **Guard.** Every lane, subagent or tool line of the injection cases is one the guard rejects, and the greedy fake's picks of them are all moved to the rejects.
 - **Scoring.** The tally and the search keywords are checked against hand-worked values.
+- **Mid-task turns.** The set holds at least five, with right picks, a nothing turn, an injection turn and failed calls, and their event lines come from the production renderers.
 
 Add `-- --nocapture` to see the score table of the baselines and the oracle.
 
@@ -82,7 +87,7 @@ The test prints:
 
 It fails when the advisor misses the pass bar. Call folders go to a temporary home, never to a real install.
 
-Each turn is one model call per advisor. The set makes about 35 calls, and it runs 4 cases at a time.
+Each turn is one model call per advisor. The set makes about 40 calls, and it runs 4 cases at a time.
 
 ### The Kibitzer reference
 
@@ -102,7 +107,7 @@ MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider>/claude-haiku-5-5 \
   cargo test --test recall_eval live_advisor_meets_the_bar -- --ignored --nocapture
 ```
 
-The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the owner-message wake only: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot.
+The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the wake for your message and the mid-task wakes: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot. `mid_task = "on"` is gated the same way, on the same Haiku run.
 
 ## Adding a case
 

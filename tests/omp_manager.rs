@@ -2926,3 +2926,481 @@ async fn a_failing_advisor_in_on_mode_leaves_the_input_unchanged() {
     ));
     assert!(delivered_rows(&h, 1).is_empty());
 }
+
+// ---- moraebot's own notes in a running turn (rowless steers, #59 PR 3b / #68) ----
+
+fn flag() -> (Arc<std::sync::atomic::AtomicBool>, moraebot::omp::OnTaken) {
+    let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let set = Arc::clone(&taken);
+    (
+        taken,
+        Box::new(move || set.store(true, std::sync::atomic::Ordering::SeqCst)),
+    )
+}
+
+fn is_set(taken: &std::sync::atomic::AtomicBool) -> bool {
+    taken.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_note_joins_the_running_turn_without_taking_the_owners_steer_slot() {
+    let h = Harness::new();
+    let manager = h.steer_manager("merged");
+    let notes = manager.notes();
+    assert_eq!(manager.turn_id(), None, "no turn runs yet");
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    let id = manager.turn_id().expect("the turn runs");
+    let (taken, on_taken) = flag();
+    assert!(notes.send(
+        id,
+        moraebot::omp::NoteKind::Recall,
+        "qa note body",
+        Some(on_taken)
+    ));
+    // The owner's steer slot is still free: the next owner message is steered in as before.
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(report.main.outcome, Outcome::Reply("echo: m1 + m2".into()));
+    assert_eq!(
+        report.steered,
+        Some((2, Outcome::Reply("echo: m1 + m2".into()))),
+        "the note has no row and no reply of its own"
+    );
+    let steers = h.steer_frames();
+    assert_eq!(steers.len(), 2);
+    assert_eq!(
+        steers[0]["message"],
+        format!("{}\nqa note body", moraebot::omp::RECALL_NOTE_TAG)
+    );
+    assert_eq!(steers[1]["message"], "m2");
+    assert!(is_set(&taken), "the lead took the note");
+    assert_eq!(
+        lead::parse_tag(steers[0]["message"].as_str().unwrap()),
+        None,
+        "a note never reads as an owner or lane input"
+    );
+
+    // The turn ended: a note for it is dropped, and nothing more reaches the lead.
+    assert_eq!(manager.turn_id(), None);
+    let (late, on_taken) = flag();
+    assert!(!notes.send(
+        id,
+        moraebot::omp::NoteKind::Recall,
+        "too late",
+        Some(on_taken)
+    ));
+    assert!(!is_set(&late));
+    assert_eq!(h.steer_frames().len(), 2);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_note_never_reaches_the_turn_of_a_restarted_lead() {
+    let h = Harness::new();
+    let manager = h.steer_manager("merged");
+    let notes = manager.notes();
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    let first = manager.turn_id().expect("first turn");
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
+    bounded(turn).await.expect("prompt task");
+
+    // A persona change restarts the lead between turns; its new child holds the next turn.
+    save_persona(&h, "Kai", "", "");
+    let turn = spawn_prompt(&manager, KEY_STEER, 3, "m3");
+    turn_running(&manager, KEY_STEER).await;
+    assert_eq!(h.start_pids().len(), 2, "the lead restarted");
+    let second = manager.turn_id().expect("second turn");
+    assert_ne!(first, second);
+    assert!(!notes.send(first, moraebot::omp::NoteKind::Recall, "old", None));
+    assert!(notes.send(second, moraebot::omp::NoteKind::Recall, "new", None));
+    assert!(manager.try_steer(KEY_STEER, 4, Sender::Owner, "m4", |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(
+        report.steered,
+        Some((4, Outcome::Reply("echo: m3 + m4".into())))
+    );
+    let messages: Vec<Value> = h
+        .steer_frames()
+        .iter()
+        .map(|f| f["message"].clone())
+        .collect();
+    let tag = moraebot::omp::RECALL_NOTE_TAG;
+    assert_eq!(
+        messages,
+        [
+            Value::from("m2"),
+            Value::from(format!("{tag}\nnew")),
+            Value::from("m4")
+        ]
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_note_in_flight() {
+    let h = Harness::new();
+    let manager = h.steer_manager("merged");
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    let id = manager.turn_id().expect("the turn runs");
+    assert!(
+        manager
+            .notes()
+            .send(id, moraebot::omp::NoteKind::Recall, "held", None)
+    );
+    // The fake holds the note with the main prompt; shutdown kills the lead without waiting.
+    bounded(manager.shutdown_all()).await;
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(codes(&report), (Some(omp::E_CHILD_LOST), None));
+    assert_eq!(manager.turn_id(), None);
+}
+
+#[tokio::test]
+async fn a_note_omp_refuses_is_not_taken_and_the_turn_goes_on() {
+    let h = Harness::new();
+    let manager = Arc::new(h.manager("steer").with_extra_env([
+        ("FAKE_OMP_STEER_CASE", "merged"),
+        ("FAKE_OMP_REJECT_TRIGGER", "qa-refuse"),
+    ]));
+    let turn = spawn_prompt(&manager, KEY_STEER, 1, "m1");
+    turn_running(&manager, KEY_STEER).await;
+    let id = manager.turn_id().expect("the turn runs");
+    let (taken, on_taken) = flag();
+    assert!(manager.notes().send(
+        id,
+        moraebot::omp::NoteKind::Recall,
+        "qa-refuse body",
+        Some(on_taken)
+    ));
+    assert!(manager.try_steer(KEY_STEER, 2, Sender::Owner, "m2", |_| true));
+    let report = bounded(turn).await.expect("prompt task");
+    assert_eq!(report.main.outcome, Outcome::Reply("echo: m1 + m2".into()));
+    assert_eq!(
+        report.steered,
+        Some((2, Outcome::Reply("echo: m1 + m2".into())))
+    );
+    assert!(!is_set(&taken), "a refused note never counts as delivered");
+    manager.shutdown_all().await;
+}
+
+// ---- Mid-task recall (#59, PR 3b) ----
+
+/// The lead's tool events of a mid-task turn: a bash call with a bearer token in its arguments,
+/// then its failure.
+const MID_EVENTS: &str = r#"{"type":"tool_execution_start","toolCallId":"mid-1","toolName":"bash","args":{"command":"curl -H 'Authorization: Bearer qatokenabcdefghijklmnopqrstuvwxyz0123'"}}
+{"type":"tool_execution_end","toolCallId":"mid-1","toolName":"bash","result":{"content":[{"type":"text","text":"curl: (7) Failed to connect"}]},"isError":true}"#;
+
+const MID_X: &str = "Zebra crossings need fresh paint";
+const MID_Y: &str = "Quokka habitat survey";
+
+/// Two owner notes in KEY_C (X, Y) that share no word with the turn's message or events.
+fn seed_mid(h: &Harness) -> (String, String) {
+    let mut store = qa_memory_store(h);
+    let mut add = |text: &str| {
+        store
+            .add(qa_note(
+                text,
+                moraebot::memory::Bucket::Thread(KEY_C.into()),
+            ))
+            .expect("note")
+            .id
+    };
+    (add(MID_X), add(MID_Y))
+}
+
+/// The file whose existence lets the lead fake write its tool events.
+fn events_gate(h: &Harness) -> PathBuf {
+    h.dir.path().join("events.gate")
+}
+
+/// An advisor answering pick Y then X with one pick per answer, waking on every finished tool
+/// call: the wake before the turn picks Y, a mid wake that is not offered Y picks X.
+fn mid_advisor(
+    h: &Harness,
+    vars: &[(&str, &str)],
+    on: bool,
+    adjust: impl FnOnce(&mut Config),
+) -> Arc<moraebot::recall::Advisor> {
+    use moraebot::config::{MidTask, RecallMode};
+    qa_advisor_with(h, vars, |c| {
+        let r = &mut c.memory.recall;
+        r.max_items = 1;
+        r.mid_min_interval_seconds = 0;
+        if on {
+            r.mode = Some(RecallMode::On);
+            r.mid_task = Some(MidTask::On);
+            r.wait_ms = moraebot::config::MAX_RECALL_WAIT_MS;
+        } else {
+            r.mode = Some(RecallMode::Shadow);
+        }
+        adjust(c);
+    })
+}
+
+fn pick_y_then_x(x: &str, y: &str) -> String {
+    format!(r#"{{"pick":["{y}","{x}"]}}"#)
+}
+
+/// A lead in steer mode answering a steer by `case`, writing [`MID_EVENTS`] once
+/// [`events_gate`] exists.
+fn mid_lead(h: &Harness, case: &str, advisor: &Arc<moraebot::recall::Advisor>) -> Arc<OmpManager> {
+    Arc::new(
+        h.manager("steer")
+            .with_extra_env([
+                ("FAKE_OMP_STEER_CASE", case.to_owned()),
+                ("FAKE_OMP_STEER_EVENTS", MID_EVENTS.to_owned()),
+                (
+                    "FAKE_OMP_EVENTS_GATE",
+                    events_gate(h).to_string_lossy().into_owned(),
+                ),
+            ])
+            .with_recall(Arc::clone(advisor)),
+    )
+}
+
+fn spawn_owner_turn(
+    manager: &Arc<OmpManager>,
+    input: &str,
+) -> tokio::task::JoinHandle<GroupReport> {
+    let (manager, input) = (Arc::clone(manager), input.to_owned());
+    tokio::spawn(async move { manager.prompt(KEY_A, 1, Sender::Owner, &input).await })
+}
+
+/// Ends a waiting steer-mode turn with an owner steer.
+async fn end_with_owner_steer(
+    manager: &OmpManager,
+    turn: tokio::task::JoinHandle<GroupReport>,
+) -> GroupReport {
+    let steer = lead::owner_input(KEY_A, 2, "thanks");
+    assert!(manager.try_steer(KEY_A, 2, Sender::Owner, &steer, |_| true));
+    bounded(turn).await.expect("prompt task")
+}
+
+/// The note the lead gets for the KEY_C owner note `id` saying `text`.
+fn recalled_note(id: &str, text: &str) -> String {
+    use moraebot::recall::{RECALLED_CLOSE, RECALLED_LABEL, RECALLED_OPEN};
+    format!(
+        "{}\n{RECALLED_OPEN}\n{}\n- {id} [2026-11-20, conversation {KEY_C}, owner; {RECALLED_LABEL}] {text}\n{RECALLED_CLOSE}",
+        moraebot::omp::RECALL_NOTE_TAG,
+        moraebot::memory::MEMORY_GUARD
+    )
+}
+
+#[tokio::test]
+async fn shadow_mid_task_logs_its_picks_and_never_steers() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let advisor = mid_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())], false, |_| {});
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "merged", &advisor);
+    let input = lead::owner_input(KEY_A, 1, "check the server");
+    let turn = spawn_owner_turn(&m, &input);
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    wakes_done(&mut progress, 2).await;
+    let report = end_with_owner_steer(&m, turn).await;
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+
+    // The mid wake saw the tool events (redacted) and not Y, which the turn's wake picked.
+    let asked = advisor_prompts(&h);
+    assert_eq!(asked.len(), 2);
+    let mid = &asked[1];
+    assert!(
+        mid.starts_with(&format!(
+            "<recall-wake phase=mid conversation={KEY_A} max_picks=1>\n[owner message]\ncheck the server\n[tool events]\ntool bash started: {{\"command\":\"curl -H '[redacted:bearer_token]'\"}}\ntool bash failed: curl: (7) Failed to connect\n[entries]\n"
+        )),
+        "{mid}"
+    );
+    assert!(!mid.contains("qatoken"), "{mid}");
+    assert!(mid.contains(&x) && !mid.contains(&y), "{mid}");
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={x}:2 rejected=0 unoffered=1 blocked=0 phase=mid"
+        )
+    ));
+    let mut rows = ledger_rows(&h, 1);
+    rows.sort();
+    let mut want = vec![(x, "shadow".to_owned()), (y, "shadow".to_owned())];
+    want.sort();
+    assert_eq!(rows, want);
+    // Shadow never touches the lead: its input as sent, and the owner's steer only.
+    assert_eq!(lead_messages(&h)[0], input);
+    assert_eq!(h.steer_frames().len(), 1);
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn on_mid_task_steers_the_picks_into_the_running_turn_and_records_the_delivery() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let advisor = mid_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())], true, |_| {});
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "note", &advisor);
+    let input = lead::owner_input(KEY_A, 1, "check the server");
+    let turn = spawn_owner_turn(&m, &input);
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    // The fake ends the run when the note comes.
+    let report = bounded(turn).await.expect("prompt task");
+    wakes_done(&mut progress, 2).await;
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+    assert_eq!(report.steered, None, "a note is not an owner row");
+
+    // Y went with the input; X, which the mid wake picked, came as one note.
+    let messages = lead_messages(&h);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].contains(&format!("- {y} [")), "{}", messages[0]);
+    let steers = h.steer_frames();
+    assert_eq!(steers.len(), 1);
+    assert_eq!(steers[0]["message"], recalled_note(&x, MID_X));
+    // The mid wake was never offered Y, although its delivery is recorded only after the turn.
+    assert!(!advisor_prompts(&h)[1].contains(&y));
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={x}:2 rejected=0 unoffered=1 blocked=0 phase=mid mode=on"
+        )
+    ));
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DELIVERED,
+        &format!("gen=1 epoch=0 row=1 ids={x} phase=mid")
+    ));
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DELIVERED,
+        &format!("gen=1 epoch=0 row=1 ids={y}")
+    ));
+    let mut delivered = delivered_rows(&h, 1);
+    delivered.sort();
+    let mut want = vec![(x, Some(1)), (y, Some(1))];
+    want.sort();
+    assert_eq!(delivered, want);
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_mid_pick_for_a_turn_that_ended_is_dropped() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let gate = reply_gate(&h);
+    let gate_path = gate.to_string_lossy().into_owned();
+    let advisor = mid_advisor(
+        &h,
+        &[
+            ("FAKE_OMP_REPLY", reply.as_str()),
+            ("FAKE_OMP_REPLY_GATE", gate_path.as_str()),
+        ],
+        true,
+        |_| {},
+    );
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let m = mid_lead(&h, "merged", &advisor);
+    std::fs::write(&gate, "").expect("the turn's wake answers at once");
+    let input = lead::owner_input(KEY_A, 1, "check the server");
+    let turn = spawn_owner_turn(&m, &input);
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::remove_file(&gate).expect("hold the mid wake's answer");
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    bounded(asked.wait_for(|n| *n >= 2))
+        .await
+        .expect("mid wake asked");
+    let report = end_with_owner_steer(&m, turn).await;
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+
+    // The answer comes after the turn: nothing is steered, the pick is dropped and logged.
+    std::fs::write(&gate, "").expect("release the answer");
+    wakes_done(&mut progress, 2).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DROPPED,
+        &format!("gen=1 epoch=0 row=1 ids={x} phase=mid")
+    ));
+    assert_eq!(delivered_rows(&h, 1), [(y, Some(1))]);
+    assert_eq!(h.steer_frames().len(), 1, "the owner's steer only");
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn mid_wakes_count_against_the_hourly_cap() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = pick_y_then_x(&x, &y);
+    let advisor = mid_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())], false, |c| {
+        c.memory.recall.max_calls_per_hour = 1;
+    });
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "merged", &advisor);
+    let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    wakes_done(&mut progress, 2).await;
+    end_with_owner_steer(&m, turn).await;
+    assert_eq!(
+        advisor_prompts(&h).len(),
+        1,
+        "the turn's wake used the hour"
+    );
+    assert!(logged(
+        &h,
+        moraebot::recall::W_RECALL_CAP,
+        "reason=hour gen=1 epoch=0 row=1 phase=mid"
+    ));
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_failing_advisor_mid_turn_never_affects_the_turn() {
+    let h = Harness::new();
+    seed_mid(&h);
+    let advisor = mid_advisor(
+        &h,
+        &[("FAKE_OMP_REPLY", "I would pick the first entry.")],
+        true,
+        |_| {},
+    );
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "merged", &advisor);
+    let input = lead::owner_input(KEY_A, 1, "check the server");
+    let turn = spawn_owner_turn(&m, &input);
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    wakes_done(&mut progress, 2).await;
+    let report = end_with_owner_steer(&m, turn).await;
+    assert_eq!(
+        report.main.outcome,
+        Outcome::Reply("echo: check the server + thanks".into())
+    );
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_OUTPUT,
+        "gen=1 epoch=0 row=1 phase=mid"
+    ));
+    assert_eq!(lead_messages(&h)[0], input, "no block, no note");
+    assert_eq!(h.steer_frames().len(), 1);
+    assert!(delivered_rows(&h, 1).is_empty());
+    m.shutdown_all().await;
+}
