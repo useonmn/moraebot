@@ -2800,6 +2800,78 @@ async fn late_picks_of_an_earlier_lead_generation_are_dropped() {
     m.shutdown_all().await;
 }
 
+/// Runs one KEY_A owner turn whose advisor answers after the wait (picking the KEY_C note `id`),
+/// so the pick is kept late; returns with the gate shut again, so the next turn's own call
+/// waits and only the late pick can reach it.
+async fn turn_with_a_late_pick(
+    h: &Harness,
+    m: &OmpManager,
+    advisor: &Arc<moraebot::recall::Advisor>,
+) {
+    let gate = reply_gate(h);
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let first = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &first)).await;
+    bounded(asked.wait_for(|n| *n >= 1)).await.expect("asked");
+    std::fs::write(&gate, "").expect("open the gate");
+    wakes_done(&mut progress, 1).await;
+    std::fs::remove_file(&gate).expect("shut the gate");
+    assert_eq!(lead_messages(h), [first.as_str()]);
+}
+
+/// moraedang on #70: a late pick is read again before it is rendered; one the owner forgot
+/// after the advisor answered is never given to the lead.
+#[tokio::test]
+async fn a_late_pick_forgotten_before_the_next_message_is_not_delivered() {
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let advisor = gated_advisor(&h, &id, 50);
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    turn_with_a_late_pick(&h, &m, &advisor).await;
+
+    qa_memory_store(&h).forget(&id).expect("forget");
+    let next = lead::owner_input(KEY_A, 2, "ok, go on");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, &next)).await;
+    assert_eq!(
+        lead_messages(&h)[1],
+        next,
+        "the forgotten note never reaches the lead"
+    );
+    assert!(delivered_rows(&h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+/// moraedang on #70: a late pick the owner corrected after the advisor answered goes in as
+/// the store holds it now: replaced, so labelled no longer in force.
+#[tokio::test]
+async fn a_late_pick_corrected_before_the_next_message_is_delivered_as_no_longer_in_force() {
+    use moraebot::recall::{RECALLED_CLOSE, RECALLED_LABEL, RECALLED_OPEN};
+    let h = Harness::new();
+    let id = seed_key_c(&h);
+    let advisor = gated_advisor(&h, &id, 50);
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    turn_with_a_late_pick(&h, &m, &advisor).await;
+
+    let corrected = qa_memory_store(&h)
+        .correct(
+            &id,
+            "Releases go out on Thursdays now",
+            moraebot::memory::Source::row(9),
+        )
+        .expect("correct");
+    let next = lead::owner_input(KEY_A, 2, "ok, go on");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, &next)).await;
+    let block = format!(
+        "{RECALLED_OPEN}\n{}\n- {id} [2026-11-20, conversation {KEY_C}, replaced by the owner, no longer in force, owner; {RECALLED_LABEL}] Releases go out on Fridays only\n{RECALLED_CLOSE}",
+        moraebot::memory::MEMORY_GUARD
+    );
+    assert_eq!(lead_messages(&h)[1], format!("{next}\n\n{block}"));
+    assert_eq!(delivered_rows(&h, 1), [(id.clone(), Some(2))]);
+    assert_ne!(corrected.new.id, id, "the correction is a new entry");
+    m.shutdown_all().await;
+}
+
 /// moraedang's point 7 on #59: during the wait the steer gate is closed, so a second owner
 /// message of the conversation is not steered into a turn that has not started (the
 /// dispatcher queues it as usual).

@@ -11,8 +11,11 @@
 //!   to the owner's input; the caller records them as `delivered` rows ([`Advisor::delivered`],
 //!   [`I_RECALL_DELIVERED`]) once the lead took the input. Picks that come after the wait are
 //!   kept for that conversation's next owner input, and dropped when the lead context changed
-//!   meanwhile (a new lead generation or a compaction). An entry delivered once is never
-//!   delivered again in the same lead context. The advisor never writes text the lead reads.
+//!   meanwhile (a new lead generation or a compaction). Before a late pick is rendered it is
+//!   read again from the store: a pick forgotten or expired since is dropped, a corrected one
+//!   is shown as no longer in force, and the injection guard runs on its current text. An
+//!   entry delivered once is never delivered again in the same lead context. The advisor never
+//!   writes text the lead reads.
 //!
 //! - **Who runs it.** One call per owner input that starts a lead turn (never a steer, a lane
 //!   result or a chat sender's message), in a fresh child locked down exactly like the
@@ -672,7 +675,7 @@ impl Advisor {
     /// slow or skipped advisor only means fewer (or no) picks. Must be called inside a tokio
     /// runtime.
     pub async fn recall(self: &Arc<Self>, wake: Wake, wait: Duration) -> Vec<Candidate> {
-        let mut picks = self.take_late(&wake);
+        let mut picks = self.current(self.take_late(&wake));
         // A late pick's section may have reached the lead since: it holds that entry now.
         picks.retain(|pick| {
             let item = PoolEntry {
@@ -782,6 +785,46 @@ impl Advisor {
     /// [`RECALLED_CAP_BYTES`]) and the picks it holds.
     pub fn render(&self, picks: &[Candidate]) -> (String, Vec<Candidate>) {
         recalled_block(picks, &self.redactor, RECALLED_CAP_BYTES)
+    }
+
+    /// `picks` as the store holds them now (moraedang on #70: a late pick is a snapshot taken
+    /// when the advisor answered, and forgetting or correcting a conversation or project entry
+    /// does not restart the lead). Each is looked up by id in the current [`memory::recall_pool`]:
+    /// one that is gone from it (forgotten, expired, missing, moved to the core) is dropped; one
+    /// that is there takes its current text and its current replaced flag, so a pick corrected
+    /// since says it is no longer in force; and the injection guard ([`unverified_claim`]) runs
+    /// again on the current text. The snapshot's text is never rendered.
+    fn current(&self, picks: Vec<Candidate>) -> Vec<Candidate> {
+        if picks.is_empty() {
+            return picks;
+        }
+        let pool = memory::recall_pool(&self.config.memory_dir(), (self.clock)());
+        let before = picks.len();
+        let fresh: Vec<Candidate> = picks
+            .into_iter()
+            .filter_map(|pick| {
+                let item = pool.iter().find(|item| item.entry.id == pick.entry.id)?;
+                if unverified_claim(&item.entry, &self.filter) {
+                    return None;
+                }
+                if entry_hash(&item.entry) != entry_hash(&pick.entry) {
+                    tracing::debug!(id = %pick.entry.id, "late recall pick changed since the answer");
+                }
+                Some(Candidate {
+                    bucket: item.bucket.clone(),
+                    entry: item.entry.clone(),
+                    replaced: item.replaced,
+                    score: pick.score,
+                })
+            })
+            .collect();
+        if fresh.len() < before {
+            tracing::info!(
+                dropped = before - fresh.len(),
+                "late recall picks dropped: forgotten, expired or refused since the answer"
+            );
+        }
+        fresh
     }
 
     /// The conversation's late picks when they were chosen for `wake`'s lead context; late
