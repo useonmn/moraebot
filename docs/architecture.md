@@ -357,6 +357,7 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 
 - lane 자식이 살아 있고, 그 job의 `stop`이 아직 없습니다(끊는 중이면 steer하지 않습니다).
 - job의 steer 우편함이 남아 있습니다. 우편함은 결과를 쓰기 직전에 닫히므로, 주 프롬프트가 이미 돌아왔지만 결과 저장 전인 짧은 구간에서만 `lane_message`가 예전처럼 `E_LANE_BUSY`로 거절됩니다.
+- steer는 그 턴의 첫 `agent_start` 뒤에만 나갑니다. omp는 이미 스트리밍 중인 run에만 steer를 받으므로, 그 전에 도착한 글은 게이트가 열릴 때까지 기다립니다(lead의 steer 게이트와 같은 신호).
 - 순서는 `lane_message`가 도착한 순서입니다. omp가 steer를 주 프롬프트의 결과 안에서 답하므로 결과 줄은 여전히 하나(`<lane id>:<순번>`)이고 `prompts`도 늘지 않습니다.
 - 주 프롬프트의 결과가 먼저 옵니다. 드레인은 결과를 먼저 확인하고 그다음 우편함을 비우므로, 이미 끝난 턴을 steer가 붙잡지 않습니다.
 - steer 글에는 lane의 꼬리말(`lane_done` 안내, `lane_report` 안내, git 안내)을 붙이지 않습니다. 그건 주 프롬프트에만 들어갑니다.

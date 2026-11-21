@@ -7,9 +7,10 @@
 //!
 //! `lane_message` on a running lane steers instead of waiting: the text goes into the job's
 //! steer inbox, and the job's own thread forwards it as `prompt{streamingBehavior:"steer"}`
-//! into the turn already in progress, the way the lead's own steer works. omp answers a steer
-//! inside the main prompt's run, so the lane still writes one result row and `prompts` does
-//! not grow; the main prompt's result is always taken before another steer goes out. The
+//! into the turn already in progress, the way the lead's own steer works. A steer only goes out
+//! after the turn's first `agent_start` (omp admits a steer into a run that is already
+//! streaming); texts that arrive earlier wait for it. omp answers a steer inside the main
+//! prompt's run, so the lane still writes one result row and `prompts` does not grow. The
 //! inbox is dropped when the job's result is written, so a `lane_message` in that last window
 //! is refused with `E_LANE_BUSY` like before. A steer carries the bare text, without the
 //! lane's footers (`lane_done`, `lane_report`, git). A lane with a done line gets
@@ -180,6 +181,14 @@ type SteerSender = mpsc::Sender<SteerText>;
 /// One mid-run text handed to the running job.
 struct SteerText {
     text: String,
+}
+
+/// Whether the turn's first `agent_start` has arrived. A steer may only go out after it: omp
+/// admits a steer into a run that is already streaming, and the lead's own steer gate waits
+/// for the same signal ([`crate::omp`]'s `note_agent_start`). Set by the job's event callback.
+#[derive(Default)]
+struct SteerGate {
+    started: bool,
 }
 
 /// What a running job's omp agent events showed. The event callback only counts;
@@ -538,10 +547,18 @@ impl LaneManager {
     }
 
     /// Counts `event` of a lane child in its job's `activity`.
-    fn note_event(&self, activity: &Mutex<Activity>, event: &Event) {
+    fn note_event(&self, activity: &Mutex<Activity>, gate: &Mutex<SteerGate>, event: &Event) {
         let agent = lock(activity).note(event);
         if agent {
             self.events.send_modify(|n| *n += 1);
+        }
+        // A steer may only join a run that is already streaming, so the gate opens on the
+        // turn's first `agent_start`, exactly as the lead's steer gate does.
+        if matches!(
+            event,
+            Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
+        ) {
+            lock(gate).started = true;
         }
     }
 
@@ -1619,6 +1636,8 @@ impl LaneManager {
                 detail: e.to_string(),
             })?;
         let claim = Arc::new(Mutex::new(Claim::None));
+        // Opens on the turn's first `agent_start`: a steer may only join a streaming run.
+        let gate = Arc::new(Mutex::new(SteerGate::default()));
         let mut tools = match &job.done {
             Some(line) => vec![self.lane_done_tool(job, line, &claim, &cwd)],
             None => Vec::new(),
@@ -1662,7 +1681,8 @@ impl LaneManager {
             {
                 let watcher = Arc::clone(self);
                 let activity = Arc::clone(activity);
-                move |event: &Event| watcher.note_event(&activity, event)
+                let gate = Arc::clone(&gate);
+                move |event: &Event| watcher.note_event(&activity, &gate, event)
             },
         )?;
         if let Err(e) = lock(&self.store).set_lane_session_id(job.id, &session_id) {
@@ -1703,7 +1723,7 @@ impl LaneManager {
                 detail: e.to_string(),
             });
         }
-        let turn = self.drain_steers(&client, steer_rx, &main_rx, turn_timeout, job.id);
+        let turn = self.drain_steers(&client, steer_rx, &main_rx, &gate, turn_timeout, job.id);
         let outcome = omp::map_result(turn);
         let replied = match (&outcome, &job.done) {
             (Outcome::Reply(text), Some(_)) => Some(text.clone()),
@@ -1740,65 +1760,72 @@ impl LaneManager {
     /// live turn as an omp steer. Returns the main prompt's result: a steer never replaces it,
     /// because omp answers a steer inside the main prompt's own run.
     ///
-    /// Each round drains the inbox first and only then waits a short slice on the main result,
-    /// so a text that arrived before the turn ended still reaches it. A text that lands in the
-    /// last window (the turn ended, the result not yet read) cannot join a finished run: omp
-    /// refuses a steer with no live client run, so it is dropped and logged at `warn` with the
-    /// lane id and the text length. It is never claimed as delivered.
+    /// A steer only goes out once the turn's first `agent_start` opened the gate: omp admits a
+    /// steer into a run that is already streaming, so an earlier one would land on nothing and
+    /// be lost. Texts that arrive before the gate opens wait in `held`. Each round drains the
+    /// inbox before the short wait on the result, so a text that arrived before the turn ended
+    /// still reaches it; whatever is left when the result arrives came too late to join the run
+    /// and is logged at `warn` rather than claimed as delivered.
     fn drain_steers(
         &self,
         client: &Arc<omp_rpc::Client>,
         steer_rx: mpsc::Receiver<SteerText>,
         main_rx: &mpsc::Receiver<Result<omp_rpc::PromptTurn, omp_rpc::Error>>,
+        gate: &Mutex<SteerGate>,
         turn_timeout: Duration,
         id: i64,
     ) -> Result<omp_rpc::PromptTurn, omp_rpc::Error> {
-        loop {
-            let mut lost = 0usize;
-            for SteerText { text } in steer_rx.try_iter() {
-                let steer = PromptCommand {
-                    message: text,
-                    images: None,
-                    streaming_behavior: Some(omp_rpc::StreamingBehavior::Steer),
-                };
-                // A steer's answer arrives inside the main prompt's result, so this wait is
-                // discarded; a failure only means the text did not join the turn.
-                let steer_client = Arc::clone(client);
-                if let Err(e) = std::thread::Builder::new()
-                    .name(format!("omp-lane-steer-{id}"))
-                    .spawn(move || {
-                        let _ = steer_client.prompt_and_wait(&steer, turn_timeout);
-                    })
-                {
-                    tracing::warn!(lane = id, error = %e, "could not start a lane steer");
-                    lost += 1;
+        let mut held: Vec<SteerText> = Vec::new();
+        // Steers whose own wait thread could not be started.
+        let mut unstarted = 0usize;
+        let outcome = loop {
+            let open = lock(gate).started;
+            if open {
+                held.extend(steer_rx.try_iter());
+                for SteerText { text } in held.drain(..) {
+                    let steer = PromptCommand {
+                        message: text,
+                        images: None,
+                        streaming_behavior: Some(omp_rpc::StreamingBehavior::Steer),
+                    };
+                    // A steer's answer arrives inside the main prompt's result, so this wait is
+                    // discarded; a failure only means the text did not join the turn.
+                    let steer_client = Arc::clone(client);
+                    if let Err(e) = std::thread::Builder::new()
+                        .name(format!("omp-lane-steer-{id}"))
+                        .spawn(move || {
+                            let _ = steer_client.prompt_and_wait(&steer, turn_timeout);
+                        })
+                    {
+                        tracing::warn!(lane = id, error = %e, "could not start a lane steer");
+                        unstarted += 1;
+                    }
                 }
-            }
-            if lost > 0 {
-                tracing::warn!(lane = id, lost, "lane steers could not be started");
             }
             match main_rx.recv_timeout(STEER_POLL) {
-                Ok(turn) => {
-                    // One last look: anything here arrived after the turn ended and cannot
-                    // join it. Say so instead of pretending it was delivered.
-                    let late: Vec<SteerText> = steer_rx.try_iter().collect();
-                    if !late.is_empty() {
-                        let chars: usize = late.iter().map(|s| s.text.chars().count()).sum();
-                        tracing::warn!(
-                            lane = id,
-                            count = late.len(),
-                            chars,
-                            "lane_message arrived after the turn ended; it was not steered"
-                        );
-                    }
-                    return turn;
-                }
+                Ok(turn) => break turn,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(omp_rpc::Error::Closed);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+        };
+        if unstarted > 0 {
+            tracing::warn!(lane = id, count = unstarted, "lane steers could not be started");
         }
+        // Everything still here arrived too late to join the run that already ended.
+        let mut late = held;
+        late.extend(steer_rx.try_iter());
+        if !late.is_empty() {
+            let chars: usize = late.iter().map(|s| s.text.chars().count()).sum();
+            tracing::warn!(
+                lane = id,
+                count = late.len(),
+                chars,
+                "lane_message arrived after the turn ended; it was not steered"
+            );
+        }
+        outcome
     }
 
     /// Stores the lane prompt's result row and the lane's new state, unless the shutdown
