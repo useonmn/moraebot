@@ -27,6 +27,7 @@ pub mod omp;
 pub mod omp_overlay;
 pub mod onboarding;
 pub mod persona;
+pub mod pin;
 pub mod recall;
 pub mod secret;
 pub mod slack_bridge;
