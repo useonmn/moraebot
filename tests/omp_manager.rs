@@ -561,7 +561,11 @@ async fn unsettled_session_defers_the_restart_until_settled() {
         r2.starts_with("echo: again") && r2.contains(moraebot::pin::UPDATE_OPEN),
         "{r2}"
     );
-    assert_eq!(r3, Outcome::Reply("echo: more".into()));
+    // The restarted child of the session held the update: it hears the new prompt holds.
+    assert_eq!(
+        r3,
+        Outcome::Reply(format!("echo: more\n\n{}", moraebot::pin::revert_notice()))
+    );
     assert_eq!(after_second, 1);
     assert_eq!(pids.len(), 2);
     assert_eq!(appends.len(), 2);
@@ -841,12 +845,13 @@ async fn reopen_checks_free_lease_then_prompts() {
     let h = Harness::new();
     h.set_session("fake-session-1");
     let manager = h.manager("ok");
+    // A resumed session may hold an earlier memory update: the input says the prompt holds.
     assert_eq!(
         bounded(manager.prompt(KEY_A, 1, Sender::Owner, "hi"))
             .await
             .main
             .outcome,
-        Outcome::Reply("echo: hi".into())
+        Outcome::Reply(format!("echo: hi\n\n{}", moraebot::pin::revert_notice()))
     );
     assert_eq!(h.frames("get_session_lease").len(), 1);
     assert_eq!(h.frames("prompt").len(), 1);
@@ -914,7 +919,7 @@ async fn lead_session_id_is_stored_and_lease_checked() {
             .await
             .main
             .outcome,
-        Outcome::Reply("echo: again".into())
+        Outcome::Reply(format!("echo: again\n\n{}", moraebot::pin::revert_notice()))
     );
     second.shutdown_all().await;
     let lines = h.log_lines();
@@ -3661,6 +3666,83 @@ async fn a_change_back_to_the_pinned_prompt_says_so_once() {
     assert!(
         !messages[3].contains(moraebot::pin::REVERT_HEADER)
             && !messages[3].contains(moraebot::pin::UPDATE_OPEN),
+        "{}",
+        messages[3]
+    );
+}
+
+/// An update block taken in the turn a compaction ran in may survive it: a later change back
+/// to the pinned prompt still says so.
+#[tokio::test]
+async fn a_change_back_after_a_compaction_still_says_so() {
+    let h = Harness::new();
+    save_sora(&h);
+    let compaction = serde_json::json!({"frame": {
+        "type": "auto_compaction_end",
+        "action": "context-full",
+        "aborted": false,
+        "willRetry": false,
+        "result": {"summary": "earlier turns", "firstKeptEntryId": "e9", "tokensBefore": 190000}
+    }});
+    let m = h
+        .manager("tools")
+        .with_extra_env([("FAKE_OMP_TOOL_CALLS", compaction.to_string())]);
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "one")).await;
+    save_persona(&h, "Kai", "", "");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, "run-tools")).await;
+    save_sora(&h);
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, "three")).await;
+    bounded(m.shutdown_all()).await;
+
+    assert_eq!(
+        h.start_pids().len(),
+        1,
+        "back to the pinned prompt: no restart"
+    );
+    let messages = prompt_messages(&h);
+    assert!(
+        messages[1].contains(moraebot::pin::UPDATE_HEADER),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        messages[2].contains(moraebot::pin::REVERT_HEADER),
+        "{}",
+        messages[2]
+    );
+}
+
+/// A lead started on its earlier session may hold update blocks from before: its first input
+/// says the system prompt holds; a new session starts with nothing to withdraw.
+#[tokio::test]
+async fn a_resumed_lead_session_hears_the_prompt_holds_once() {
+    let h = Harness::new();
+    save_sora(&h);
+    let m1 = h.manager("ok");
+    bounded(m1.prompt(KEY_A, 1, Sender::Owner, "one")).await;
+    bounded(m1.shutdown_all()).await;
+    let m2 = h.manager("ok");
+    bounded(m2.prompt(KEY_A, 2, Sender::Owner, "two")).await;
+    bounded(m2.prompt(KEY_A, 3, Sender::Owner, "three")).await;
+    bounded(m2.new_session()).await.expect("new session");
+    bounded(m2.prompt(KEY_A, 4, Sender::Owner, "four")).await;
+    bounded(m2.shutdown_all()).await;
+
+    let messages = prompt_messages(&h);
+    assert_eq!(messages.len(), 4);
+    assert!(!messages[0].contains(moraebot::pin::UPDATE_OPEN));
+    assert!(
+        messages[1].starts_with("two") && messages[1].contains(moraebot::pin::REVERT_HEADER),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        !messages[2].contains(moraebot::pin::UPDATE_OPEN),
+        "{}",
+        messages[2]
+    );
+    assert!(
+        !messages[3].contains(moraebot::pin::UPDATE_OPEN),
         "{}",
         messages[3]
     );

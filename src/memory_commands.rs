@@ -21,6 +21,9 @@
 //! - refresh: the whole message `기억 새로고침` / `refresh memory` ([`refresh_request`]); the
 //!   lead's system prompt is set again before its next turn instead of waiting for its prompt
 //!   cache to go cold. The dispatcher answers it like a status question.
+//! - recent recalls: the whole message `최근 떠올린 기억` / `recent recalls`
+//!   ([`recent_recalls_request`]) lists the last [`RECENT_RECALLS`] recall ledger rows with
+//!   each entry's current text.
 //!
 //! A question (`... 기억해?`) is not a remember request, and id commands must be short (at
 //! most [`MAX_ID_COMMAND_WORDS`] words) so a sentence that merely mentions an id and a verb
@@ -248,6 +251,57 @@ pub fn refresh_text(lang: crate::status::Lang) -> &'static str {
             "Saved memory goes into the lead's system prompt again before its next reply."
         }
     }
+}
+
+/// How many ledger rows the recent-recalls answer lists.
+pub const RECENT_RECALLS: usize = 10;
+
+/// The owner's recent-recalls command: the whole message is `최근 떠올린 기억` or
+/// `recent recalls` (normalized like [`refresh_request`]). Returns the language it was given in.
+pub fn recent_recalls_request(text: &str) -> Option<crate::status::Lang> {
+    match normalize(text).as_str() {
+        "최근 떠올린 기억" => Some(crate::status::Lang::Korean),
+        "recent recalls" => Some(crate::status::Lang::English),
+        _ => None,
+    }
+}
+
+/// The answer to the recent-recalls command: one line per ledger row of `rows` (newest
+/// first) with its age at `now` (unix seconds), wake phase, state, entry id and the entry's
+/// current text, or `(gone)` when it was forgotten, replaced or removed.
+pub fn recent_recalls(
+    memory: &MemoryHandle,
+    lang: crate::status::Lang,
+    rows: &[crate::store::RecentRecall],
+    now: i64,
+) -> String {
+    use crate::status::Lang;
+    if rows.is_empty() {
+        return match lang {
+            Lang::Korean => "아직 떠올린 기억이 없어요.".into(),
+            Lang::English => "No recalls yet.".into(),
+        };
+    }
+    let mut out = vec![match lang {
+        Lang::Korean => format!("최근 떠올린 기억 {}개 (최신순):", rows.len()),
+        Lang::English => format!("Last {} recalls, newest first:", rows.len()),
+    }];
+    for recall in rows {
+        let row = &recall.row;
+        let text = match memory.show(&row.entry_id) {
+            Ok(Some(found)) if !found.archived => found.entry.text,
+            Ok(_) => "(gone)".to_owned(),
+            Err(err) => failure(&row.entry_id, &err),
+        };
+        let phase = if recall.mid { "mid" } else { "owner" };
+        out.push(format!(
+            "- {} {phase} {} {} {text}",
+            crate::status::ago(lang, now - row.at),
+            row.state.as_str(),
+            row.entry_id
+        ));
+    }
+    out.join("\n")
 }
 
 /// The memory id in `word` (`m-` and 6 to 16 lowercase hex digits, maybe a particle after
@@ -888,5 +942,79 @@ mod tests {
             .await
             .reply;
         assert!(one.contains("a correction you gave me"), "{one}");
+    }
+
+    #[tokio::test]
+    async fn recent_recalls_lists_ledger_rows_with_entry_text() {
+        use crate::status::Lang;
+        use crate::store::{LogLevel, LogRow, RecallRow, RecallState, Store};
+
+        assert_eq!(
+            recent_recalls_request("Recent recalls?"),
+            Some(Lang::English)
+        );
+        assert_eq!(
+            recent_recalls_request("최근 떠올린 기억"),
+            Some(Lang::Korean)
+        );
+        assert_eq!(recent_recalls_request("show recent recalls please"), None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = Day::from_ymd(2026, 11, 22).expect("day");
+        let store = MemoryStore::open(
+            &dir.path().join("memory"),
+            Redactor::default(),
+            Arc::new(move || today),
+        )
+        .expect("open");
+        let memory = MemoryHandle::spawn(store).expect("spawn");
+        let added = memory
+            .add(NewEntry {
+                text: "deploys go through make release".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::General,
+                src: Source::row(3),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add");
+        let mut ledger = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        let row = |id: &str, state, at| RecallRow {
+            conversation: "k".into(),
+            entry_id: id.into(),
+            entry_hash: String::new(),
+            state,
+            lead_generation: 2,
+            lead_epoch: 0,
+            row_id: Some(9),
+            at,
+        };
+        ledger
+            .record_recall(&[
+                row(&added.id, RecallState::Delivered, 1000),
+                row("m-abcdef", RecallState::Shadow, 1600),
+            ])
+            .expect("ledger");
+        ledger
+            .memory_log(&LogRow {
+                at: 1600,
+                level: LogLevel::Info,
+                code: crate::recall::I_RECALL_PICK,
+                job_id: None,
+                omp_version: None,
+                detail: Some("gen=2 epoch=0 row=9 offered=3 picks=m-abcdef:1 phase=mid".into()),
+            })
+            .expect("log");
+        let rows = ledger.recent_recalls(RECENT_RECALLS).expect("rows");
+        let text = recent_recalls(&memory, Lang::English, &rows, 1660);
+        assert_eq!(
+            text,
+            format!(
+                "Last 2 recalls, newest first:\n- 1 min ago mid shadow m-abcdef (gone)\n\
+                 - 11 min ago owner delivered {} deploys go through make release",
+                added.id
+            )
+        );
     }
 }

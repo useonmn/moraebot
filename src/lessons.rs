@@ -3,10 +3,13 @@
 //! ([`Bucket::SelfObs`]), so it can be shown (`what do you know about yourself?`). No model
 //! reads or rewrites it.
 //!
-//! Each new correction is compared with the earlier ones of the last [`WINDOW_DAYS`] days: the
-//! matched correction phrase is removed from both texts (it says only that the owner is
-//! annoyed, not what about), and the rest is compared by character-bigram Jaccard similarity
-//! ([`similarity`], at least [`SIMILAR_AT`]). When this message makes the [`ASK_EVERY`]th, or
+//! Patterns are matched in the owner's own sentences ([`memory::own_sentences`]: not in
+//! `>`-quoted lines or code fences). Each new correction is compared with the earlier ones of
+//! the last [`WINDOW_DAYS`] days, read from what moraebot committed: the matched correction
+//! phrase and common English function words are removed from both texts (they say only that
+//! the owner is annoyed, not what about), and the rest is compared by the Jaccard similarity
+//! of n-grams inside each word ([`similarity`], at least [`SIMILAR_AT`]). When this message
+//! makes the [`ASK_EVERY`]th, or
 //! a multiple of it, similar correction, the lead input gets a short block ([`note`]) that quotes
 //! them and asks the lead to offer the owner, once, to keep it as a standing rule
 //! (`기억해: ...`). moraebot never saves the rule itself.
@@ -18,12 +21,20 @@ use crate::memory::{self, Bucket, Entry, MemoryHandle, NewEntry, Prov, Source};
 
 /// How far back an earlier correction still counts, in days.
 pub const WINDOW_DAYS: i64 = 90;
-/// The longest saved correction, in characters; longer owner text is cut.
+/// The longest saved correction, in characters. A longer message is saved as its own
+/// sentences that hold a correction phrase, cut to this.
 pub const MAX_CHARS: usize = 280;
-/// The least character-bigram Jaccard similarity of two corrections about the same thing.
-/// The same complaint in other words scores 0.33 and more in the tests, unrelated ones 0.2
-/// and less.
-pub const SIMILAR_AT: f64 = 0.3;
+/// The least similarity ([`similarity`]) of two corrections about the same thing. The same
+/// complaint in other words scores 0.33 and more in the tests, unrelated ones 0.2 and less.
+pub const SIMILAR_AT: f64 = 0.27;
+/// Words that say nothing about what a complaint is about.
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "about", "again", "an", "and", "are", "as", "at", "be", "been", "but", "by", "did", "do",
+    "does", "don", "done", "for", "from", "he", "here", "how", "i", "in", "into", "is", "it",
+    "just", "me", "my", "no", "not", "of", "on", "or", "our", "please", "s", "she", "so", "t",
+    "than", "that", "the", "then", "there", "these", "they", "this", "those", "to", "us", "was",
+    "we", "were", "what", "when", "why", "with", "you", "your",
+];
 /// The lead is asked to offer a standing rule at every this many similar corrections.
 pub const ASK_EVERY: usize = 3;
 /// The most earlier corrections quoted in the note (the newest).
@@ -48,12 +59,12 @@ pub fn capture(
     row_id: i64,
     text: &str,
 ) -> Option<String> {
-    if !config.enabled || !says_correction(text, &config.correction_patterns) {
+    if !config.enabled {
         return None;
     }
-    let saved = trimmed(text);
+    let saved = saved_text(text, &config.correction_patterns)?;
     let src = Source::row(row_id);
-    let earlier = match memory.entries(&Bucket::SelfObs) {
+    let earlier = match memory.trusted_entries(&Bucket::SelfObs) {
         Ok(entries) => earlier_similar(
             &entries,
             &saved,
@@ -83,6 +94,25 @@ pub fn capture(
     let count = earlier.len() + 1;
     tracing::info!(code = I_LESSON_SAVED, row = row_id, %id, similar = count, "correction saved");
     (count % ASK_EVERY == 0).then(|| note(count, &earlier, &id, memory.today(), &saved))
+}
+
+/// What is saved of the owner's `text` when it corrects the bot (`None` when it does not):
+/// the whole text folded ([`trimmed`]) when it fits [`MAX_CHARS`], else the owner's own
+/// sentences that hold one of `patterns`, joined and cut to the limit.
+pub fn saved_text(text: &str, patterns: &[String]) -> Option<String> {
+    let hits: Vec<String> = memory::own_sentences(text)
+        .into_iter()
+        .map(|(_, sentence)| sentence)
+        .filter(|sentence| holds_pattern(sentence, patterns))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    let whole = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if whole.chars().count() <= MAX_CHARS {
+        return Some(whole);
+    }
+    Some(trimmed(&hits.join(" ")))
 }
 
 /// The owner's `text` with line breaks and runs of spaces folded, at most [`MAX_CHARS`]
@@ -158,41 +188,77 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `text` corrects the bot: it holds one of `patterns` (see [`phrase_at`]), so
+/// Whether `text` corrects the bot: one of the owner's own sentences
+/// ([`memory::own_sentences`]) holds one of `patterns` (see [`phrase_at`]), so
 /// `하지 말라고 했` matches "하지 말라고 했잖아" and `몇 번 말해` does not match "몇 번 버스 타?"
-/// (moraedang on #59 and #65). Case is ignored.
+/// (moraedang on #59 and #65). Case is ignored; quoted lines and code fences are not the
+/// owner's words.
 pub fn says_correction(text: &str, patterns: &[String]) -> bool {
-    let have = words(text);
+    memory::own_sentences(text)
+        .iter()
+        .any(|(_, sentence)| holds_pattern(sentence, patterns))
+}
+
+/// Whether one sentence holds one of `patterns`.
+fn holds_pattern(sentence: &str, patterns: &[String]) -> bool {
+    let have = words(sentence);
     patterns
         .iter()
         .any(|pattern| phrase_at(&have, pattern).is_some())
 }
 
-/// What `text` complains about: its words without those of the first pattern it holds,
-/// joined without spaces (all its words when it holds none).
-fn complaint(text: &str, patterns: &[String]) -> String {
-    let have = words(text);
-    let matched: HashSet<usize> = patterns
-        .iter()
-        .find_map(|pattern| phrase_at(&have, pattern))
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    have.iter()
-        .enumerate()
-        .filter(|(i, _)| !matched.contains(i))
-        .map(|(_, w)| w.as_str())
-        .collect()
+/// What `text` complains about: the words of the owner's own sentences without those of the
+/// first pattern a sentence holds and without [`FUNCTION_WORDS`].
+fn complaint(text: &str, patterns: &[String]) -> Vec<String> {
+    let mut matched_once = false;
+    let mut out = Vec::new();
+    for (_, sentence) in memory::own_sentences(text) {
+        let have = words(&sentence);
+        let matched: HashSet<usize> = if matched_once {
+            HashSet::new()
+        } else {
+            patterns
+                .iter()
+                .find_map(|pattern| phrase_at(&have, pattern))
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+        matched_once |= !matched.is_empty();
+        out.extend(
+            have.into_iter()
+                .enumerate()
+                .filter(|(i, w)| !matched.contains(i) && !FUNCTION_WORDS.contains(&w.as_str()))
+                .map(|(_, w)| w),
+        );
+    }
+    out
 }
 
-/// The character-bigram Jaccard similarity of `a` and `b`: shared bigrams over all bigrams;
-/// 0 when neither has one.
-pub fn similarity(a: &str, b: &str) -> f64 {
-    let bigrams = |s: &str| -> HashSet<(char, char)> {
-        let chars: Vec<char> = s.chars().collect();
-        chars.windows(2).map(|w| (w[0], w[1])).collect()
+/// The Jaccard similarity of the n-grams inside the words `a` and `b` (shared over all; 0 when
+/// neither has one). Never across words, so two words do not make a gram that neither holds.
+/// A word with a character past Latin (Hangul and the like) gives character bigrams, other
+/// words trigrams, so "delete" and "create" share nothing; a word no longer than its n is one
+/// gram.
+pub fn similarity(a: &[String], b: &[String]) -> f64 {
+    let grams = |words: &[String]| -> HashSet<String> {
+        let mut out = HashSet::new();
+        for word in words {
+            let chars: Vec<char> = word.chars().collect();
+            let n = if chars.iter().any(|&c| u32::from(c) > 0x2ff) {
+                2
+            } else {
+                3
+            };
+            if chars.len() <= n {
+                out.insert(word.clone());
+            } else {
+                out.extend(chars.windows(n).map(|w| w.iter().collect::<String>()));
+            }
+        }
+        out
     };
-    let (a, b) = (bigrams(a), bigrams(b));
+    let (a, b) = (grams(a), grams(b));
     let all = a.union(&b).count();
     if all == 0 {
         return 0.0;
@@ -357,11 +423,120 @@ mod tests {
                 "I told you to run the tests before you commit",
                 "Stop doing force pushes to main",
             ),
+            // Review: the same verb or object alone made these similar as joined bigrams.
+            (
+                "Stop doing that, you keep adding comments to the code",
+                "Stop doing that, you keep pushing changes to the main branch",
+            ),
+            (
+                "why did you delete the file again?",
+                "why did you create the file again?",
+            ),
+            (
+                "I told you to run the tests",
+                "I told you to run the linter",
+            ),
         ] {
             assert!(similar(a, b) < SIMILAR_AT, "{a} | {b}: {}", similar(a, b));
         }
         // The shared phrase alone makes nothing similar.
         assert!(similar("왜 또?", "왜 또?") < SIMILAR_AT);
+    }
+
+    #[test]
+    fn only_the_owners_own_sentences_count() {
+        let patterns = patterns();
+        for text in [
+            "> 왜 또 영어로 답해?\n이거 봐줘",
+            "이 로그 봐줘\n```\nwhy did you push again\n```",
+            "~~~\nI told you\n~~~",
+        ] {
+            assert!(!says_correction(text, &patterns), "{text}");
+            assert_eq!(saved_text(text, &patterns), None, "{text}");
+        }
+        assert!(says_correction("> 인용\n왜 또 영어로 답해?", &patterns));
+        // The quoted text says nothing about what the owner complains about.
+        let quoted = "> 몇 번 말해, 커밋 메시지는 한국어로 써\n왜 또 영어로 답해?";
+        assert_eq!(complaint(quoted, &patterns), ["영어로", "답해"]);
+    }
+
+    #[test]
+    fn a_long_message_saves_the_sentences_that_hold_the_correction() {
+        let patterns = patterns();
+        let filler = "오늘 배포 일정은 이렇게 갑니다. ".repeat(20);
+        let text = format!("{filler}그리고 왜 또 영어로 답해? {filler}");
+        assert_eq!(
+            saved_text(&text, &patterns).as_deref(),
+            Some("그리고 왜 또 영어로 답해?")
+        );
+        let long = format!("왜 또 {}", "가".repeat(400));
+        let cut = saved_text(&long, &patterns).expect("correction");
+        assert_eq!(cut.chars().count(), MAX_CHARS);
+        assert!(cut.starts_with("왜 또 ") && cut.ends_with('…'));
+        assert_eq!(
+            saved_text("  왜 또\n그래  ", &patterns).as_deref(),
+            Some("왜 또 그래")
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_lines_are_not_earlier_corrections_and_a_row_counts_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = day("2026-11-21");
+        let store = MemoryStore::open(dir.path(), Redactor::default(), Arc::new(move || today))
+            .expect("open");
+        let memory = MemoryHandle::spawn(store).expect("spawn");
+        let config = SelfConfig::default();
+        memory
+            .add(NewEntry {
+                text: "왜 또 영어로 답해?".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::SelfObs,
+                src: Source::row(2),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add");
+        // Another process writes an owner line moraebot never committed.
+        let path = memory.root().join(Bucket::SelfObs.rel_path());
+        let mut file = std::fs::read_to_string(&path).expect("read");
+        file.push_str(
+            "- [2026-11-20] 몇 번 말해, 영어로 답하지 마 <!-- id: m-abcdef; prov: owner; src: row=3 -->\n",
+        );
+        std::fs::write(&path, file).expect("write");
+        assert_eq!(
+            capture(&memory, &config, 4, "또 그러네, 영어로 답하지 마"),
+            None,
+            "the forged line is not a second earlier correction"
+        );
+        // The worker capturing a steered row again neither saves nor counts it twice.
+        assert_eq!(
+            capture(&memory, &config, 4, "또 그러네, 영어로 답하지 마"),
+            None
+        );
+        memory
+            .add(NewEntry {
+                text: "barrier".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::Thread("k".into()),
+                src: Source::row(99),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add");
+        assert_eq!(
+            capture(&memory, &config, 4, "또 그러네, 영어로 답하지 마"),
+            None
+        );
+        let rows: Vec<Option<String>> = memory
+            .trusted_entries(&Bucket::SelfObs)
+            .expect("entries")
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        assert_eq!(rows, [Some("row=2".into()), Some("row=4".into())]);
     }
 
     #[test]

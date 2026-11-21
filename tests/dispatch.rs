@@ -4329,7 +4329,7 @@ async fn queued_status_question_is_answered_by_the_worker() {
         [(
             "444".to_owned(),
             format!(
-                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet."
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: off (mid-task off), 0 calls in the last hour, last delivered pick never."
             )
         )]
     );
@@ -4752,6 +4752,69 @@ async fn the_third_similar_correction_asks_the_lead_to_offer_a_rule() {
     assert!(note.contains(moraebot::lessons::NOTE_OPEN), "{note}");
     assert!(note.contains("3 times"), "{note}");
     assert!(note.contains("기억해: <rule>"), "{note}");
+    h.close().await;
+}
+
+/// An owner correction steered into a running turn is captured too, and the note rides on
+/// the steered text.
+#[tokio::test]
+async fn a_steered_correction_is_captured_with_its_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open_steer(dir.path(), "merged").attach_memory();
+    for (row, text) in [
+        (901, "왜 또 영어로 답해?"),
+        (902, "몇 번 말해, 영어로 답하지 마"),
+    ] {
+        memory
+            .add(moraebot::memory::NewEntry {
+                text: text.into(),
+                prov: moraebot::memory::Prov::Owner,
+                bucket: Bucket::SelfObs,
+                src: moraebot::memory::Source::row(row),
+                expires: None,
+                why: None,
+            })
+            .await
+            .unwrap();
+    }
+    let a = queued(
+        h.handle(in_thread("1300000000000000990", THREAD_A, "A"))
+            .await,
+    );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    steered(
+        h.handle(in_thread(
+            "1300000000000000991",
+            THREAD_A,
+            "또 그러네, 영어로 답하지 마",
+        ))
+        .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let prompts = h.prompts();
+    assert_eq!(behavior(&prompts[1]), "steer");
+    let steer = prompts[1]["message"].as_str().unwrap();
+    assert!(steer.contains(moraebot::lessons::NOTE_OPEN), "{steer}");
+    assert!(steer.contains("3 times"), "{steer}");
+    memory
+        .add(moraebot::memory::NewEntry {
+            text: "barrier".into(),
+            prov: moraebot::memory::Prov::Owner,
+            bucket: Bucket::General,
+            src: moraebot::memory::Source::new("test").unwrap(),
+            expires: None,
+            why: None,
+        })
+        .await
+        .unwrap();
+    let saved: Vec<String> = memory
+        .entries(&Bucket::SelfObs)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    assert_eq!(saved.last().unwrap(), "또 그러네, 영어로 답하지 마");
     h.close().await;
 }
 

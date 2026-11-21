@@ -225,6 +225,9 @@ Forget only moves an entry to `archive/`; its text is still in the git history (
    ```
 
 5. Check with `git log -p | grep -F 'the secret sentence'` (no output), then delete `/tmp/purge.txt`.
-6. Start moraebot again.
+6. Delete `~/.moraebot/memory.head` (`rm ~/.moraebot/memory.head`).
+7. Start moraebot again.
+
+`memory.head` names moraebot's last own commit; at start moraebot resets any commit after it as one it did not make. The purge rewrote every commit, so step 6 tells moraebot to trust the purged history once. If you skip it, moraebot sees that the commit in `memory.head` is gone, logs `W_MEMORY_HEAD_PRUNED`, and trusts the purged HEAD the same way, without resetting anything (this also covers a memory folder restored from a backup). But if the old commit is still there (step 4's `gc` did not run) and `memory.head` was kept, moraebot cannot tell the purge from a forged rewrite: it resets the folder to the old, unpurged commit and saves the purge as a patch in `.rejected/`. So do step 6.
 
 This can't be undone. If a commit message held the text, `--replace-text` rewrites it too.

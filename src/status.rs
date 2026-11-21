@@ -72,13 +72,16 @@ pub struct LaneLine<'a> {
 /// The status answer for conversation `key`: the lead's turn (`lead`, its intent already
 /// cleaned), the running lanes of this conversation (`lanes`, each task's first line cleaned by
 /// `clean`, which scrubs secrets and paths like a lane note), the number of running lanes of
-/// other conversations, and one last line from `cache`: the lead's prompt cache hit rate over
-/// its recent turns and whether a memory change waits for the next lead restart.
+/// other conversations, then one line from `cache`: the lead's prompt cache hit rate over
+/// its recent turns and whether a memory change waits for the next lead restart, and one from
+/// `recall` when given: the recall advisor's modes and recent use.
+#[allow(clippy::too_many_arguments)]
 pub fn reply(
     lang: Lang,
     key: &str,
     lead: Option<&LeadStatus>,
     cache: &LeadCache,
+    recall: Option<&RecallStatus>,
     lanes: &[LaneLine],
     others: usize,
     clean: &dyn Fn(&str) -> String,
@@ -150,7 +153,60 @@ pub fn reply(
         );
     }
     lines.push(cache_line(lang, cache));
+    if let Some(recall) = recall {
+        lines.push(recall_line(lang, recall));
+    }
     lines.join("\n")
+}
+
+/// What the status answer tells about the recall advisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallStatus {
+    /// `memory.recall.mode` (`off`, `shadow`, `on`).
+    pub mode: &'static str,
+    /// The mode while a lead turn runs (`off`, `shadow`, `on`).
+    pub mid: &'static str,
+    /// Advisor calls answered in the last hour.
+    pub calls_last_hour: i64,
+    /// Seconds since the newest delivered pick; `None` when none was ever delivered.
+    pub last_delivered: Option<i64>,
+}
+
+/// The recall advisor line of a status answer.
+fn recall_line(lang: Lang, recall: &RecallStatus) -> String {
+    let last = recall.last_delivered.map(|secs| ago(lang, secs));
+    match lang {
+        Lang::Korean => format!(
+            "기억 떠올리기: {} (작업 중 {}), 최근 1시간 호출 {}번, 마지막 전달 {}",
+            recall.mode,
+            recall.mid,
+            recall.calls_last_hour,
+            last.as_deref().unwrap_or("없음")
+        ),
+        Lang::English => format!(
+            "Recall: {} (mid-task {}), {} calls in the last hour, last delivered pick {}.",
+            recall.mode,
+            recall.mid,
+            recall.calls_last_hour,
+            last.as_deref().unwrap_or("never")
+        ),
+    }
+}
+
+/// How long ago `secs` seconds is, in whole minutes, hours or days.
+pub fn ago(lang: Lang, secs: i64) -> String {
+    let secs = secs.max(0);
+    let (n, ko, en) = if secs < 3600 {
+        (secs / 60, "분", "min")
+    } else if secs < 86_400 {
+        (secs / 3600, "시간", "h")
+    } else {
+        (secs / 86_400, "일", "d")
+    };
+    match lang {
+        Lang::Korean => format!("{n}{ko} 전"),
+        Lang::English => format!("{n} {en} ago"),
+    }
 }
 
 /// The prompt cache line of a status answer.
@@ -254,6 +310,7 @@ mod tests {
                 "p:th:1",
                 Some(&lead),
                 &none,
+                None,
                 &lanes,
                 2,
                 &clean
@@ -269,6 +326,7 @@ mod tests {
                 "p:th:1",
                 Some(&no_intent),
                 &none,
+                None,
                 &[],
                 0,
                 &clean
@@ -282,14 +340,23 @@ mod tests {
     fn another_conversations_turn_is_named_without_details() {
         let lead = turn("p:th:2", Some(("bash", Some("secret plan"))));
         let none = LeadCache::default();
-        let text = reply(Lang::English, "p:th:1", Some(&lead), &none, &[], 0, &clean);
+        let text = reply(
+            Lang::English,
+            "p:th:1",
+            Some(&lead),
+            &none,
+            None,
+            &[],
+            0,
+            &clean,
+        );
         assert_eq!(
             text,
             "Working on another conversation for 7 min.\nNo background lanes are running.\n\
              Prompt cache: no usage measured yet."
         );
         assert_eq!(
-            reply(Lang::Korean, "p:th:1", None, &none, &[], 1, &clean),
+            reply(Lang::Korean, "p:th:1", None, &none, None, &[], 1, &clean),
             "지금 하고 있는 일은 없어요\n다른 대화의 백그라운드 작업도 1개 돌고 있어요\n\
              프롬프트 캐시: 아직 잰 사용량이 없어요"
         );
@@ -308,19 +375,64 @@ mod tests {
             last_restart: None,
             memory_waiting: true,
         };
-        let english = reply(Lang::English, "p:th:1", None, &cache, &[], 0, &clean);
+        let english = reply(Lang::English, "p:th:1", None, &cache, None, &[], 0, &clean);
         assert_eq!(
             english.lines().last(),
             Some(
                 "Prompt cache hit rate: 97% over the last 3 turns. A memory change waits for the next lead restart."
             )
         );
-        let korean = reply(Lang::Korean, "p:th:1", None, &cache, &[], 0, &clean);
+        let korean = reply(Lang::Korean, "p:th:1", None, &cache, None, &[], 0, &clean);
         assert_eq!(
             korean.lines().last(),
             Some(
                 "프롬프트 캐시 적중률: 최근 3턴 97% (바뀐 기억은 다음 lead 재시작 때 시스템 프롬프트에 반영돼요)"
             )
+        );
+    }
+
+    #[test]
+    fn the_recall_line_follows_the_cache_line() {
+        let recall = RecallStatus {
+            mode: "on",
+            mid: "shadow",
+            calls_last_hour: 4,
+            last_delivered: Some(125),
+        };
+        let none = LeadCache::default();
+        let english = reply(
+            Lang::English,
+            "p:th:1",
+            None,
+            &none,
+            Some(&recall),
+            &[],
+            0,
+            &clean,
+        );
+        assert_eq!(
+            english.lines().last(),
+            Some(
+                "Recall: on (mid-task shadow), 4 calls in the last hour, last delivered pick 2 min ago."
+            )
+        );
+        let never = RecallStatus {
+            last_delivered: None,
+            ..recall
+        };
+        let korean = reply(
+            Lang::Korean,
+            "p:th:1",
+            None,
+            &none,
+            Some(&never),
+            &[],
+            0,
+            &clean,
+        );
+        assert_eq!(
+            korean.lines().last(),
+            Some("기억 떠올리기: on (작업 중 shadow), 최근 1시간 호출 4번, 마지막 전달 없음")
         );
     }
 

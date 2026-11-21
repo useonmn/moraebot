@@ -954,10 +954,9 @@ struct GivenState {
     /// Per conversation key, per memory bucket label: the hash of the bucket's section last
     /// put into that conversation's lead input that the child took.
     sections: HashMap<String, HashMap<String, u64>>,
-    /// The hash of the appended system prompt text whose update block (`pin::update_notice`
-    /// against the pinned text) the child took last; `None` when it holds no update (none
-    /// given, a revert block taken since, or a compaction forgot it).
-    update: Option<u64>,
+    /// The update block (`pin::update_notice` against the pinned text) the child holds;
+    /// unknown after a compaction with one held, and on a resumed session.
+    update: crate::pin::Held,
     /// Counts the child's context compactions ([`note_compaction`]): an input built before
     /// one is not recorded after it. Above 0, the provider's prompt cache is cold anyway.
     epoch: u64,
@@ -1055,7 +1054,7 @@ fn note_compaction(given: &Given, event: &Event) {
     if compacted {
         let mut given = lock(given);
         given.sections.clear();
-        given.update = None;
+        given.update = given.update.forgotten();
         given.epoch += 1;
         tracing::info!("omp compacted the lead's context; its memory sections go in again");
     }
@@ -1249,6 +1248,11 @@ pub struct OmpManager {
     cache_window: Option<Duration>,
     /// The owner asked to set the lead's system prompt again before its next turn.
     refresh: AtomicBool,
+    /// The persona file's refusal code last logged; logged again only when it changes.
+    persona_refused: Mutex<Option<&'static str>>,
+    /// What the last lead child started in this process was given; a later child of the same
+    /// session holds the update blocks it held.
+    last_given: Mutex<Option<Given>>,
     /// Token usage and restarts of the lead.
     metrics: Arc<Mutex<LeadMetrics>>,
     lead_watch: Arc<Mutex<LeadWatch>>,
@@ -1302,6 +1306,8 @@ impl OmpManager {
             handoff_after: config.lead.handoff_after(),
             cache_window: config.lead.cache_window(),
             refresh: AtomicBool::new(false),
+            persona_refused: Mutex::default(),
+            last_given: Mutex::default(),
             metrics: Default::default(),
             lead_down: AtomicBool::new(false),
             config,
@@ -1402,6 +1408,10 @@ impl OmpManager {
     /// Gives the lead `memory_write`, which queues entries for `memory`'s worker. The lead
     /// always has `memory_search`; lanes never get `memory_write`.
     pub fn with_memory(mut self, memory: memory::MemoryHandle) -> Self {
+        // The lane manager is first shared when the lead child starts.
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .outcome_memory = Some(memory.clone());
         self.memory = Some(memory);
         self
     }
@@ -1601,6 +1611,15 @@ impl OmpManager {
         let mut live = self.live.lock().await;
         // Between turns: the live mutex is held, so no turn or steer is open here.
         let (append, refused) = self.lead_append();
+        {
+            let mut logged = lock(&self.persona_refused);
+            if *logged != refused {
+                if let Some(code) = refused {
+                    tracing::warn!(code, "persona file not used");
+                }
+                *logged = refused;
+            }
+        }
         let requested = self.refresh.load(Ordering::Relaxed);
         let reason = live
             .as_ref()
@@ -1621,9 +1640,6 @@ impl OmpManager {
             self.refresh.store(false, Ordering::Relaxed);
         }
         if live.is_none() {
-            if let Some(code) = refused {
-                tracing::warn!(code, "persona file not used");
-            }
             match self.start(append.clone()).await {
                 Ok(started) => {
                     self.lead_down.store(false, Ordering::Relaxed);
@@ -1665,7 +1681,7 @@ impl OmpManager {
                 .values()
                 .flat_map(|sections| sections.keys().cloned())
                 .collect();
-            let update = memory_update(&current.append, &append, given.update);
+            let update = crate::pin::next_notice(&current.append, &append, given.update);
             (input, fresh, given.epoch, held, update)
         };
         let input = match &update {
@@ -2104,7 +2120,7 @@ impl OmpManager {
 
     /// The lead's appended system prompt: the hints, then `persona.md` read now, then the core
     /// memory read now. A refused persona file is left out and its code is returned, so the
-    /// caller logs it once per start; core memory problems are logged by `memory::core_block`.
+    /// caller logs it when it changes; core memory problems are logged by `memory::core_block`.
     fn lead_append(&self) -> (String, Option<&'static str>) {
         let (text, refused) = match persona::load(&self.config.home) {
             Ok(p) => (persona::append(&self.hints, p.as_deref()), None),
@@ -2171,7 +2187,18 @@ impl OmpManager {
             ));
         }
         let turn = Arc::clone(&self.turn);
-        let given = Given::default();
+        // A resumed session holds the update blocks its earlier child held; what a child of
+        // an earlier process held is unknown.
+        let update = match (&previous_session, lock(&self.last_given).as_ref()) {
+            (None, _) => crate::pin::Held::Nothing,
+            (Some(_), Some(last)) => lock(last).update,
+            (Some(_), None) => crate::pin::Held::Unknown,
+        };
+        let given = Given::new(Mutex::new(GivenState {
+            update,
+            ..GivenState::default()
+        }));
+        *lock(&self.last_given) = Some(Arc::clone(&given));
         let compacted = Arc::clone(&given);
         // An earlier child of this session may have read outside text; that stays in its
         // context. A store that cannot tell counts as read.
@@ -2484,32 +2511,16 @@ fn record_given(given: &Given, fresh: Fresh, epoch: u64) {
     }
 }
 
-/// The memory block for a child pinned to `pinned` whose appended system prompt would be
-/// `current` now, given that it holds the update for the text hashed `held`
-/// ([`GivenState::update`]): the block and the value `held` takes once the child took it.
-/// `None` when the child holds what it needs already: an update block goes in once per
-/// distinct `current` text, and a revert block once when the text is back to `pinned` (or
-/// differs only in lines an update never lists) after an update.
-fn memory_update(pinned: &str, current: &str, held: Option<u64>) -> Option<(String, Option<u64>)> {
-    let notice = if pinned == current {
-        String::new()
-    } else {
-        crate::pin::update_notice(pinned, current)
-    };
-    if notice.is_empty() {
-        return held.map(|_| (crate::pin::revert_notice(), None));
-    }
-    let hash = text_hash(current);
-    (held != Some(hash)).then_some((notice, Some(hash)))
-}
-
-/// Remembers which update block the child took (`update`, see [`memory_update`]), unless its
-/// context was compacted since the input was built, like [`record_given`].
-fn record_update(given: &Given, update: Option<u64>, epoch: u64) {
+/// Remembers which update block the child took (`update`, see [`crate::pin::next_notice`]).
+/// When its context was compacted since the input was built, the block may or may not have
+/// survived, so what it holds is unknown.
+fn record_update(given: &Given, update: crate::pin::Held, epoch: u64) {
     let mut given = lock(given);
-    if given.epoch == epoch {
-        given.update = update;
-    }
+    given.update = if given.epoch == epoch {
+        update
+    } else {
+        crate::pin::Held::Unknown
+    };
 }
 
 /// What the steer's input counts as given: the child's sections with the open turn's main
@@ -2535,7 +2546,7 @@ fn given_view(
 
 /// The prompt was refused before it ran ([`map_result`]'s [`E_PROMPT_REJECTED`]): the child
 /// never saw its input.
-fn rejected(outcome: &Outcome) -> bool {
+pub(crate) fn rejected(outcome: &Outcome) -> bool {
     matches!(
         outcome,
         Outcome::Failed {

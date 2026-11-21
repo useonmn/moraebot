@@ -410,6 +410,14 @@ pub struct RecallRow {
     pub at: i64,
 }
 
+/// One recall ledger row for the owner's "recent recalls" command; `mid` when a mid wake (on
+/// tool events) wrote it, else the wake before an owner turn did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRecall {
+    pub row: RecallRow,
+    pub mid: bool,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS inbox(
     id INTEGER PRIMARY KEY,
@@ -809,6 +817,77 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The newest `limit` recall ledger rows, newest first, each with whether it came from a
+    /// mid wake: a mid wake's ledger rows share their lead context, row and second with an
+    /// [`I_RECALL_PICK`](crate::recall::I_RECALL_PICK) (shadow, rejected) or
+    /// [`I_RECALL_DELIVERED`](crate::recall::I_RECALL_DELIVERED) (delivered) log row whose
+    /// detail says `phase=mid`.
+    pub fn recent_recalls(&self, limit: usize) -> Result<Vec<RecentRecall>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.conversation, l.entry_id, l.entry_hash, l.state, l.lead_generation,
+                    l.lead_epoch, l.row_id, l.at,
+                    EXISTS(SELECT 1 FROM memory_log m
+                           WHERE m.at = l.at
+                             AND m.code = CASE l.state WHEN 'delivered' THEN ?2 ELSE ?3 END
+                             AND m.detail LIKE 'gen=' || l.lead_generation || ' epoch='
+                                 || l.lead_epoch || ' row=' || l.row_id || ' %'
+                             AND m.detail LIKE '% ' || ?4 || '%')
+             FROM recall_ledger l
+             ORDER BY l.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                crate::recall::I_RECALL_DELIVERED,
+                crate::recall::I_RECALL_PICK,
+                crate::recall::MID_PHASE
+            ],
+            |r| {
+                let state: String = r.get(3)?;
+                Ok(RecentRecall {
+                    row: RecallRow {
+                        conversation: r.get(0)?,
+                        entry_id: r.get(1)?,
+                        entry_hash: r.get(2)?,
+                        state: RecallState::parse(&state).ok_or_else(|| {
+                            rusqlite::Error::InvalidColumnType(
+                                3,
+                                state,
+                                rusqlite::types::Type::Text,
+                            )
+                        })?,
+                        lead_generation: r.get(4)?,
+                        lead_epoch: r.get(5)?,
+                        row_id: r.get(6)?,
+                        at: r.get(7)?,
+                    },
+                    mid: r.get(8)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Recall advisor calls answered at or after `since` (unix seconds): their
+    /// [`I_RECALL_PICK`](crate::recall::I_RECALL_PICK) log rows.
+    pub fn recall_calls_since(&self, since: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_log WHERE code = ?1 AND at >= ?2",
+            params![crate::recall::I_RECALL_PICK, since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When the newest `delivered` recall ledger row was written (unix seconds).
+    pub fn last_delivered_recall(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(at) FROM recall_ledger WHERE state = 'delivered'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Deletes memory log rows and recall ledger rows older than 30 days before `now`.

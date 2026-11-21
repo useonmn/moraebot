@@ -24,6 +24,7 @@ pub mod new_session;
 pub mod omp;
 pub mod omp_overlay;
 pub mod onboarding;
+pub mod outcome;
 pub mod persona;
 pub mod pin;
 pub mod recall;

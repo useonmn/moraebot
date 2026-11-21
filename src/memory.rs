@@ -20,8 +20,14 @@
 //! Lanes run as the same Unix user and can write these files. So an owner line counts as the
 //! owner's only when moraebot committed it: the prompt blocks and searches drop owner lines
 //! that HEAD does not hold, the writer drops them before it rewrites a file, and startup
-//! recovery never commits them. (A process that runs git in this folder itself can still
-//! commit one; that needs lanes under another user, a later step.)
+//! recovery never commits them. moraebot keeps its last own commit in memory while it runs;
+//! `memory.head` beside the folder only carries it from one run to the next.
+//!
+//! Limits while lanes share the Unix user: a process that runs git in this folder itself
+//! can still commit an owner line. And while moraebot is stopped, anyone who can write the
+//! home can replace `memory.head` (or delete it, so HEAD is trusted once at the next start)
+//! and plant a `memory.pending` journal that the next start replays. Closing these needs
+//! lanes under another user, a later step.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -92,6 +98,11 @@ pub const W_MEMORY_GIT_CONFIG: &str = "W_MEMORY_GIT_CONFIG";
 pub const W_MEMORY_BUDGET_CLAMPED: &str = "W_MEMORY_BUDGET_CLAMPED";
 /// The journal of an interrupted write did not match the repository and was dropped.
 pub const W_MEMORY_PENDING_DROPPED: &str = "W_MEMORY_PENDING_DROPPED";
+/// `memory.head` was removed or changed while moraebot ran; it was rewritten from memory.
+pub const W_MEMORY_HEAD_TAMPERED: &str = "W_MEMORY_HEAD_TAMPERED";
+/// The commit in `memory.head` is no longer in the repository (history purged, or the
+/// folder restored from a backup); HEAD was trusted and recorded at start.
+pub const W_MEMORY_HEAD_PRUNED: &str = "W_MEMORY_HEAD_PRUNED";
 
 /// Folders of the 0.2.0 store (`memory-full`) inside the memory folder, and its omp overlay.
 const OLD_LAYOUT: [&str; 6] = [
@@ -1184,6 +1195,21 @@ pub fn entries(root: &Path, bucket: &Bucket, today: Day) -> Result<Vec<Entry>, M
         .collect())
 }
 
+/// The live, unexpired entries of one bucket for a prompt, oldest first: owner lines moraebot
+/// did not commit are dropped ([`read_trusted`]).
+pub fn trusted_entries(
+    root: &Path,
+    bucket: &Bucket,
+    today: Day,
+) -> Result<Vec<Entry>, MemoryError> {
+    bucket.validate()?;
+    Ok(read_trusted(root, &[bucket.rel_path()])
+        .into_iter()
+        .flat_map(|(_, file)| file.entries)
+        .filter(|e| !e.expired(today))
+        .collect())
+}
+
 /// The core block for the lead's system prompt: [`CORE_HEADER`], then the owner entries of
 /// `core/owner.md` and `core/boundaries.md`, at most `cap` bytes. When they do not fit, the
 /// newest are kept and a marker line says how many were left out. Expired entries are
@@ -1907,7 +1933,12 @@ impl MemoryStore {
             base: String::new(),
             _lock: lock,
         };
-        let fresh = !store.root.join(".git").exists();
+        let fresh = match fs::symlink_metadata(store.root.join(".git")) {
+            Ok(_) => false,
+            Err(e) if e.kind() == ErrorKind::NotFound => true,
+            Err(e) => return Err(MemoryError::io(".git", &e)),
+        };
+        forget_head(&store.root);
         if fresh {
             store.git(&["init", "-q", "-b", "main"])?;
         }
@@ -1915,7 +1946,7 @@ impl MemoryStore {
         store.write_atomic(".gitignore", GITIGNORE)?;
         store.remove_temp_files();
         if !fresh {
-            store.reconcile_head()?;
+            store.reconcile_head(true)?;
             store.replay_journal()?;
             store.recover()?;
         }
@@ -1953,7 +1984,7 @@ impl MemoryStore {
     pub fn apply(&mut self, ops: Vec<Op>) -> Vec<Result<Outcome, MemoryError>> {
         let base = self
             .sanitize_git(true)
-            .and_then(|()| self.reconcile_head())
+            .and_then(|()| self.reconcile_head(false))
             .and_then(|()| self.git(&["rev-parse", "HEAD"]));
         match base {
             Ok(base) => self.base = base.trim().to_owned(),
@@ -2456,8 +2487,10 @@ impl MemoryStore {
         self.record_head(head.trim())
     }
 
-    /// Writes `sha` to [`HEAD_FILE`]: the commit trusted reads and the next batch build on.
+    /// Records `sha` as moraebot's own commit: in memory (what trusted reads and the next
+    /// batch build on) and in [`HEAD_FILE`] (for the next start).
     fn record_head(&self, sha: &str) -> Result<(), MemoryError> {
+        remember_head(&self.root, sha);
         Self::write_path(
             &beside(&self.root, HEAD_FILE),
             HEAD_FILE,
@@ -2484,19 +2517,42 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Makes `.git/config` exactly [`CANONICAL_GIT_CONFIG`] (logging when it differed and
-    /// `warn` is set) and removes `.git/info/attributes`: no filter driver, fsmonitor, hook
-    /// path or alias someone planted there takes effect.
+    /// Refuses a `.git` that is not a plain folder (a gitfile or symlink points git at
+    /// another repository), makes `.git/config` exactly [`canonical_git_config`] (logging when
+    /// it differed and `warn` is set) and removes `.git/info/attributes`, `.git/commondir` and
+    /// `.git/config.worktree`: no filter driver, fsmonitor, hook path or alias someone planted
+    /// there takes effect.
     fn sanitize_git(&self, warn: bool) -> Result<(), MemoryError> {
+        let is_dir = fs::symlink_metadata(self.root.join(".git"))
+            .map_err(|e| MemoryError::io(".git", &e))?
+            .is_dir();
+        if !is_dir {
+            return Err(MemoryError::new(
+                E_MEMORY_GIT,
+                "memory .git is not a folder (a symlink or gitfile); refusing to use it",
+            ));
+        }
         let config = self.root.join(".git/config");
-        if fs::read_to_string(&config).ok().as_deref() != Some(CANONICAL_GIT_CONFIG) {
+        let canonical = canonical_git_config(&self.root);
+        if fs::read_to_string(&config).ok().as_deref() != Some(canonical.as_str()) {
             if warn {
                 tracing::warn!(
                     code = W_MEMORY_GIT_CONFIG,
                     "memory .git/config was changed; rewritten"
                 );
             }
-            self.write_atomic(".git/config", CANONICAL_GIT_CONFIG)?;
+            self.write_atomic(".git/config", &canonical)?;
+        }
+        for rel in [".git/commondir", ".git/config.worktree"] {
+            match fs::remove_file(self.root.join(rel)) {
+                Ok(()) => tracing::warn!(
+                    code = W_MEMORY_GIT_CONFIG,
+                    file = rel,
+                    "memory git file removed"
+                ),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(MemoryError::io(rel, &e)),
+            }
         }
         match fs::remove_file(self.root.join(".git/info/attributes")) {
             Ok(()) => {
@@ -2511,17 +2567,47 @@ impl MemoryStore {
         }
     }
 
-    /// Resets commits moraebot did not make: when HEAD is not the commit in [`HEAD_FILE`],
+    /// Resets commits moraebot did not make: when HEAD is not moraebot's last own commit,
     /// the diff from that commit to HEAD is saved as `.rejected/foreign-<time>.patch` and the
-    /// repository is reset to it. Without a recorded commit (an older store), HEAD is trusted
-    /// once and recorded.
-    fn reconcile_head(&self) -> Result<(), MemoryError> {
+    /// repository is reset to it.
+    ///
+    /// At `open` the commit is read from [`HEAD_FILE`]; HEAD is trusted once and recorded
+    /// when the file is missing or malformed (an older store), or names a commit the
+    /// repository no longer has (history purged, or the folder restored from a backup; logged
+    /// as [`W_MEMORY_HEAD_PRUNED`]). Nothing is reset then: a reset to an old commit would
+    /// bring back what a purge removed. After `open` the commit kept in memory is the truth;
+    /// a [`HEAD_FILE`] that no longer matches it was tampered with and is rewritten.
+    fn reconcile_head(&self, open: bool) -> Result<(), MemoryError> {
         let Ok(head) = self.git(&["rev-parse", "--verify", "-q", "HEAD"]) else {
             return Ok(());
         };
         let head = head.trim();
-        let Some(recorded) = recorded_head(&self.root) else {
-            return self.record_head(head);
+        let recorded = if open {
+            let Some(recorded) = recorded_head(&self.root) else {
+                return self.record_head(head);
+            };
+            if recorded != head
+                && self
+                    .git(&["cat-file", "-e", &format!("{recorded}^{{commit}}")])
+                    .is_err()
+            {
+                tracing::warn!(code = W_MEMORY_HEAD_PRUNED, missing = %recorded, trusted = head, "memory.head names a commit the repository no longer has; HEAD trusted");
+                return self.record_head(head);
+            }
+            remember_head(&self.root, &recorded);
+            recorded
+        } else {
+            let Some(known) = known_head(&self.root) else {
+                return self.record_head(head);
+            };
+            if recorded_head(&self.root).as_deref() != Some(known.as_str()) {
+                tracing::warn!(
+                    code = W_MEMORY_HEAD_TAMPERED,
+                    "memory.head was removed or changed; rewritten"
+                );
+                self.record_head(&known)?;
+            }
+            known
         };
         if recorded == head {
             return Ok(());
@@ -2683,14 +2769,88 @@ fn recorded_head(root: &Path) -> Option<String> {
         .then(|| sha.to_owned())
 }
 
-/// The revision trusted reads take committed owner lines from: moraebot's last own commit,
-/// or HEAD before one is recorded.
-fn trusted_rev(root: &Path) -> String {
-    recorded_head(root).unwrap_or_else(|| "HEAD".to_owned())
+/// moraebot's last own commit per memory folder, as the open store keeps it: a lane that
+/// rewrites or removes [`HEAD_FILE`] does not change what trusted reads take.
+static HEADS: std::sync::Mutex<BTreeMap<PathBuf, String>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn known_head(root: &Path) -> Option<String> {
+    HEADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .cloned()
 }
 
-/// Runs git in the memory folder `root` with a fixed identity, no hooks, no signing and no
-/// user excludes; `input` goes to its stdin. Returns its stdout.
+fn remember_head(root: &Path, sha: &str) {
+    HEADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), sha.to_owned());
+}
+
+fn forget_head(root: &Path) {
+    HEADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(root);
+}
+
+/// The revision trusted reads take committed owner lines from: moraebot's last own commit
+/// as the store opened in this process keeps it; without one (no store opened here), the
+/// commit in [`HEAD_FILE`], or HEAD before one is recorded.
+fn trusted_rev(root: &Path) -> String {
+    known_head(root)
+        .or_else(|| recorded_head(root))
+        .unwrap_or_else(|| "HEAD".to_owned())
+}
+
+/// The `.git/config` the memory repository may have: [`CANONICAL_GIT_CONFIG`] with the
+/// existing `core.repositoryformatversion` (0 or 1) and every `extensions.*` key but
+/// `worktreeConfig` (which would read `.git/config.worktree`), so a sha256 or reftable
+/// repository keeps working. Names and values are kept only when plain words.
+fn canonical_git_config(root: &Path) -> String {
+    let listed = run_git(root, &["config", "--file", ".git/config", "--list"], None)
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default();
+    let word = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    let mut version = "0";
+    let mut extensions = BTreeMap::new();
+    for line in listed.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key == "core.repositoryformatversion" && value == "1" {
+            version = "1";
+        } else if let Some(name) = key.strip_prefix("extensions.")
+            && name != "worktreeconfig"
+            && word(name)
+            && word(value)
+        {
+            extensions.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    if extensions.is_empty() && version == "0" {
+        return CANONICAL_GIT_CONFIG.to_owned();
+    }
+    let mut config =
+        CANONICAL_GIT_CONFIG.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    if !extensions.is_empty() {
+        config.push_str("[extensions]\n");
+        for (name, value) in extensions {
+            config.push_str(&format!("\t{name} = {value}\n"));
+        }
+    }
+    config
+}
+
+/// Runs git in the memory folder `root` with a fixed identity, no hooks, no signing, no
+/// user excludes or attributes, no replace refs, and the repository pinned to `root/.git`
+/// (a planted `commondir` or gitfile cannot point it elsewhere); `input` goes to its stdin.
+/// Returns its stdout.
 fn run_git(root: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, MemoryError> {
     let mut command = Command::new("git");
     command
@@ -2711,6 +2871,10 @@ fn run_git(root: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, 
             "core.excludesFile=/dev/null",
             "-c",
             "core.autocrlf=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.useReplaceRefs=false",
         ])
         .args(args)
         // Only what git needs: no inherited GIT_* variable, global or system config, or
@@ -2725,6 +2889,12 @@ fn run_git(root: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, 
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Relative to `root` (`-C` runs first), so a relative `root` works too.
+        .env("GIT_DIR", ".git")
+        .env("GIT_COMMON_DIR", ".git")
+        .env("GIT_WORK_TREE", ".")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -3113,6 +3283,12 @@ impl MemoryHandle {
     /// The live, unexpired entries of one bucket, oldest first.
     pub fn entries(&self, bucket: &Bucket) -> Result<Vec<Entry>, MemoryError> {
         entries(&self.root, bucket, (self.clock)())
+    }
+
+    /// The live, unexpired entries of one bucket for a prompt, oldest first, without owner
+    /// lines moraebot did not commit ([`trusted_entries`]).
+    pub fn trusted_entries(&self, bucket: &Bucket) -> Result<Vec<Entry>, MemoryError> {
+        trusted_entries(&self.root, bucket, (self.clock)())
     }
 
     /// The memory folder.
@@ -3991,7 +4167,8 @@ mod tests {
             ],
         );
         let head = git(root, &["rev-parse", "HEAD"]);
-        fs::write(beside(root, HEAD_FILE), head).expect("record head");
+        fs::write(beside(root, HEAD_FILE), &head).expect("record head");
+        remember_head(root, head.trim());
     }
 
     /// What a lane shell can do: append an owner-looking line to a memory file.
@@ -4943,5 +5120,153 @@ mod tests {
         let text = text.replace(&budget, "budget_bytes: 999999999\n");
         let file = MemFile::parse(&text).expect("parse");
         assert_eq!(file.budget, MAX_BUDGET_BYTES);
+    }
+
+    fn hand_commit(root: &Path, message: &str) {
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@localhost",
+                "commit",
+                "-qam",
+                message,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_purged_history_neither_stops_the_store_nor_comes_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        store
+            .add(owner("the secret sentence", Bucket::Owner, 1))
+            .expect("add");
+        store
+            .add(owner("kept rule", Bucket::Owner, 2))
+            .expect("add");
+        drop(store);
+        // The purge: one new commit without the text, the old history gone for good.
+        let path = root.join("core/owner.md");
+        let text: String = fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .filter(|l| !l.contains("secret sentence"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fs::write(&path, text).expect("write");
+        git(&root, &["checkout", "-q", "--orphan", "purged"]);
+        hand_commit(&root, "purged");
+        git(&root, &["branch", "-q", "-D", "main"]);
+        git(&root, &["branch", "-m", "main"]);
+        git(&root, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&root, &["gc", "-q", "--prune=now"]);
+        let purged = git(&root, &["rev-parse", "HEAD"]);
+        let (_store, _) = open(dir.path(), "2026-11-20");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), purged);
+        assert_eq!(
+            fs::read_to_string(beside(&root, HEAD_FILE)).expect("head"),
+            purged
+        );
+        assert!(!root.join(REJECTED_DIR).exists());
+        let block = core_block(&root, day("2026-11-20"), 6000);
+        assert!(block.contains("kept rule") && !block.contains("secret sentence"));
+        assert!(!git(&root, &["log", "-p", "--all"]).contains("secret sentence"));
+    }
+
+    #[test]
+    fn a_replace_ref_does_not_change_the_trusted_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        store
+            .add(owner("real rule", Bucket::Owner, 1))
+            .expect("add");
+        let blob = git(&root, &["rev-parse", "HEAD:core/owner.md"]);
+        forge(&root, "core/owner.md", "forged rule", "m-555555");
+        let forged = git(&root, &["hash-object", "-w", "core/owner.md"]);
+        git(&root, &["replace", blob.trim(), forged.trim()]);
+        let block = core_block(&root, day("2026-11-20"), 6000);
+        assert!(block.contains("real rule") && !block.contains("forged"));
+    }
+
+    #[test]
+    fn a_planted_commondir_or_worktree_config_runs_no_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        let (script, marker) = (dir.path().join("decoy.sh"), dir.path().join("ran"));
+        decoy(&script, &marker);
+        let filter = format!(
+            "[filter \"evil\"]\n\tclean = {0}\n\tsmudge = {0}\n",
+            script.display()
+        );
+        let evil = dir.path().join("evil");
+        fs::create_dir(&evil).expect("evil");
+        fs::write(evil.join("config"), &filter).expect("config");
+        fs::write(root.join(".git/commondir"), format!("{}\n", evil.display())).expect("commondir");
+        fs::write(root.join(".git/config.worktree"), &filter).expect("config.worktree");
+        fs::write(root.join(".gitattributes"), "*.md filter=evil\n").expect("attributes");
+        store
+            .add(owner("filters stay idle", Bucket::Owner, 1))
+            .expect("add");
+        assert!(!marker.exists(), "a planted filter ran");
+        assert!(!root.join(".git/commondir").exists());
+        assert!(!root.join(".git/config.worktree").exists());
+        drop(store);
+        fs::rename(root.join(".git"), root.join("elsewhere")).expect("move");
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join(".git")).expect("symlink");
+        let (clock, _) = clock("2026-11-20");
+        let err = MemoryStore::open(dir.path(), Redactor::default(), clock)
+            .err()
+            .expect("a symlinked .git is refused");
+        assert_eq!(err.code, E_MEMORY_GIT);
+    }
+
+    #[test]
+    fn a_removed_memory_head_does_not_make_a_forged_commit_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        store
+            .add(owner("real rule", Bucket::Owner, 1))
+            .expect("add");
+        forge(&root, "core/owner.md", "forged rule", "m-666666");
+        hand_commit(&root, "owner row=9: forged");
+        fs::remove_file(beside(&root, HEAD_FILE)).expect("rm head");
+        let block = core_block(&root, day("2026-11-20"), 6000);
+        assert!(block.contains("real rule") && !block.contains("forged"));
+        store
+            .add(owner("next rule", Bucket::Owner, 2))
+            .expect("add");
+        let committed = git(&root, &["show", "HEAD:core/owner.md"]);
+        assert!(committed.contains("next rule") && !committed.contains("forged"));
+        assert_eq!(
+            fs::read_to_string(beside(&root, HEAD_FILE)).expect("head"),
+            git(&root, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn the_canonical_config_keeps_the_format_version_and_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        git(&root, &["config", "core.repositoryformatversion", "1"]);
+        git(&root, &["config", "extensions.noop", "true"]);
+        git(&root, &["config", "extensions.worktreeConfig", "true"]);
+        git(&root, &["config", "filter.evil.clean", "false"]);
+        store
+            .add(owner("format kept", Bucket::Owner, 1))
+            .expect("add");
+        assert_eq!(
+            fs::read_to_string(root.join(".git/config")).expect("config"),
+            CANONICAL_GIT_CONFIG
+                .replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "[extensions]\n\tnoop = true\n"
+        );
     }
 }

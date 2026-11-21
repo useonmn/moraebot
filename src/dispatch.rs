@@ -395,11 +395,20 @@ pub enum Handled {
     Status(i64),
 }
 
+/// The current time in unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// What an owner row asks of the memory store.
 enum MemoryAct {
     Run(Command),
     /// The owner's yes (`true`) or no to the forget question about this id.
     Confirm(String, bool),
+    /// The recent-recalls command, in the owner's language.
+    Recalls(status::Lang),
 }
 
 /// How often a conversation saw an owner message, a delivered reply or posted news, and
@@ -472,6 +481,8 @@ pub struct Dispatcher {
     omp_check: Option<OverlayCheck>,
     /// `[memory.self]`: owner corrections are captured with it ([`lessons::capture`]).
     self_config: SelfConfig,
+    /// `memory.recall.mode` and the mid-task mode, for the status answer.
+    recall_modes: (&'static str, &'static str),
 }
 
 impl Dispatcher {
@@ -506,6 +517,10 @@ impl Dispatcher {
             session_confirmed: Mutex::default(),
             omp_check: None,
             self_config: config.memory.self_file.clone(),
+            recall_modes: (
+                config.memory.recall_mode().as_str(),
+                config.memory.recall_mid_task().as_str(),
+            ),
         }
     }
 
@@ -1011,12 +1026,19 @@ impl Dispatcher {
                 }
             }
         }
-        // The same body the worker would send for this row.
-        let body = lead::owner_input(
+        // The same body the worker would send for this row, with the correction note: when it
+        // is not steered, the worker captures it again, which saves and counts nothing twice.
+        let mut body = lead::owner_input(
             key.as_str(),
             id,
             &files::prompt_with_files(&event.text, &saved),
         );
+        if sender == Sender::Owner
+            && let Some(memory) = &self.memory
+            && let Some(note) = lessons::capture(memory, &self.self_config, id, &event.text)
+        {
+            body = format!("{body}\n\n{note}");
+        }
         let mut claim_error = None;
         let steered = self.omp.try_steer(key.as_str(), id, sender, &body, |main| {
             self.store().steer_into(id, main).unwrap_or_else(|err| {
@@ -1217,7 +1239,8 @@ impl Dispatcher {
             .and_then(|target| {
                 memory_commands::confirmation(text).map(|yes| MemoryAct::Confirm(target, yes))
             })
-            .or_else(|| memory_commands::parse(text).map(MemoryAct::Run));
+            .or_else(|| memory_commands::parse(text).map(MemoryAct::Run))
+            .or_else(|| memory_commands::recent_recalls_request(text).map(MemoryAct::Recalls));
         let Some(act) = act else {
             if arrival {
                 lock(&self.forget_asked).remove(key);
@@ -1233,6 +1256,12 @@ impl Dispatcher {
         }
         let reply = match act {
             MemoryAct::Confirm(target, yes) => memory_commands::forget(memory, &target, yes).await,
+            MemoryAct::Recalls(lang) => {
+                let rows = self
+                    .store()
+                    .recent_recalls(memory_commands::RECENT_RECALLS)?;
+                memory_commands::recent_recalls(memory, lang, &rows, unix_now())
+            }
             MemoryAct::Run(command) => {
                 let answer = memory_commands::run(memory, key, id, command).await;
                 if let Some(target) = answer.confirm_forget {
@@ -1383,10 +1412,23 @@ impl Dispatcher {
             key,
             lead.as_ref(),
             &self.omp.lead_cache(),
+            Some(&self.recall_status()?),
             &lanes,
             others.len(),
             &|text| self.omp.clean_note(text),
         ))
+    }
+
+    /// The recall advisor's modes and recent use, for the status answer.
+    fn recall_status(&self) -> Result<status::RecallStatus, StoreError> {
+        let now = unix_now();
+        let store = self.store();
+        Ok(status::RecallStatus {
+            mode: self.recall_modes.0,
+            mid: self.recall_modes.1,
+            calls_last_hour: store.recall_calls_since(now - 3600)?,
+            last_delivered: store.last_delivered_recall()?.map(|at| now - at),
+        })
     }
 
     /// Drops lane news row `row` when its lane no longer runs: the note is out of date and the
