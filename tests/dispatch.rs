@@ -20,9 +20,9 @@ use moraebot::config::{
 use moraebot::config::{DEFAULT_HANDOFF_AFTER, DEFAULT_STALL_AFTER};
 use moraebot::dispatch::{
     Dispatcher, E_DISPATCH_HELD, Handled, MAX_REPLY_MESSAGES, N_FAILED, N_FILE_NOT_ALLOWED,
-    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_OMP_VERSION,
-    N_ONBOARDING_HELLO, N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT, notice_text,
-    reply_messages,
+    N_FILE_NOT_RECEIVED, N_FILE_NOT_SENT, N_INTERRUPTED, N_LANE_INTERRUPTED, N_NEW_SESSION_FILES,
+    N_OMP_VERSION, N_ONBOARDING_HELLO, N_REPLY_TRUNCATED, N_THREAD_FAILED, N_UNSUPPORTED_INPUT,
+    notice_text, reply_messages,
 };
 use moraebot::dispatch::{NEWS_AFTER, news_line, stalled_text};
 use moraebot::files::{self, OutFile, SavedFile};
@@ -5787,4 +5787,63 @@ async fn a_chat_sender_cannot_start_a_new_session() {
     assert_eq!(handled, Handled::Chat);
     assert!(backups.is_empty());
     assert_eq!(lead_id, None, "the lead never started");
+}
+
+#[tokio::test]
+async fn a_new_session_command_with_a_file_is_refused_and_never_reaches_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let mut handled = Vec::new();
+    for (mid, text) in [("7461", "/new"), ("7462", "새 세션")] {
+        let ev = with_files(
+            session_msg(mid, text),
+            vec![attachment("a.txt", "ref-a", 3)],
+        );
+        handled.push(h.handle(ev).await);
+    }
+    h.drain().await;
+    let stored = h.count();
+    let fetched = fetches(&h);
+    let starts = h.starts();
+    let notices = notices(&h, N_NEW_SESSION_FILES);
+    h.close().await;
+
+    assert_eq!(
+        handled,
+        [
+            Handled::Notice(N_NEW_SESSION_FILES),
+            Handled::Notice(N_NEW_SESSION_FILES),
+        ]
+    );
+    assert_eq!(stored, 0, "nothing stored");
+    assert!(fetched.is_empty(), "no file fetched");
+    assert_eq!(starts, 0, "the lead never started");
+    assert_eq!(notices, 2);
+}
+
+#[tokio::test]
+async fn another_owner_message_closes_the_new_session_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    start_running_lane(&h);
+    queued(h.handle(session_msg("7471", "new session")).await);
+    h.drain().await;
+    queued(h.handle(session_msg("7472", "something else")).await);
+    h.drain().await;
+    queued(h.handle(session_msg("7473", "new session confirm")).await);
+    h.drain().await;
+    let texts: Vec<String> = h.sends().into_iter().map(|(_, text)| text).collect();
+    let backups = session_backups(&h);
+    h.close().await;
+
+    let question = new_session::confirm_text(Lang::English, 1);
+    assert_eq!(
+        texts,
+        [
+            question.clone(),
+            "echo: something else".to_owned(),
+            question
+        ]
+    );
+    assert!(backups.is_empty(), "a stale confirmation changed nothing");
 }
