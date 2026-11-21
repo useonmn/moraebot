@@ -82,10 +82,26 @@ pub struct OverlayCheck {
 }
 
 /// Asks `omp` whether it knows every [`OVERLAY_KEYS`] setting (`omp config get <key> --json`)
-/// and which version it is (`omp --version`). No model is called.
-pub fn check(omp: &Path) -> Result<OverlayCheck, ConfigError> {
+/// and which version it is (`omp --version`). No model is called. omp runs in `home`, the
+/// service's working folder, so `run` and `check-config` get the same answer: omp loads the
+/// project settings of its working folder, and one it cannot load fails every `config get`.
+pub fn check(omp: &Path, home: &Path) -> Result<OverlayCheck, ConfigError> {
     for key in OVERLAY_KEYS {
-        let output = run(omp, &["config", "get", key, "--json"])?;
+        let output = run(omp, home, &["config", "get", key, "--json"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() && !stderr.contains(&format!("Unknown setting: {key}")) {
+            // omp failed for another reason (e.g. a settings file it cannot load); that says
+            // nothing about the key, so report omp's own error instead.
+            return Err(ConfigError::new(
+                E_OMP_OVERLAY,
+                format!(
+                    "`{} config get {key}` failed in {}: {}",
+                    omp.display(),
+                    home.display(),
+                    error_line(&stderr)
+                ),
+            ));
+        }
         let known = output.status.success()
             && serde_json::from_slice::<serde_json::Value>(&output.stdout)
                 .is_ok_and(|v| v["key"] == key);
@@ -99,7 +115,7 @@ pub fn check(omp: &Path) -> Result<OverlayCheck, ConfigError> {
             ));
         }
     }
-    let output = run(omp, &["--version"])?;
+    let output = run(omp, home, &["--version"])?;
     let version = parse_version(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         ConfigError::new(
             E_OMP_OVERLAY,
@@ -114,18 +130,35 @@ pub fn check(omp: &Path) -> Result<OverlayCheck, ConfigError> {
     Ok(OverlayCheck { version, warning })
 }
 
-/// Runs `omp args` with the same filtered environment as every omp child, so the check never
-/// passes a messenger token or the jev key.
-fn run(omp: &Path, args: &[&str]) -> Result<std::process::Output, ConfigError> {
+/// The line of omp's stderr that names the error: the first `error:` line (omp prints a
+/// source excerpt before it), else the last non-empty line.
+fn error_line(stderr: &str) -> &str {
+    let mut lines = stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines
+        .clone()
+        .find(|l| l.to_ascii_lowercase().starts_with("error:"))
+        .or_else(|| lines.next_back())
+        .unwrap_or("no error output")
+}
+
+/// Runs `omp args` in `dir` with the same filtered environment as every omp child, so the
+/// check never passes a messenger token or the jev key.
+fn run(omp: &Path, dir: &Path, args: &[&str]) -> Result<std::process::Output, ConfigError> {
     Command::new(omp)
         .args(args)
+        .current_dir(dir)
         .env_clear()
         .envs(crate::omp::check_env(&[]))
         .output()
         .map_err(|e| {
             ConfigError::io(
                 E_OMP_OVERLAY,
-                &format!("cannot run {} {}", omp.display(), args.join(" ")),
+                &format!(
+                    "cannot run {} {} in {}",
+                    omp.display(),
+                    args.join(" "),
+                    dir.display()
+                ),
                 &e,
             )
         })
@@ -215,7 +248,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let omp = fake_omp(dir.path(), CHECKED_OMP_VERSION, "");
         assert_eq!(
-            check(&omp).expect("passes"),
+            check(&omp, dir.path()).expect("passes"),
             OverlayCheck {
                 version: CHECKED_OMP_VERSION.to_owned(),
                 warning: None,
@@ -227,7 +260,7 @@ mod tests {
     fn other_version_passes_with_warning() {
         let dir = tempfile::tempdir().expect("tempdir");
         let omp = fake_omp(dir.path(), "19.0.1", "");
-        let found = check(&omp).expect("passes");
+        let found = check(&omp, dir.path()).expect("passes");
         assert_eq!(found.version, "19.0.1");
         assert!(found.warning.is_some_and(|w| w.starts_with(W_OMP_VERSION)));
     }
@@ -237,12 +270,55 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         for key in OVERLAY_KEYS {
             let omp = fake_omp(dir.path(), CHECKED_OMP_VERSION, key);
-            assert_eq!(
-                check(&omp).expect_err("refused").code,
-                E_OMP_OVERLAY,
-                "{key}"
+            let err = check(&omp, dir.path()).expect_err("refused");
+            assert_eq!(err.code, E_OMP_OVERLAY, "{key}");
+            assert!(
+                err.to_string().contains("does not know the setting"),
+                "{err}"
             );
         }
+    }
+
+    #[test]
+    fn check_runs_in_home_and_tells_a_failed_load_from_an_unknown_key() {
+        // Like omp, the stand-in loads `<cwd>/.omp/config.yml` before it answers and fails
+        // every `config get` when that file is broken. It also fails anywhere but `home`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".omp")).expect("home");
+        let path = dir.path().join("omp");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$(pwd -P)\" != '{home}' ]; then echo \"error: wrong cwd $(pwd)\" >&2; exit 1; fi\n\
+             if [ -f .omp/config.yml ]; then\n\
+               echo '2755 | throw new Error(' >&2\n\
+               echo 'error: Settings config is invalid: .omp/config.yml' >&2\n\
+               echo '  at #load (settings.ts:2318:25)' >&2\n\
+               exit 1\n\
+             fi\n\
+             if [ \"$1\" = --version ]; then echo 'omp/{CHECKED_OMP_VERSION}'; exit 0; fi\n\
+             printf '{{\"key\": \"%s\", \"value\": null}}\\n' \"$3\"\n",
+            home = home.canonicalize().expect("canonical home").display()
+        );
+        std::fs::write(&path, script).expect("write fake omp");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert!(
+            check(&path, &home)
+                .expect("passes in home")
+                .warning
+                .is_none()
+        );
+
+        std::fs::write(home.join(".omp/config.yml"), "memory: [oops\n").expect("broken");
+        let err = check(&path, &home).expect_err("refused");
+        assert_eq!(err.code, E_OMP_OVERLAY);
+        let text = err.to_string();
+        assert!(!text.contains("does not know the setting"), "{text}");
+        assert!(
+            text.contains("error: Settings config is invalid: .omp/config.yml"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -257,13 +333,16 @@ mod tests {
         );
         std::fs::write(&path, script).expect("write fake omp");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(check(&path).expect_err("refused").code, E_OMP_OVERLAY);
+        assert_eq!(
+            check(&path, dir.path()).expect_err("refused").code,
+            E_OMP_OVERLAY
+        );
     }
 
     #[test]
     fn missing_omp_refuses_start() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = check(&dir.path().join("no-omp")).expect_err("refused");
+        let err = check(&dir.path().join("no-omp"), dir.path()).expect_err("refused");
         assert_eq!(err.code, E_OMP_OVERLAY);
     }
 

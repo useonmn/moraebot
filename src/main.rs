@@ -228,7 +228,7 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
         report_bridge(&bridge.socket, &mut stdout)?;
     }
     // The same start check `run` makes, so a dry check catches it before a restart.
-    let overlay_ok = match omp_overlay::check(&config.omp_path) {
+    let overlay_ok = match omp_overlay::check(&config.omp_path, &config.home) {
         Ok(found) => {
             match found.warning {
                 Some(warning) => writeln!(stdout, "WARN omp overlay: {warning}")?,
@@ -404,7 +404,7 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     config.validate()?;
     memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home, logging::CORE_LOG_PREFIX)?;
-    let overlay = omp_overlay::check(&config.omp_path)?;
+    let overlay = omp_overlay::check(&config.omp_path, &config.home)?;
     match &overlay.warning {
         Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),
         None => tracing::info!(omp = %overlay.version, "omp memory overlay checked"),

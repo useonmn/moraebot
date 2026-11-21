@@ -90,10 +90,10 @@ The lead and every lane run omp with `--config ~/.moraebot/omp-overlay.yml`, whi
 
 moraebot can't read the settings omp finally uses, so at start `moraebot run` asks omp two things without calling a model:
 
-- `omp config get <key> --json` for both keys. If omp doesn't know one (a newer omp renamed it), the overlay would be silently ignored, so moraebot refuses to start with `E_OMP_OVERLAY`. Update moraebot.
+- `omp config get <key> --json` for both keys. If omp doesn't know one (it answers `Unknown setting`; a newer omp renamed it), the overlay would be silently ignored, so moraebot refuses to start with `E_OMP_OVERLAY`. Update moraebot. If omp fails for another reason, for example a settings file it can't load, `E_OMP_OVERLAY` shows omp's own error line instead.
 - `omp --version`. If it isn't the version the overlay was checked against (18.22.2), the log gets a `W_OMP_VERSION` warning and moraebot starts anyway. That version was also checked to read a one-line `--append-system-prompt` value as a file, once, at start, which is what keeps memory out of argv; an omp upgrade needs both facts checked again. moraebot tells you once per omp version, in your DM (or the configured channel when the DM can't be opened): "The installed omp is not the version moraebot's memory settings were checked against. Run `moraebot check-config` for the details." A `W_OMP_VERSION` row in the memory log remembers that you were told; rows are kept 30 days, so a lasting mismatch is mentioned at most about once a month.
 
-`moraebot check-config` asks the same two things and prints `OK`, `WARN` or `FAIL omp overlay`, so you can check an omp upgrade before you restart the service.
+`moraebot check-config` asks the same two things and prints `OK`, `WARN` or `FAIL omp overlay`, so you can check an omp upgrade before you restart the service. Both run omp in the moraebot home folder (the service's working folder), not in your shell's current folder, so omp reads the same project settings either way.
 
 ## The observer
 
