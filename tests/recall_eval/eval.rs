@@ -72,13 +72,70 @@ fn owner_prov() -> String {
     "owner".to_owned()
 }
 
-/// One owner message and the entry keys that should be recalled for it.
+/// One owner message and the entry keys that should be recalled for it. A mid turn
+/// (`phase: "mid"`) is a wake while the lead works on that message, after its tool `events`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Turn {
     pub message: String,
     #[serde(default)]
     pub gold: Vec<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub events: Vec<ToolCall>,
+}
+
+impl Turn {
+    pub fn mid(&self) -> bool {
+        match self.phase.as_deref() {
+            None => false,
+            Some("mid") => {
+                assert!(!self.events.is_empty(), "a mid turn needs tool events");
+                true
+            }
+            Some(other) => panic!("unknown phase {other}"),
+        }
+    }
+}
+
+/// One lead tool call of a mid turn: it started with `args` and, with a `result`, ended.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCall {
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub error: bool,
+}
+
+/// A mid turn's tool event lines, rendered by the production functions the lead's event drain
+/// uses ([`recall::event_start_line`], [`recall::event_end_line`]).
+pub fn event_lines(turn: &Turn, redactor: &Redactor, filter: &ExcerptFilter) -> Vec<String> {
+    if !turn.mid() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for call in &turn.events {
+        let args = (!call.args.is_null()).then_some(&call.args);
+        lines.push(recall::event_start_line(&call.tool, args, redactor));
+        if let Some(result) = &call.result {
+            let source = moraebot::memory_tools::tool_source(&call.tool, args);
+            let result = serde_json::Value::from(result.as_str());
+            lines.push(recall::event_end_line(
+                &call.tool,
+                source,
+                Some(&result),
+                call.error,
+                redactor,
+                filter,
+            ));
+        }
+    }
+    lines
 }
 
 pub fn cases() -> Vec<Case> {
@@ -249,6 +306,8 @@ pub struct Wake {
     pub message: String,
     /// The production advisor message ([`recall::message`]).
     pub text: String,
+    /// A mid turn's tool event lines; empty for a wake before the turn.
+    pub events: Vec<String>,
     /// The candidates the message holds, best first.
     pub candidates: Vec<Candidate>,
     /// The gold ids not picked in an earlier turn (only fakes look at them).
@@ -425,6 +484,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
             }
             Method::Advisor(advisor) => {
                 given.extend(buckets.iter().map(Bucket::label));
+                let events = event_lines(turn, &redactor, &filter);
                 let lead_wake = recall::Wake {
                     conversation: case.conversation.clone(),
                     row_id: n as i64 + 1,
@@ -432,6 +492,8 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                     generation: 1,
                     epoch: 0,
                     given: given.clone(),
+                    events: events.clone(),
+                    exclude: HashSet::new(),
                 };
                 let seen = ledger
                     .recall_seen(
@@ -445,7 +507,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                 let skip = |item: &PoolEntry| recall::hidden(item, &lead_wake.given, &seen);
                 let (mut candidates, lines): (Vec<Candidate>, Vec<String>) = recall::rank(
                     memory::recall_pool(&seeded.root, today),
-                    &turn.message,
+                    &recall::rank_text(&turn.message, &events),
                     &mentioned,
                     today,
                     recall_config.max_candidates,
@@ -457,6 +519,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                 let (text, held) = recall::message(
                     &case.conversation,
                     &turn.message,
+                    &events,
                     &lines,
                     recall_config.max_items,
                     recall_config.max_input_bytes,
@@ -481,6 +544,7 @@ pub async fn run_case(case: &Case, seeded: &Seeded, method: &Method<'_>) -> Vec<
                         case: case.id.clone(),
                         message: turn.message.clone(),
                         text,
+                        events,
                         candidates,
                         gold: gold.clone(),
                         case_gold: case_gold.clone(),

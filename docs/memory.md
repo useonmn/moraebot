@@ -168,6 +168,28 @@ The owner's rules here are standing instructions to follow. A remembered approva
 
 On mode adds up to `wait_ms` to each of your turns and sends the advisor's model one call per message. **Turning it on by default is gated** on a live eval rerun with the production advisor model, Haiku (`MORAEBOT_RECALL_EVAL_MODEL`, see [Recall advisor eval](recall-eval.md)); the run so far used another small model. Until then it stays an explicit setting.
 
+#### Mid-task recall
+
+While the lead works on one of your messages, the advisor can also wake on the lead's tool calls (`memory.recall.mid_task`). This is **off unless you set it**: no install starts these extra calls, or sends tool text to the advisor's model, without a config edit. Each call the lead starts and each one that ends becomes one short line: the tool's name with its arguments (at most 400 characters), or the head of its result (at most 600) and whether it failed. The lines are redacted like every memory text (your configured secrets and the known secret shapes), put on one line and escaped. Only the head of a large result or argument list is read, at most eight times the line's limit, so a huge tool output never slows the turn. A result from outside the work folder (the web, a shell, a subagent, GitHub, an MCP tool) that claims your approval or speaks to the advisor is replaced by `(left out)` before the advisor sees it. The lines live only in the running turn; they never go into a trace, a log or memory.
+
+When a call ends, the advisor wakes again with your message, the newest lines (in at most a quarter of `max_input_bytes`) and the same kind of candidate list, ranked against your message and the lines together. Its prompt tells it to pick only what would change the lead's very next step: a note that explains the error it just hit, a command that failed before, a constraint the step is about to break. A mid wake runs only when all of these hold:
+
+- the turn is for a message of yours (never a lane result, a steer or a chat sender's message);
+- the turn had fewer than `mid_max_wakes_per_turn` mid wakes (2 by default); a wake that was then skipped (another call running, or the hourly cap) still counts against this limit;
+- at least `mid_min_interval_seconds` (60 by default) passed since the turn started or since its last mid wake;
+- `max_calls_per_hour` admits it: mid wakes count against the same hourly cap as the wakes for your messages;
+- no advisor call runs right now. A mid call has its own slot: one still running when the turn ends never makes the wake for your next message wait or skip; it finishes on its own and its picks are dropped with the turn.
+
+An entry is never offered twice in one lead context: the ledger hides what was picked or delivered before, and the turn also remembers what its input and its earlier mid wakes already gave it.
+
+- **Shadow** (`mid_task = "shadow"`): the picks are only logged, as `I_RECALL_PICK` rows ending in `phase=mid`. The lead never sees anything.
+- **On** (`mid_task = "on"`, accepted only together with `mode = "on"`): the picks are sent into the running turn as a note of moraebot's own: a steer whose first line is `[moraebot memory recalled]`, followed by the same recalled block as above (guard line, every line labelled reference only, at most 1500 bytes, the injection guard first). A note has no inbox row and gets no reply of its own; it never takes the place of a message of yours, so your next message in the conversation is still folded into the turn as before. The lead's guidance says such a note is reference only and is never answered on its own. The picks are recorded as delivered (`I_RECALL_DELIVERED ... phase=mid`) once the lead took the note. If the turn ended before the advisor answered, the note is not sent: the picks are dropped (`I_RECALL_DROPPED`) and can be offered again later. A note never outlives its turn, a shutdown or a lead restart.
+- **Off** (`mid_task = "off"`, the default): no wake on tool calls.
+
+A mid wake writes no row of its own to `recall_ledger`, in either mode: it judged entries against tool calls your next message's wake never sees, so nothing it picked or rejected hides an entry from that wake. Only a delivered note leaves `delivered` rows. Within the turn its picks are not offered again.
+
+A failing, slow or skipped mid wake changes nothing in the turn. A note that omp receives just as the turn ends may start one more short run of the lead; its text is not posted.
+
 #### Which mode runs
 
 Left unset, the mode is `shadow` when jev is on (`memory.jev.enabled = true`) **and** `memory.recall.model` names a model, and `off` otherwise: a default install, or an upgraded one with jev on but no model, starts no advisor child and never one on the lead's model unasked. To turn it on, set `memory.recall.model` to a small fast model of your omp providers; with jev on and no model, `moraebot check-config` prints one line saying so. `memory.recall.mode = "shadow"` turns it on without a model too, and then it runs on omp's default model (usually the lead's, the expensive one), which `check-config` warns about. `"off"` turns it off whatever else is set. `"on"` is only ever set by you; without a model it runs on omp's default model before every turn, which `check-config` warns about.
@@ -185,7 +207,7 @@ When jev is on, moraebot sends TypeSafe's System One API (`https://api.typesafe.
 
 It never sends the lead's reply, a tool's output, row ids, conversation keys or user ids. TypeSafe documents that requests are not used for training; retention follows its Data Processing Agreement.
 
-The summarizer runs on this machine through omp, with omp's default model and provider: the same ones the lead uses, which have already seen your messages and the lanes' and subagents' reports during the turn. Each summarizer call sends the provider the redacted sentences one job picked and the fixed summarizer prompt. Self consolidation and the recall advisor run the same way on `memory.recall.model`; an advisor call sends the provider your redacted message, the redacted candidate entries and its fixed prompt.
+The summarizer runs on this machine through omp, with omp's default model and provider: the same ones the lead uses, which have already seen your messages and the lanes' and subagents' reports during the turn. Each summarizer call sends the provider the redacted sentences one job picked and the fixed summarizer prompt. Self consolidation and the recall advisor run the same way on `memory.recall.model`; an advisor call sends the provider your redacted message, the redacted candidate entries and its fixed prompt, and a mid wake also the redacted tool event lines described in [Mid-task recall](#mid-task-recall).
 
 ### Turning it on and off
 
@@ -229,6 +251,9 @@ Every key is optional.
 | `memory.recall.max_calls_per_hour` | 30 | Advisor calls allowed in any hour; a wake over it is skipped. |
 | `memory.recall.max_input_bytes` | 16384 | The largest advisor message; candidates that don't fit are left out. |
 | `memory.recall.timeout_seconds` | 60 | Limit of one advisor call. |
+| `memory.recall.mid_task` | `off` | What the advisor does while the lead works on your message ([Mid-task recall](#mid-task-recall)): `"shadow"` logs the picks of wakes on tool calls, `"on"` steers them into the turn (only with `mode = "on"`), `"off"` never wakes on tool calls. |
+| `memory.recall.mid_max_wakes_per_turn` | 2 | The most wakes on tool calls in one lead turn (at least 1). |
+| `memory.recall.mid_min_interval_seconds` | 60 | The least time from a turn's start or its last wake on a tool call to the next one; 0 allows one after every finished call, within the per-turn cap. |
 | `memory.recall.wait_ms` | 2500 | On mode: how long a turn of yours waits for the advisor before it starts without the picks (0 to 10000; 0 never waits, so every pick goes with your next message). |
 | `memory.self.correction_patterns` | built in (`몇 번 말해`, `몇 번을 말해`, `몇 번째 말하`, `왜 또`, `또 그러`, `그러지 마`, `하지 말라고 했`, `I told you`, `why did you … again`, `stop doing`, `don't do that again`) | Phrases that make your sentence a correction of moraebot: words in order, the last one as a word start, `…` for any words between, case ignored. The list replaces the built-in one. |
 
@@ -264,8 +289,9 @@ The `memory_log` table of `inbox.sqlite` keeps one row per settled job and per p
 | `M_SELF_CONSOLIDATED` | Self consolidation ran for a day (`detail` is `day=<date>`); it runs again the next day. |
 | `E_SELF_CONSOLIDATE` | The consolidation call could not run (`detail` `run`) or its answer did not parse (`answer`); the observations wait for the next day. |
 | `W_SELF_GROUP_DROPPED` | A group of the consolidation answer was not saved; `detail` is `reason=below_bar`, `unoffered`, `unknown_reading`, `source` or a summary check's reason. |
-| `I_RECALL_PICK` | The recall advisor answered: `detail` is `gen=<lead generation> epoch=<compactions> row=<inbox row> offered=<n> picks=<id>:<score>,... rejected=<n> unoffered=<n> blocked=<n>` (`blocked` counts unverified picks that claimed approval or spoke to the advisor), with ` mode=on` at the end in on mode. |
-| `I_RECALL_DELIVERED` | On mode: recalled entries went into the lead's input: `detail` is `gen=<lead generation> epoch=<compactions> row=<inbox row> ids=<id>,...`. A late pick names the row of the message it went with. |
+| `I_RECALL_PICK` | The recall advisor answered: `detail` is `gen=<lead generation> epoch=<compactions> row=<inbox row> offered=<n> picks=<id>:<score>,... rejected=<n> unoffered=<n> blocked=<n>` (`blocked` counts unverified picks that claimed approval or spoke to the advisor), then ` phase=mid` for a wake on the lead's tool calls, and ` mode=on` at the end in on mode. |
+| `I_RECALL_DELIVERED` | On mode: recalled entries went into the lead's input: `detail` is `gen=<lead generation> epoch=<compactions> row=<inbox row> ids=<id>,...`. A late pick names the row of the message it went with; a mid-task note names the turn's row and ends in ` phase=mid`. |
+| `I_RECALL_DROPPED` | Mid-task on mode: the lead turn ended before its recalled note could be sent: `detail` is `gen=<lead generation> epoch=<compactions> row=<inbox row> ids=<id>,... phase=mid`. Nothing was delivered. |
 | `E_RECALL_SPAWN` | The advisor child could not run (spawn, tools listed, provider error); `detail` names the lead context and row. |
 | `E_RECALL_TIMEOUT` | The advisor call took longer than `memory.recall.timeout_seconds`. |
 | `E_RECALL_OUTPUT` | The advisor's answer held no JSON object. |

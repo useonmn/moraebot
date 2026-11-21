@@ -362,6 +362,13 @@ lead의 답은 그 입력의 줄(row)에 저장하고 `reply_target(conversation
 - 턴이 받지 못한 글(게이트가 열리기 전에 턴이 끝났거나, 턴이 끝난 뒤 결과 저장 전에 도착한 글)은 job 항목을 지운 직후 도착 순서대로 이어 붙여 lane의 다음 프롬프트로 돌립니다. 일하지 않는 lane에 `lane_message`를 보낸 것과 같습니다. lead가 끊은 job이나 종료로 끊긴 job이면 돌리지 않고 개수와 길이만 로그에 남깁니다.
 - steer 글에는 lane의 꼬리말(`lane_done` 안내, `lane_report` 안내, git 안내)을 붙이지 않습니다. 그건 주 프롬프트에만 들어갑니다.
 
+**moraebot 노트(rowless steer).** moraebot이 스스로 lead의 진행 중인 턴에 글을 넣을 때는 `LeadNotes`(`OmpManager::notes()`)를 씁니다. 지금은 recall advisor의 mid-task 선택(`memory.recall.mid_task = "on"`)만 씁니다.
+
+- 노트는 `prompt{streamingBehavior:"steer"}` 하나이고 첫 줄이 `NoteKind`의 태그 줄입니다(지금은 `[moraebot memory recalled]`). `conversation=`이 없으므로 `lead::parse_tag`는 주인 입력이나 lane 결과로 읽지 않습니다.
+- inbox 줄이 없고 따로 답을 받지 않습니다. 주인 steer 자리(`OpenTurn::steer`)를 쓰지 않으므로 같은 대화의 다음 주인 메시지는 그대로 끼워 넣어집니다.
+- 노트는 `TurnId`로 그 턴에만 들어가고, 그 턴의 첫 `agent_start` 뒤에만 나갑니다(`opens_steer_gate`, lane steer와 같은 신호). 턴이 이미 끝났거나 아직 시작하지 않았으면 보내지 않고, 부른 쪽이 버립니다.
+- `prompt`는 주 프롬프트와 주인 steer 다음에 노트의 결과를 같은 턴 제한 안에서 기다리고 답 글은 버립니다. 노트는 열린 턴에만 있으므로 턴 종료, 셧다운, lead 재시작을 넘어 남지 않습니다.
+
 다른 대화의 메시지와 lane 결과는 끼워 넣지 않고 다음 턴을 기다립니다. 워커와 steer 경로는 모두 `claim`/`steer_into`로 줄을 차지하므로 한 줄은 한 경로에서만 돕니다. 묶음의 답은 하나로 합쳐 주 메시지 줄에 저장하고(`finish_group`, 끼워 넣은 줄은 `done`), 한 번 보냅니다. 묶음 중 하나라도 실패하거나 끊기면 묶음 전체가 `failed`(`fail_group`) 또는 `needs_check`(`interrupt_group`)가 됩니다.
 
 **재시작 규칙.** 무엇도 두 번 돌리지 않습니다.

@@ -559,10 +559,7 @@ impl LaneManager {
         }
         // A steer may only join a run that is already streaming, so the gate opens on the
         // turn's first `agent_start`, exactly as the lead's steer gate does.
-        if matches!(
-            event,
-            Event::Notification(RpcNotification::RpcAgentEvent(RpcAgentEvent::AgentStart(_)))
-        ) {
+        if omp::opens_steer_gate(event) {
             lock(gate).started = true;
         }
     }
