@@ -3,7 +3,16 @@
 //! The lead calls `lane_start`, `lane_message` and `lane_status` (registered on the lead
 //! child next to `send_file`). A lane is its own omp RPC child whose appended system prompt
 //! is only its memory block, passed as a private file (`omp::write_append_file`); it runs one
-//! prompt on a worker thread and closes. A lane with a done line gets
+//! prompt on a worker thread and closes.
+//!
+//! `lane_message` on a running lane steers instead of waiting: the text goes into the job's
+//! steer inbox, and the job's own thread forwards it as `prompt{streamingBehavior:"steer"}`
+//! into the turn already in progress, the way the lead's own steer works. omp answers a steer
+//! inside the main prompt's run, so the lane still writes one result row and `prompts` does
+//! not grow; the main prompt's result is always taken before another steer goes out. The
+//! inbox is dropped when the job's result is written, so a `lane_message` in that last window
+//! is refused with `E_LANE_BUSY` like before. A steer carries the bare text, without the
+//! lane's footers (`lane_done`, `lane_report`, git). A lane with a done line gets
 //! exactly one host tool, `lane_done`: the lane claims its work is done, moraebot runs
 //! the Done checks inside that call and refuses a claim that fails them. Its result is
 //! stored as one queued inbox row (`platform = LANE_PLATFORM`) in the same transaction as
@@ -56,7 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -121,6 +130,10 @@ pub const E_LANE_IDLE: &str = "E_LANE_IDLE";
 /// `lane_status` cuts each task to this many characters.
 const STATUS_TASK_CHARS: usize = 200;
 
+/// How often a running lane job looks for a text `lane_message` steered into its live turn.
+/// Short enough that a steer joins the turn promptly, long enough not to spin.
+const STEER_POLL: Duration = Duration::from_millis(200);
+
 /// A lane progress note is cut to this many characters.
 pub const REPORT_CHARS: usize = 200;
 
@@ -155,6 +168,18 @@ struct LaneChild {
     activity: Arc<Mutex<Activity>>,
     /// Set once by `stop`: the cleaned reason. A stopped job starts no child or check.
     stop: Option<String>,
+    /// Taken by the steer drain when the job's main prompt returned: from then on the lane
+    /// refuses a steer and a `lane_message` waits for the result like before.
+    steer: Option<SteerSender>,
+}
+
+/// The running job's steer inbox: `lane_message` sends here while the lane is running, and
+/// the job's own thread forwards each text into the live omp turn as a steer.
+type SteerSender = mpsc::Sender<SteerText>;
+
+/// One mid-run text handed to the running job.
+struct SteerText {
+    text: String,
 }
 
 /// What a running job's omp agent events showed. The event callback only counts;
@@ -730,8 +755,10 @@ impl LaneManager {
             .load_mode(ToolLoadMode::Essential),
             HostTool::new(
                 LANE_MESSAGE_TOOL,
-                "Send more work to a lane whose result already arrived. A running lane \
-                 refuses. The result comes back to you later as a new message.",
+                "Send more work to a lane. A running lane takes the text as a steer: omp folds it \
+                 into the turn already in progress and the lane answers it in that same result. An \
+                 idle, failed or stopped lane starts a new prompt instead. Either way the answer \
+                 comes back to you later as a new message.",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -913,6 +940,35 @@ impl LaneManager {
         if set.stopping {
             return Err(refused(E_LANE_STOPPING, "the gateway is stopping"));
         }
+        // A running lane takes the text as a steer into its live turn, in the same order the
+        // lead's own steer uses. Only a lane whose steer inbox is gone (its main prompt
+        // already returned, its result not yet written) falls through to the busy refusal.
+        let steerable = set
+            .children
+            .get(&id)
+            .is_some_and(|child| child.stop.is_none() && child.steer.is_some());
+        if steerable {
+            let Some(child) = set.children.get_mut(&id) else {
+                unreachable!("checked above");
+            };
+            let Some(sender) = child.steer.as_ref() else {
+                unreachable!("checked above");
+            };
+            match sender.send(SteerText {
+                text: text.to_owned(),
+            }) {
+                Ok(()) => {
+                    tracing::info!(lane = id, "steered into the running lane");
+                    return Ok(json!({ "lane_id": id, "accepted": true, "steered": true })
+                        .to_string()
+                        .into());
+                }
+                // The receiver went away between the check and the send: the prompt ended.
+                Err(_) => {
+                    child.steer = None;
+                }
+            }
+        }
         let job = {
             let mut store = lock(&self.store);
             let store_err = |e: crate::store::StoreError| refused(e.code(), &e.to_string());
@@ -1012,9 +1068,12 @@ impl LaneManager {
         let manager = Arc::clone(self);
         let activity = Arc::new(Mutex::new(Activity::default()));
         let worker_activity = Arc::clone(&activity);
+        // `lane_message` sends a mid-run text here; the worker drains it while its main
+        // prompt runs. Dropped with the sender once the worker's result is written.
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerText>();
         match std::thread::Builder::new()
             .name(format!("omp-lane-{id}"))
-            .spawn(move || manager.run_worker(job, worker_activity))
+            .spawn(move || manager.run_worker(job, worker_activity, steer_rx))
         {
             Ok(worker) => {
                 set.children.insert(
@@ -1026,6 +1085,7 @@ impl LaneManager {
                         conversation_key: key.clone(),
                         activity,
                         stop: None,
+                        steer: Some(steer_tx),
                     },
                 );
                 tracing::info!(lane = id, seq, "lane started");
@@ -1045,9 +1105,14 @@ impl LaneManager {
 
     /// One lane prompt: open the child, send the prompt, map the result, close the
     /// child; then the final section under `inner`.
-    fn run_worker(self: Arc<Self>, job: Job, activity: Arc<Mutex<Activity>>) {
+    fn run_worker(
+        self: Arc<Self>,
+        job: Job,
+        activity: Arc<Mutex<Activity>>,
+        steer_rx: mpsc::Receiver<SteerText>,
+    ) {
         let mut pid = None;
-        let outcome = self.run_prompt(&job, &mut pid, &activity);
+        let outcome = self.run_prompt(&job, &mut pid, &activity, steer_rx);
         let written = {
             let mut set = lock(&self.inner);
             let written = self.write_result(&set, job.id, job.seq, &job.conversation_key, outcome);
@@ -1520,6 +1585,7 @@ impl LaneManager {
         job: &Job,
         pid: &mut Option<u32>,
         activity: &Arc<Mutex<Activity>>,
+        steer_rx: mpsc::Receiver<SteerText>,
     ) -> Result<LaneOutcome, Outcome> {
         let cwd = self.job_cwd(job)?;
         let name = format!("lane-{}", job.id);
@@ -1619,7 +1685,26 @@ impl LaneManager {
             images: None,
             streaming_behavior: None,
         };
-        let outcome = omp::map_result(client.prompt_and_wait(&prompt, self.turn_timeout));
+        // The main prompt runs on its own thread so a steer can join the turn already in
+        // progress, exactly as `serve_lead` does for the lead's turn: concurrent waits on one
+        // client are allowed, and a steer prompt is answered inside the main prompt's result.
+        let client = Arc::new(client);
+        let main_client = Arc::clone(&client);
+        let turn_timeout = self.turn_timeout;
+        let (main_tx, main_rx) = mpsc::channel();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("omp-lane-main-{}", job.id))
+            .spawn(move || {
+                let _ = main_tx.send(main_client.prompt_and_wait(&prompt, turn_timeout));
+            })
+        {
+            return Err(Outcome::Failed {
+                code: E_OMP_SPAWN,
+                detail: e.to_string(),
+            });
+        }
+        let turn = self.drain_steers(&client, steer_rx, &main_rx, turn_timeout, job.id);
+        let outcome = omp::map_result(turn);
         let replied = match (&outcome, &job.done) {
             (Outcome::Reply(text), Some(_)) => Some(text.clone()),
             (Outcome::NoAgent, Some(_)) => Some(EMPTY_REPLY.to_owned()),
@@ -1643,8 +1728,77 @@ impl LaneManager {
                 }),
             },
         };
-        omp::close(&name, client);
+        match Arc::try_unwrap(client) {
+            Ok(client) => omp::close(&name, client),
+            // Nothing else holds it: the steer threads returned before the main prompt did.
+            Err(_) => tracing::warn!(lane = job.id, "lane client still shared at close"),
+        }
         Ok(outcome)
+    }
+
+    /// Waits for the main prompt, forwarding every text `lane_message` sent meanwhile into the
+    /// live turn as an omp steer. Returns the main prompt's result: a steer never replaces it,
+    /// because omp answers a steer inside the main prompt's own run.
+    ///
+    /// Each round drains the inbox first and only then waits a short slice on the main result,
+    /// so a text that arrived before the turn ended still reaches it. A text that lands in the
+    /// last window (the turn ended, the result not yet read) cannot join a finished run: omp
+    /// refuses a steer with no live client run, so it is dropped and logged at `warn` with the
+    /// lane id and the text length. It is never claimed as delivered.
+    fn drain_steers(
+        &self,
+        client: &Arc<omp_rpc::Client>,
+        steer_rx: mpsc::Receiver<SteerText>,
+        main_rx: &mpsc::Receiver<Result<omp_rpc::PromptTurn, omp_rpc::Error>>,
+        turn_timeout: Duration,
+        id: i64,
+    ) -> Result<omp_rpc::PromptTurn, omp_rpc::Error> {
+        loop {
+            let mut lost = 0usize;
+            for SteerText { text } in steer_rx.try_iter() {
+                let steer = PromptCommand {
+                    message: text,
+                    images: None,
+                    streaming_behavior: Some(omp_rpc::StreamingBehavior::Steer),
+                };
+                // A steer's answer arrives inside the main prompt's result, so this wait is
+                // discarded; a failure only means the text did not join the turn.
+                let steer_client = Arc::clone(client);
+                if let Err(e) = std::thread::Builder::new()
+                    .name(format!("omp-lane-steer-{id}"))
+                    .spawn(move || {
+                        let _ = steer_client.prompt_and_wait(&steer, turn_timeout);
+                    })
+                {
+                    tracing::warn!(lane = id, error = %e, "could not start a lane steer");
+                    lost += 1;
+                }
+            }
+            if lost > 0 {
+                tracing::warn!(lane = id, lost, "lane steers could not be started");
+            }
+            match main_rx.recv_timeout(STEER_POLL) {
+                Ok(turn) => {
+                    // One last look: anything here arrived after the turn ended and cannot
+                    // join it. Say so instead of pretending it was delivered.
+                    let late: Vec<SteerText> = steer_rx.try_iter().collect();
+                    if !late.is_empty() {
+                        let chars: usize = late.iter().map(|s| s.text.chars().count()).sum();
+                        tracing::warn!(
+                            lane = id,
+                            count = late.len(),
+                            chars,
+                            "lane_message arrived after the turn ended; it was not steered"
+                        );
+                    }
+                    return turn;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(omp_rpc::Error::Closed);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     /// Stores the lane prompt's result row and the lane's new state, unless the shutdown
@@ -1939,6 +2093,7 @@ mod tests {
         ));
         let activity = Arc::new(Mutex::new(Activity::default()));
         lock(&activity).note(&agent_start());
+        let (steer, _steer_rx) = mpsc::channel();
         lock(&manager.inner).children.insert(
             1,
             LaneChild {
@@ -1948,6 +2103,7 @@ mod tests {
                 conversation_key: "discord:th:111".into(),
                 activity,
                 stop: None,
+                steer: Some(steer),
             },
         );
         let wake = manager.wake();
@@ -2065,6 +2221,7 @@ mod tests {
     /// Registers a dummy running job for lane `id` in conversation `key`; returns its activity.
     fn qa_child(manager: &LaneManager, id: i64, key: &str) -> Arc<Mutex<Activity>> {
         let activity = Arc::new(Mutex::new(Activity::default()));
+        let (steer, _steer_rx) = mpsc::channel();
         lock(&manager.inner).children.insert(
             id,
             LaneChild {
@@ -2074,6 +2231,7 @@ mod tests {
                 conversation_key: key.into(),
                 activity: Arc::clone(&activity),
                 stop: None,
+                steer: Some(steer),
             },
         );
         activity

@@ -428,7 +428,7 @@ async fn fourth_running_lane_is_refused() {
 }
 
 #[tokio::test]
-async fn lane_message_refused_while_running() {
+async fn lane_message_steers_a_running_lane() {
     let h = Harness::new();
     let omp = h.manager(
         "hang",
@@ -441,10 +441,82 @@ async fn lane_message_refused_while_running() {
     let results = h.tool_results();
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(!results[0].0, "{results:?}");
-    assert_refused(&results[1], E_LANE_BUSY);
-    assert_eq!(h.lane(1).prompts, 1);
+    // The lane is still running, so the text was folded into the turn instead of refused.
+    assert!(!results[1].0, "{results:?}");
+    let accepted: Value = serde_json::from_str(&results[1].1).expect("json result");
+    assert_eq!(accepted["steered"], true, "{results:?}");
+    assert_eq!(h.lane(1).prompts, 1, "a steer starts no new prompt");
     bounded(omp.shutdown_all()).await;
     assert!(h.lane_starts().len() <= 1, "no second lane child");
+}
+
+/// The text really crosses into the running turn: the lane child receives its own `prompt`
+/// frame with `streamingBehavior: steer` and the `lane_message` text, and the main prompt's
+/// one result row is unchanged (a steer never opens a second prompt).
+#[tokio::test]
+async fn lane_message_text_reaches_the_lane_child_as_a_steer() {
+    let h = Harness::new();
+    let omp = h.manager(
+        "steer",
+        &[
+            lane_start("t1"),
+            json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+        ],
+    );
+    let wake = omp.lane_wake();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+    bounded(notified).await;
+
+    let start = *h.lane_starts().first().expect("a lane started");
+    let frames: Vec<Value> = h.log_lines()[start..]
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let prompts: Vec<&Value> = frames.iter().filter(|f| f["type"] == "prompt").collect();
+    assert_eq!(prompts.len(), 2, "one main prompt and one steer: {prompts:?}");
+    assert_eq!(prompts[0]["streamingBehavior"], Value::Null, "{prompts:?}");
+    assert!(prompts[0]["message"].as_str().unwrap().contains("t1"));
+    // The steer carries the lane_message text and nothing of the main prompt's footers.
+    let steer_message = prompts[1]["message"].as_str().expect("steer message");
+    assert!(steer_message.contains("t2"), "{steer_message:?}");
+    assert!(
+        !steer_message.contains("[moraebot] At each big step"),
+        "the steer is the bare text, not a second full lane prompt: {steer_message:?}"
+    );
+
+    let lane = h.lane(1);
+    bounded(omp.shutdown_all()).await;
+    assert_eq!(lane.prompts, 1, "the steer was not a new prompt");
+    assert_eq!(h.lane_starts().len(), 1, "no second lane child");
+}
+
+/// A steer for a lane that just finished does not open a second prompt either; it is refused
+/// as busy because the running job's inbox is gone by then.
+#[tokio::test]
+async fn lane_message_after_the_turn_ended_is_not_a_steer() {
+    let h = Harness::new();
+    let omp = h.manager("ok", &[lane_start("t1")]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    // The lane is idle now: the text starts a real second prompt, not a steer.
+    let m2 = h.manager(
+        "ok",
+        &[json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}})],
+    );
+    prompt_until_lane_result(&m2, 2, "run-tools again").await;
+    let results = h.tool_results();
+    let accepted: Value =
+        serde_json::from_str(&results.last().expect("lane_message result").1).expect("json");
+    let lane = h.lane(1);
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    bounded(m2.shutdown_all()).await;
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["steered"], Value::Null, "{accepted:?}");
+    assert_eq!(lane.prompts, 2);
+    assert_eq!(starts.len(), 2);
 }
 
 #[tokio::test]
