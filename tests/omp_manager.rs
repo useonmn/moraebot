@@ -3239,11 +3239,9 @@ async fn shadow_mid_task_logs_its_picks_and_never_steers() {
             "gen=1 epoch=0 row=1 offered=1 picks={x}:2 rejected=0 unoffered=1 blocked=0 phase=mid"
         )
     ));
-    let mut rows = ledger_rows(&h, 1);
-    rows.sort();
-    let mut want = vec![(x, "shadow".to_owned()), (y, "shadow".to_owned())];
-    want.sort();
-    assert_eq!(rows, want);
+    // The turn's own wake wrote its shadow row; the mid wake writes none.
+    assert_eq!(ledger_rows(&h, 1), [(y, "shadow".to_owned())]);
+    assert!(!x.is_empty());
     // Shadow never touches the lead: its input as sent, and the owner's steer only.
     assert_eq!(lead_messages(&h)[0], input);
     assert_eq!(h.steer_frames().len(), 1);
@@ -3513,5 +3511,55 @@ async fn a_mid_wake_still_running_never_makes_the_next_owner_wake_busy() {
     // `a_mid_pick_for_a_turn_that_ended_is_dropped`) and steered nothing.
     wakes_done(&mut progress, 3).await;
     assert_eq!(h.steer_frames().len(), 1, "the owner's steer only");
+    m.shutdown_all().await;
+}
+
+/// dori review of #71: a mid wake writes no ledger row in any mode, so its rejects (judged on
+/// tool events) never hide an entry from a later owner wake.
+#[tokio::test]
+async fn a_mid_wakes_reject_never_hides_the_entry_from_the_next_owner_wake() {
+    let h = Harness::new();
+    let (x, y) = seed_mid(&h);
+    let reply = h.dir.path().join("advisor.reply");
+    std::fs::write(&reply, format!(r#"{{"pick":["{y}"]}}"#)).expect("turn reply");
+    let reply_path = reply.to_string_lossy().into_owned();
+    let advisor = mid_advisor(
+        &h,
+        &[("FAKE_OMP_REPLY_FILE", reply_path.as_str())],
+        true,
+        |_| {},
+    );
+    let mut progress = advisor.progress();
+    let m = mid_lead(&h, "merged", &advisor);
+    let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
+    turn_running(&m, KEY_A).await;
+    wakes_done(&mut progress, 1).await;
+    // The mid wake rejects X.
+    std::fs::write(&reply, format!(r#"{{"pick":[],"reject":["{x}"]}}"#)).expect("mid reply");
+    std::fs::write(events_gate(&h), "").expect("let the tool events come");
+    wakes_done(&mut progress, 2).await;
+    end_with_owner_steer(&m, turn).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        "gen=1 epoch=0 row=1 offered=1 picks= rejected=1 unoffered=0 blocked=0 phase=mid mode=on"
+    ));
+    assert!(
+        ledger_rows(&h, 1).iter().all(|(id, _)| id != &x),
+        "{:?}",
+        ledger_rows(&h, 1)
+    );
+
+    // The next owner wake is offered X again and delivers it.
+    std::fs::write(&reply, format!(r#"{{"pick":["{x}"]}}"#)).expect("next reply");
+    let next = lead::owner_input(KEY_A, 3, "and now?");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
+    wakes_done(&mut progress, 3).await;
+    assert!(advisor_prompts(&h)[2].contains(&x), "X offered again");
+    let mut delivered = delivered_rows(&h, 1);
+    delivered.sort();
+    let mut want = vec![(x, Some(3)), (y, Some(1))];
+    want.sort();
+    assert_eq!(delivered, want);
     m.shutdown_all().await;
 }

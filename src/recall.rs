@@ -508,7 +508,7 @@ pub fn drop_unverified_claims(
 /// `text` fit for a tool event line: redacted (configured secrets and the known secret shapes),
 /// on one line, escaped like entry text, at most `max` characters (`…` marks a cut).
 fn event_text(text: &str, max: usize, redactor: &Redactor) -> String {
-    let (text, _) = redactor.redact(text);
+    let (text, _) = redactor.redact(head(text, max * EVENT_INPUT_FACTOR));
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let flat = memory::escaped(&flat);
     if flat.chars().count() <= max {
@@ -527,26 +527,101 @@ fn tool_name(name: &str) -> String {
         .collect()
 }
 
-/// The text of a tool result: a string as is, the text parts of a `content` list joined by
-/// spaces, anything else as compact JSON.
-fn result_text(result: &Value) -> String {
-    match result {
-        Value::String(text) => text.clone(),
-        Value::Object(map) if map.get("content").is_some_and(Value::is_array) => map["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(" "),
-        other => other.to_string(),
+/// How much more text than a line keeps is read from a tool's arguments or result: the event
+/// drain never serializes or redacts a whole multi-MB result.
+const EVENT_INPUT_FACTOR: usize = 8;
+
+/// The first `bytes` bytes of `text` at most. A cut text loses its last, possibly partial,
+/// word too, so the redactor never sees half a secret it cannot recognise.
+fn head(text: &str, bytes: usize) -> &str {
+    if text.len() <= bytes {
+        return text;
     }
+    let mut end = bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &text[..end];
+    cut.rfind(char::is_whitespace).map_or("", |at| &cut[..at])
+}
+
+/// A writer that keeps the first `limit` bytes and then refuses, so serializing stops there.
+struct Capped {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = self.limit - self.bytes.len();
+        if room == 0 {
+            return Err(std::io::Error::other("full"));
+        }
+        let take = buf.len().min(room);
+        self.bytes.extend_from_slice(&buf[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `value` as compact JSON, at most `limit` bytes plus a cut marker: serialization stops once
+/// the limit is reached.
+fn capped_json(value: &Value, limit: usize) -> String {
+    let mut out = Capped {
+        bytes: Vec::new(),
+        limit: limit + 1,
+    };
+    // A full writer ends serialization with an error: what was written is the head.
+    let _ = serde_json::to_writer(&mut out, value);
+    String::from_utf8_lossy(&out.bytes).into_owned()
+}
+
+/// The head of a tool result's text: a string's head, the text parts of a `content` list
+/// joined by spaces until the limit, anything else as compact JSON. Longer than `limit` bytes
+/// (by at most one byte) only when the result was cut, so [`head`] drops its partial word.
+fn result_text(result: &Value, limit: usize) -> String {
+    match result {
+        Value::String(text) => text[..head_len(text, limit + 1)].to_owned(),
+        Value::Object(map) if map.get("content").is_some_and(Value::is_array) => {
+            let mut out = String::new();
+            for text in map["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+            {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&text[..head_len(text, limit + 1 - out.len().min(limit))]);
+                if out.len() > limit {
+                    break;
+                }
+            }
+            out
+        }
+        other => capped_json(other, limit),
+    }
+}
+
+/// The byte length of `text`'s first `limit` bytes at most, ending on a character boundary.
+fn head_len(text: &str, limit: usize) -> usize {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// The tool event line of a lead tool call that started: its name and its arguments as compact
 /// JSON, redacted, at most [`MID_ARGS_CHARS`] characters.
 pub fn event_start_line(name: &str, args: Option<&Value>, redactor: &Redactor) -> String {
-    let args = args.map(Value::to_string).unwrap_or_default();
+    let args = args
+        .map(|args| capped_json(args, MID_ARGS_CHARS * EVENT_INPUT_FACTOR))
+        .unwrap_or_default();
     format!(
         "tool {} started: {}",
         tool_name(name),
@@ -568,7 +643,9 @@ pub fn event_end_line(
     filter: &ExcerptFilter,
 ) -> String {
     let mut head = event_text(
-        &result.map(result_text).unwrap_or_default(),
+        &result
+            .map(|result| result_text(result, MID_RESULT_CHARS * EVENT_INPUT_FACTOR))
+            .unwrap_or_default(),
         MID_RESULT_CHARS,
         redactor,
     );
@@ -953,8 +1030,8 @@ impl Advisor {
             if on {
                 this.steer_picks(&mid, picks, turn, &notes);
             } else {
-                // Shadow picks are not offered again in this turn (with mode on they write no
-                // ledger row, see `answer`).
+                // Shadow picks are not offered again in this turn (a mid wake writes no ledger
+                // row, see `answer`).
                 lock(&mid.shown).extend(picks.into_iter().map(|p| p.entry.id));
             }
             lock(&this.mid_running).take();
@@ -1355,13 +1432,18 @@ impl Advisor {
                 .find(|c| &c.entry.id == id)
                 .map_or(0, |c| c.score)
         };
-        // A shadow mid wake beside on mode writes no row: what it picked or rejected was never
-        // given to the lead, and on-mode owner wakes must still be offered those entries.
-        let records = !(shadow && !wake.events.is_empty() && self.injects());
-        let rows: Vec<RecallRow> = ledger_rows(wake, &answer, candidates, now)
-            .into_iter()
-            .filter(|row| records && (shadow || row.state == RecallState::Rejected))
-            .collect();
+        // A mid wake writes no ledger row in any mode: it judged entries against tool events
+        // the owner wakes never see, so nothing it picked or rejected may hide an entry from
+        // them. Only `delivered` (once the lead took its note) does; within the turn its picks
+        // stay out through `MidTurn::shown`.
+        let rows: Vec<RecallRow> = if wake.events.is_empty() {
+            ledger_rows(wake, &answer, candidates, now)
+                .into_iter()
+                .filter(|row| shadow || row.state == RecallState::Rejected)
+                .collect()
+        } else {
+            Vec::new()
+        };
         if let Err(err) = lock(&self.store).record_recall(&rows) {
             tracing::warn!(code = err.code(), "recall ledger not written");
         }
@@ -1717,6 +1799,34 @@ mod tests {
             );
             assert!(end.ends_with(text), "{end}");
         }
+    }
+
+    #[test]
+    fn huge_tool_results_and_args_are_read_only_up_to_a_head() {
+        let limit = MID_RESULT_CHARS * EVENT_INPUT_FACTOR;
+        let big = "word ".repeat(2_000_000);
+        let as_string = Value::String(big.clone());
+        assert!(result_text(&as_string, limit).len() <= limit + 1);
+        let content = serde_json::json!({"content": [
+            {"type": "text", "text": big.clone()},
+            {"type": "text", "text": "tail-part"}
+        ]});
+        let text = result_text(&content, limit);
+        assert!(text.len() <= limit + 1, "{}", text.len());
+        assert!(!text.contains("tail-part"));
+        let object = serde_json::json!({"rows": [big.clone(), big.clone()]});
+        assert!(result_text(&object, limit).len() <= limit + 1);
+        let args = serde_json::json!({"blob": big});
+        assert!(
+            capped_json(&args, MID_ARGS_CHARS * EVENT_INPUT_FACTOR).len()
+                <= MID_ARGS_CHARS * EVENT_INPUT_FACTOR + 1
+        );
+        let line = event_start_line("write", Some(&args), &Redactor::default());
+        assert!(line.chars().count() < MID_ARGS_CHARS + 32, "{}", line.len());
+        // A cut head loses its partial last word, so no half secret reaches the redactor.
+        assert_eq!(head("aaa bbbbbb", 7), "aaa");
+        assert_eq!(head("aaa bbb", 7), "aaa bbb");
+        assert_eq!(head("한글 x", 4), "", "never inside a character");
     }
 
     fn mid_turn(max_wakes: u32, interval: Duration, start: Instant) -> MidTurn {

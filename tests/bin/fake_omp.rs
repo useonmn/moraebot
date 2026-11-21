@@ -19,7 +19,8 @@
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
 //! echoed whole. The log keeps the full frame. With FAKE_OMP_REPLY set, an
-//! echoed prompt is answered with that text instead. Without it, a summarizer
+//! echoed prompt is answered with that text instead; FAKE_OMP_REPLY_FILE=<path> wins over it
+//! and is read for each answer, so a test can change the reply between calls. Without it, a summarizer
 //! child (its `--session-dir` contains `/summarizer/`) answers each numbered
 //! note line `<n>. <note>` with `<n>. echo: <note>`, like moraebot's
 //! summarizer is asked to.
@@ -759,20 +760,24 @@ fn prompt_message(frame: &Value) -> &str {
 }
 
 fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
-    let text = std::env::var("FAKE_OMP_REPLY").unwrap_or_else(|_| {
-        if SUMMARIZER.get().copied().unwrap_or(false) {
-            message
-                .lines()
-                .map(|line| match line.split_once(". ") {
-                    Some((n, note)) => format!("{n}. echo: {note}"),
-                    None => format!("echo: {line}"),
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            format!("echo: {message}")
-        }
-    });
+    let from_file =
+        std::env::var_os("FAKE_OMP_REPLY_FILE").and_then(|path| std::fs::read_to_string(path).ok());
+    let text = from_file
+        .map_or_else(|| std::env::var("FAKE_OMP_REPLY"), Ok)
+        .unwrap_or_else(|_| {
+            if SUMMARIZER.get().copied().unwrap_or(false) {
+                message
+                    .lines()
+                    .map(|line| match line.split_once(". ") {
+                        Some((n, note)) => format!("{n}. echo: {note}"),
+                        None => format!("echo: {line}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                format!("echo: {message}")
+            }
+        });
     end_run(&text, json!({}), out);
     completed(id, out);
 }
