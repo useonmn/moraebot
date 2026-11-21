@@ -271,6 +271,8 @@ pub const DEFAULT_HANDOFF_AFTER: Duration = Duration::from_secs(5 * 60);
 pub struct LeadConfig {
     /// Absent means [`DEFAULT_HANDOFF_AFTER`]; `0` turns the busy note off.
     pub handoff_after_minutes: Option<u64>,
+    /// Absent means `true`: moraebot answers owner status questions itself.
+    pub direct_status: Option<bool>,
 }
 
 impl LeadConfig {
@@ -282,6 +284,12 @@ impl LeadConfig {
             Some(0) => None,
             Some(minutes) => Some(Duration::from_secs(minutes.saturating_mul(60))),
         }
+    }
+
+    /// Whether moraebot answers an owner status question ("status", "뭐 하고 있어", ...)
+    /// itself; when `false` the message goes to the lead like any other.
+    pub fn direct_status(&self) -> bool {
+        self.direct_status.unwrap_or(true)
     }
 }
 
@@ -864,6 +872,8 @@ struct OmpSection {
 struct LeadSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     handoff_after_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_status: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1523,9 +1533,12 @@ impl Config {
                 max_cost_usd: omp.max_cost_usd,
                 stall_after_minutes: omp.stall_after_minutes,
             },
-            lead: LeadConfig {
-                handoff_after_minutes: file.lead.and_then(|lead| lead.handoff_after_minutes),
-            },
+            lead: file
+                .lead
+                .map_or_else(LeadConfig::default, |lead| LeadConfig {
+                    handoff_after_minutes: lead.handoff_after_minutes,
+                    direct_status: lead.direct_status,
+                }),
             memory,
         })
     }
@@ -1646,9 +1659,11 @@ impl Config {
                 max_cost_usd: self.omp.max_cost_usd,
                 stall_after_minutes: self.omp.stall_after_minutes,
             }),
-            lead: self.lead.handoff_after_minutes.map(|minutes| LeadSection {
-                handoff_after_minutes: Some(minutes),
-            }),
+            lead: (self.lead.handoff_after_minutes.is_some() || self.lead.direct_status.is_some())
+                .then_some(LeadSection {
+                    handoff_after_minutes: self.lead.handoff_after_minutes,
+                    direct_status: self.lead.direct_status,
+                }),
             memory: self.memory.to_section(),
         };
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
@@ -3089,6 +3104,27 @@ mod tests {
         assert_eq!(fx.load(&off).expect("loads").lead.handoff_after(), None);
         let unknown = format!("{}[lead]\nhandoff_after = 3\n", fx.valid_toml());
         assert!(fx.load(&unknown).is_err());
+    }
+
+    #[test]
+    fn direct_status_defaults_on_and_can_be_turned_off() {
+        let fx = Fixture::new();
+        assert!(
+            fx.load(&fx.valid_toml())
+                .expect("loads")
+                .lead
+                .direct_status()
+        );
+        let off = format!("{}[lead]\ndirect_status = false\n", fx.valid_toml());
+        let cfg = fx.load(&off).expect("loads");
+        assert!(!cfg.lead.direct_status());
+        assert_eq!(cfg.lead.handoff_after(), Some(DEFAULT_HANDOFF_AFTER));
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.lead.direct_status, Some(false));
+        let on = format!("{}[lead]\ndirect_status = true\n", fx.valid_toml());
+        assert!(fx.load(&on).expect("loads").lead.direct_status());
     }
 
     #[test]

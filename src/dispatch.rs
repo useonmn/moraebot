@@ -44,7 +44,8 @@
 //! command row queued without that check (a race with the worker, a restart) is answered
 //! by the worker the same way; lane-result rows are never checked.
 //!
-//! Owner status questions ([`crate::status`]): in the same slot, right after the memory check,
+//! Owner status questions ([`crate::status`]), unless `lead.direct_status = false`: in the same
+//! slot, right after the memory check,
 //! an owner row without attachments whose whole text is a status question ("뭐 하고 있어",
 //! "status", ...) is claimed and answered by moraebot from the lead's turn state
 //! ([`OmpManager::lead_status`]) and the running lanes, also while a lead turn runs. The lead
@@ -79,7 +80,9 @@
 //! not handed on yet goes to the lead for every conversation that had no owner message,
 //! delivered reply or handed-on news for [`NEWS_AFTER`]; the lead tells the owner. While the
 //! lead runs a turn of the lane's conversation the note is sent into that turn
-//! ([`NoteKind::News`]); otherwise it is stored as a dedup'd lane inbox row
+//! ([`NoteKind::News`]); it counts as handed on only once the lead took it, and a note omp
+//! refused, or that a cut turn never answered, becomes the row below at the next step;
+//! otherwise it is stored as a dedup'd lane inbox row
 //! ([`lead::lane_news`]) that waits for the lead like a lane result. A news row whose lane no
 //! longer runs when its turn comes is dropped ([`E_LANE_NEWS_STALE`]). Only while the lead
 //! cannot start ([`OmpManager::lead_down`]) is the raw [`news_line`] posted instead. A note
@@ -380,6 +383,26 @@ struct Talk {
     seen: Option<(u64, Instant)>,
 }
 
+/// Lane news notes sent into a running lead turn. A sent note is only queued: it counts as
+/// handed on once the lead took it. Until it settles its message id is in `in_flight`, so the
+/// same note is not offered twice; the turn's end pushes it to `settled` with whether the lead
+/// took it, and the next news step finishes it.
+#[derive(Default)]
+struct NewsNotes {
+    in_flight: std::collections::HashSet<String>,
+    settled: Vec<(LaneNews, bool)>,
+}
+
+/// What [`Dispatcher::hand_news`] did with a note.
+enum Handed {
+    /// Stored as a lane row, or posted while the lead cannot start: handed on now.
+    Now,
+    /// Sent into the running turn; it settles when the turn ends.
+    Sent,
+    /// Not handed on; the next news step tries again.
+    No,
+}
+
 pub struct Dispatcher {
     owner_id: String,
     /// Who may talk to moraebot, from the active messenger's config.
@@ -406,6 +429,10 @@ pub struct Dispatcher {
     wake: Notify,
     /// Talk per conversation key, for lane news.
     talk: Mutex<HashMap<String, Talk>>,
+    /// Lane news sent into a running turn as notes, until each is settled.
+    news_notes: Arc<Mutex<NewsNotes>>,
+    /// Owner status questions are answered by moraebot itself (`lead.direct_status`).
+    direct_status: bool,
     /// The memory store; without it no message is a memory command.
     memory: Option<MemoryHandle>,
     /// The id each conversation was last asked to confirm forgetting.
@@ -441,6 +468,8 @@ impl Dispatcher {
             pending: Mutex::new(Vec::new()),
             wake: Notify::new(),
             talk: Mutex::default(),
+            news_notes: Arc::default(),
+            direct_status: config.lead.direct_status(),
             memory: None,
             forget_asked: Mutex::default(),
             observer: None,
@@ -1173,7 +1202,7 @@ impl Dispatcher {
         text: &str,
         arrival: bool,
     ) -> Result<Option<Handled>, StoreError> {
-        let Some(lang) = status::request(text) else {
+        let Some(lang) = status::request(text).filter(|_| self.direct_status) else {
             return Ok(None);
         };
         if arrival {
@@ -1219,6 +1248,7 @@ impl Dispatcher {
             lead.as_ref(),
             &lanes,
             others.len(),
+            &|text| self.omp.clean_note(text),
         ))
     }
 
@@ -1562,12 +1592,16 @@ impl Dispatcher {
         self.omp.lanes()
     }
 
-    /// One news step at tick time `now`: every conversation's quiet clock is updated, then
-    /// each lane of `news` whose conversation is quiet for [`NEWS_AFTER`] gets its note handed
-    /// on by [`Self::hand_news`]; handed-on texts are marked. Returns the number of notes
-    /// handed on.
+    /// One news step at tick time `now`: notes settled since the last step are finished first
+    /// (a note the lead took is marked handed on; a refused or cut one is stored as a lane row
+    /// instead), every conversation's quiet clock is updated, then each lane of `news` whose
+    /// conversation is quiet for [`NEWS_AFTER`] gets its note handed on by [`Self::hand_news`].
+    /// Handed-on texts are marked and count as talk. Returns the number of notes handed on in
+    /// this step; a note just sent into a turn counts once it settled.
     pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
+        let mut handed = self.settle_news_notes();
         let due: Vec<LaneNews> = {
+            let in_flight = lock(&self.news_notes).in_flight.clone();
             let mut talk = lock(&self.talk);
             for t in talk.values_mut() {
                 if t.seen.is_none_or(|(count, _)| count != t.said) {
@@ -1582,6 +1616,7 @@ impl Dispatcher {
             news.into_iter()
                 .filter(|n| {
                     reply_target(&n.conversation_key).is_some()
+                        && !in_flight.contains(&n.message_id())
                         && talk.get(&n.conversation_key).is_none_or(|t| {
                             t.seen.is_some_and(|(_, since)| {
                                 now.saturating_duration_since(since) >= NEWS_AFTER
@@ -1591,37 +1626,81 @@ impl Dispatcher {
                 .collect()
         };
 
-        let mut sent = 0;
         for n in due {
             let Some(target) = reply_target(&n.conversation_key) else {
                 continue;
             };
-            if self.hand_news(target, &n).await {
-                self.lanes().news_posted(n.lane_id, &n.text);
-                self.talked(&n.conversation_key);
-                sent += 1;
+            match self.hand_news(target, &n).await {
+                Handed::Now => {
+                    self.news_handed(&n);
+                    handed += 1;
+                }
+                Handed::Sent | Handed::No => {}
             }
         }
-        sent
+        handed
+    }
+
+    /// Finishes the lane news notes whose turn ended: a note the lead took is handed on; one
+    /// omp refused, or that a cut turn never answered, is stored as a lane row so it waits for
+    /// its turn (a note whose row cannot be stored is offered again while its lane runs).
+    /// Returns the number handed on.
+    fn settle_news_notes(&self) -> usize {
+        let settled = {
+            let mut notes = lock(&self.news_notes);
+            let settled = std::mem::take(&mut notes.settled);
+            for (n, _) in &settled {
+                notes.in_flight.remove(&n.message_id());
+            }
+            settled
+        };
+        let mut handed = 0;
+        for (n, taken) in settled {
+            if taken {
+                tracing::info!(lane = n.lane_id, "lane news taken by the running turn");
+            } else {
+                tracing::warn!(
+                    lane = n.lane_id,
+                    "lane news note not delivered; queued as a row"
+                );
+            }
+            if taken || self.queue_news_row(&n) {
+                self.news_handed(&n);
+                handed += 1;
+            }
+        }
+        handed
+    }
+
+    /// Marks lane note `n` handed on: never offered again for its lane, and talk in its
+    /// conversation.
+    fn news_handed(&self, n: &LaneNews) {
+        self.lanes().news_posted(n.lane_id, &n.text);
+        self.talked(&n.conversation_key);
     }
 
     /// Hands lane note `n` to the lead: a [`NoteKind::News`] note when the running turn is of
-    /// the note's conversation, else a lane inbox row that waits for the lead (a turn of
-    /// another conversation finishes first). While the lead cannot start, the raw
-    /// [`news_line`] is posted in `target` instead. Returns whether the note was handed on (a
-    /// row that already exists, or a lane that stopped meanwhile, counts as handed on).
-    async fn hand_news(&self, target: &str, n: &LaneNews) -> bool {
+    /// the note's conversation ([`Handed::Sent`], settled when the turn ends), else a lane inbox
+    /// row that waits for the lead (a turn of another conversation finishes first). While the
+    /// lead cannot start, the raw [`news_line`] is posted in `target` instead.
+    async fn hand_news(&self, target: &str, n: &LaneNews) -> Handed {
         if let Some((turn, key)) = self.omp.open_turn()
             && key == n.conversation_key
-            && self.omp.notes().send(
+        {
+            let notes = Arc::clone(&self.news_notes);
+            let note = n.clone();
+            let on_settled = Box::new(move |taken: bool| lock(&notes).settled.push((note, taken)));
+            lock(&self.news_notes).in_flight.insert(n.message_id());
+            if self.omp.notes().send(
                 turn,
                 NoteKind::News,
                 &lead::lane_news_note(n.lane_id, &n.text),
-                None,
-            )
-        {
-            tracing::info!(lane = n.lane_id, "lane news sent into the running turn");
-            return true;
+                Some(on_settled),
+            ) {
+                tracing::info!(lane = n.lane_id, "lane news sent into the running turn");
+                return Handed::Sent;
+            }
+            lock(&self.news_notes).in_flight.remove(&n.message_id());
         }
         if self.omp.lead_down() {
             return match self
@@ -1631,14 +1710,25 @@ impl Dispatcher {
             {
                 Ok(_) => {
                     tracing::info!(lane = n.lane_id, "lead is down; lane news posted");
-                    true
+                    Handed::Now
                 }
                 Err(err) => {
                     tracing::warn!(lane = n.lane_id, code = err.code, "lane news send failed");
-                    false
+                    Handed::No
                 }
             };
         }
+        if self.queue_news_row(n) {
+            Handed::Now
+        } else {
+            Handed::No
+        }
+    }
+
+    /// Stores lane note `n` as a lane inbox row for the lead and wakes the worker. Returns
+    /// whether it is handed on: a new row, a row that already exists, or a lane that stopped
+    /// meanwhile (its result follows) all count.
+    fn queue_news_row(&self, n: &LaneNews) -> bool {
         let input = lead::lane_news(&n.conversation_key, n.lane_id, &n.text);
         let stored = self.store().news_notice(n.lane_id, &n.message_id(), &input);
         match stored {

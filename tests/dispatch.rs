@@ -3776,25 +3776,26 @@ async fn lane_news_is_steered_into_a_running_turn_of_its_conversation() {
     let step = h.spawn_step();
     h.wait_turn(&key).await;
     let t0 = Instant::now();
-    let rows_before = h.count();
+    let n = news(&[(lane, &key, "qa step 1")]);
     let first = h.dispatcher.post_news(Vec::new(), t0).await;
-    let handed = h
-        .dispatcher
-        .post_news(news(&[(lane, &key, "qa step 1")]), t0 + NEWS_AFTER)
-        .await;
-    let rows_after = h.count();
+    let sent = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    // In flight: the same note is not offered again before it settles.
+    let again = h.dispatcher.post_news(n.clone(), t0 + 2 * NEWS_AFTER).await;
     steered(
         h.handle(in_thread("1300000000000000981", THREAD_A, "B"))
             .await,
     );
     assert!(bounded(step).await.unwrap());
+    // The turn ended and the lead took the note: the next step marks it handed on.
+    let settled = h.dispatcher.post_news(n, t0 + 3 * NEWS_AFTER).await;
+    let rows = news_rows(&h);
     let messages = raw_prompt_messages(&h);
     h.close().await;
 
-    assert_eq!([first, handed], [0, 1]);
-    assert_eq!(
-        rows_after, rows_before,
-        "no news row while the turn takes the note"
+    assert_eq!([first, sent, again, settled], [0, 0, 0, 1]);
+    assert!(
+        rows.is_empty(),
+        "no news row: the turn took the note: {rows:?}"
     );
     assert_eq!(
         messages,
@@ -3808,6 +3809,89 @@ async fn lane_news_is_steered_into_a_running_turn_of_its_conversation() {
             lead::owner_input(&key, a + 1, "B"),
         ]
     );
+}
+
+#[tokio::test]
+async fn lane_news_omp_refuses_waits_as_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::build(
+        dir.path(),
+        "steer",
+        PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+        false,
+        vec![
+            ("FAKE_OMP_STEER_CASE", "merged".to_owned()),
+            ("FAKE_OMP_REJECT_TRIGGER", "qa-refuse".to_owned()),
+        ],
+    );
+    let a = queued(
+        h.handle(in_thread("1300000000000000984", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", &key);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let t0 = Instant::now();
+    let n = news(&[(lane, &key, "qa-refuse step 1")]);
+    let quiet = h.dispatcher.post_news(Vec::new(), t0).await;
+    let sent = h.dispatcher.post_news(n.clone(), t0 + NEWS_AFTER).await;
+    let rows_during = news_rows(&h);
+    steered(
+        h.handle(in_thread("1300000000000000985", THREAD_A, "B"))
+            .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let settled = h
+        .dispatcher
+        .post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK)
+        .await;
+    let rows = news_rows(&h);
+    h.close().await;
+
+    assert_eq!([quiet, sent, settled], [0, 0, 1]);
+    assert!(rows_during.is_empty(), "{rows_during:?}");
+    assert_eq!(
+        rows,
+        [(
+            n[0].message_id(),
+            lead::lane_news(&key, lane, "qa-refuse step 1"),
+            State::Queued
+        )]
+    );
+}
+
+#[tokio::test]
+async fn lane_news_in_a_cut_turn_waits_as_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_steer(dir.path(), "merged");
+    let a = queued(
+        h.handle(in_thread("1300000000000000986", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let lane = running_lane(&h, "call-1", &key);
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let t0 = Instant::now();
+    let quiet = h.dispatcher.post_news(Vec::new(), t0).await;
+    let sent = h
+        .dispatcher
+        .post_news(news(&[(lane, &key, "qa step 1")]), t0 + NEWS_AFTER)
+        .await;
+    // The turn ends without an answer to the held note: a shutdown kills the lead.
+    bounded(h.dispatcher.shutdown()).await;
+    assert!(bounded(step).await.unwrap());
+    let settled = h
+        .dispatcher
+        .post_news(Vec::new(), t0 + NEWS_AFTER + WATCH_TICK)
+        .await;
+    let rows = news_rows(&h);
+
+    assert_eq!([quiet, sent, settled], [0, 0, 1]);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, lead::lane_news(&key, lane, "qa step 1"));
+    assert_eq!(rows[0].2, State::Queued);
 }
 
 #[tokio::test]
@@ -4193,10 +4277,45 @@ async fn status_question_is_answered_while_a_turn_runs_and_never_reaches_the_lea
 }
 
 #[tokio::test]
+async fn status_questions_go_to_the_lead_when_direct_status_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
+    config.lead.direct_status = Some(false);
+    let h = Harness::with_config(dir.path(), config, "ok", false, Vec::new());
+    let id = queued(h.handle(event("4444", OWNER, Some("444"), "status")).await);
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let sends = h.sends();
+    let row = h.row(id);
+    h.close().await;
+
+    assert_eq!(messages, [lead::owner_input(NEWS_KEY, id, "status")]);
+    assert_eq!(sends, [("444".to_owned(), "echo: status".to_owned())]);
+    assert_eq!(row.state, State::Done);
+}
+
+#[tokio::test]
 async fn queued_status_question_is_answered_by_the_worker() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::open(dir.path(), "ok");
-    let lane = running_lane(&h, "call-1", NEWS_KEY);
+    let task = format!("fix {}/src\nmore", h.config.work_dir.display());
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane(
+            "call-1",
+            NEWS_KEY,
+            &task,
+            Some("file ."),
+            None,
+            MAX_RUNNING_LANES,
+        )
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    };
     let id = queue_owner_row(&h, "4443", NEWS_KEY, "status");
     let stepped = h.step().await;
     let sends = h.sends();
@@ -4212,7 +4331,7 @@ async fn queued_status_question_is_answered_by_the_worker() {
         [(
             "444".to_owned(),
             format!(
-                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: t1"
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src"
             )
         )]
     );

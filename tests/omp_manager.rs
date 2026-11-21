@@ -2930,12 +2930,12 @@ async fn a_failing_advisor_in_on_mode_leaves_the_input_unchanged() {
 
 // ---- moraebot's own notes in a running turn (rowless steers, #59 PR 3b / #68) ----
 
-fn flag() -> (Arc<std::sync::atomic::AtomicBool>, moraebot::omp::OnTaken) {
+fn flag() -> (Arc<std::sync::atomic::AtomicBool>, moraebot::omp::OnSettled) {
     let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let set = Arc::clone(&taken);
     (
         taken,
-        Box::new(move || set.store(true, std::sync::atomic::Ordering::SeqCst)),
+        Box::new(move |took| set.store(took, std::sync::atomic::Ordering::SeqCst)),
     )
 }
 

@@ -419,6 +419,27 @@ fn text_hash(text: &str) -> u64 {
     h.finish()
 }
 
+/// The canonical work folder, the root of lane worktrees.
+fn lanes_root(config: &Config) -> PathBuf {
+    std::fs::canonicalize(&config.work_dir)
+        .or_else(|_| std::path::absolute(&config.work_dir))
+        .unwrap_or_else(|_| config.work_dir.clone())
+}
+
+/// `raw` made safe to show the owner with [`news_text`], with the paths a `lane_report` note
+/// loses: the lanes root and the work folder become `.`, `$HOME` (real and canonical) `~`.
+pub fn clean_note(raw: &str, config: &Config) -> String {
+    let root = lanes_root(config);
+    let work = std::path::absolute(&config.work_dir).ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home_real = home.as_deref().and_then(|h| std::fs::canonicalize(h).ok());
+    let mut paths = vec![(root.as_path(), ".")];
+    paths.extend(work.as_deref().map(|p| (p, ".")));
+    paths.extend(home_real.as_deref().map(|p| (p, "~")));
+    paths.extend(home.as_deref().map(|p| (p, "~")));
+    news_text(raw, &paths)
+}
+
 /// A lane's progress note made safe to post: secrets become `[secret]`, each path in `paths`
 /// becomes its mark (in order), `@` becomes U+FF20 so no mention fires, whitespace runs become
 /// one space, and the result is cut to `REPORT_CHARS` characters.
@@ -1391,9 +1412,7 @@ impl LaneManager {
 
     /// `<work dir>` canonical (else absolute, else as given): the base of lane worktrees.
     fn lanes_root(&self) -> PathBuf {
-        std::fs::canonicalize(&self.config.work_dir)
-            .or_else(|_| std::path::absolute(&self.config.work_dir))
-            .unwrap_or_else(|_| self.config.work_dir.clone())
+        lanes_root(&self.config)
     }
 
     /// The folder job `job` works in: the work folder, or for a lane with a repo its
@@ -1623,15 +1642,7 @@ impl LaneManager {
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let root = self.lanes_root();
-        let work = std::path::absolute(&self.config.work_dir).ok();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let home_real = home.as_deref().and_then(|h| std::fs::canonicalize(h).ok());
-        let mut paths = vec![(root.as_path(), ".")];
-        paths.extend(work.as_deref().map(|p| (p, ".")));
-        paths.extend(home_real.as_deref().map(|p| (p, "~")));
-        paths.extend(home.as_deref().map(|p| (p, "~")));
-        let text = news_text(raw, &paths);
+        let text = clean_note(raw, &self.config);
         if text.is_empty() {
             return Err(refused(E_LANE_ARGS, "text must be a non-empty line"));
         }

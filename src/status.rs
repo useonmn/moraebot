@@ -10,7 +10,6 @@
 
 use std::time::Duration;
 
-use crate::lane::news_text;
 use crate::omp::LeadStatus;
 
 /// The language a status question was asked in; the answer uses it.
@@ -70,14 +69,17 @@ pub struct LaneLine<'a> {
     pub task: &'a str,
 }
 
-/// The status answer for conversation `key`: the lead's turn (`lead`), the running lanes of
-/// this conversation (`lanes`) and the number of running lanes of other conversations.
+/// The status answer for conversation `key`: the lead's turn (`lead`, its intent already
+/// cleaned), the running lanes of this conversation (`lanes`, each task's first line cleaned by
+/// `clean`, which scrubs secrets and paths like a lane note) and the number of running lanes of
+/// other conversations.
 pub fn reply(
     lang: Lang,
     key: &str,
     lead: Option<&LeadStatus>,
     lanes: &[LaneLine],
     others: usize,
+    clean: &dyn Fn(&str) -> String,
 ) -> String {
     let mut lines = Vec::new();
     match lead {
@@ -118,7 +120,7 @@ pub fn reply(
             Lang::English => format!("Background lanes of this conversation: {}", lanes.len()),
         });
         for lane in lanes {
-            let task = first_line(lane.task);
+            let task = first_line(lane.task, clean);
             lines.push(match (lang, lane.running) {
                 (Lang::Korean, Some(running)) => {
                     format!("- lane {} ({}분째): {task}", lane.id, minutes(running))
@@ -153,14 +155,14 @@ fn minutes(running: Duration) -> u64 {
     (running.as_secs() / 60).max(1)
 }
 
-/// The task's first non-empty line, cleaned like a lane note and cut to [`TASK_CHARS`].
-fn first_line(task: &str) -> String {
+/// The task's first non-empty line, cleaned by `clean` and cut to [`TASK_CHARS`].
+fn first_line(task: &str, clean: &dyn Fn(&str) -> String) -> String {
     let line = task
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
-    let line = news_text(line, &[]);
+    let line = clean(line);
     if line.chars().count() <= TASK_CHARS {
         return line;
     }
@@ -171,6 +173,13 @@ fn first_line(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lane::news_text;
+    use std::path::Path;
+
+    /// Cleans like a lane note with `/qa/work` as the work folder.
+    fn clean(text: &str) -> String {
+        news_text(text, &[(Path::new("/qa/work"), ".")])
+    }
 
     #[test]
     fn only_whole_status_questions_match() {
@@ -211,17 +220,17 @@ mod tests {
         let lanes = [LaneLine {
             id: 4,
             running: Some(Duration::from_secs(30)),
-            task: "\nfix the build\nmore detail",
+            task: "\nfix the build in /qa/work/src\nmore detail",
         }];
         assert_eq!(
-            reply(Lang::English, "p:th:1", Some(&lead), &lanes, 2),
+            reply(Lang::English, "p:th:1", Some(&lead), &lanes, 2, &clean),
             "Working on this conversation for 7 min.\nCurrent step: running the tests\n\
-             Background lanes of this conversation: 1\n- lane 4 (1 min): fix the build\n\
+             Background lanes of this conversation: 1\n- lane 4 (1 min): fix the build in ./src\n\
              2 more lanes run for other conversations."
         );
         let no_intent = turn("p:th:1", Some(("read", None)));
         assert_eq!(
-            reply(Lang::Korean, "p:th:1", Some(&no_intent), &[], 0),
+            reply(Lang::Korean, "p:th:1", Some(&no_intent), &[], 0, &clean),
             "이 대화 일을 7분째 하고 있어요\n지금 단계: read\n돌고 있는 백그라운드 작업은 없어요"
         );
     }
@@ -229,13 +238,13 @@ mod tests {
     #[test]
     fn another_conversations_turn_is_named_without_details() {
         let lead = turn("p:th:2", Some(("bash", Some("secret plan"))));
-        let text = reply(Lang::English, "p:th:1", Some(&lead), &[], 0);
+        let text = reply(Lang::English, "p:th:1", Some(&lead), &[], 0, &clean);
         assert_eq!(
             text,
             "Working on another conversation for 7 min.\nNo background lanes are running."
         );
         assert_eq!(
-            reply(Lang::Korean, "p:th:1", None, &[], 1),
+            reply(Lang::Korean, "p:th:1", None, &[], 1, &clean),
             "지금 하고 있는 일은 없어요\n다른 대화의 백그라운드 작업도 1개 돌고 있어요"
         );
     }
@@ -243,7 +252,7 @@ mod tests {
     #[test]
     fn a_long_task_line_is_cut() {
         let task = "x".repeat(200);
-        let line = first_line(&task);
+        let line = first_line(&task, &clean);
         assert_eq!(line.chars().count(), TASK_CHARS + 1);
         assert!(line.ends_with('…'));
     }
