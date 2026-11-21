@@ -489,7 +489,11 @@ async fn lane_message_text_reaches_the_lane_child_as_a_steer() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    assert_eq!(steered.len(), 2, "one main prompt and one steer: {steered:?}");
+    assert_eq!(
+        steered.len(),
+        2,
+        "one main prompt and one steer: {steered:?}"
+    );
     assert_eq!(steered[0]["streamingBehavior"], Value::Null, "{steered:?}");
     assert!(
         steered[0]["message"].as_str().unwrap().contains("t1"),
@@ -510,8 +514,8 @@ async fn lane_message_text_reaches_the_lane_child_as_a_steer() {
     bounded(omp.shutdown_all()).await;
 }
 
-/// A steer for a lane that just finished does not open a second prompt either; it is refused
-/// as busy because the running job's inbox is gone by then.
+/// A `lane_message` for a lane whose job already ended is not a steer: the idle lane starts a
+/// real second prompt in a new child.
 #[tokio::test]
 async fn lane_message_after_the_turn_ended_is_not_a_steer() {
     let h = Harness::new();
@@ -534,6 +538,77 @@ async fn lane_message_after_the_turn_ended_is_not_a_steer() {
     assert_eq!(accepted["steered"], Value::Null, "{accepted:?}");
     assert_eq!(lane.prompts, 2);
     assert_eq!(starts.len(), 2);
+}
+
+/// A steer that omp answers in a run of its own (it reached omp as the main run ended) is part
+/// of the lane's result: the job waits for it and stores its newer reply, not the main one.
+#[tokio::test]
+async fn a_steer_answered_in_its_own_run_is_the_lane_result() {
+    let h = Harness::new();
+    let omp = h
+        .manager(
+            "steer",
+            &[
+                lane_start("t1"),
+                json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+            ],
+        )
+        .with_extra_env([("FAKE_OMP_STEER_CASE", "separate".to_owned())]);
+    prompt_until_lane_result(&omp, 1, "run-tools go").await;
+    let lane = h.lane(1);
+    let row = queued_row(&h, 1);
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    assert_eq!(lane.state, LaneState::Idle);
+    assert_eq!(lane.prompts, 1, "the steer was not a new prompt");
+    assert_eq!(starts.len(), 1, "no second lane child");
+    let reply = row.text.split_once('\n').expect("tag line").1;
+    assert!(reply.starts_with("echo: t2"), "{reply:?}");
+}
+
+/// A `lane_message` the running turn never took (here the main prompt was refused before any
+/// `agent_start`, so no steer could join it) is not dropped: it runs as the lane's next prompt.
+/// Whether the text arrives while the job runs or after it ended, the outcome is the same.
+#[tokio::test]
+async fn a_lane_message_the_turn_never_took_runs_as_the_next_prompt() {
+    let h = Harness::new();
+    let omp = h
+        .manager(
+            "ok",
+            &[
+                lane_start("reject-me t1"),
+                json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}}),
+            ],
+        )
+        .with_extra_env([("FAKE_OMP_REJECT_TRIGGER", "reject-me".to_owned())]);
+    let wake = omp.lane_wake();
+    bounded(omp.prompt(KEY, 1, Sender::Owner, "run-tools go")).await;
+    bounded(async {
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let lane = h.lane(1);
+            if lane.prompts == 2 && lane.state != LaneState::Running {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await;
+    let second = h.frames_after_start(1, "prompt");
+    let starts = h.lane_starts();
+    bounded(omp.shutdown_all()).await;
+    assert_eq!(starts.len(), 2, "the text ran in the lane's next child");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0]["streamingBehavior"], Value::Null, "{second:?}");
+    assert!(
+        second[0]["message"].as_str().unwrap().starts_with("t2"),
+        "{second:?}"
+    );
+    let row = queued_row(&h, 2);
+    let reply = row.text.split_once('\n').expect("tag line").1;
+    assert!(reply.starts_with("echo: t2"), "{reply:?}");
 }
 
 #[tokio::test]
