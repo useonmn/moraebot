@@ -3508,18 +3508,9 @@ async fn a_mid_wake_still_running_never_makes_the_next_owner_wake_busy() {
         "reason=busy gen=1 epoch=0 row=3"
     ));
     std::fs::write(&gate, "").expect("release both answers");
+    // Both calls finish; the stale mid call reaches no turn (that path is pinned by
+    // `a_mid_pick_for_a_turn_that_ended_is_dropped`) and steered nothing.
     wakes_done(&mut progress, 3).await;
-    // The mid pick is X, or Y when the first turn's wait ran out before Y came.
-    let dropped = |id: &str| {
-        logged(
-            &h,
-            moraebot::recall::I_RECALL_DROPPED,
-            &format!("gen=1 epoch=0 row=1 ids={id} phase=mid"),
-        )
-    };
-    assert!(
-        dropped(&x) || dropped(&y),
-        "the mid pick was dropped with its turn"
-    );
+    assert_eq!(h.steer_frames().len(), 1, "the owner's steer only");
     m.shutdown_all().await;
 }
