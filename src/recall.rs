@@ -138,6 +138,54 @@ pub fn entry_hash(entry: &Entry) -> String {
     format!("{hash:016x}")
 }
 
+/// Whether `item` is kept from the advisor for a wake: a live entry of a bucket whose section
+/// the lead holds (`given`, bucket labels), or an entry the ledger rows `seen`
+/// ([`Store::recall_seen`]) name: picked or delivered in this lead context, or rejected in this
+/// conversation and unchanged since (same [`entry_hash`]).
+pub fn hidden(item: &PoolEntry, given: &HashSet<String>, seen: &[RecallRow]) -> bool {
+    let id = &item.entry.id;
+    (!item.replaced && given.contains(&item.bucket.label()))
+        || seen.iter().any(|row| {
+            &row.entry_id == id
+                && (row.state != RecallState::Rejected || row.entry_hash == entry_hash(&item.entry))
+        })
+}
+
+/// The ledger rows of `answer` to `wake`, written at `at` (unix seconds): one `shadow` row per
+/// pick and one `rejected` row per reject, each with its entry's hash from `candidates`.
+pub fn ledger_rows(
+    wake: &Wake,
+    answer: &Answer,
+    candidates: &[Candidate],
+    at: i64,
+) -> Vec<RecallRow> {
+    let row = |id: &String, state| RecallRow {
+        conversation: wake.conversation.clone(),
+        entry_id: id.clone(),
+        entry_hash: candidates
+            .iter()
+            .find(|c| &c.entry.id == id)
+            .map(|c| entry_hash(&c.entry))
+            .unwrap_or_default(),
+        state,
+        lead_generation: wake.generation,
+        lead_epoch: wake.epoch as i64,
+        row_id: Some(wake.row_id),
+        at,
+    };
+    answer
+        .pick
+        .iter()
+        .map(|id| row(id, RecallState::Shadow))
+        .chain(
+            answer
+                .reject
+                .iter()
+                .map(|id| row(id, RecallState::Rejected)),
+        )
+        .collect()
+}
+
 /// The candidates for one owner `message` out of `pool`, best first, each with its line as
 /// `line` renders it (once: rendering redacts, and the caller sends these lines). Entries `skip` refuses
 /// are left out. The score is ten points per shared term ([`terms`]), five more for an entry of
@@ -536,15 +584,7 @@ impl Advisor {
         let root = self.config.memory_dir();
         let mentioned = memory::mentioned_projects(&root, &wake.message);
         let recall = &self.config.memory.recall;
-        let skip = |item: &PoolEntry| {
-            let id = &item.entry.id;
-            (!item.replaced && wake.given.contains(&item.bucket.label()))
-                || seen.iter().any(|row| {
-                    &row.entry_id == id
-                        && (row.state != RecallState::Rejected
-                            || row.entry_hash == entry_hash(&item.entry))
-                })
-        };
+        let skip = |item: &PoolEntry| hidden(item, &wake.given, &seen);
         let (candidates, lines): (Vec<Candidate>, Vec<String>) = rank(
             memory::recall_pool(&root, today),
             &wake.message,
@@ -609,31 +649,7 @@ impl Advisor {
                 .find(|c| &c.entry.id == id)
                 .map_or(0, |c| c.score)
         };
-        let row = |id: &String, state| RecallRow {
-            conversation: wake.conversation.clone(),
-            entry_id: id.clone(),
-            entry_hash: candidates
-                .iter()
-                .find(|c| &c.entry.id == id)
-                .map(|c| entry_hash(&c.entry))
-                .unwrap_or_default(),
-            state,
-            lead_generation: wake.generation,
-            lead_epoch: wake.epoch as i64,
-            row_id: Some(wake.row_id),
-            at: now,
-        };
-        let rows: Vec<RecallRow> = answer
-            .pick
-            .iter()
-            .map(|id| row(id, RecallState::Shadow))
-            .chain(
-                answer
-                    .reject
-                    .iter()
-                    .map(|id| row(id, RecallState::Rejected)),
-            )
-            .collect();
+        let rows = ledger_rows(&wake, &answer, candidates, now);
         if let Err(err) = lock(&self.store).record_recall(&rows) {
             tracing::warn!(code = err.code(), "recall ledger not written");
         }
