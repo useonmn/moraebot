@@ -50,6 +50,9 @@ pub fn summarizer_root(config: &Config) -> PathBuf {
 
 pub struct Summarizer {
     config: Config,
+    /// Holds one folder per call (`<pid>-<n>`) and the overlay.
+    root: PathBuf,
+    log_name: String,
     extra_env: Vec<(OsString, OsString)>,
     timeout: Duration,
     next: AtomicU64,
@@ -58,11 +61,20 @@ pub struct Summarizer {
 impl Summarizer {
     /// A summarizer running `config`'s omp. Folders a crash left behind are removed.
     pub fn new(config: &Config) -> Self {
-        remove_dir(&summarizer_root(config));
+        Self::locked(config, summarizer_root(config), LOG_NAME, SUMMARY_TIMEOUT)
+    }
+
+    /// A locked caller like the summarizer, with its call folders under `root`, its stderr in
+    /// the log named `log_name` and `timeout` per call (the recall advisor is one). Folders a
+    /// crash left behind are removed.
+    pub fn locked(config: &Config, root: PathBuf, log_name: &str, timeout: Duration) -> Self {
+        remove_dir(&root);
         Self {
             config: config.clone(),
+            root,
+            log_name: log_name.to_owned(),
             extra_env: Vec::new(),
-            timeout: SUMMARY_TIMEOUT,
+            timeout,
             next: AtomicU64::new(0),
         }
     }
@@ -88,16 +100,22 @@ impl Summarizer {
             let line = note.split_whitespace().collect::<Vec<_>>().join(" ");
             text.push_str(&format!("\n{}. {line}", i + 1));
         }
-        self.ask(SUMMARY_GUIDANCE, text).await
+        self.ask(SUMMARY_GUIDANCE, text, None).await
     }
 
-    /// One locked call with the fixed system prompt `guidance` and `message`, in a fresh child
-    /// and session folder (removed afterwards). Self consolidation uses it with its own
-    /// guidance. `Err` when the child could not run.
-    pub async fn ask(&self, guidance: &'static str, message: String) -> Result<String, String> {
+    /// One locked call with the fixed system prompt `guidance` and `message` on `model`
+    /// (`None`: omp's default model), in a fresh child and session folder (removed afterwards).
+    /// Self consolidation and the recall advisor use it with their own guidance. `Err` when the
+    /// child could not run.
+    pub async fn ask(
+        &self,
+        guidance: &'static str,
+        message: String,
+        model: Option<&str>,
+    ) -> Result<String, String> {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        let run = summarizer_root(&self.config).join(format!("{}-{n}", std::process::id()));
-        let result = self.run(&run, guidance, message).await;
+        let run = self.root.join(format!("{}-{n}", std::process::id()));
+        let result = self.run(&run, guidance, message, model).await;
         remove_dir(&run);
         result
     }
@@ -107,9 +125,10 @@ impl Summarizer {
         run: &std::path::Path,
         guidance: &'static str,
         message: String,
+        model: Option<&str>,
     ) -> Result<String, String> {
         let (session, cwd) = (run.join("session"), run.join("cwd"));
-        let overlay = summarizer_root(&self.config).join("omp-locked.yml");
+        let overlay = self.root.join("omp-locked.yml");
         let prepared = private_dir(&session)
             .and_then(|()| private_dir(&cwd))
             .and_then(|()| {
@@ -120,8 +139,8 @@ impl Summarizer {
             .and_then(|()| {
                 child_command(
                     &self.config,
-                    locked_args(&self.config, &session, &cwd, &overlay, guidance),
-                    &omp::stderr_log_path(&self.config, LOG_NAME),
+                    locked_args(&self.config, &session, &cwd, &overlay, guidance, model),
+                    &omp::stderr_log_path(&self.config, &self.log_name),
                     &self.extra_env,
                 )
             });
@@ -130,9 +149,10 @@ impl Summarizer {
         let timeout = self.timeout;
         let group: Arc<Mutex<Option<GroupKill>>> = Arc::default();
         let guard = KillOnDrop(Arc::clone(&group));
+        let log_name = self.log_name.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let opened = omp::open_child(
-                LOG_NAME,
+                &log_name,
                 command,
                 Vec::new(),
                 session_dir,
@@ -158,7 +178,7 @@ impl Summarizer {
                         state.dump_tools.into_iter().map(|tool| tool.name).collect();
                     Outcome::Failed {
                         code: crate::chat::E_CHAT_TOOLS,
-                        detail: format!("the summarizer lists tools: {names:?}"),
+                        detail: format!("the locked child lists tools: {names:?}"),
                     }
                 }
                 Err(e) => Outcome::Failed {
@@ -166,7 +186,7 @@ impl Summarizer {
                     detail: e.to_string(),
                 },
             };
-            omp::close(LOG_NAME, client);
+            omp::close(&log_name, client);
             Ok(outcome)
         });
         let outcome = worker.await.map_err(|e| e.to_string())?;

@@ -21,7 +21,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinError;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, RecallMode};
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::jev::{self, Jev};
@@ -31,6 +31,7 @@ use crate::observer::Observer;
 use crate::omp::{OmpManager, lock};
 use crate::omp_overlay::{self, OverlayCheck};
 use crate::onboarding;
+use crate::recall::Advisor;
 use crate::store::{Store, StoreError};
 
 /// File name of the inbox database inside the home folder.
@@ -122,6 +123,8 @@ impl Gateway {
             redactor.clone(),
             memory::system_clock(),
         )?)?;
+        let advisor = (config.memory.recall_mode() == RecallMode::Shadow)
+            .then(|| Arc::new(Advisor::new(config, Arc::clone(&store), redactor.clone())));
         let observer = Observer::new(
             config,
             Arc::clone(&store),
@@ -130,9 +133,12 @@ impl Gateway {
             redactor,
             jev::system_now(),
         );
-        let omp = OmpManager::new(config.clone(), Arc::clone(&store))
+        let mut omp = OmpManager::new(config.clone(), Arc::clone(&store))
             .with_hints(lead::system_prompt(&guidance, &hints))
             .with_memory(memory.clone());
+        if let Some(advisor) = advisor {
+            omp = omp.with_recall(advisor);
+        }
         let tools =
             onboarding::host_tools(Arc::clone(&store), config.home.clone(), omp.turn_context());
         let omp = omp.with_host_tools(tools);

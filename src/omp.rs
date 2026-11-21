@@ -52,6 +52,7 @@ use crate::lane::LaneManager;
 use crate::lead;
 use crate::memory;
 use crate::persona;
+use crate::recall::{Advisor, Wake};
 use crate::store::{MAX_TRACE_TOOLS, Store, ToolSource, ToolUse, TurnTrace};
 
 /// The line above the core memory block in the lead's system prompt.
@@ -904,6 +905,9 @@ struct Live {
     given: Given,
     /// The child has used a tool that may read outside text (see [`TurnContext`]).
     outside: Arc<AtomicBool>,
+    /// This child's lead generation ([`Store::next_lead_generation`]); `None` when the store
+    /// could not count it (the recall advisor then skips this child's turns).
+    generation: Option<i64>,
 }
 
 impl Live {
@@ -954,6 +958,8 @@ pub struct OmpManager {
     /// The memory writer for the lead's `memory_write`; `None` leaves the tool out.
     memory: Option<memory::MemoryHandle>,
     host_tools: Vec<HostTool>,
+    /// The recall advisor woken beside each owner turn; `None` with `memory.recall.mode = off`.
+    recall: Option<Arc<Advisor>>,
     live: tokio::sync::Mutex<Option<Live>>,
     lead_kill: LeadKill,
     gate: SteerGate,
@@ -996,6 +1002,7 @@ impl OmpManager {
             memory_clock: memory::system_clock(),
             memory: None,
             host_tools: Vec::new(),
+            recall: None,
             live: Default::default(),
             lead_kill: Default::default(),
             gate: Default::default(),
@@ -1083,6 +1090,18 @@ impl OmpManager {
     pub fn with_host_tools(mut self, tools: Vec<HostTool>) -> Self {
         self.host_tools.extend(tools);
         self
+    }
+
+    /// Wakes `advisor` beside every lead turn an owner input starts (shadow mode: it never
+    /// changes the input).
+    pub fn with_recall(mut self, advisor: Arc<Advisor>) -> Self {
+        self.recall = Some(advisor);
+        self
+    }
+
+    /// Whether a recall advisor is woken beside owner turns.
+    pub fn recall_on(&self) -> bool {
+        self.recall.is_some()
     }
 
     /// The running turn's main row and conversation, for host-tool handlers; `None`
@@ -1181,19 +1200,34 @@ impl OmpManager {
         });
         lock(&self.lead_watch).begin(key);
         self.tool_starts.clear();
-        let (text, fresh, epoch) = {
+        let (input, fresh, epoch, held) = {
             let given = lock(&current.given);
-            let (text, fresh) = thread_memory(
+            let (input, fresh) = thread_memory(
                 &self.config.memory_dir(),
                 (self.memory_clock)(),
                 text,
                 &given.sections,
             );
-            (text, fresh, given.epoch)
+            let held: HashSet<String> = given
+                .sections
+                .values()
+                .flat_map(|sections| sections.keys().cloned())
+                .collect();
+            (input, fresh, given.epoch, held)
         };
+        let wake =
+            self.recall
+                .as_ref()
+                .zip(current.generation)
+                .and_then(|(advisor, generation)| {
+                    Some((
+                        advisor,
+                        recall_wake(text, row_id, generation, epoch, held, &fresh)?,
+                    ))
+                });
         let (done, result) = oneshot::channel();
         let request = PromptRequest {
-            text,
+            text: input,
             timeout: self.turn_timeout,
             behavior: StreamingBehavior::FollowUp,
             done,
@@ -1214,6 +1248,10 @@ impl OmpManager {
             });
             current.requests.send(request).is_ok()
         };
+        // Beside the turn, never before it: the advisor's picks are only logged (shadow).
+        if sent && let Some((advisor, wake)) = wake {
+            advisor.wake(wake);
+        }
         let main = if sent {
             result.await.unwrap_or(Err(RpcError::Closed))
         } else {
@@ -1375,6 +1413,9 @@ impl OmpManager {
     pub async fn shutdown_all(&self) {
         self.lanes.stop_accepting();
         self.chat.shutdown_all();
+        if let Some(advisor) = &self.recall {
+            advisor.stop();
+        }
         self.kill_lead();
         self.lanes.shutdown_all().await;
         if let Some(live) = self.live.lock().await.take() {
@@ -1520,6 +1561,16 @@ impl OmpManager {
         if let Err(e) = lock(&self.store).set_session_id(lead::LEAD_SESSION, &started.session_id) {
             tracing::warn!(code = e.code(), "could not store the lead's omp session id");
         }
+        let generation = match lock(&self.store).next_lead_generation() {
+            Ok(generation) => Some(generation),
+            Err(e) => {
+                tracing::warn!(
+                    code = e.code(),
+                    "lead generation not counted; recall skips this lead"
+                );
+                None
+            }
+        };
         tracing::info!(pid = started.pid, "omp lead child ready");
         Ok(Live {
             requests,
@@ -1529,6 +1580,7 @@ impl OmpManager {
             settled: true,
             given,
             outside,
+            generation,
         })
     }
 }
@@ -1703,6 +1755,35 @@ fn thread_memory(
         format!("{text}\n\n{block}"),
         Some((tag.conversation, fresh)),
     )
+}
+
+/// The recall advisor's wake for lead input `text` (row `row_id`): only an owner row's input
+/// (the tag's `message=`, no lane), with the owner's message without its tag line, the lead
+/// context (`generation`, compaction `epoch`), and the bucket labels the lead holds: `held`
+/// from earlier inputs and this input's `fresh` ones.
+fn recall_wake(
+    text: &str,
+    row_id: i64,
+    generation: i64,
+    epoch: u64,
+    mut held: HashSet<String>,
+    fresh: &Fresh,
+) -> Option<Wake> {
+    let tag = lead::parse_tag(text).filter(|t| t.message.is_some() && t.lane.is_none())?;
+    if let Some((_, sections)) = fresh {
+        held.extend(sections.iter().map(|(label, _)| label.clone()));
+    }
+    Some(Wake {
+        conversation: tag.conversation,
+        row_id,
+        message: text
+            .split_once('\n')
+            .map_or("", |(_, body)| body)
+            .to_owned(),
+        generation,
+        epoch,
+        given: held,
+    })
 }
 
 /// Remembers what an input the child took gave its conversation, unless the child's context

@@ -527,6 +527,48 @@ pub struct LogRow {
     pub detail: Option<String>,
 }
 
+/// What the recall advisor's answer did with one entry (#59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallState {
+    /// Given to the lead (live mode, a later release).
+    Delivered,
+    /// Turned down by the advisor for this conversation.
+    Rejected,
+    /// Picked in shadow mode: logged, never given to the lead.
+    Shadow,
+}
+
+impl RecallState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Rejected => "rejected",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [Self::Delivered, Self::Rejected, Self::Shadow]
+            .into_iter()
+            .find(|state| state.as_str() == text)
+    }
+}
+
+/// One `recall_ledger` row. `lead_generation` counts lead starts ([`Store::next_lead_generation`],
+/// persisted, so it never repeats after a restart) and `lead_epoch` the compactions of that
+/// lead child; together they name one lead context. `at` is unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallRow {
+    pub conversation: String,
+    pub entry_id: String,
+    pub entry_hash: String,
+    pub state: RecallState,
+    pub lead_generation: i64,
+    pub lead_epoch: i64,
+    pub row_id: Option<i64>,
+    pub at: i64,
+}
+
 /// Pending memory jobs ([`Store::memory_backlog`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Backlog {
@@ -623,6 +665,22 @@ CREATE TABLE IF NOT EXISTS memory_log(
     jev_model TEXT,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS counters(
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recall_ledger(
+    id INTEGER PRIMARY KEY,
+    conversation TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    entry_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('delivered','rejected','shadow')),
+    lead_generation INTEGER NOT NULL,
+    lead_epoch INTEGER NOT NULL,
+    row_id INTEGER,
+    at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS recall_ledger_at ON recall_ledger(at);
 CREATE TABLE IF NOT EXISTS memory_cursor(
     path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -1163,7 +1221,85 @@ impl Store {
         Ok(busy == 0 && last.is_none_or(|at| now - at >= seconds))
     }
 
-    /// Deletes memory log rows and settled memory jobs older than 30 days before `now`.
+    /// The next lead generation: 1 for the first lead child this home ever started, one more
+    /// for each start after it, kept in the store so a restart never repeats one (moraedang on
+    /// #59: the in-memory compaction epoch starts at 0 for every child).
+    pub fn next_lead_generation(&self) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "INSERT INTO counters(name, value) VALUES ('lead_generation', 1)
+             ON CONFLICT(name) DO UPDATE SET value = value + 1
+             RETURNING value",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Writes `rows` to the recall ledger in one transaction.
+    pub fn record_recall(&mut self, rows: &[RecallRow]) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO recall_ledger(conversation, entry_id, entry_hash, state,
+                     lead_generation, lead_epoch, row_id, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    row.conversation,
+                    row.entry_id,
+                    row.entry_hash,
+                    row.state.as_str(),
+                    row.lead_generation,
+                    row.lead_epoch,
+                    row.row_id,
+                    row.at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The ledger rows that keep an entry from being offered again for `conversation`: every
+    /// delivered or shadow row of the lead context `(generation, epoch)`, whatever its
+    /// conversation (the lead holds them all), and the rejected rows of `conversation` at or
+    /// after `since`.
+    pub fn recall_seen(
+        &self,
+        conversation: &str,
+        generation: i64,
+        epoch: i64,
+        since: i64,
+    ) -> Result<Vec<RecallRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation, entry_id, entry_hash, state, lead_generation, lead_epoch,
+                    row_id, at
+             FROM recall_ledger
+             WHERE (state IN ('delivered', 'shadow') AND lead_generation = ?2
+                    AND lead_epoch = ?3)
+                OR (state = 'rejected' AND conversation = ?1 AND at >= ?4)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![conversation, generation, epoch, since], |r| {
+            let state: String = r.get(3)?;
+            Ok(RecallRow {
+                conversation: r.get(0)?,
+                entry_id: r.get(1)?,
+                entry_hash: r.get(2)?,
+                state: RecallState::parse(&state).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(3, state, rusqlite::types::Type::Text)
+                })?,
+                lead_generation: r.get(4)?,
+                lead_epoch: r.get(5)?,
+                row_id: r.get(6)?,
+                at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Deletes memory log rows, recall ledger rows and settled memory jobs older than 30 days
+    /// before `now`.
     /// Pending jobs and cursor rows are kept.
     pub fn prune_memory(&mut self, now: i64) -> Result<(), StoreError> {
         let cutoff = now - MEMORY_KEEP_SECONDS;
@@ -1171,6 +1307,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM memory_log WHERE at < ?1", [cutoff])?;
+        tx.execute("DELETE FROM recall_ledger WHERE at < ?1", [cutoff])?;
         tx.execute(
             "DELETE FROM memory_jobs WHERE state != 'pending' AND updated_at < ?1",
             [cutoff],
@@ -4058,6 +4195,60 @@ mod tests {
         assert_eq!(
             s.get(id).unwrap().unwrap().reply.as_deref(),
             Some("the reply")
+        );
+    }
+
+    #[test]
+    fn lead_generations_survive_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("inbox.sqlite");
+        let store = Store::open(&path).expect("open");
+        assert_eq!(store.next_lead_generation().unwrap(), 1);
+        assert_eq!(store.next_lead_generation().unwrap(), 2);
+        drop(store);
+        let store = Store::open(&path).expect("reopen");
+        assert_eq!(store.next_lead_generation().unwrap(), 3);
+    }
+
+    #[test]
+    fn recall_seen_holds_the_lead_contexts_picks_and_the_conversations_recent_rejections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(&dir.path().join("inbox.sqlite")).expect("open");
+        let row = |conversation: &str, id: &str, state, generation, epoch, at| RecallRow {
+            conversation: conversation.into(),
+            entry_id: id.into(),
+            entry_hash: "h".into(),
+            state,
+            lead_generation: generation,
+            lead_epoch: epoch,
+            row_id: Some(1),
+            at,
+        };
+        store
+            .record_recall(&[
+                row("a", "m-000001", RecallState::Shadow, 2, 0, 100),
+                row("b", "m-000002", RecallState::Delivered, 2, 0, 100),
+                row("a", "m-000003", RecallState::Shadow, 1, 0, 100),
+                row("a", "m-000004", RecallState::Shadow, 2, 1, 100),
+                row("a", "m-000005", RecallState::Rejected, 1, 0, 500),
+                row("a", "m-000006", RecallState::Rejected, 2, 0, 90),
+                row("b", "m-000007", RecallState::Rejected, 2, 0, 500),
+            ])
+            .unwrap();
+        let seen: Vec<String> = store
+            .recall_seen("a", 2, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.entry_id)
+            .collect();
+        // Picks of this lead context from any conversation; rejections of this conversation
+        // since 100 from any lead context.
+        assert_eq!(seen, ["m-000001", "m-000002", "m-000005"]);
+        store.prune_memory(100 + MEMORY_KEEP_SECONDS + 1).unwrap();
+        assert_eq!(
+            store.recall_seen("a", 1, 0, 0).unwrap().len(),
+            1,
+            "only the row at 500 is left"
         );
     }
 }

@@ -1486,6 +1486,62 @@ fn dm(message_id: &str, text: &str) -> InboundEvent {
     }
 }
 
+/// #59, PR 2: the gateway wakes a recall advisor only in shadow mode: the default with jev on and
+/// `memory.recall.model` set, or asked for with `mode = "shadow"`. An upgraded jev install
+/// without a model, jev off (the default install) or `mode = "off"` starts none (moraedang on
+/// #66).
+#[tokio::test]
+async fn gateway_runs_the_recall_advisor_only_in_shadow_mode() {
+    let jev = FakeJev::start().await;
+    type Case = (&'static str, fn(&mut Config), bool);
+    let cases: [Case; 5] = [
+        ("jev on, no model, mode unset", |_| {}, false),
+        (
+            "jev on, model set",
+            |c| c.memory.recall.model = "qa-small".into(),
+            true,
+        ),
+        (
+            "mode shadow, no model",
+            |c| c.memory.recall.mode = Some(moraebot::config::RecallMode::Shadow),
+            true,
+        ),
+        (
+            "jev off, model set",
+            |c| {
+                c.memory.jev.enabled = false;
+                c.memory.recall.model = "qa-small".into();
+            },
+            false,
+        ),
+        (
+            "mode off, model set",
+            |c| {
+                c.memory.recall.model = "qa-small".into();
+                c.memory.recall.mode = Some(moraebot::config::RecallMode::Off);
+            },
+            false,
+        ),
+    ];
+    for (name, adjust, on) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config(
+            root.path(),
+            PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+            &jev.base_url(),
+        );
+        adjust(&mut config);
+        let adapter: Arc<dyn MessengerAdapter> = Arc::new(FakeAdapter::new());
+        let gateway = Gateway::open(&config, adapter).unwrap();
+        let mut seen = None;
+        drop(gateway.with_omp(|omp| {
+            seen = Some(omp.recall_on());
+            omp
+        }));
+        assert_eq!(seen, Some(on), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn gateway_observes_a_reply_end_to_end() {
     let root = tempfile::tempdir().unwrap();
@@ -2148,7 +2204,7 @@ async fn seed_observation(fx: &Fixture, row: i64, text: &str) -> String {
 /// in `self/self.md`; a single plain one waits.
 #[tokio::test]
 async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
-    let fx = Fixture::new().await;
+    let fx = Fixture::with(|config| config.memory.recall.model = "qa-small".into()).await;
     owner_turn(&fx, "m0", "안녕");
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
     let a = seed_observation(&fx, 1, "I answered in English").await;
@@ -2157,7 +2213,11 @@ async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
     let reply = format!(
         "{{\"groups\":[{{\"obs\":[\"{a}\",\"{b}\"],\"text\":\"I answer in English; the owner wants Korean\",\"reconfirms\":null}},{{\"obs\":[\"{c}\"],\"text\":\"I push to main\"}}]}}"
     );
-    let fx = fx.with_summarizer(&[("FAKE_OMP_REPLY", reply.as_str())]);
+    let first = fx.root.path().join("consolidate.log");
+    let fx = fx.with_summarizer(&[
+        ("FAKE_OMP_REPLY", reply.as_str()),
+        ("FAKE_OMP_LOG", first.to_str().unwrap()),
+    ]);
 
     // The owner's turn just ended: not quiet yet.
     assert_eq!(fx.observer.run_once().await, Pass::Idle);
@@ -2181,6 +2241,13 @@ async fn observer_promotes_corrections_once_a_day_while_the_lead_is_quiet() {
             .memory_logged("W_SELF_GROUP_DROPPED", "reason=below_bar")
             .unwrap()
     );
+    // Consolidation runs on memory.recall.model (#59, PR 2).
+    let started = std::fs::read_to_string(&first).unwrap();
+    let start = started
+        .lines()
+        .find(|l| l.starts_with("START pid="))
+        .expect("consolidation child started");
+    assert!(start.contains("\"--model=qa-small\""), "{start}");
 
     // Once a day: a second quiet pass asks nothing again.
     let log = fx.root.path().join("fake-omp.log");

@@ -2253,3 +2253,322 @@ async fn a_steer_after_a_mid_turn_compaction_carries_the_memory_block_again() {
         "the compaction may have summarised the main input's block away: {steer}"
     );
 }
+
+// ---- Recall advisor in shadow mode (#59, PR 2) ----
+
+fn advisor_log(h: &Harness) -> PathBuf {
+    h.dir.path().join("advisor.log")
+}
+
+/// An advisor on the fake omp with model `qa-small`, its own log, scripted by `vars`.
+fn qa_advisor(h: &Harness, vars: &[(&str, &str)]) -> Arc<moraebot::recall::Advisor> {
+    qa_advisor_with(h, vars, |_| {})
+}
+
+/// [`qa_advisor`] with `adjust` applied to its config.
+fn qa_advisor_with(
+    h: &Harness,
+    vars: &[(&str, &str)],
+    adjust: impl FnOnce(&mut Config),
+) -> Arc<moraebot::recall::Advisor> {
+    let mut config = h.config.clone();
+    config.memory.recall.model = "qa-small".into();
+    adjust(&mut config);
+    let mut env: Vec<(String, String)> = vars
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    env.push((
+        "FAKE_OMP_LOG".into(),
+        advisor_log(h).to_string_lossy().into_owned(),
+    ));
+    Arc::new(
+        moraebot::recall::Advisor::new(
+            &config,
+            Arc::clone(&h.store),
+            moraebot::memory::Redactor::default(),
+        )
+        .with_extra_env(env)
+        .with_clock(Arc::new(|| {
+            moraebot::memory::Day::parse("2026-11-21").expect("date")
+        })),
+    )
+}
+
+fn advisor_lines(h: &Harness) -> Vec<String> {
+    std::fs::read_to_string(advisor_log(h))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn advisor_prompts(h: &Harness) -> Vec<String> {
+    advisor_lines(h)
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|f| f["type"] == "prompt")
+        .map(|f| f["message"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+fn logged(h: &Harness, code: &str, detail: &str) -> bool {
+    h.store.lock().unwrap().memory_logged(code, detail).unwrap()
+}
+
+/// The ledger rows of lead context `(generation, 0)` as (id, state).
+fn ledger_rows(h: &Harness, generation: i64) -> Vec<(String, String)> {
+    h.store
+        .lock()
+        .unwrap()
+        .recall_seen(KEY_A, generation, 0, 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.entry_id, r.state.as_str().to_owned()))
+        .collect()
+}
+
+/// One note in another conversation's thread: a candidate the lead does not hold.
+fn seed_other_thread(h: &Harness) -> String {
+    let mut store = qa_memory_store(h);
+    let added = store
+        .add(qa_note(
+            "Releases go out on Fridays only",
+            moraebot::memory::Bucket::Thread(KEY_B.into()),
+        ))
+        .expect("note");
+    added.id
+}
+
+async fn wakes_done(progress: &mut tokio::sync::watch::Receiver<u64>, count: u64) {
+    bounded(progress.wait_for(|n| *n >= count))
+        .await
+        .expect("advisor progress");
+}
+
+#[tokio::test]
+async fn shadow_recall_logs_its_picks_and_never_changes_the_lead_input() {
+    let h = Harness::new();
+    let id = seed_other_thread(&h);
+    let reply = format!(r#"{{"pick":["{id}","m-ffffff"],"reject":[]}}"#);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())]);
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(
+        outcome,
+        Outcome::Reply("echo: Can we ship the release today?".into())
+    );
+    wakes_done(&mut progress, 1).await;
+
+    // The lead got its input exactly as without an advisor: nothing recalled, nothing in chat.
+    let lead_prompts = h.frames("prompt");
+    assert_eq!(lead_prompts.len(), 1);
+    assert_eq!(lead_prompts[0]["message"], input.as_str());
+
+    // The advisor ran locked, on the recall model, and was offered the other thread's note.
+    let start = advisor_lines(&h)
+        .into_iter()
+        .find(|l| l.starts_with("START pid="))
+        .expect("advisor started");
+    let argv = start_argv(&start);
+    assert!(argv.contains(&"--model=qa-small".to_owned()), "{argv:?}");
+    assert!(argv.contains(&"--no-tools".to_owned()), "{argv:?}");
+    let asked = advisor_prompts(&h);
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].contains("Can we ship the release today?"),
+        "{}",
+        asked[0]
+    );
+    assert!(
+        asked[0].contains(&format!("- {id} ["))
+            && asked[0].contains("Releases go out on Fridays only"),
+        "{}",
+        asked[0]
+    );
+
+    // The pick is logged with its score and the lead context; the unoffered id is dropped.
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        &format!("gen=1 epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=1 blocked=0")
+    ));
+    assert_eq!(ledger_rows(&h, 1), [(id, "shadow".to_owned())]);
+    m.shutdown_all().await;
+}
+
+/// moraedang's point 1 on #59: the ledger's lead context is a persisted generation, not the
+/// in-memory compaction epoch (which is 0 again for every new lead child).
+#[tokio::test]
+async fn a_shadow_pick_is_offered_again_only_to_a_new_lead_generation() {
+    let h = Harness::new();
+    let id = seed_other_thread(&h);
+    let reply = format!(r#"{{"pick":["{id}"]}}"#);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())]);
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let ask = |row: i64, text: &str| lead::owner_input(KEY_A, row, text);
+
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &ask(1, "first"))).await;
+    wakes_done(&mut progress, 1).await;
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &ask(1, "second"))).await;
+    wakes_done(&mut progress, 2).await;
+    assert_eq!(
+        advisor_prompts(&h).len(),
+        1,
+        "the same lead child already holds the pick: nothing left to offer, no call"
+    );
+
+    // A persona change restarts the lead between turns: a new generation, epoch 0 again.
+    save_persona(&h, "Kai", "", "");
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &ask(1, "third"))).await;
+    wakes_done(&mut progress, 3).await;
+    let asked = advisor_prompts(&h);
+    assert_eq!(asked.len(), 2, "the new lead child never saw the pick");
+    assert!(asked[1].contains(&id), "{}", asked[1]);
+    for generation in [1, 2] {
+        let detail = format!(
+            "gen={generation} epoch=0 row=1 offered=1 picks={id}:2 rejected=0 unoffered=0 blocked=0"
+        );
+        assert!(
+            logged(&h, moraebot::recall::I_RECALL_PICK, &detail),
+            "{detail}"
+        );
+        assert_eq!(
+            ledger_rows(&h, generation),
+            [(id.clone(), "shadow".to_owned())]
+        );
+    }
+    m.shutdown_all().await;
+}
+
+/// The failure rule: a hanging advisor never holds the lead turn, and a wake while it still
+/// runs is skipped and logged.
+#[tokio::test]
+async fn a_hanging_advisor_never_holds_the_lead_turn() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_MODE", "hang")]);
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "hello");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hello".into()));
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hello".into()));
+    wakes_done(&mut progress, 1).await;
+    assert_eq!(*progress.borrow(), 1, "the first wake still runs");
+    assert!(logged(
+        &h,
+        moraebot::recall::W_RECALL_CAP,
+        "reason=busy gen=1 epoch=0 row=1"
+    ));
+    assert!(ledger_rows(&h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_advisor_that_lists_tools_is_refused_and_logged() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_DUMP_TOOLS", "bash")]);
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "hello");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hello".into()));
+    wakes_done(&mut progress, 1).await;
+    assert!(
+        advisor_prompts(&h).is_empty(),
+        "no prompt reaches a child with tools"
+    );
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_SPAWN,
+        "gen=1 epoch=0 row=1"
+    ));
+    assert!(ledger_rows(&h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn lane_results_and_untagged_inputs_never_wake_the_advisor() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor(&h, &[]);
+    let progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let lane = lead::lane_result(KEY_A, 7, &lead::LaneResult::Text("done"));
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, &lane)).await;
+    bounded(m.prompt(KEY_A, 1, Sender::Owner, "untagged")).await;
+    m.shutdown_all().await;
+    assert_eq!(*progress.borrow(), 0);
+    assert!(advisor_lines(&h).is_empty());
+}
+
+/// A turn with an advisor that fails is the same turn as without one; the failure is logged.
+async fn turn_with_failing_advisor(h: &Harness, advisor: Arc<moraebot::recall::Advisor>) {
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "hello");
+    let outcome = bounded(m.prompt(KEY_A, 1, Sender::Owner, &input))
+        .await
+        .main
+        .outcome;
+    assert_eq!(outcome, Outcome::Reply("echo: hello".into()));
+    wakes_done(&mut progress, 1).await;
+    let lead_prompts = h.frames("prompt");
+    assert_eq!(lead_prompts.len(), 1);
+    assert_eq!(lead_prompts[0]["message"], input.as_str());
+    assert!(ledger_rows(h, 1).is_empty());
+    m.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_advisor_past_its_time_limit_is_logged_and_the_turn_is_unaffected() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor_with(&h, &[("FAKE_OMP_MODE", "hang")], |c| {
+        c.memory.recall.timeout_seconds = 1;
+    });
+    turn_with_failing_advisor(&h, advisor).await;
+    assert_eq!(advisor_prompts(&h).len(), 1, "the advisor was asked");
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_TIMEOUT,
+        "gen=1 epoch=0 row=1"
+    ));
+}
+
+#[tokio::test]
+async fn an_advisor_answer_without_json_is_logged_and_the_turn_is_unaffected() {
+    let h = Harness::new();
+    seed_other_thread(&h);
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY", "I would pick the first entry.")]);
+    turn_with_failing_advisor(&h, advisor).await;
+    assert_eq!(advisor_prompts(&h).len(), 1, "the advisor was asked");
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_OUTPUT,
+        "gen=1 epoch=0 row=1"
+    ));
+    assert!(!logged(
+        &h,
+        moraebot::recall::I_RECALL_PICK,
+        "gen=1 epoch=0 row=1 offered=1 picks= rejected=0 unoffered=0 blocked=0"
+    ));
+}

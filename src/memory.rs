@@ -189,6 +189,11 @@ impl Day {
         Day(self.0 + days)
     }
 
+    /// The days from `earlier` to this day (negative when `earlier` is later).
+    pub fn days_after(self, earlier: Day) -> i64 {
+        self.0 - earlier.0
+    }
+
     /// Today in the local time zone of this machine.
     pub fn today_local() -> Day {
         let secs = SystemTime::now()
@@ -730,6 +735,12 @@ impl ExcerptFilter {
         )
     }
 
+    /// Whether `text` claims an approval or permission (the `approval` list, matched like in
+    /// [`Self::allows`]). Text that hides or disguises characters counts as a claim.
+    pub fn claims_approval(&self, text: &str) -> bool {
+        matches_folded(&self.approval, text)
+    }
+
     /// `Ok` when `sentence` may be saved, else the first reason it may not.
     pub fn allows(&self, sentence: &str, redactor: &Redactor) -> Result<(), ExcerptDrop> {
         let folded = fold_for_match(sentence)?;
@@ -836,6 +847,15 @@ fn hidden(c: char) -> bool {
             | 0x20D0..=0x20FF
             | 0xFE20..=0xFE2F
     ) || (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+}
+
+/// Whether any of the lower-case `patterns` is in `text` once it is folded ([`fold_for_match`])
+/// and lower-cased; text the fold refuses (hidden or look-alike characters) counts as a match.
+pub(crate) fn matches_folded(patterns: &[String], text: &str) -> bool {
+    match fold_for_match(text) {
+        Ok(folded) => matches_any(patterns, &folded.to_lowercase()),
+        Err(_) => true,
+    }
 }
 
 /// Whether any of `patterns` is in `lower`. A pattern of only ASCII letters, digits and `_`
@@ -1334,7 +1354,7 @@ fn render_core(newest_first: &[(usize, usize, Entry)], omitted: usize) -> String
 /// Entry text for a prompt block: `<<<` and `>>>` anywhere become `‹‹‹` and `›››`, and a
 /// leading `[moraebot` gets a backslash, so no entry can pose as a tag line or a block
 /// delimiter, at the start of its line or in the middle of it.
-fn escaped(text: &str) -> String {
+pub(crate) fn escaped(text: &str) -> String {
     let text = text.replace("<<<", "‹‹‹").replace(">>>", "›››");
     if text.starts_with("[moraebot") {
         format!("\\{text}")
@@ -1865,6 +1885,50 @@ pub fn search(
         ));
     }
     out
+}
+
+/// One entry the recall advisor may be offered ([`recall_pool`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolEntry {
+    pub bucket: Bucket,
+    pub entry: Entry,
+    /// An archived entry the owner replaced (`superseded_by`): no longer in force.
+    pub replaced: bool,
+}
+
+/// Every entry the recall advisor (#59) may be offered as of `today`: the live entries of
+/// `projects/` and `threads/` (every conversation's, moraedang's point 8 on #59), and the
+/// archived entries of `core/`, `projects/` and `threads/` the owner replaced. Never the core
+/// files (the lead has them in its system prompt), never `self/` (an observation never met the
+/// promotion bar, moraedang's point 3; the readings are the self block), never an entry the
+/// owner forgot (archived without `superseded_by`), never an expired one. Owner lines moraebot
+/// did not commit, and non-owner lines in `core/`, are skipped as in every read block.
+pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
+    let live = ["projects", "threads"]
+        .iter()
+        .flat_map(|dir| md_files(root, dir));
+    let archived = ["core", "projects", "threads"]
+        .iter()
+        .flat_map(|dir| md_files(root, &format!("{ARCHIVE}{dir}")));
+    let rels: Vec<String> = live.chain(archived).collect();
+    let mut pool = Vec::new();
+    for (rel, file) in read_trusted(root, &rels) {
+        let in_archive = rel.starts_with(ARCHIVE);
+        for entry in file.entries {
+            if entry.expired(today)
+                || (file.bucket.owner_only() && entry.prov != Prov::Owner)
+                || (in_archive && entry.superseded_by.is_none())
+            {
+                continue;
+            }
+            pool.push(PoolEntry {
+                bucket: file.bucket.clone(),
+                entry,
+                replaced: in_archive,
+            });
+        }
+    }
+    pool
 }
 
 /// What one successful op adds to the batch commit message.
@@ -4633,5 +4697,67 @@ mod tests {
             let out = search(store.root(), day("2026-11-21"), "zebra", scope, None);
             assert_eq!(out, "No saved memory matches.", "{scope:?}");
         }
+    }
+
+    #[test]
+    fn the_recall_pool_holds_live_notes_and_replaced_ones_never_forgotten_core_or_self() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-21");
+        let project = Bucket::Project("usunmn/moraebot".into());
+        let thread = Bucket::Thread("discord:th:1".into());
+        let kept = store
+            .add(owner("project note", project.clone(), 1))
+            .expect("add");
+        let other = store
+            .add(owner("thread note", thread.clone(), 2))
+            .expect("add");
+        let old = store
+            .add(owner("old wording", thread.clone(), 3))
+            .expect("add");
+        let new = store
+            .correct(&old.id, "new wording", Source::row(4))
+            .expect("correct");
+        let gone = store
+            .add(owner("forgotten note", project.clone(), 5))
+            .expect("add");
+        store.forget(&gone.id).expect("forget");
+        let mut lane = owner("lane note", project.clone(), 6);
+        lane.prov = Prov::Lane;
+        lane.src = Source::lane(3, 1);
+        let lane = store.add(lane).expect("add");
+        let mut stale = owner("stale note", project.clone(), 7);
+        stale.prov = Prov::Tool;
+        stale.expires = Some(day("2026-11-20"));
+        store.add(stale).expect("add");
+        store
+            .add(owner("core rule", Bucket::Owner, 8))
+            .expect("add");
+        let mut obs = owner("a correction", Bucket::SelfObs, 9);
+        obs.src = Source::observation(9, 0, 9, false);
+        store.add(obs).expect("add");
+        store
+            .add(reading("a reading", &["m-00000a"], day("2027-01-01")))
+            .expect("add");
+
+        let pool = recall_pool(store.root(), day("2026-11-21"));
+        let mut seen: Vec<(String, bool)> = pool
+            .iter()
+            .map(|p| (p.entry.id.clone(), p.replaced))
+            .collect();
+        seen.sort();
+        let mut want = vec![
+            (kept.id, false),
+            (other.id, false),
+            (new.new.id, false),
+            (old.id.clone(), true),
+            (lane.id, false),
+        ];
+        want.sort();
+        assert_eq!(seen, want);
+        let replaced = pool
+            .iter()
+            .find(|p| p.entry.id == old.id)
+            .expect("replaced");
+        assert_eq!(replaced.bucket, thread);
     }
 }

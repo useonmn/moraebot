@@ -902,7 +902,11 @@ impl Observer {
         if !offer.pending.is_empty() {
             let answer = self
                 .summarizer
-                .ask(CONSOLIDATE_GUIDANCE, consolidate::message(&offer))
+                .ask(
+                    CONSOLIDATE_GUIDANCE,
+                    consolidate::message(&offer),
+                    self.config.memory.recall_model(),
+                )
                 .await;
             match answer.as_deref().map(consolidate::parse_reply) {
                 Ok(Some(found)) => groups = found,
