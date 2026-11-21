@@ -3367,36 +3367,124 @@ async fn a_fresh_candidate_at_a_tool_start_is_steered_into_the_running_turn() {
     m.shutdown_all().await;
 }
 
-/// The cooldown: once `mid_max_delivered` notes went to the conversation, its next tool
-/// events wake nothing until the window passed.
+/// Unrelated owner notes in [`ZEPHYR`] that take the pool past
+/// [`moraebot::recall::POOL_ALL_BYTES`]: from then on a wake is offered only the candidates
+/// that share a term with it, so each mid wake below is offered exactly what its events name.
+fn pad_pool(h: &Harness) {
+    let mut store = qa_memory_store(h);
+    let mut bytes = 0;
+    for n in 0.. {
+        if bytes > moraebot::recall::POOL_ALL_BYTES {
+            break;
+        }
+        let text = (0..150)
+            .map(|i| format!("pad{n}w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bytes += text.len();
+        store
+            .add(qa_note(
+                &text,
+                moraebot::memory::Bucket::Project(ZEPHYR.into()),
+            ))
+            .expect("pad note");
+    }
+}
+
+/// Z: related only to the tool result of [`TWO_PICK_EVENTS`] (`zebra`, `paint`).
+const MID_Z: &str = "Zebra paint dries overnight";
+
+/// One tool call whose start names X's `curl` and whose end names Z's `zebra paint`: over a
+/// padded pool the start's wake is offered X alone, the end's wake X and Z.
+const TWO_PICK_EVENTS: &str = r#"{"type":"tool_execution_start","toolCallId":"mid-1","toolName":"bash","args":{"command":"curl example"}}
+{"type":"tool_execution_end","toolCallId":"mid-1","toolName":"bash","result":{"content":[{"type":"text","text":"zebra paint failed"}]},"isError":true}"#;
+
+/// X, Z and the padding; Z's id is returned.
+fn seed_two_picks(h: &Harness) -> (String, String) {
+    let (x, _) = seed_mid(h);
+    let z = qa_memory_store(h)
+        .add(qa_note(
+            MID_Z,
+            moraebot::memory::Bucket::Project(ZEPHYR.into()),
+        ))
+        .expect("note")
+        .id;
+    pad_pool(h);
+    (x, z)
+}
+
+/// [`mid_lead`] writing [`TWO_PICK_EVENTS`] instead.
+fn two_pick_lead(h: &Harness, advisor: &Arc<moraebot::recall::Advisor>) -> Arc<OmpManager> {
+    Arc::new(
+        h.manager("steer")
+            .with_extra_env([
+                ("FAKE_OMP_STEER_CASE", "merged".to_owned()),
+                ("FAKE_OMP_STEER_EVENTS", TWO_PICK_EVENTS.to_owned()),
+                (
+                    "FAKE_OMP_EVENTS_GATE",
+                    events_gate(h).to_string_lossy().into_owned(),
+                ),
+            ])
+            .with_recall(Arc::clone(advisor)),
+    )
+}
+
+fn recall_notes(h: &Harness) -> Vec<String> {
+    h.steer_frames()
+        .iter()
+        .filter_map(|f| f["message"].as_str())
+        .filter(|m| m.starts_with(moraebot::omp::RECALL_NOTE_TAG))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The cooldown counts a note when it is sent: within one turn two mid wakes each pick a
+/// different entry (X at the tool start, Z at its end), both calls run, and with
+/// `mid_max_delivered = 1` only one note goes in. A fresh lead child sharing the advisor then
+/// starts no mid wake in that conversation while the window lasts.
 #[tokio::test]
-async fn a_full_cooldown_keeps_mid_wakes_from_starting() {
+async fn the_cooldown_holds_within_one_turn_and_across_turns() {
     let h = Harness::new();
-    let (x, y) = seed_mid(&h);
-    let reply = pick_y_then_x(&x, &y);
+    let (x, z) = seed_two_picks(&h);
+    let reply = format!(r#"{{"pick":["{z}","{x}"]}}"#);
     let advisor = mid_advisor(&h, &[("FAKE_OMP_REPLY", reply.as_str())], true, |c| {
         c.memory.recall.mid_max_delivered = 1;
     });
     let mut progress = advisor.progress();
-    let m = mid_lead(&h, "note", &advisor);
+    let m = two_pick_lead(&h, &advisor);
     let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
     turn_running(&m, KEY_A).await;
     wakes_done(&mut progress, 1).await;
     std::fs::write(events_gate(&h), "").expect("let the tool events come");
-    bounded(turn).await.expect("prompt task");
+    wakes_done(&mut progress, MID_TURN_WAKES).await;
+    end_with_owner_steer(&m, turn).await;
+
+    // Both mid wakes asked (X alone, then X and Z): each had its own pick.
+    let asked = advisor_prompts(&h);
+    assert_eq!(asked.len(), 2, "no owner call, two mid calls: {asked:?}");
+    assert!(
+        asked.iter().any(|a| a.contains(&x) && !a.contains(&z)),
+        "{asked:?}"
+    );
+    assert!(asked.iter().any(|a| a.contains(&z)), "{asked:?}");
     assert!(logged(
         &h,
-        moraebot::recall::I_RECALL_DELIVERED,
-        &format!("gen=1 epoch=0 row=1 ids={x} phase=mid")
+        moraebot::recall::I_RECALL_PICK,
+        &format!(
+            "gen=1 epoch=0 row=1 offered=1 picks={x}:12 rejected=0 unoffered=1 blocked=0 phase=mid mode=on"
+        )
     ));
-    let before = *progress.borrow();
+    // One note only, though neither had settled when the second was ready.
+    let notes = recall_notes(&h);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(delivered_rows(&h, 1).len(), 1);
+    m.shutdown_all().await;
 
-    // The next turn's tool events find the conversation's one delivery inside the window.
-    std::fs::remove_file(events_gate(&h)).expect("hold the next events");
+    // A fresh lead child (generation 2) sharing the advisor: its tool events wake nothing.
+    let before = *progress.borrow();
+    let m = two_pick_lead(&h, &advisor);
     let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 3, "check the server again"));
     turn_running(&m, KEY_A).await;
-    wakes_done(&mut progress, before + 1).await;
-    std::fs::write(events_gate(&h), "").expect("let the tool events come");
     let steer = lead::owner_input(KEY_A, 4, "thanks");
     bounded(async {
         while !m.try_steer(KEY_A, 4, Sender::Owner, &steer, |_| true) {
@@ -3405,11 +3493,14 @@ async fn a_full_cooldown_keeps_mid_wakes_from_starting() {
     })
     .await;
     bounded(turn).await.expect("prompt task");
+    wakes_done(&mut progress, before + 1).await;
     assert_eq!(
         *progress.borrow(),
         before + 1,
         "only the owner wake: no mid wake started"
     );
+    assert_eq!(advisor_prompts(&h).len(), 2);
+    assert_eq!(recall_notes(&h).len(), 1);
     m.shutdown_all().await;
 }
 
@@ -3601,13 +3692,13 @@ async fn mid_wakes_write_shadow_and_rejected_ledger_rows() {
     m.shutdown_all().await;
 }
 
-/// R1 M4: a call still running (here a mid wake's) never makes the next owner wake busy; an
-/// owner wake with something new asks the advisor at once.
+/// R1 M4: calls still running (here two mid wakes') never make the next owner wake busy: mid
+/// wakes leave one place for owner wakes.
 #[tokio::test]
-async fn a_call_still_running_never_makes_the_next_owner_wake_busy() {
+async fn calls_still_running_never_make_the_next_owner_wake_busy() {
     let h = Harness::new();
-    let (x, y) = seed_mid(&h);
-    let reply = pick_y_then_x(&x, &y);
+    let (x, z) = seed_two_picks(&h);
+    let reply = format!(r#"{{"pick":["{z}","{x}"]}}"#);
     let gate = reply_gate(&h);
     let gate_path = gate.to_string_lossy().into_owned();
     let advisor = mid_advisor(
@@ -3622,26 +3713,24 @@ async fn a_call_still_running_never_makes_the_next_owner_wake_busy() {
     );
     let mut progress = advisor.progress();
     let mut asked = advisor.asked();
-    let m = mid_lead(&h, "merged", &advisor);
-    std::fs::write(&gate, "").expect("the first turn's wake answers at once");
+    let m = two_pick_lead(&h, &advisor);
     let turn = spawn_owner_turn(&m, &lead::owner_input(KEY_A, 1, "check the server"));
     turn_running(&m, KEY_A).await;
     wakes_done(&mut progress, 1).await;
-    std::fs::remove_file(&gate).expect("hold the mid wake's answer");
     std::fs::write(events_gate(&h), "").expect("let the tool events come");
     bounded(asked.wait_for(|n| *n >= 2))
         .await
-        .expect("mid wake asked");
+        .expect("both mid wakes asked");
     end_with_owner_steer(&m, turn).await;
 
-    // A new note makes the next owner wake fresh; the mid call still runs.
+    // A new note makes the next owner wake fresh; both mid calls still run.
     qa_memory_store(&h)
         .add(qa_note(
-            "Zebra paint dries overnight",
+            "Walrus tusks grow slowly",
             moraebot::memory::Bucket::Project(ZEPHYR.into()),
         ))
         .expect("note");
-    let next = lead::owner_input(KEY_A, 3, "and now?");
+    let next = lead::owner_input(KEY_A, 3, "how do walrus tusks grow?");
     bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
     bounded(asked.wait_for(|n| *n >= 3))
         .await
@@ -3651,11 +3740,104 @@ async fn a_call_still_running_never_makes_the_next_owner_wake_busy() {
         moraebot::recall::W_RECALL_CAP,
         "reason=busy gen=1 epoch=0 row=3"
     ));
-    std::fs::write(&gate, "").expect("release both answers");
-    // Both calls finish; the stale mid call reaches no turn (that path is pinned by
-    // `a_mid_pick_for_a_turn_that_ended_is_dropped`) and steered nothing.
+    std::fs::write(&gate, "").expect("release the answers");
     wakes_done(&mut progress, MID_TURN_WAKES + 1).await;
-    assert_eq!(h.steer_frames().len(), 1, "the owner's steer only");
+    m.shutdown_all().await;
+}
+
+/// A call that failed offered nothing: the next wake with the same candidates asks again.
+#[tokio::test]
+async fn after_a_failed_call_the_next_wake_asks_again() {
+    let h = Harness::new();
+    seed_project_note(&h);
+    let reply = h.dir.path().join("advisor.reply");
+    std::fs::write(&reply, "I would pick the first entry.").expect("bad reply");
+    let reply_path = reply.to_string_lossy().into_owned();
+    let advisor = qa_advisor(&h, &[("FAKE_OMP_REPLY_FILE", reply_path.as_str())]);
+    let mut progress = advisor.progress();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 1, "Can we ship the release today?");
+    m.prompt(KEY_A, 1, Sender::Owner, &input).await;
+    wakes_done(&mut progress, 1).await;
+    assert!(logged(
+        &h,
+        moraebot::recall::E_RECALL_OUTPUT,
+        "gen=1 epoch=0 row=1"
+    ));
+    std::fs::write(&reply, r#"{"pick":[]}"#).expect("good reply");
+    let input = lead::owner_input(KEY_A, 2, "Can we ship the release today?");
+    m.prompt(KEY_A, 2, Sender::Owner, &input).await;
+    wakes_done(&mut progress, 2).await;
+    assert_eq!(
+        advisor_prompts(&h).len(),
+        2,
+        "the same candidates asked again"
+    );
+    // An answered call keeps them offered: a third wake has nothing new.
+    let input = lead::owner_input(KEY_A, 3, "Can we ship the release today?");
+    m.prompt(KEY_A, 3, Sender::Owner, &input).await;
+    wakes_done(&mut progress, 3).await;
+    assert_eq!(advisor_prompts(&h).len(), 2);
+    m.shutdown_all().await;
+}
+
+/// On mode: an owner wake that misses `wait_ms` while its turn still runs steers its picks
+/// into that turn as a recalled note, recorded as delivered once the lead took it.
+#[tokio::test]
+async fn a_late_owner_pick_is_steered_into_its_running_turn() {
+    let h = Harness::new();
+    let (_, y) = seed_mid(&h);
+    let reply = format!(r#"{{"pick":["{y}"]}}"#);
+    let gate = reply_gate(&h);
+    let gate_path = gate.to_string_lossy().into_owned();
+    let advisor = mid_advisor(
+        &h,
+        &[
+            ("FAKE_OMP_REPLY", reply.as_str()),
+            ("FAKE_OMP_REPLY_GATE", gate_path.as_str()),
+        ],
+        true,
+        |c| {
+            c.memory.recall.wait_ms = 0;
+            c.memory.recall.mid_task = Some(moraebot::config::MidTask::Off);
+        },
+    );
+    let mut progress = advisor.progress();
+    let mut asked = advisor.asked();
+    let m = Arc::new(
+        h.manager("steer")
+            .with_extra_env([("FAKE_OMP_STEER_CASE", "merged")])
+            .with_recall(Arc::clone(&advisor)),
+    );
+    let input = lead::owner_input(KEY_A, 1, "check the server");
+    let turn = spawn_owner_turn(&m, &input);
+    turn_running(&m, KEY_A).await;
+    bounded(asked.wait_for(|n| *n >= 1))
+        .await
+        .expect("owner wake asked");
+    std::fs::write(&gate, "").expect("the answer comes after the wait");
+    wakes_done(&mut progress, 1).await;
+    let report = end_with_owner_steer(&m, turn).await;
+    assert!(
+        matches!(report.main.outcome, Outcome::Reply(_)),
+        "{report:?}"
+    );
+    assert_eq!(lead_messages(&h)[0], input, "the input went without it");
+    let steers = h.steer_frames();
+    assert_eq!(steers.len(), 2, "{steers:?}");
+    assert_eq!(steers[0]["message"], recalled_note(&y, MID_Y));
+    assert_eq!(delivered_rows(&h, 1), [(y.clone(), Some(1))]);
+    assert!(logged(
+        &h,
+        moraebot::recall::I_RECALL_DELIVERED,
+        &format!("gen=1 epoch=0 row=1 ids={y}")
+    ));
+    // Not kept for the next owner input as well.
+    let next = lead::owner_input(KEY_A, 3, "and now?");
+    bounded(m.prompt(KEY_A, 3, Sender::Owner, &next)).await;
+    let messages = lead_messages(&h);
+    let last = messages.last().expect("the next input");
+    assert!(last.contains("and now?") && !last.contains(&y), "{last}");
     m.shutdown_all().await;
 }
 

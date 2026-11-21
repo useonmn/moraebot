@@ -245,10 +245,10 @@ pub fn refresh_request(text: &str) -> Option<crate::status::Lang> {
 pub fn refresh_text(lang: crate::status::Lang) -> &'static str {
     match lang {
         crate::status::Lang::Korean => {
-            "다음 답변 전에 저장된 기억을 시스템 프롬프트에 다시 반영할게요."
+            "리드가 다음에 턴 사이에서 쉴 때 저장된 기억을 시스템 프롬프트에 다시 반영할게요."
         }
         crate::status::Lang::English => {
-            "Saved memory goes into the lead's system prompt again before its next reply."
+            "Saved memory goes into the lead's system prompt again when the lead is next idle between turns."
         }
     }
 }
@@ -276,6 +276,7 @@ pub fn recent_recalls(
     now: i64,
 ) -> String {
     use crate::status::Lang;
+    use crate::store::{RecallPhase, RecallState};
     if rows.is_empty() {
         return match lang {
             Lang::Korean => "아직 떠올린 기억이 없어요.".into(),
@@ -289,14 +290,29 @@ pub fn recent_recalls(
     for row in rows {
         let text = match memory.show(&row.entry_id) {
             Ok(Some(found)) if !found.archived => found.entry.text,
-            Ok(_) => "(gone)".to_owned(),
+            Ok(_) => match lang {
+                Lang::Korean => "(없어짐)".to_owned(),
+                Lang::English => "(gone)".to_owned(),
+            },
             Err(err) => failure(&row.entry_id, &err),
         };
-        let phase = row.phase.as_str();
+        let (phase, state) = match lang {
+            Lang::English => (row.phase.as_str(), row.state.as_str()),
+            Lang::Korean => (
+                match row.phase {
+                    RecallPhase::Owner => "오너 메시지",
+                    RecallPhase::Mid => "작업 중",
+                },
+                match row.state {
+                    RecallState::Delivered => "전달됨",
+                    RecallState::Rejected => "거절됨",
+                    RecallState::Shadow => "기록만",
+                },
+            ),
+        };
         out.push(format!(
-            "- {} {phase} {} {} {text}",
+            "- {} {phase} {state} {} {text}",
             crate::status::ago(lang, now - row.at),
-            row.state.as_str(),
             row.entry_id
         ));
     }
@@ -1005,6 +1021,12 @@ mod tests {
                  - 11 min ago owner delivered {} deploys go through make release",
                 added.id
             )
+        );
+        let text = recent_recalls(&memory, Lang::Korean, &rows, 1660);
+        assert!(
+            text.contains("작업 중 기록만 m-abcdef (없어짐)")
+                && text.contains("오너 메시지 전달됨"),
+            "{text}"
         );
     }
 }

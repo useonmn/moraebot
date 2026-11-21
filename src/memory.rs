@@ -1840,7 +1840,8 @@ pub struct PoolEntry {
 /// archived entries of those the owner replaced. Never the core files (the lead has them in
 /// its system prompt), never an entry the owner forgot (archived without `superseded_by`),
 /// never an expired one. Owner lines moraebot did not commit, and non-owner lines in
-/// `self/`, are skipped as in every read block.
+/// `self/`, are skipped as in every read block; so are the observer's legacy summaries in
+/// `self/` (owner provenance, `src: obs ...`): a model wrote them, not the owner.
 pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
     let live = ["projects", "threads", "self"]
         .iter()
@@ -1855,6 +1856,11 @@ pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
         for entry in file.entries {
             if entry.expired(today)
                 || (file.bucket.owner_only() && entry.prov != Prov::Owner)
+                || (file.bucket == Bucket::SelfObs
+                    && entry
+                        .src
+                        .as_deref()
+                        .is_some_and(|src| src.starts_with("obs ")))
                 || (in_archive && entry.superseded_by.is_none())
             {
                 continue;
@@ -1870,10 +1876,11 @@ pub fn recall_pool(root: &Path, today: Day) -> Vec<PoolEntry> {
 }
 
 /// The commit trusted reads of the memory folder `root` take owner lines from (moraebot's
-/// last own commit), when one is recorded: while it stays the same, so does
-/// [`recall_pool`] for a day.
+/// last own commit, as the store opened in this process keeps it, else as recorded beside
+/// the folder), when one is known: while it stays the same, so does [`recall_pool`] for a
+/// day.
 pub fn trusted_head(root: &Path) -> Option<String> {
-    recorded_head(root)
+    known_head(root).or_else(|| recorded_head(root))
 }
 
 /// What one successful op adds to the batch commit message.
@@ -4960,6 +4967,10 @@ mod tests {
         let correction = store
             .add(owner("a correction", Bucket::SelfObs, 9))
             .expect("add");
+        // The observer's legacy summary: owner provenance, but a model wrote it.
+        let mut legacy = owner("the owner wants short replies", Bucket::SelfObs, 10);
+        legacy.src = Source::new("obs row=10 s=0 turn=10").expect("source");
+        store.add(legacy).expect("add");
 
         let pool = recall_pool(store.root(), day("2026-11-21"));
         let mut seen: Vec<(String, bool)> = pool
@@ -5121,6 +5132,46 @@ mod tests {
         assert_eq!(commits(&root)[0], "owner row=1: crash");
         assert!(!root.join(REJECTED_DIR).exists());
         assert!(!beside(&root, PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn a_journal_that_does_not_match_is_dropped_and_nothing_is_committed() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        let capture = crate::logging::Capture::default();
+        let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
+            Some("info"),
+            FmtSpan::NONE,
+            capture.clone(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, _) = open(dir.path(), "2026-11-20");
+        let root = store.root().to_path_buf();
+        drop(store);
+        let head = git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+        let before = commits(&root);
+        for (base, rel) in [
+            ("0".repeat(40), "core/owner.md"),
+            (head.clone(), "core/owner.txt"),
+            (head.clone(), "../escape.md"),
+            (head.clone(), "core/../../escape.md"),
+        ] {
+            let journal = serde_json::json!({
+                "base": base,
+                "message": "owner row=1: planted",
+                "files": { rel: "PLANTED-9c1" },
+            });
+            fs::write(beside(&root, PENDING_FILE), journal.to_string()).expect("journal");
+            let (store, _) = open(dir.path(), "2026-11-20");
+            drop(store);
+            assert!(!beside(&root, PENDING_FILE).exists(), "{rel}");
+            assert_eq!(commits(&root), before, "{base} {rel}");
+            assert!(!dir.path().join("escape.md").exists());
+            assert!(!root.join("core/owner.txt").exists());
+            let owner = fs::read_to_string(root.join("core/owner.md")).unwrap_or_default();
+            assert!(!owner.contains("PLANTED"), "{rel}");
+        }
+        let dropped = capture.contents().matches(W_MEMORY_PENDING_DROPPED).count();
+        assert_eq!(dropped, 4);
     }
 
     #[test]

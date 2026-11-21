@@ -165,8 +165,10 @@ pub fn write_tool(
 ) -> HostTool {
     HostTool::new(
         MEMORY_WRITE_TOOL,
-        "Save a note in moraebot's memory, for example when the owner asks you to remember \
-         something. Returns the entry id at once; the write finishes in the background. \
+        "Save a note in moraebot's memory: when the owner asks you to remember something, \
+         and when you learn something a later turn will need (an approach or command that \
+         failed or worked here and why, a project fact you had to dig out); one short fact \
+         per note, never a secret. Returns the entry id at once; the write finishes in the background. \
          moraebot decides whose words it is: it counts as the owner's only when `text` is \
          one whole sentence the owner wrote in this turn, copied exactly (a quoted `>` line \
          or a code block the owner pasted does not count); anything else is \

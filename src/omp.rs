@@ -1053,20 +1053,31 @@ struct LeadMetrics {
     pinned: Option<String>,
 }
 
-/// The usage of every assistant `message_end` the turn's main prompt saw, from submission to
-/// its `prompt_result` (the client collects them in order, so none is missed or counted for
-/// the next turn); nothing for a turn that failed before its result.
-fn turn_usage(turn: &Result<PromptTurn, RpcError>) -> TokenUsage {
-    let mut sum = TokenUsage::default();
-    for event in turn.iter().flat_map(|turn| &turn.events) {
-        if let RpcAgentEvent::MessageEnd(end) = event
-            && let omp_rpc::AgentMessage::Assistant(message) = &end.message
-            && let Some(usage) = &message.usage
-        {
-            sum.add_usage(usage);
+/// The usage of one lead turn: every assistant `message_end` its main prompt, its owner steer
+/// and its notes saw, from submission to their `prompt_result` (the client collects them in
+/// order, so none is missed or counted for the next turn). A run that answered several of
+/// them shows up in each; it is counted once (same message, field for field). Nothing for a
+/// prompt that failed before its result.
+#[derive(Default)]
+struct TurnUsage {
+    sum: TokenUsage,
+    seen: HashSet<String>,
+}
+
+impl TurnUsage {
+    fn add(&mut self, turn: &Result<PromptTurn, RpcError>) {
+        for event in turn.iter().flat_map(|turn| &turn.events) {
+            if let RpcAgentEvent::MessageEnd(end) = event
+                && let omp_rpc::AgentMessage::Assistant(message) = &end.message
+                && let Some(usage) = &message.usage
+                && self
+                    .seen
+                    .insert(serde_json::to_string(message).unwrap_or_default())
+            {
+                self.sum.add_usage(usage);
+            }
         }
     }
-    sum
 }
 
 /// Forgets what the lead child was given when omp reports a compaction of its context
@@ -1285,6 +1296,9 @@ pub struct OmpManager {
     /// What the last lead child started in this process was given; a later child of the same
     /// session holds the update blocks it held.
     last_given: Mutex<Option<Given>>,
+    /// The text the last lead child had pinned when it was lost: its successor starts with it
+    /// (the session still holds what it was given), so the usual restart rules apply.
+    lost_append: Mutex<Option<String>>,
     /// Token usage and restarts of the lead.
     metrics: Arc<Mutex<LeadMetrics>>,
     lead_watch: Arc<Mutex<LeadWatch>>,
@@ -1340,6 +1354,7 @@ impl OmpManager {
             refresh: AtomicBool::new(false),
             persona_refused: Mutex::default(),
             last_given: Mutex::default(),
+            lost_append: Mutex::default(),
             metrics: Default::default(),
             lead_down: AtomicBool::new(false),
             config,
@@ -1672,12 +1687,15 @@ impl OmpManager {
             self.refresh.store(false, Ordering::Relaxed);
         }
         if live.is_none() {
-            match self.start(append.clone()).await {
+            let lost = lock(&self.lost_append).take();
+            let pinned = lost.clone().unwrap_or_else(|| append.clone());
+            match self.start(pinned).await {
                 Ok(started) => {
                     self.lead_down.store(false, Ordering::Relaxed);
                     *live = Some(started);
                 }
                 Err(outcome) => {
+                    *lock(&self.lost_append) = lost;
                     self.lead_down.store(true, Ordering::Relaxed);
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
@@ -1729,13 +1747,31 @@ impl OmpManager {
                         recall_wake(text, row_id, generation, epoch, held, &fresh)?,
                     ))
                 });
+        // Given out before the recall: a late owner pick is steered into this very turn
+        // while it runs.
+        let turn_id = TurnId(self.turns.fetch_add(1, Ordering::Relaxed) + 1);
+        let shown = crate::recall::Shown::default();
         // On mode: before the turn, waiting at most `wait_ms`; the steer gate is still closed,
         // so a second owner message meanwhile queues as usual (moraedang's point 7 on #59).
         let (input, recalled) = match wake {
             Some((advisor, wake)) if advisor.injects() => {
-                let picks = advisor.recall(wake.clone(), advisor.wait()).await;
-                let (block, shown) = advisor.render(&picks);
-                (append_block(input, &block), Some((advisor, wake, shown)))
+                let picks = advisor
+                    .recall(
+                        wake.clone(),
+                        advisor.wait(),
+                        turn_id,
+                        self.notes(),
+                        Arc::clone(&shown),
+                    )
+                    .await;
+                let (block, held) = advisor.render(&picks);
+                let cut: Vec<_> = picks
+                    .into_iter()
+                    .filter(|pick| !held.iter().any(|h| h.entry.id == pick.entry.id))
+                    .collect();
+                advisor.release(&wake, &cut);
+                lock(&shown).extend(held.iter().map(|pick| pick.entry.id.clone()));
+                (append_block(input, &block), Some((advisor, wake, held)))
             }
             wake => {
                 // Shadow mode wakes after the send below.
@@ -1752,12 +1788,12 @@ impl OmpManager {
         };
         let mid = recalled
             .as_ref()
-            .and_then(|(advisor, wake, shown)| advisor.mid_turn(wake, shown));
+            .and_then(|(advisor, wake, _)| advisor.mid_turn(wake, Arc::clone(&shown)));
         let _gate_close = GateClose(&self.gate);
         let sent = {
             let mut gate = lock(&self.gate);
             *gate = Some(OpenTurn {
-                id: TurnId(self.turns.fetch_add(1, Ordering::Relaxed) + 1),
+                id: turn_id,
                 key: key.to_owned(),
                 main_row_id: row_id,
                 sender,
@@ -1790,7 +1826,8 @@ impl OmpManager {
             .map(|turn| (turn.steer, turn.notes))
             .unwrap_or_default();
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
-        let usage = turn_usage(&main);
+        let mut usage = TurnUsage::default();
+        usage.add(&main);
         let mut settled = turn_settled(&main);
         let main = map_result(main);
         // Only an input the child took is given: a rejected prompt never reached it.
@@ -1802,6 +1839,8 @@ impl OmpManager {
             if let Some((advisor, wake, shown)) = &recalled {
                 advisor.delivered(wake, shown);
             }
+        } else if let Some((advisor, wake, shown)) = &recalled {
+            advisor.release(wake, shown);
         }
 
         let mut killed = false;
@@ -1817,11 +1856,14 @@ impl OmpManager {
                     // Never let the child outlive the turn limit by waiting for the steer.
                     self.kill_lead();
                     killed = true;
-                    map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                    let turn = result.await.unwrap_or(Err(RpcError::Closed));
+                    usage.add(&turn);
+                    map_result(turn)
                 } else {
                     match tokio::time::timeout(self.turn_timeout, &mut result).await {
                         Ok(turn) => {
                             let turn = turn.unwrap_or(Err(RpcError::Closed));
+                            usage.add(&turn);
                             settled &= turn_settled(&turn);
                             map_result(turn)
                         }
@@ -1852,11 +1894,14 @@ impl OmpManager {
                     self.kill_lead();
                     killed = true;
                 }
-                map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                let turn = result.await.unwrap_or(Err(RpcError::Closed));
+                usage.add(&turn);
+                map_result(turn)
             } else {
                 match tokio::time::timeout(self.turn_timeout, &mut result).await {
                     Ok(turn) => {
                         let turn = turn.unwrap_or(Err(RpcError::Closed));
+                        usage.add(&turn);
                         settled &= turn_settled(&turn);
                         map_result(turn)
                     }
@@ -1877,7 +1922,7 @@ impl OmpManager {
             }
         }
         let files = take_sent(&current.sent_files);
-        self.end_usage(usage);
+        self.end_usage(usage.sum);
 
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
@@ -1886,6 +1931,9 @@ impl OmpManager {
             self.save_outside(current);
         }
         if lost && let Some(current) = live.take() {
+            // The next child starts with the text this one had pinned: the usual restart rules,
+            // not the loss, decide when a changed memory text takes over.
+            *lock(&self.lost_append) = Some(current.append.clone());
             tracing::warn!(
                 conversation = %key,
                 row = row_id,
@@ -2020,6 +2068,8 @@ impl OmpManager {
             old.close(&self.lead_kill).await;
             self.note_restart("new_session");
         }
+        // A new session holds nothing: its child starts with the current text.
+        lock(&self.lost_append).take();
         let session_dir = lead_session_dir(&self.config);
         let backup = if std::fs::symlink_metadata(&session_dir).is_ok() {
             let backup = crate::new_session::backup_dir(&session_dir, std::time::SystemTime::now());

@@ -4,7 +4,8 @@
 //! [`chat::CHAT_OVERLAY`]): no tools, extensions, skills, rules, context files, LSP or PTY, no
 //! config discovery source, memory, lesson capture or advisor, an empty working folder, and a
 //! `get_state` check that refuses the call when the child lists any tool. Each call runs in a
-//! fresh child with a fresh session folder under the caller's root, and the folder is removed
+//! fresh child with a fresh session folder under the caller's root (the empty working folder
+//! is one shared `cwd` there, so calls share a cached prompt prefix), and the folder is removed
 //! afterwards, so omp's session file does not keep the text on disk. The child gets the same
 //! environment as every omp child (no messenger token) and runs on the owner's own model
 //! provider.
@@ -82,7 +83,9 @@ impl Summarizer {
         message: String,
         model: Option<&str>,
     ) -> Result<String, String> {
-        let (session, cwd) = (run.join("session"), run.join("cwd"));
+        // One shared empty cwd: omp names the cwd at the start of the first user turn, so a
+        // per-call cwd would keep calls from sharing a cached prompt prefix.
+        let (session, cwd) = (run.join("session"), self.root.join("cwd"));
         let overlay = self.root.join("omp-locked.yml");
         let prepared = private_dir(&session)
             .and_then(|()| private_dir(&cwd))

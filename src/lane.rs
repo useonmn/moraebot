@@ -2814,7 +2814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_failed_lane_result_is_remembered_once() {
+    async fn only_failed_stopped_or_unmet_lane_results_are_remembered_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut m = qa_manager(dir.path());
         let today = memory::Day::from_ymd(2026, 11, 22).expect("day");
@@ -2826,16 +2826,14 @@ mod tests {
         .expect("memory store");
         let handle = memory::MemoryHandle::spawn(store).expect("spawn");
         Arc::get_mut(&mut m).expect("not shared").outcome_memory = Some(handle.clone());
-        for (n, task) in [(1, "fix the build\nmore"), (2, "write docs")] {
+        for (n, task) in [
+            (1, "fix the build\nmore"),
+            (2, "write docs"),
+            (3, "run the migration"),
+            (4, "ship it"),
+        ] {
             lock(&m.store)
-                .start_lane(
-                    &format!("call-{n}"),
-                    "discord:th:111",
-                    task,
-                    None,
-                    None,
-                    MAX_RUNNING_LANES,
-                )
+                .start_lane(&format!("call-{n}"), "discord:th:111", task, None, None, 4)
                 .expect("start lane");
         }
         let failed = || {
@@ -2855,6 +2853,29 @@ mod tests {
                 "discord:th:111",
                 Ok(LaneOutcome::Plain(Outcome::Reply("done".into())))
             ));
+            assert!(m.write_result(
+                &set,
+                3,
+                1,
+                "discord:th:111",
+                Ok(LaneOutcome::Stopped {
+                    reason: "owner changed plans\nmore".into()
+                })
+            ));
+            assert!(
+                m.write_result(
+                    &set,
+                    4,
+                    1,
+                    "discord:th:111",
+                    Ok(LaneOutcome::Unmet {
+                        text: "all done, trust me".into(),
+                        receipt:
+                            "evidence: x\n- file a -> ok\n- cmd make test -> E_CHECK_EXIT: exit 2"
+                                .into(),
+                    })
+                )
+            );
         }
         // The worker takes jobs in order: once this add is saved, the queued ones are too.
         handle
@@ -2869,13 +2890,23 @@ mod tests {
             .await
             .expect("barrier");
         let saved = handle.entries(&memory::Bucket::General).expect("entries");
-        assert_eq!(saved.len(), 1, "{saved:?}");
+        let mut texts: Vec<&str> = saved.iter().map(|e| e.text.as_str()).collect();
+        texts.sort_unstable();
         assert_eq!(
-            saved[0].text,
-            format!(
-                "Lane 1 result failed with {}. Task: fix the build. Error: spawn failed",
-                omp::E_OMP_SPAWN
-            )
+            texts,
+            [
+                format!(
+                    "Lane 1 result failed with {}. Task: fix the build. Error: spawn failed",
+                    omp::E_OMP_SPAWN
+                ),
+                format!(
+                    "Lane 3 result failed with {E_LANE_STOPPED}. Task: run the migration. Stopped: owner changed plans"
+                ),
+                format!(
+                    "Lane 4 result failed with {}. Task: ship it. Failed checks: cmd make test",
+                    done::E_DONE_UNMET
+                ),
+            ]
         );
     }
 }

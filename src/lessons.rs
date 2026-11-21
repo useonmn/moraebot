@@ -129,7 +129,8 @@ pub fn trimmed(text: &str) -> String {
 
 /// The owner entries of `entries` (`self/observations.md`) from the last [`WINDOW_DAYS`] days
 /// as of `today` that are similar to `text`, oldest first. An entry with `src` (the same row,
-/// saved before a restart) is not an earlier one.
+/// saved before a restart) is not an earlier one, and neither is a legacy observer summary
+/// (owner provenance, `src` starting with `obs `): it is a model summary, not the owner's words.
 pub fn earlier_similar(
     entries: &[Entry],
     text: &str,
@@ -141,6 +142,7 @@ pub fn earlier_similar(
     entries
         .iter()
         .filter(|e| e.prov == Prov::Owner && e.src.as_deref() != Some(src.as_str()))
+        .filter(|e| !e.src.as_deref().is_some_and(|s| s.starts_with("obs ")))
         .filter(|e| (0..=WINDOW_DAYS).contains(&today.days_after(e.day)))
         .filter(|e| similarity(&complaint(&e.text, patterns), &wanted) >= SIMILAR_AT)
         .cloned()
@@ -547,6 +549,12 @@ mod tests {
             entry("m-00000b", "2026-08-22", "영어로 답하지 마", "row=2"),
             entry("m-00000c", "2026-11-01", "왜 또 main에 푸시했어?", "row=3"),
             entry(
+                "m-00000e",
+                "2026-11-10",
+                "영어로 답하지 마",
+                "obs 2026-11-10",
+            ),
+            entry(
                 "m-00000d",
                 "2026-11-20",
                 "몇 번 말해, 영어로 답하지 마",
@@ -562,7 +570,8 @@ mod tests {
             &src,
         );
         let ids: Vec<&str> = found.iter().map(|e| e.id.as_str()).collect();
-        // m-00000b is 91 days old, m-00000c is about something else, m-00000d is this row.
+        // m-00000b is 91 days old, m-00000c is about something else, m-00000d is this row,
+        // m-00000e is a legacy observer summary.
         assert_eq!(ids, ["m-00000a"]);
     }
 

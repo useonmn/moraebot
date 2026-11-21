@@ -9,7 +9,9 @@
 //!   first ([`rank`], no model call) and asks the advisor only when they hold an entry not yet
 //!   offered in this lead generation, or one offered only while it was unrelated and related
 //!   now ([`Offered`]); an entry picked, delivered or rejected is in the ledger and never a
-//!   candidate ([`hidden`]). A wake with nothing new costs nothing.
+//!   candidate ([`hidden`]). A wake with nothing new costs nothing. A failed call, and a pick
+//!   left out, refused or never delivered, is released ([`Advisor::release`]): the next wake
+//!   may ask about it again.
 //! - **Shadow mode** ([`Advisor::wake`]): the call runs beside the lead turn; the picks are
 //!   only logged ([`I_RECALL_PICK`]) and kept in the recall ledger as `shadow` rows.
 //! - **On mode** (the default, [`Advisor::recall`]): the owner wake runs before the turn,
@@ -18,8 +20,9 @@
 //!   reference only, replaced entries labelled no longer in force, at most
 //!   [`RECALLED_CAP_BYTES`]) and appended to the owner's input; the caller records them as
 //!   `delivered` rows ([`Advisor::delivered`], [`I_RECALL_DELIVERED`]) once the lead took the
-//!   input. A call that misses the wait never holds up the next owner wake; its picks go with
-//!   the conversation's next owner input while they are younger than [`LATE_TTL`] and the
+//!   input. A call that misses the wait never holds up the next owner wake; while its turn
+//!   still runs, its picks are steered in like a mid note (below), else they go with the
+//!   conversation's next owner input while they are younger than [`LATE_TTL`] and the
 //!   lead generation is the same ([`LatePicks`]). Before a late pick is rendered it is read
 //!   again from the store: a pick forgotten or expired since is dropped, a corrected one is
 //!   shown as no longer in force, and the injection guard runs on its current text. An entry
@@ -32,14 +35,15 @@
 //!   into the running turn as a rowless note ([`crate::omp::LeadNotes`]) holding the same
 //!   recalled block, and recorded as delivered once the lead took it. A note for a turn that
 //!   has ended is dropped ([`I_RECALL_DROPPED`]). At most `mid_max_delivered` notes go to a
-//!   conversation per `mid_cooldown_minutes` ([`Cooldown`]); a wake that delivers nothing
-//!   never counts.
+//!   conversation per `mid_cooldown_minutes` ([`Cooldown`]), counted when sent (refunded when
+//!   the lead does not take one); a wake that sends nothing never counts. Picks join the
+//!   turn's [`Shown`] before their note is sent, so two wakes never send one entry twice.
 //! - **Who runs it.** A fresh child locked down exactly like the summarizer
 //!   ([`Summarizer::locked`]: no tools, extensions, skills, context files, an empty working
 //!   folder, the chat overlay, and a refusal when the child lists any tool), on
 //!   `memory.recall.model` (`@smol` by default). At most [`MAX_CALLS_AT_ONCE`] calls run at
-//!   once; a wake over it is skipped. A slow, failing or crashed advisor changes nothing else
-//!   the lead gets.
+//!   once, mid wakes using one less; a wake over it is skipped. A slow, failing or crashed
+//!   advisor changes nothing else the lead gets.
 //! - **What it sees.** The candidates moraebot chose in code ([`rank`]): the current
 //!   conversation's thread, every project, `_general`, the owner's corrections (shown as "the
 //!   owner corrected me before") and the replaced entries of those; never another
@@ -106,8 +110,9 @@ pub const MID_RESULT_CHARS: usize = 600;
 pub const MID_EVENT_LINES: usize = 16;
 /// The longest lead assistant text (its plan) a mid wake carries, in characters.
 pub const PLAN_CHARS: usize = 1500;
-/// The most advisor calls running at once; a wake over it is skipped ([`Skip::Busy`]).
-pub const MAX_CALLS_AT_ONCE: usize = 2;
+/// The most advisor calls running at once; a wake over it is skipped ([`Skip::Busy`]). Mid
+/// wakes use at most one less, so an owner wake always finds a place.
+pub const MAX_CALLS_AT_ONCE: usize = 3;
 /// How long on mode keeps a pick that came after its turn's wait.
 pub const LATE_TTL: Duration = Duration::from_secs(30 * 60);
 /// The highest score recency alone gives ([`rank`]): a candidate above it shares a term
@@ -325,14 +330,42 @@ pub fn recalled_block(
 }
 
 /// Whether `item` may be offered in `conversation`: never a core entry (the lead holds the
-/// core in its system prompt), and another conversation's thread only in the owner's DM (only
-/// the owner reads a DM, while a shared thread has other readers).
+/// core in its system prompt), and another conversation's thread only in the owner's DM
+/// ([`is_dm`]; only the owner reads a DM, while a shared thread has other readers).
 pub fn in_scope(item: &PoolEntry, conversation: &str) -> bool {
     match &item.bucket {
-        Bucket::Thread(key) => key == conversation || conversation.contains(":dm:"),
+        Bucket::Thread(key) => key == conversation || is_dm(conversation),
         Bucket::Owner | Bucket::Boundaries => false,
         Bucket::Project(_) | Bucket::General | Bucket::SelfObs => true,
     }
+}
+
+/// Whether `conversation` is a DM with the owner: a `<platform>:dm:<channel>` key (Discord),
+/// or a Slack DM thread `slack:th:D<channel>:<ts>` (the Slack bridge runs each DM message as
+/// a thread of its `D...` channel; channels, private or public, never start with `D`).
+pub fn is_dm(conversation: &str) -> bool {
+    conversation.contains(":dm:")
+        || conversation
+            .strip_prefix("slack:th:D")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(channel, ts)| {
+                !channel.is_empty()
+                    && channel
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                    && !ts.is_empty()
+            })
+}
+
+/// Whether `item` was saved from the owner message of inbox row `row_id` itself: a correction
+/// captured from that message (`src: row=<row_id> ...`) is not a past one.
+fn from_row(item: &PoolEntry, row_id: i64) -> bool {
+    item.bucket == Bucket::SelfObs
+        && item
+            .entry
+            .src
+            .as_deref()
+            .is_some_and(|src| src.split(' ').next() == Some(format!("row={row_id}").as_str()))
 }
 
 /// Whether `candidate` is related to the wake it was ranked for: it shares a term or belongs
@@ -748,6 +781,7 @@ pub fn prepare(
     let skip = |item: &PoolEntry| {
         !in_scope(item, &wake.conversation)
             || wake.exclude.contains(&item.entry.id)
+            || from_row(item, wake.row_id)
             || hidden(item, &wake.given, seen)
     };
     let (candidates, lines): (Vec<Candidate>, Vec<String>) = rank(
@@ -844,8 +878,8 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Whether a call may start at `now`; when it may, it is counted.
-    pub fn admit(&mut self, now: Instant, per_hour: u32) -> Result<(), Skip> {
+    /// Whether a call may start at `now`, without counting it.
+    pub fn check(&mut self, now: Instant, per_hour: u32) -> Result<(), Skip> {
         while self
             .calls
             .front()
@@ -863,6 +897,12 @@ impl Gate {
         {
             return Err(Skip::Breaker);
         }
+        Ok(())
+    }
+
+    /// Whether a call may start at `now`; when it may, it is counted.
+    pub fn admit(&mut self, now: Instant, per_hour: u32) -> Result<(), Skip> {
+        self.check(now, per_hour)?;
         self.calls.push_back(now);
         self.last_attempt = Some(now);
         Ok(())
@@ -943,6 +983,11 @@ pub enum ToolEvent<'a> {
     Said { text: &'a str },
 }
 
+/// The entry ids one owner turn got so far: recalled with its input, steered in as a late
+/// owner pick, or picked by a mid wake (a note being sent counts at once, so two wakes never
+/// send the same entry). Shared by the turn's wakes.
+pub type Shown = Arc<Mutex<HashSet<String>>>;
+
 /// The mid-task state of one running owner turn ([`Advisor::mid_turn`]): its owner wake, its
 /// newest tool event lines and the lead's latest plan. It lives in the lead's open turn and
 /// goes with it.
@@ -952,15 +997,23 @@ pub struct MidTurn {
     /// Each started call's source, so its end line knows whether the result is outside text.
     sources: HashMap<String, ToolSource>,
     plan: String,
-    /// Entry ids this turn got so far; a delivered or shadow mid pick is added.
-    shown: Arc<Mutex<HashSet<String>>>,
+    shown: Shown,
 }
 
 /// A mid wake [`Advisor::mid_event`] decided on. Its `wake` carries the turn's lead context;
 /// the caller sets the current one (epoch, held sections) before it starts.
 pub struct MidWake {
     pub wake: Wake,
-    shown: Arc<Mutex<HashSet<String>>>,
+    shown: Shown,
+}
+
+/// Why picks meant for a running turn were not steered in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotSent {
+    /// The conversation's [`Cooldown`] is full.
+    Cooling,
+    /// The turn is not running (ended, or not started yet).
+    Closed,
 }
 
 /// The entries offered to the advisor per conversation in one lead generation, each with
@@ -988,25 +1041,40 @@ impl Offered {
             })
     }
 
-    /// Records that `candidates` were offered in `conversation` in lead `generation`; an
-    /// older generation's record of the conversation is dropped.
+    /// Records that `candidates` were offered in `conversation` in lead `generation`; the
+    /// records of older generations (every conversation's) are dropped.
     pub fn mark(&mut self, conversation: &str, generation: i64, candidates: &[Candidate]) {
+        self.conversations.retain(|_, (at, _)| *at == generation);
         let slot = self
             .conversations
             .entry(conversation.to_owned())
             .or_insert_with(|| (generation, HashMap::new()));
-        if slot.0 != generation {
-            *slot = (generation, HashMap::new());
-        }
         for c in candidates {
             *slot.1.entry(c.entry.id.clone()).or_insert(false) |= related(c);
         }
     }
+
+    /// Forgets that `ids` were offered in `conversation` in lead `generation`: the call
+    /// failed, or its picks never reached the lead, so the next wake may ask about them again.
+    pub fn unmark<'a>(
+        &mut self,
+        conversation: &str,
+        generation: i64,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        if let Some((at, known)) = self.conversations.get_mut(conversation)
+            && *at == generation
+        {
+            for id in ids {
+                known.remove(id);
+            }
+        }
+    }
 }
 
-/// When mid-task notes were delivered, per conversation: the throttle of mid wakes. Only a
-/// delivered note counts; a wake that picked nothing, or whose note the lead never took, does
-/// not.
+/// When mid-task notes were sent, per conversation: the throttle of mid wakes. A note counts
+/// from the moment it is sent; one the lead did not take is refunded ([`Cooldown::refund`]),
+/// and a wake that picked nothing never counts.
 #[derive(Debug, Default)]
 pub struct Cooldown {
     delivered: HashMap<String, VecDeque<Instant>>,
@@ -1014,7 +1082,7 @@ pub struct Cooldown {
 
 impl Cooldown {
     /// Whether a mid wake may start in `conversation` at `now`: fewer than `max` notes were
-    /// delivered there within `window`.
+    /// sent there within `window`.
     pub fn admits(&mut self, conversation: &str, now: Instant, max: u32, window: Duration) -> bool {
         let Some(times) = self.delivered.get_mut(conversation) else {
             return true;
@@ -1028,12 +1096,39 @@ impl Cooldown {
         times.len() < max as usize
     }
 
-    /// Counts a note delivered in `conversation` at `at`.
-    pub fn charge(&mut self, conversation: &str, at: Instant) {
+    /// Counts a note about to be sent in `conversation` at `now` when [`Self::admits`] lets
+    /// it, and returns the time it is counted at (for [`Self::refund`]); `None` when the
+    /// conversation is cooling down. Conversations with nothing left in `window` are dropped.
+    pub fn reserve(
+        &mut self,
+        conversation: &str,
+        now: Instant,
+        max: u32,
+        window: Duration,
+    ) -> Option<Instant> {
+        if !self.admits(conversation, now, max, window) {
+            return None;
+        }
+        self.delivered.retain(|_, times| {
+            times
+                .back()
+                .is_some_and(|&at| now.saturating_duration_since(at) < window)
+        });
         self.delivered
             .entry(conversation.to_owned())
             .or_default()
-            .push_back(at);
+            .push_back(now);
+        Some(now)
+    }
+
+    /// Takes back the note counted at `at` in `conversation`: it was not sent, or the lead
+    /// did not take it.
+    pub fn refund(&mut self, conversation: &str, at: Instant) {
+        if let Some(times) = self.delivered.get_mut(conversation)
+            && let Some(index) = times.iter().position(|&t| t == at)
+        {
+            times.remove(index);
+        }
     }
 }
 
@@ -1054,16 +1149,28 @@ struct Late {
 
 impl LatePicks {
     /// Keeps `picks` that came at `at` for `conversation`'s next owner input in lead
-    /// `generation`; picks kept for an older generation are dropped.
+    /// `generation`. Picks kept for an older generation are dropped, and so are those
+    /// [`LATE_TTL`] old; the latter are returned per conversation (they were never delivered).
     pub fn keep(
         &mut self,
         conversation: &str,
         generation: i64,
         picks: Vec<Candidate>,
         at: Instant,
-    ) {
+    ) -> Vec<(String, Vec<Candidate>)> {
+        let mut expired = Vec::new();
+        self.conversations.retain(|key, late| {
+            if late.generation != generation {
+                return false;
+            }
+            if at.saturating_duration_since(late.at) < LATE_TTL {
+                return true;
+            }
+            expired.push((key.clone(), std::mem::take(&mut late.picks)));
+            false
+        });
         if picks.is_empty() {
-            return;
+            return expired;
         }
         tracing::info!(
             conversation,
@@ -1078,33 +1185,44 @@ impl LatePicks {
                 at,
                 picks: Vec::new(),
             });
-        if late.generation != generation {
-            late.generation = generation;
-            late.picks.clear();
-        }
         late.at = at;
         for pick in picks {
             if !late.picks.iter().any(|p| p.entry.id == pick.entry.id) {
                 late.picks.push(pick);
             }
         }
+        expired
     }
 
     /// Takes `conversation`'s late picks for an owner input at `now` in lead `generation`:
-    /// none when they were chosen for another generation or are [`LATE_TTL`] old.
-    pub fn take(&mut self, conversation: &str, generation: i64, now: Instant) -> Vec<Candidate> {
+    /// none when they were chosen for another generation or are [`LATE_TTL`] old. Returns the
+    /// picks taken, then the ones dropped as too old in this generation.
+    pub fn take(
+        &mut self,
+        conversation: &str,
+        generation: i64,
+        now: Instant,
+    ) -> (Vec<Candidate>, Vec<Candidate>) {
         let Some(late) = self.conversations.remove(conversation) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        if late.generation == generation && now.saturating_duration_since(late.at) < LATE_TTL {
-            return late.picks;
+        if late.generation != generation {
+            tracing::info!(
+                conversation,
+                dropped = late.picks.len(),
+                "late recall picks dropped: the lead changed"
+            );
+            return (Vec::new(), Vec::new());
+        }
+        if now.saturating_duration_since(late.at) < LATE_TTL {
+            return (late.picks, Vec::new());
         }
         tracing::info!(
             conversation,
             dropped = late.picks.len(),
-            "late recall picks dropped: too old or the lead changed"
+            "late recall picks dropped: too old"
         );
-        Vec::new()
+        (Vec::new(), late.picks)
     }
 }
 
@@ -1146,6 +1264,9 @@ pub struct Advisor {
     /// Calls that reached the advisor child.
     asked: watch::Sender<u64>,
     late: Mutex<LatePicks>,
+    /// Per conversation, the last cap or breaker skip a mid wake logged and when: logged
+    /// once per window, not on every tool event.
+    cap_logged: Mutex<HashMap<String, (Skip, Instant)>>,
 }
 
 impl Advisor {
@@ -1175,6 +1296,7 @@ impl Advisor {
             progress: watch::channel(0).0,
             asked: watch::channel(0).0,
             late: Mutex::default(),
+            cap_logged: Mutex::default(),
         }
     }
 
@@ -1194,9 +1316,9 @@ impl Advisor {
         self.config.memory.recall_mid_task()
     }
 
-    /// The mid-task state of an owner turn that starts with `wake` (its input already carries
-    /// `shown`); `None` with `mid_task = "off"`.
-    pub fn mid_turn(&self, wake: &Wake, shown: &[Candidate]) -> Option<MidTurn> {
+    /// The mid-task state of an owner turn that starts with `wake`, sharing the ids the turn
+    /// got so far (`shown`); `None` with `mid_task = "off"`.
+    pub fn mid_turn(&self, wake: &Wake, shown: Shown) -> Option<MidTurn> {
         if self.mid_task() == MidTask::Off {
             return None;
         }
@@ -1205,10 +1327,19 @@ impl Advisor {
             events: VecDeque::new(),
             sources: HashMap::new(),
             plan: String::new(),
-            shown: Arc::new(Mutex::new(
-                shown.iter().map(|c| c.entry.id.clone()).collect(),
-            )),
+            shown,
         })
+    }
+
+    /// The window of the mid-task [`Cooldown`] (`memory.recall.mid_cooldown_minutes`).
+    fn mid_window(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .memory
+                .recall
+                .mid_cooldown_minutes
+                .saturating_mul(60),
+        )
     }
 
     /// Adds `event` of the running turn to `mid`: a tool call as a redacted line, an assistant
@@ -1258,7 +1389,7 @@ impl Advisor {
             &mid.wake.conversation,
             now,
             recall.mid_max_delivered,
-            Duration::from_secs(recall.mid_cooldown_minutes * 60),
+            self.mid_window(),
         ) {
             tracing::debug!(conversation = %mid.wake.conversation, "mid recall cooling down");
             return None;
@@ -1290,55 +1421,134 @@ impl Advisor {
             let on = this.mid_task() == MidTask::On;
             let picks = this.answer(&mid.wake, !on).await;
             if on {
-                this.steer_picks(&mid, picks, turn, &notes);
+                match this.steer_note(&mid.wake, picks, turn, &notes, &mid.shown) {
+                    Ok(()) => {}
+                    Err((NotSent::Cooling, picks)) => {
+                        tracing::debug!(conversation = %mid.wake.conversation, "mid recall cooling down; picks not sent");
+                        this.release(&mid.wake, &picks);
+                    }
+                    Err((NotSent::Closed, picks)) => {
+                        let ids: Vec<&str> = picks.iter().map(|p| p.entry.id.as_str()).collect();
+                        let detail = format!(
+                            "{} ids={}{}",
+                            mid.wake.context(),
+                            ids.join(","),
+                            mid.wake.phase()
+                        );
+                        tracing::info!(code = I_RECALL_DROPPED, %detail, "the lead turn ended before the recalled note");
+                        this.log(unix_now(), LogLevel::Info, I_RECALL_DROPPED, detail);
+                        this.release(&mid.wake, &picks);
+                    }
+                }
             } else {
-                lock(&mid.shown).extend(picks.into_iter().map(|p| p.entry.id));
+                lock(&mid.shown).extend(picks.iter().map(|p| p.entry.id.clone()));
+                // On mode keeps no ledger row of a shadow mid pick: the next owner wake may
+                // offer it again and deliver it.
+                if this.injects() {
+                    this.release(&mid.wake, &picks);
+                }
             }
             this.progress.send_modify(|n| *n += 1);
         });
     }
 
-    /// Mid-task on mode: sends `picks` (without any already delivered in the lead context or
-    /// given to this turn) as one recalled note into lead turn `turn`. Delivery is recorded,
-    /// and counted by the conversation's [`Cooldown`], once the lead took the note; a turn
-    /// that ended first drops them ([`I_RECALL_DROPPED`]).
-    fn steer_picks(
+    /// Sends `picks` (without any already delivered in the lead context or given to this
+    /// turn, `shown`) as one recalled note into lead turn `turn` while it runs. They join
+    /// `shown` before the note is sent, so a second wake never sends them too. The note counts
+    /// against the conversation's [`Cooldown`] once sent and is refunded when the lead does
+    /// not take it; delivery is recorded once the lead took it. Picks the block leaves out
+    /// ([`RECALLED_CAP_BYTES`]) or the lead does not take are [`Self::release`]d. Returns the
+    /// picks it did not send, and why.
+    fn steer_note(
         self: &Arc<Self>,
-        mid: &MidWake,
+        wake: &Wake,
         picks: Vec<Candidate>,
         turn: TurnId,
         notes: &LeadNotes,
-    ) {
-        let Some(mut picks) = self.undelivered(&mid.wake, picks) else {
-            return;
+        shown: &Shown,
+    ) -> Result<(), (NotSent, Vec<Candidate>)> {
+        let Some(picks) = self.undelivered(wake, picks) else {
+            return Ok(());
         };
-        picks.retain(|pick| !lock(&mid.shown).contains(&pick.entry.id));
-        let (block, shown) = self.render(&picks);
-        if shown.is_empty() {
-            return;
+        let picks: Vec<Candidate> = {
+            let mut shown = lock(shown);
+            picks
+                .into_iter()
+                .filter(|pick| shown.insert(pick.entry.id.clone()))
+                .collect()
+        };
+        if picks.is_empty() {
+            return Ok(());
         }
-        let ids: Vec<String> = shown.iter().map(|p| p.entry.id.clone()).collect();
+        let unshow = |picks: &[Candidate]| {
+            let mut shown = lock(shown);
+            for pick in picks {
+                shown.remove(&pick.entry.id);
+            }
+        };
+        let (block, held) = self.render(&picks);
+        let cut: Vec<Candidate> = picks
+            .into_iter()
+            .filter(|pick| !held.iter().any(|h| h.entry.id == pick.entry.id))
+            .collect();
+        unshow(&cut);
+        self.release(wake, &cut);
+        if held.is_empty() {
+            return Ok(());
+        }
+        let Some(at) = lock(&self.cooldown).reserve(
+            &wake.conversation,
+            Instant::now(),
+            self.config.memory.recall.mid_max_delivered,
+            self.mid_window(),
+        ) else {
+            unshow(&held);
+            return Err((NotSent::Cooling, held));
+        };
         let this = Arc::clone(self);
-        let wake = mid.wake.clone();
-        let taken = shown.clone();
+        let settled_wake = wake.clone();
+        let taken = held.clone();
         let on_settled = Box::new(move |took: bool| {
             if took {
-                lock(&this.cooldown).charge(&wake.conversation, Instant::now());
-                this.delivered(&wake, &taken);
+                this.delivered(&settled_wake, &taken);
+            } else {
+                lock(&this.cooldown).refund(&settled_wake.conversation, at);
+                this.release(&settled_wake, &taken);
             }
         });
         if notes.send(turn, NoteKind::Recall, &block, Some(on_settled)) {
-            lock(&mid.shown).extend(ids);
+            return Ok(());
+        }
+        lock(&self.cooldown).refund(&wake.conversation, at);
+        unshow(&held);
+        Err((NotSent::Closed, held))
+    }
+
+    /// Forgets that `picks` were offered to `wake`'s conversation in its lead generation
+    /// ([`Offered::unmark`]): they never reached the lead, so a later wake may ask again.
+    pub fn release(&self, wake: &Wake, picks: &[Candidate]) {
+        self.release_ids(&wake.conversation, wake.generation, picks);
+    }
+
+    fn release_ids(&self, conversation: &str, generation: i64, picks: &[Candidate]) {
+        if picks.is_empty() {
             return;
         }
-        let detail = format!(
-            "{} ids={}{}",
-            mid.wake.context(),
-            ids.join(","),
-            mid.wake.phase()
+        lock(&self.offered).unmark(
+            conversation,
+            generation,
+            picks.iter().map(|p| p.entry.id.as_str()),
         );
-        tracing::info!(code = I_RECALL_DROPPED, %detail, "the lead turn ended before the recalled note");
-        self.log(unix_now(), LogLevel::Info, I_RECALL_DROPPED, detail);
+    }
+
+    /// Keeps `picks` that came after `wake`'s wait for the conversation's next owner input
+    /// ([`LatePicks`]); those too old by now are released.
+    fn keep_late(&self, wake: &Wake, picks: Vec<Candidate>) {
+        let expired =
+            lock(&self.late).keep(&wake.conversation, wake.generation, picks, Instant::now());
+        for (conversation, picks) in expired {
+            self.release_ids(&conversation, wake.generation, &picks);
+        }
     }
 
     /// Runs `task` on `runtime` as one of the advisor's tasks ([`Self::stop`] ends it).
@@ -1389,11 +1599,23 @@ impl Advisor {
     /// On mode: the entries to recall for `wake`, waiting at most `wait` for the advisor. They
     /// are the conversation's late picks still valid for the wake ([`LatePicks`]), then this
     /// call's picks when they come in time, without an entry already delivered in this lead
-    /// context; best first. A call that comes later keeps its picks for the conversation's
-    /// next owner input; it never makes that input's own wake wait or skip. A failing, slow or
-    /// skipped advisor only means fewer (or no) picks. Must be called inside a tokio runtime.
-    pub async fn recall(self: &Arc<Self>, wake: Wake, wait: Duration) -> Vec<Candidate> {
-        let late = lock(&self.late).take(&wake.conversation, wake.generation, Instant::now());
+    /// context; best first. A call that comes later steers its picks into lead turn `turn`
+    /// through `notes` while that turn runs (like a mid note: `shown` is the turn's, and the
+    /// [`Cooldown`] counts it); otherwise, or with the cooldown full, it keeps them for the
+    /// conversation's next owner input. It never makes that input's own wake wait or skip. A
+    /// failing, slow or skipped advisor only means fewer (or no) picks. Must be called inside
+    /// a tokio runtime.
+    pub async fn recall(
+        self: &Arc<Self>,
+        wake: Wake,
+        wait: Duration,
+        turn: TurnId,
+        notes: LeadNotes,
+        shown: Shown,
+    ) -> Vec<Candidate> {
+        let (late, expired) =
+            lock(&self.late).take(&wake.conversation, wake.generation, Instant::now());
+        self.release(&wake, &expired);
         let mut picks = self.current(late);
         // A late pick's section may have reached the lead since: it holds that entry now.
         picks.retain(|pick| {
@@ -1410,9 +1632,11 @@ impl Advisor {
         let asked = wake.clone();
         self.spawn(&Handle::current(), async move {
             let picks = this.answer(&asked, false).await;
-            // The turn stopped waiting: keep them for the next owner input.
-            if let Err(picks) = found.send(picks) {
-                lock(&this.late).keep(&asked.conversation, asked.generation, picks, Instant::now());
+            // The turn stopped waiting: into the running turn, else the next owner input.
+            if let Err(picks) = found.send(picks)
+                && let Err((_, picks)) = this.steer_note(&asked, picks, turn, &notes, &shown)
+            {
+                this.keep_late(&asked, picks);
             }
             this.progress.send_modify(|n| *n += 1);
         });
@@ -1573,7 +1797,13 @@ impl Advisor {
             return Ok(None);
         }
         let mut asking = lock(&self.asking);
-        if *asking >= MAX_CALLS_AT_ONCE {
+        // One place is kept for owner wakes: mid wakes never make the next owner wake busy.
+        let places = if wake.events.is_empty() {
+            MAX_CALLS_AT_ONCE
+        } else {
+            MAX_CALLS_AT_ONCE - 1
+        };
+        if *asking >= places {
             return Err(Skip::Busy);
         }
         lock(&self.gate).admit(Instant::now(), self.config.memory.recall.max_calls_per_hour)?;
@@ -1585,17 +1815,32 @@ impl Advisor {
     /// One advisor call for `wake`, when its candidates hold something new: its usable picks,
     /// best first, after the injection guard. In shadow mode (`shadow`) picks and rejects are
     /// written to the ledger; otherwise only the rejects, since a pick counts only once it was
-    /// delivered. Owner and mid wakes write the same rows.
+    /// delivered. Owner and mid wakes write the same rows. A failed call forgets that its
+    /// candidates were offered, so the next wake asks again.
     async fn answer(&self, wake: &Wake, shadow: bool) -> Vec<Candidate> {
         let today = (self.clock)();
         let now = unix_now();
+        let recall = &self.config.memory.recall;
+        // A mid wake comes with every tool event: over the cap it costs nothing, not even a
+        // ranking, and is logged once per window.
+        if !wake.events.is_empty()
+            && let Err(skip) = lock(&self.gate).check(Instant::now(), recall.max_calls_per_hour)
+        {
+            self.skipped_mid(wake, skip);
+            return Vec::new();
+        }
         let seen = lock(&self.store).recall_seen(
             &wake.conversation,
             wake.generation,
             wake.epoch as i64,
             now - REJECT_DAYS * DAY_SECONDS,
         );
-        let seen = match seen {
+        let seen: Vec<RecallRow> = match seen {
+            // On mode delivers what a shadow mid wake only logged: its rows hide nothing.
+            Ok(seen) if self.injects() => seen
+                .into_iter()
+                .filter(|row| !(row.state == RecallState::Shadow && row.phase == RecallPhase::Mid))
+                .collect(),
             Ok(seen) => seen,
             Err(err) => {
                 tracing::warn!(
@@ -1606,7 +1851,6 @@ impl Advisor {
             }
         };
         let mentioned = memory::mentioned_projects(&self.config.memory_dir(), &rank_text(wake));
-        let recall = &self.config.memory.recall;
         let pool = self.pool(today);
         let (candidates, text) = prepare(
             &pool,
@@ -1658,6 +1902,7 @@ impl Advisor {
                     tracing::warn!(code, "recall advisor answer not usable");
                 }
                 self.log(now, LogLevel::Error, code, context);
+                self.release(wake, candidates);
                 return Vec::new();
             }
         };
@@ -1698,6 +1943,28 @@ impl Advisor {
             .iter()
             .filter_map(|id| candidates.iter().find(|c| &c.entry.id == id).cloned())
             .collect()
+    }
+
+    /// Logs a mid wake skipped by the hourly cap or the breaker, once per conversation and
+    /// reason per window ([`HOUR`] or [`BREAKER_PROBE`]).
+    fn skipped_mid(&self, wake: &Wake, skip: Skip) {
+        let now = Instant::now();
+        let window = match skip {
+            Skip::Breaker => BREAKER_PROBE,
+            Skip::Hour | Skip::Busy => HOUR,
+        };
+        {
+            let mut logged = lock(&self.cap_logged);
+            logged.retain(|_, (_, at)| now.saturating_duration_since(*at) < HOUR);
+            if logged.get(&wake.conversation).is_some_and(|(last, at)| {
+                *last == skip && now.saturating_duration_since(*at) < window
+            }) {
+                tracing::debug!(conversation = %wake.conversation, reason = skip.as_str(), "mid recall wake skipped");
+                return;
+            }
+            logged.insert(wake.conversation.clone(), (skip, now));
+        }
+        self.skipped(wake, skip);
     }
 
     fn skipped(&self, wake: &Wake, skip: Skip) {
@@ -2073,6 +2340,88 @@ mod tests {
             got,
             ["m-000001", "m-000002", "m-000003", "m-000004", "m-000005"]
         );
+        // A Slack DM is a thread of its `D` channel: the same widening.
+        let slack_dm = wake(
+            "slack:th:D0123ABCD:1700000000.000100",
+            "check it",
+            "",
+            &events,
+        );
+        let (candidates, _) = prepare(
+            &pool,
+            &slack_dm,
+            &[],
+            &[],
+            today,
+            &RecallConfig::default(),
+            &Redactor::default(),
+        );
+        assert!(candidates.iter().any(|c| c.entry.id == "m-000002"));
+        assert!(candidates.iter().any(|c| c.entry.id == "m-000001"));
+    }
+
+    #[test]
+    fn dm_keys_of_both_adapters_are_recognised_and_shared_threads_are_not() {
+        for key in [
+            "discord:dm:1300000000000000009",
+            "slack:dm:D0123ABCD",
+            "slack:th:D0123ABCD:1700000000.000100",
+        ] {
+            assert!(is_dm(key), "{key}");
+        }
+        for key in [
+            "discord:th:1300000000000000001",
+            "slack:th:C0123ABCD:1700000000.000100",
+            "slack:th:G0123ABCD:1700000000.000100",
+            "slack:th:D0123ABCD",
+            "slack:th:Dabc:1700000000.000100",
+            "slack:th::1700000000.000100",
+            "discord:th:D1:2",
+        ] {
+            assert!(!is_dm(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_current_messages_own_correction_is_never_offered_as_a_past_one() {
+        let today = day("2026-11-21");
+        let mut own = item(
+            "m-000001",
+            "2026-11-21",
+            "do not curl prod",
+            Bucket::SelfObs,
+            Prov::Owner,
+        );
+        own.entry.src = Some("row=1".into());
+        let mut sentence = item(
+            "m-000002",
+            "2026-11-21",
+            "curl is slow",
+            Bucket::SelfObs,
+            Prov::Owner,
+        );
+        sentence.entry.src = Some("row=1 s=0 turn=1".into());
+        let mut past = item(
+            "m-000003",
+            "2026-11-20",
+            "curl needs vpn",
+            Bucket::SelfObs,
+            Prov::Owner,
+        );
+        past.entry.src = Some("row=12".into());
+        let pool = vec![own, sentence, past];
+        let owner_wake = wake("discord:th:1", "curl prod please", "", &[]);
+        let (candidates, _) = prepare(
+            &pool,
+            &owner_wake,
+            &[],
+            &[],
+            today,
+            &RecallConfig::default(),
+            &Redactor::default(),
+        );
+        let got: Vec<&str> = candidates.iter().map(|c| c.entry.id.as_str()).collect();
+        assert_eq!(got, ["m-000003"], "row 1 is the wake's own message");
     }
 
     #[test]
@@ -2105,27 +2454,49 @@ mod tests {
             offered.fresh("k", 2, &first[1..]),
             "the old generation is gone"
         );
+        assert!(
+            !offered.conversations.contains_key("other"),
+            "every conversation's old generation is pruned"
+        );
+        offered.unmark("k", 2, ["m-000001"]);
+        assert!(
+            offered.fresh("k", 2, &first[..1]),
+            "a released entry is fresh again"
+        );
     }
 
     #[test]
-    fn the_cooldown_counts_only_delivered_notes() {
+    fn the_cooldown_counts_sent_notes_and_refunds_the_ones_not_taken() {
         let start = Instant::now();
         let window = Duration::from_secs(600);
         let mut cooldown = Cooldown::default();
         for n in 0..10 {
             assert!(
                 cooldown.admits("k", start + Duration::from_secs(n), 2, window),
-                "wakes that deliver nothing never count"
+                "wakes that send nothing never count"
             );
         }
-        cooldown.charge("k", start);
+        cooldown.reserve("k", start, 2, window).expect("room");
         assert!(cooldown.admits("k", start, 2, window));
-        cooldown.charge("k", start + Duration::from_secs(60));
+        let second = cooldown
+            .reserve("k", start + Duration::from_secs(60), 2, window)
+            .expect("room");
         assert!(!cooldown.admits("k", start + Duration::from_secs(61), 2, window));
+        assert_eq!(
+            cooldown.reserve("k", start + Duration::from_secs(61), 2, window),
+            None,
+            "a full window refuses at once, before any note settled"
+        );
         assert!(
             cooldown.admits("other", start, 2, window),
             "per conversation"
         );
+        cooldown.refund("k", second);
+        assert!(
+            cooldown.admits("k", start + Duration::from_secs(61), 2, window),
+            "a note the lead did not take is refunded"
+        );
+        cooldown.reserve("k", start + Duration::from_secs(62), 2, window);
         assert!(
             cooldown.admits("k", start + window, 2, window),
             "the first left the window"
@@ -2139,24 +2510,33 @@ mod tests {
         let mut late = LatePicks::default();
         late.keep("k", 1, picks.clone(), start);
         assert!(
-            late.take("other", 1, start).is_empty(),
+            late.take("other", 1, start).0.is_empty(),
             "never another conversation"
         );
         assert_eq!(
             late.take("k", 1, start + LATE_TTL - Duration::from_secs(1)),
-            picks
+            (picks.clone(), Vec::new())
         );
-        assert!(late.take("k", 1, start).is_empty(), "taken once");
+        assert!(late.take("k", 1, start).0.is_empty(), "taken once");
         late.keep("k", 1, picks.clone(), start);
-        assert!(
-            late.take("k", 1, start + LATE_TTL).is_empty(),
-            "older than 30 minutes"
+        assert_eq!(
+            late.take("k", 1, start + LATE_TTL),
+            (Vec::new(), picks.clone()),
+            "older than 30 minutes: returned as expired"
         );
         late.keep("k", 1, picks.clone(), start);
-        assert!(
-            late.take("k", 2, start).is_empty(),
+        assert_eq!(
+            late.take("k", 2, start),
+            (Vec::new(), Vec::new()),
             "another lead generation"
         );
+        // Keeping prunes: another generation's picks go, expired ones come back.
+        late.keep("a", 1, picks.clone(), start);
+        late.keep("b", 2, picks.clone(), start);
+        assert!(!late.conversations.contains_key("a"));
+        let expired = late.keep("c", 2, Vec::new(), start + LATE_TTL);
+        assert_eq!(expired, vec![("b".to_owned(), picks)]);
+        assert!(late.conversations.is_empty());
     }
 
     #[test]
