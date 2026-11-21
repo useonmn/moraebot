@@ -96,6 +96,11 @@ pub const E_CHILD_LOST: &str = "E_CHILD_LOST";
 /// Warn log code: a lead turn ran past `lead.handoff_after_minutes` while an owner message of
 /// its conversation waits; moraebot sent it one busy note.
 pub const W_LEAD_BUSY: &str = "W_LEAD_BUSY";
+/// Log code: the owner's new-session command gave the lead an empty session (#74); the line
+/// carries the old session's backup folder.
+pub const I_LEAD_NEW_SESSION: &str = "I_LEAD_NEW_SESSION";
+/// The lead's session folder could not be moved aside for a new session; the lead keeps it.
+pub const E_LEAD_NEW_SESSION: &str = "E_LEAD_NEW_SESSION";
 /// Warn log code: a running lead or lane turn showed no progress for `omp.stall_after_minutes`.
 /// Only a notice follows; the turn keeps running.
 pub const W_TURN_STALLED: &str = "W_TURN_STALLED";
@@ -1799,6 +1804,40 @@ impl OmpManager {
         if let Some(live) = self.live.lock().await.take() {
             live.abort(&self.lead_kill).await;
         }
+    }
+
+    /// Gives the lead a new, empty omp session (the owner's new-session command, #74). Called
+    /// between turns: it waits for the `live` mutex, so a running turn ends first. The lead child
+    /// is closed (and reaped) with [`Live::close`], then `<home>/lead/session` is renamed to a
+    /// free `session-backup-<UTC time>` folder beside it (never deleted) and the lead's session
+    /// row is cleared. `live` stays empty, so the next [`Self::prompt`] starts a child through
+    /// [`Self::start`] as after any restart, with a new lead generation. Lanes, chat children,
+    /// the recall advisor and the memory are not touched. Returns the backup folder (`None` when
+    /// there was no session folder); a folder that cannot be moved is an error and the next
+    /// child resumes it.
+    pub async fn new_session(&self) -> std::io::Result<Option<PathBuf>> {
+        let mut live = self.live.lock().await;
+        if let Some(old) = live.take() {
+            old.close(&self.lead_kill).await;
+        }
+        let session_dir = lead_session_dir(&self.config);
+        let backup = if std::fs::symlink_metadata(&session_dir).is_ok() {
+            let backup = crate::new_session::backup_dir(&session_dir, std::time::SystemTime::now());
+            std::fs::rename(&session_dir, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+        // The folder decides what omp resumes; the row is only the lease check's input.
+        if let Err(e) = lock(&self.store).clear_session_id(lead::LEAD_SESSION) {
+            tracing::warn!(code = e.code(), "the lead's old session id was not cleared");
+        }
+        tracing::info!(
+            code = I_LEAD_NEW_SESSION,
+            backup = ?backup,
+            "lead session moved aside; the next lead turn starts a new session"
+        );
+        Ok(backup)
     }
 
     /// The lead's appended system prompt: the hints, then `persona.md` read now, then the core

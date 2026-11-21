@@ -34,10 +34,12 @@ use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
 use moraebot::memory::{Bucket, Day, MemoryHandle, MemoryStore, Redactor};
 use moraebot::memory_commands;
+use moraebot::new_session;
 use moraebot::observer::Observer;
 use moraebot::omp::{self, E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::omp_overlay::{OverlayCheck, W_OMP_VERSION};
 use moraebot::onboarding::{self, GreetTarget};
+use moraebot::status::Lang;
 use moraebot::store::{
     Admitted, JobKind, JobPayload, LaneJob, LaneStart, LaneState, MemoryJob, OnboardingRow,
     OnboardingState, State, Store, TurnTrace,
@@ -5477,4 +5479,312 @@ async fn every_handled_event_is_acked_and_a_store_error_is_not() {
     runner.abort();
     let _ = runner.await;
     h.close().await;
+}
+
+// --- New session command (#74) ---
+
+const SESSION_THREAD: &str = "555";
+const SESSION_KEY: &str = "fake:th:555";
+
+fn session_msg(message_id: &str, text: &str) -> InboundEvent {
+    event(message_id, OWNER, Some(SESSION_THREAD), text)
+}
+
+/// Every `SESSION_ENTRIES <pid> <n>` line fake-omp logged at `open_session`.
+fn session_entries(h: &Harness) -> Vec<(u32, i64)> {
+    h.log_lines()
+        .iter()
+        .filter_map(|l| {
+            let (pid, n) = l.strip_prefix("SESSION_ENTRIES ")?.split_once(' ')?;
+            Some((pid.parse().ok()?, n.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The `session-backup-*` folders beside the lead's session folder.
+fn session_backups(h: &Harness) -> Vec<PathBuf> {
+    let Ok(dir) = std::fs::read_dir(h.config.home.join("lead")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("session-backup-"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Writes a history file into the lead's session folder, as an omp that kept a session would.
+fn plant_history(h: &Harness) {
+    let dir = omp::lead_session_dir(&h.config);
+    std::fs::write(dir.join("history.jsonl"), "old turns").expect("history file");
+}
+
+fn start_running_lane(h: &Harness) -> i64 {
+    match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane(
+            "call-74",
+            SESSION_KEY,
+            "long work",
+            None,
+            None,
+            MAX_RUNNING_LANES,
+        )
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected New, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_session_moves_the_session_aside_and_the_next_turn_starts_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let before = queued(h.handle(session_msg("7401", "before")).await);
+    h.drain().await;
+    plant_history(&h);
+    let command = queued(h.handle(session_msg("7402", "새 세션")).await);
+    let row_kept = {
+        // The worker has not run the command yet: nothing changed.
+        let store = h.store.lock().unwrap();
+        store.session_id(lead::LEAD_SESSION).unwrap().is_some()
+    };
+    let after = queued(h.handle(session_msg("7403", "after")).await);
+    h.drain().await;
+    let backups = session_backups(&h);
+    let entries = session_entries(&h);
+    let starts = h.start_argvs();
+    let messages = raw_prompt_messages(&h);
+    let sends = h.sends();
+    let command_row = h.row(command);
+    let session_dir = omp::lead_session_dir(&h.config);
+    let session_id = h
+        .store
+        .lock()
+        .unwrap()
+        .session_id(lead::LEAD_SESSION)
+        .unwrap();
+    h.close().await;
+
+    assert!(row_kept);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(backups[0].join("history.jsonl")).unwrap(),
+        "old turns"
+    );
+    assert!(!session_dir.join("history.jsonl").exists());
+    assert_eq!(starts.len(), 2, "a new lead child started");
+    assert_eq!(
+        entries,
+        [(starts[0].0, 0), (starts[1].0, 0)],
+        "the new child opened an empty session folder"
+    );
+    assert_eq!(
+        messages,
+        [
+            lead::owner_input(SESSION_KEY, before, "before"),
+            lead::owner_input(SESSION_KEY, after, "after"),
+        ],
+        "the command never reaches the lead"
+    );
+    assert_eq!(command_row.state, State::Done);
+    assert_eq!(sends.len(), 3);
+    assert_eq!(
+        sends[0],
+        (SESSION_THREAD.to_owned(), "echo: before".to_owned())
+    );
+    let name = backups[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        sends[1].1.starts_with("새 세션을 열었어요") && sends[1].1.contains(&name),
+        "{}",
+        sends[1].1
+    );
+    assert_eq!(
+        sends[2],
+        (SESSION_THREAD.to_owned(), "echo: after".to_owned())
+    );
+    assert!(session_id.is_some(), "the new child stored its session id");
+}
+
+#[tokio::test]
+async fn new_session_with_running_lanes_asks_first_and_changes_nothing_until_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    queued(h.handle(session_msg("7411", "before")).await);
+    h.drain().await;
+    plant_history(&h);
+    start_running_lane(&h);
+    queued(h.handle(session_msg("7412", "new session")).await);
+    h.drain().await;
+    let asked = h.sends();
+    let backups_after_ask = session_backups(&h);
+    let id_after_ask = h
+        .store
+        .lock()
+        .unwrap()
+        .session_id(lead::LEAD_SESSION)
+        .unwrap();
+    let history_kept = omp::lead_session_dir(&h.config)
+        .join("history.jsonl")
+        .exists();
+
+    queued(h.handle(session_msg("7413", "new session confirm")).await);
+    h.drain().await;
+    queued(h.handle(session_msg("7414", "after")).await);
+    h.drain().await;
+    let sends = h.sends();
+    let backups = session_backups(&h);
+    let starts = h.starts();
+    h.close().await;
+
+    assert_eq!(
+        asked.last().map(|(_, text)| text.as_str()),
+        Some(new_session::confirm_text(Lang::English, 1).as_str())
+    );
+    assert!(backups_after_ask.is_empty());
+    assert!(history_kept);
+    assert!(id_after_ask.is_some());
+    assert_eq!(backups.len(), 1);
+    assert!(backups[0].join("history.jsonl").exists());
+    assert!(
+        sends[2].1.starts_with("Opened a new session."),
+        "{}",
+        sends[2].1
+    );
+    assert_eq!(sends[3].1, "echo: after");
+    assert_eq!(starts, 2);
+}
+
+#[tokio::test]
+async fn new_session_keeps_the_gateway_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let inbound = h.adapter.start().await.unwrap();
+    let runner = tokio::spawn(Arc::clone(&h.dispatcher).run(inbound));
+    h.adapter
+        .inject(channel_msg("1300000000000007421", "one"))
+        .await;
+    bounded(h.adapter.wait_for_send(1)).await;
+    h.adapter
+        .inject(channel_msg("1300000000000007422", "/new"))
+        .await;
+    bounded(h.adapter.wait_for_send(2)).await;
+    h.adapter
+        .inject(channel_msg("1300000000000007423", "two"))
+        .await;
+    bounded(h.adapter.wait_for_send(3)).await;
+    let serving = !runner.is_finished();
+    let texts: Vec<String> = h.sends().into_iter().map(|(_, text)| text).collect();
+    let pids: Vec<u32> = h.start_argvs().into_iter().map(|(pid, _)| pid).collect();
+    runner.abort();
+    let _ = runner.await;
+    h.close().await;
+
+    assert!(serving, "the dispatcher kept running");
+    assert_eq!(texts[0], "echo: one");
+    assert!(
+        texts[1].starts_with("Opened a new session."),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(texts[2], "echo: two");
+    assert_eq!(pids.len(), 2);
+    assert_ne!(pids[0], pids[1]);
+    assert!(!alive(pids[0]), "the old lead child was reaped");
+}
+
+#[tokio::test]
+async fn new_session_waits_for_the_running_turn_and_rows_behind_it_reach_the_new_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("reply-gate");
+    let h = Harness::build(
+        dir.path(),
+        "ok",
+        PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")),
+        false,
+        vec![("FAKE_OMP_REPLY_GATE", gate.to_string_lossy().into_owned())],
+    );
+    let a = queued(h.handle(in_thread("7431", THREAD_A, "A")).await);
+    let key = h.row(a).conversation_key;
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let command = h.handle(in_thread("7432", THREAD_A, "새 세션")).await;
+    let later = h.handle(in_thread("7433", THREAD_A, "later")).await;
+    std::fs::write(&gate, "").unwrap();
+    assert!(bounded(step).await.unwrap());
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let starts = h.start_argvs();
+    let entries = session_entries(&h);
+    let sends = h.sends();
+    let backups = session_backups(&h);
+    h.close().await;
+
+    queued(command);
+    let later = queued(later);
+    assert_eq!(
+        messages,
+        [
+            lead::owner_input(&key, a, "A"),
+            lead::owner_input(&key, later, "later"),
+        ]
+    );
+    assert_eq!(starts.len(), 2);
+    assert_eq!(entries, [(starts[0].0, 0), (starts[1].0, 0)]);
+    assert_eq!(backups.len(), 1);
+    let texts: Vec<&str> = sends.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert_eq!(texts[0], "echo: A");
+    assert!(texts[1].starts_with("새 세션을 열었어요"), "{}", texts[1]);
+    assert_eq!(texts[2], "echo: later");
+}
+
+#[tokio::test]
+async fn a_longer_message_about_a_new_session_goes_to_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open(dir.path(), "ok");
+    let id = queued(h.handle(session_msg("7441", "새 세션 열어줄래?")).await);
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    let backups = session_backups(&h);
+    h.close().await;
+
+    assert_eq!(
+        messages,
+        [lead::owner_input(SESSION_KEY, id, "새 세션 열어줄래?")]
+    );
+    assert!(backups.is_empty());
+}
+
+#[tokio::test]
+async fn a_chat_sender_cannot_start_a_new_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::open_allowlist(dir.path(), None);
+    let handled = h
+        .handle(event("7451", FRIEND, Some(SESSION_THREAD), "새 세션"))
+        .await;
+    h.chats_done().await;
+    let backups = session_backups(&h);
+    let lead_id = h
+        .store
+        .lock()
+        .unwrap()
+        .session_id(lead::LEAD_SESSION)
+        .unwrap();
+    h.close().await;
+
+    assert_eq!(handled, Handled::Chat);
+    assert!(backups.is_empty());
+    assert_eq!(lead_id, None, "the lead never started");
 }
