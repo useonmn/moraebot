@@ -245,7 +245,30 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
             false
         }
     };
-    Ok(if checks_ok && overlay_ok {
+    let tools_ok = match config.lead.tools() {
+        None => {
+            writeln!(stdout, "OK   lead tools: omp's own defaults")?;
+            true
+        }
+        Some(tools) => {
+            match omp_overlay::check_tools(&config.omp_path, &config.home, &config.work_dir, tools)
+            {
+                Ok(()) if tools.is_empty() => {
+                    writeln!(stdout, "OK   lead tools: none (only moraebot's tools)")?;
+                    true
+                }
+                Ok(()) => {
+                    writeln!(stdout, "OK   lead tools: {}", tools.join(", "))?;
+                    true
+                }
+                Err(err) => {
+                    writeln!(stdout, "FAIL lead tools: {err}")?;
+                    false
+                }
+            }
+        }
+    };
+    Ok(if checks_ok && overlay_ok && tools_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -408,6 +431,9 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
     match &overlay.warning {
         Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),
         None => tracing::info!(omp = %overlay.version, "omp memory overlay checked"),
+    }
+    if let Some(tools) = config.lead.tools() {
+        omp_overlay::check_tools(&config.omp_path, &config.home, &config.work_dir, tools)?;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

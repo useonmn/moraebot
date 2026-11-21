@@ -14,9 +14,12 @@
 //!   ignores an unknown key and its memory would come back on;
 //! - warns when omp is not the version the merge was checked against ([`CHECKED_OMP_VERSION`]).
 //!
+//! [`check_tools`] asks omp at start whether it knows every built-in tool of `[lead] tools`.
+//!
 //! The file name differs from the 0.2.0 `omp/config-overlay.yml`, which still refuses start
 //! (`memory::check_old_layout`).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +30,8 @@ use crate::config::ConfigError;
 pub const E_OMP_OVERLAY: &str = "E_OMP_OVERLAY";
 /// omp is not the version the overlay merge was checked against.
 pub const W_OMP_VERSION: &str = "W_OMP_VERSION";
+/// omp refuses the lead's `--tools` list, or cannot be asked.
+pub const E_LEAD_TOOLS: &str = "E_LEAD_TOOLS";
 
 /// The omp version whose `--config` merge the overlay was checked against. It also stands for
 /// a second fact: a one-line `--append-system-prompt` value is read as a file, once, at start
@@ -87,7 +92,7 @@ pub struct OverlayCheck {
 /// project settings of its working folder, and one it cannot load fails every `config get`.
 pub fn check(omp: &Path, home: &Path) -> Result<OverlayCheck, ConfigError> {
     for key in OVERLAY_KEYS {
-        let output = run(omp, home, &["config", "get", key, "--json"])?;
+        let output = run(omp, home, &["config", "get", key, "--json"], E_OMP_OVERLAY)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() && !stderr.contains(&format!("Unknown setting: {key}")) {
             // omp failed for another reason (e.g. a settings file it cannot load); that says
@@ -115,7 +120,7 @@ pub fn check(omp: &Path, home: &Path) -> Result<OverlayCheck, ConfigError> {
             ));
         }
     }
-    let output = run(omp, home, &["--version"])?;
+    let output = run(omp, home, &["--version"], E_OMP_OVERLAY)?;
     let version = parse_version(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         ConfigError::new(
             E_OMP_OVERLAY,
@@ -130,6 +135,55 @@ pub fn check(omp: &Path, home: &Path) -> Result<OverlayCheck, ConfigError> {
     Ok(OverlayCheck { version, warning })
 }
 
+/// Asks `omp` whether it can give the lead every built-in tool in `tools` (the lead's
+/// `--tools` list). omp checks `--tools` against the session it builds, before `ready`, and
+/// exits on a name it does not know or a tool the session's settings turn off, so a bad list
+/// would make every lead start fail; asking omp itself keeps the check in step with omp's own
+/// tool list across versions. The probe builds the lead's session: `omp --mode rpc --no-ui
+/// --no-title --no-session --cwd <work_dir> --config <overlay> --tools=<list>` with stdin at
+/// EOF, so the work folder's project settings and the memory overlay (which turns off omp's
+/// memory tools) apply as they do for the lead. omp exits 0 at once when it can give every
+/// tool. No model is called and no session file is written. The overlay is written first.
+/// An empty list (`--no-tools`) needs no probe.
+pub fn check_tools(
+    omp: &Path,
+    home: &Path,
+    work_dir: &Path,
+    tools: &[String],
+) -> Result<(), ConfigError> {
+    if tools.is_empty() {
+        return Ok(());
+    }
+    write_overlay(home)?;
+    let flag = format!("--tools={}", tools.join(","));
+    let overlay = overlay_path(home);
+    let args: [&OsStr; 10] = [
+        "--mode".as_ref(),
+        "rpc".as_ref(),
+        "--no-ui".as_ref(),
+        "--no-title".as_ref(),
+        "--no-session".as_ref(),
+        "--cwd".as_ref(),
+        work_dir.as_os_str(),
+        "--config".as_ref(),
+        overlay.as_os_str(),
+        flag.as_ref(),
+    ];
+    let output = run(omp, home, &args, E_LEAD_TOOLS)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(ConfigError::new(
+        E_LEAD_TOOLS,
+        format!(
+            "{} refuses the lead tools {}: {}; set `[lead] tools` in config.toml to tools this omp offers",
+            omp.display(),
+            tools.join(", "),
+            error_line(&String::from_utf8_lossy(&output.stderr))
+        ),
+    ))
+}
+
 /// The line of omp's stderr that names the error: the first `error:` line (omp prints a
 /// source excerpt before it), else the last non-empty line.
 fn error_line(stderr: &str) -> &str {
@@ -142,21 +196,32 @@ fn error_line(stderr: &str) -> &str {
 }
 
 /// Runs `omp args` in `dir` with the same filtered environment as every omp child, so the
-/// check never passes a messenger token or the jev key.
-fn run(omp: &Path, dir: &Path, args: &[&str]) -> Result<std::process::Output, ConfigError> {
+/// check never passes a messenger token or the jev key. stdin is null. `code` is the error
+/// code when omp cannot be run.
+fn run<S: AsRef<OsStr>>(
+    omp: &Path,
+    dir: &Path,
+    args: &[S],
+    code: &'static str,
+) -> Result<std::process::Output, ConfigError> {
     Command::new(omp)
         .args(args)
         .current_dir(dir)
         .env_clear()
         .envs(crate::omp::check_env(&[]))
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| {
+            let shown: Vec<_> = args
+                .iter()
+                .map(|arg| arg.as_ref().to_string_lossy())
+                .collect();
             ConfigError::io(
-                E_OMP_OVERLAY,
+                code,
                 &format!(
                     "cannot run {} {} in {}",
                     omp.display(),
-                    args.join(" "),
+                    shown.join(" "),
                     dir.display()
                 ),
                 &e,
@@ -199,6 +264,76 @@ mod tests {
         std::fs::write(&path, script).expect("write fake omp");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         path
+    }
+
+    /// A stand-in omp for the lead tool probe: knows the tools `read`, `grep`, `glob` and
+    /// `web_search`, prints omp's error for any other, and touches `ran` whenever it runs.
+    fn fake_tools_omp(dir: &Path) -> PathBuf {
+        let path = dir.join("omp-tools");
+        let script = format!(
+            "#!/bin/sh\n\
+             touch '{ran}'\n\
+             for a in \"$@\"; do case \"$a\" in --tools=*) list=\"${{a#--tools=}}\";; esac; done\n\
+             bad=''\n\
+             for t in $(echo \"$list\" | tr ',' ' '); do\n\
+               case \"$t\" in read|grep|glob|web_search) ;; *) bad=\"$bad $t\";; esac\n\
+             done\n\
+             if [ -n \"$bad\" ]; then\n\
+               echo \"Error: Unknown tool in --tools:$bad.\" >&2\n\
+               echo 'Known tools: read, grep, glob, web_search' >&2\n\
+               exit 2\n\
+             fi\n\
+             exit 0\n",
+            ran = dir.join("ran").display()
+        );
+        std::fs::write(&path, script).expect("write fake omp");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn known_lead_tools_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let omp = fake_tools_omp(dir.path());
+        check_tools(
+            &omp,
+            dir.path(),
+            dir.path(),
+            &names(&["read", "grep", "glob", "web_search"]),
+        )
+        .expect("passes");
+        assert!(dir.path().join("ran").exists());
+    }
+
+    #[test]
+    fn unknown_lead_tool_refuses_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let omp = fake_tools_omp(dir.path());
+        let err = check_tools(
+            &omp,
+            dir.path(),
+            dir.path(),
+            &names(&["read", "lane_start"]),
+        )
+        .expect_err("refused");
+        assert_eq!(err.code, E_LEAD_TOOLS);
+        assert!(
+            err.to_string()
+                .contains("Error: Unknown tool in --tools: lane_start."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_lead_tools_skip_the_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let omp = fake_tools_omp(dir.path());
+        check_tools(&omp, dir.path(), dir.path(), &[]).expect("passes");
+        assert!(!dir.path().join("ran").exists(), "omp is not run");
     }
 
     #[test]

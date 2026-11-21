@@ -262,22 +262,74 @@ impl OmpConfig {
     }
 }
 
-/// How long a lead turn may run while an owner message of its conversation waits before the
-/// busy note, when `lead.handoff_after_minutes` is left out.
+/// How long a lead turn may run before the busy note, when `lead.handoff_after_minutes` is
+/// left out.
 pub const DEFAULT_HANDOFF_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// `[lead]`: how moraebot nudges a lead turn that keeps the owner waiting.
+/// `[lead]`: how moraebot nudges a lead turn that runs long, and which omp built-in tools the
+/// lead gets.
 #[derive(Debug, Clone, Default)]
 pub struct LeadConfig {
     /// Absent means [`DEFAULT_HANDOFF_AFTER`]; `0` turns the busy note off.
     pub handoff_after_minutes: Option<u64>,
     /// Absent means `true`: moraebot answers owner status questions itself.
     pub direct_status: Option<bool>,
+    /// omp built-in tools of the lead (`--tools`). Absent means omp's own default tools, so the
+    /// lead can do light work itself; an empty list leaves it only moraebot's host tools
+    /// (`--no-tools`).
+    pub tools: Option<Vec<String>>,
+}
+
+/// Tool names moraebot registers itself as RPC host tools; `lead.tools` names only omp
+/// built-ins, and omp refuses these at start because they do not exist yet.
+const HOST_TOOL_NAMES: [&str; 11] = [
+    crate::omp::SEND_FILE_TOOL,
+    crate::lane::LANE_START_TOOL,
+    crate::lane::LANE_MESSAGE_TOOL,
+    crate::lane::LANE_STATUS_TOOL,
+    crate::lane::LANE_CLOSE_TOOL,
+    crate::lane::LANE_STOP_TOOL,
+    crate::done::LANE_DONE_TOOL,
+    crate::lane::LANE_REPORT_TOOL,
+    crate::memory_tools::MEMORY_SEARCH_TOOL,
+    crate::memory_tools::MEMORY_WRITE_TOOL,
+    crate::onboarding::FINISH_TOOL,
+];
+
+/// Refuses (`E_CONFIG_VALUE`) a `lead.tools` name that is not `^[a-z][a-z0-9_]*$`, appears
+/// twice, or is one of moraebot's own host tools.
+fn validate_lead_tools(tools: &[String]) -> Result<(), ConfigError> {
+    for (i, name) in tools.iter().enumerate() {
+        let mut chars = name.chars();
+        let well_formed = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !well_formed {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("lead.tools: {name:?} is not a tool name (a-z, 0-9, _)"),
+            ));
+        }
+        if tools[..i].contains(name) {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("lead.tools: {name} is listed twice"),
+            ));
+        }
+        if HOST_TOOL_NAMES.contains(&name.as_str()) {
+            return Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!(
+                    "lead.tools: {name} is a moraebot tool the lead always has; list only omp built-in tools"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl LeadConfig {
-    /// How long a lead turn may run while an owner message of its conversation waits before
-    /// moraebot sends the busy note; `None` when it is turned off. It never stops the turn.
+    /// How long a lead turn may run before moraebot sends the busy note; `None` when it is
+    /// turned off. It never stops the turn.
     pub fn handoff_after(&self) -> Option<Duration> {
         match self.handoff_after_minutes {
             None => Some(DEFAULT_HANDOFF_AFTER),
@@ -290,6 +342,12 @@ impl LeadConfig {
     /// itself; when `false` the message goes to the lead like any other.
     pub fn direct_status(&self) -> bool {
         self.direct_status.unwrap_or(true)
+    }
+
+    /// The lead's omp built-in tools when `lead.tools` limits them; `None` means omp's own
+    /// default tools.
+    pub fn tools(&self) -> Option<&[String]> {
+        self.tools.as_deref()
     }
 }
 
@@ -874,6 +932,8 @@ struct LeadSection {
     handoff_after_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     direct_status: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1520,6 +1580,16 @@ impl Config {
         let work_dir =
             env.expand_tilde(&file.work_dir.unwrap_or_else(|| DEFAULT_WORK_DIR.into()))?;
 
+        let lead = file
+            .lead
+            .map_or_else(LeadConfig::default, |lead| LeadConfig {
+                handoff_after_minutes: lead.handoff_after_minutes,
+                direct_status: lead.direct_status,
+                tools: lead.tools,
+            });
+        if let Some(tools) = &lead.tools {
+            validate_lead_tools(tools)?;
+        }
         Ok(Config {
             messenger,
             discord,
@@ -1533,12 +1603,7 @@ impl Config {
                 max_cost_usd: omp.max_cost_usd,
                 stall_after_minutes: omp.stall_after_minutes,
             },
-            lead: file
-                .lead
-                .map_or_else(LeadConfig::default, |lead| LeadConfig {
-                    handoff_after_minutes: lead.handoff_after_minutes,
-                    direct_status: lead.direct_status,
-                }),
+            lead,
             memory,
         })
     }
@@ -1659,11 +1724,14 @@ impl Config {
                 max_cost_usd: self.omp.max_cost_usd,
                 stall_after_minutes: self.omp.stall_after_minutes,
             }),
-            lead: (self.lead.handoff_after_minutes.is_some() || self.lead.direct_status.is_some())
-                .then_some(LeadSection {
-                    handoff_after_minutes: self.lead.handoff_after_minutes,
-                    direct_status: self.lead.direct_status,
-                }),
+            lead: (self.lead.handoff_after_minutes.is_some()
+                || self.lead.direct_status.is_some()
+                || self.lead.tools.is_some())
+            .then(|| LeadSection {
+                handoff_after_minutes: self.lead.handoff_after_minutes,
+                direct_status: self.lead.direct_status,
+                tools: self.lead.tools.clone(),
+            }),
             memory: self.memory.to_section(),
         };
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
@@ -3125,6 +3193,73 @@ mod tests {
         assert_eq!(again.lead.direct_status, Some(false));
         let on = format!("{}[lead]\ndirect_status = true\n", fx.valid_toml());
         assert!(fx.load(&on).expect("loads").lead.direct_status());
+    }
+
+    #[test]
+    fn lead_tools_default_to_omp_and_keep_a_list_or_an_empty_list() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(cfg.lead.tools(), None, "no list: omp's own default tools");
+        let list = format!("{}[lead]\ntools = [\"read\", \"bash\"]\n", fx.valid_toml());
+        let cfg = fx.load(&list).expect("loads");
+        assert_eq!(
+            cfg.lead.tools(),
+            Some(&["read".to_owned(), "bash".to_owned()][..])
+        );
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.lead.tools, Some(vec!["read".into(), "bash".into()]));
+        let empty = format!("{}[lead]\ntools = []\n", fx.valid_toml());
+        let cfg = fx.load(&empty).expect("loads");
+        assert_eq!(cfg.lead.tools, Some(Vec::new()));
+        assert_eq!(cfg.lead.tools(), Some(&[][..]));
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.lead.tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn lead_tools_refuse_bad_names_duplicates_and_moraebot_tools() {
+        let fx = Fixture::new();
+        let mut bad: Vec<String> = [
+            "\"Bash\"",
+            "\"web-search\"",
+            "\"\"",
+            "\"1read\"",
+            "\"read\", \"read\"",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        bad.extend(HOST_TOOL_NAMES.map(|name| format!("\"{name}\"")));
+        for list in bad {
+            let text = format!("{}[lead]\ntools = [{list}]\n", fx.valid_toml());
+            assert_eq!(
+                fx.load(&text).expect_err("refused").code,
+                E_CONFIG_VALUE,
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_tool_names_cover_every_moraebot_tool() {
+        for name in [
+            "send_file",
+            "lane_start",
+            "lane_message",
+            "lane_status",
+            "lane_close",
+            "lane_stop",
+            "lane_done",
+            "lane_report",
+            "memory_search",
+            "memory_write",
+            "onboarding_finish",
+        ] {
+            assert!(HOST_TOOL_NAMES.contains(&name), "{name}");
+        }
     }
 
     #[test]

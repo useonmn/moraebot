@@ -4128,7 +4128,6 @@ async fn busy_lead_gets_one_note_while_an_owner_row_waits() {
     let step = h.spawn_step();
     h.wait_turn(&key).await;
     let t0 = Instant::now();
-    let empty = h.dispatcher.post_busy_note(t0 + DEFAULT_HANDOFF_AFTER);
     let later = queue_owner_row(&h, "1300000000000000991", &key, "later");
     let early = h.dispatcher.post_busy_note(t0);
     let sent = h.dispatcher.post_busy_note(t0 + DEFAULT_HANDOFF_AFTER);
@@ -4140,15 +4139,13 @@ async fn busy_lead_gets_one_note_while_an_owner_row_waits() {
     let later_row = h.row(later);
     h.close().await;
 
-    assert!(!empty, "nothing waits: no note");
     assert!(!early, "the turn is younger than the threshold");
     assert!(sent);
     assert!(!again, "one note per turn");
     assert_eq!(messages.len(), 3, "{messages:?}");
-    assert!(
-        messages[1].starts_with(&format!("{}\n", omp::BUSY_NOTE_TAG)),
-        "{}",
-        messages[1]
+    assert_eq!(
+        messages[1],
+        format!("{}\n{}", omp::BUSY_NOTE_TAG, lead::busy_note(5, true))
     );
     assert_eq!(messages[2], lead::owner_input(&key, later, "later"));
     assert_eq!(reply.len(), 1);
@@ -4156,6 +4153,37 @@ async fn busy_lead_gets_one_note_while_an_owner_row_waits() {
         later_row.state,
         State::Done,
         "the waiting row got its own turn"
+    );
+}
+
+#[tokio::test]
+async fn busy_lead_gets_a_note_when_nothing_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    // `note`: the first moraebot note ends the run.
+    let h = Harness::open_steer(dir.path(), "note");
+    let a = queued(
+        h.handle(in_thread("1300000000000000994", THREAD_A, "A"))
+            .await,
+    );
+    let key = h.row(a).conversation_key;
+    let step = h.spawn_step();
+    h.wait_turn(&key).await;
+    let sent = h
+        .dispatcher
+        .post_busy_note(Instant::now() + DEFAULT_HANDOFF_AFTER);
+    assert!(bounded(step).await.unwrap());
+    h.drain().await;
+    let messages = raw_prompt_messages(&h);
+    h.close().await;
+
+    assert!(
+        sent,
+        "a long turn gets the note even when no owner message waits"
+    );
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(
+        messages[1],
+        format!("{}\n{}", omp::BUSY_NOTE_TAG, lead::busy_note(5, false))
     );
 }
 
