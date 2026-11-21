@@ -44,6 +44,13 @@
 //! command row queued without that check (a race with the worker, a restart) is answered
 //! by the worker the same way; lane-result rows are never checked.
 //!
+//! Owner status questions ([`crate::status`]): in the same slot, right after the memory check,
+//! an owner row without attachments whose whole text is a status question ("뭐 하고 있어",
+//! "status", ...) is claimed and answered by moraebot from the lead's turn state
+//! ([`OmpManager::lead_status`]) and the running lanes, also while a lead turn runs. The lead
+//! never sees it, and a status row queued without that check is answered by the worker the
+//! same way.
+//!
 //! A message of the conversation whose lead turn is running is steered into that turn
 //! once its files are saved, only when it comes from the same sender as the turn, when the store accepts the claim ([`Store::steer_into`]);
 //! otherwise it is queued. A turn and its steered row form one group: one reply on the
@@ -68,11 +75,20 @@
 //! the first meeting and posts one fixed greeting: in the owner's DM (in the configured
 //! channel when the DM fails), or in the channel when the request says so.
 //!
-//! Lane news: after every lane watchdog tick, the newest unposted progress note of each
-//! running lane is delivered in every conversation that had no owner message, delivered
-//! reply or delivered news for [`NEWS_AFTER`]; the lead is not involved. Each lane has one
-//! news message: the first note is posted, later notes edit it, and a failed edit posts a
-//! new one. A note the messenger did not accept is tried again on the next tick.
+//! Lane news: after every lane watchdog tick, the newest progress note of each running lane
+//! not handed on yet goes to the lead for every conversation that had no owner message,
+//! delivered reply or handed-on news for [`NEWS_AFTER`]; the lead tells the owner. While the
+//! lead runs a turn of the lane's conversation the note is sent into that turn
+//! ([`NoteKind::News`]); otherwise it is stored as a dedup'd lane inbox row
+//! ([`lead::lane_news`]) that waits for the lead like a lane result. A news row whose lane no
+//! longer runs when its turn comes is dropped ([`E_LANE_NEWS_STALE`]). Only while the lead
+//! cannot start ([`OmpManager::lead_down`]) is the raw [`news_line`] posted instead. A note
+//! that could not be handed on is tried again on the next tick.
+//!
+//! Busy lead turn: after every lane watchdog tick, a lead turn that has run for
+//! `lead.handoff_after_minutes` while an owner row of its conversation waits (steered into it
+//! or queued) gets one [`NoteKind::Busy`] note asking it to hand off and answer
+//! ([`OmpManager::lead_busy`], log code `W_LEAD_BUSY`). Nothing is killed.
 //!
 //! Stalled lead turn: after every lane watchdog tick, a lead turn that sent no omp agent event
 //! for `omp.stall_after_minutes` gets one [`N_TURN_STALLED`] notice in its conversation
@@ -102,11 +118,14 @@ use crate::lead;
 use crate::memory::MemoryHandle;
 use crate::memory_commands::{self, Command};
 use crate::observer::Observer;
-use crate::omp::{ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, OmpManager, Outcome, key_slug, lock};
+use crate::omp::{
+    ABORT_JOIN_BOUND, E_COST_CAP, GroupReport, NoteKind, OmpManager, Outcome, key_slug, lock,
+};
 use crate::omp_overlay::{OverlayCheck, W_OMP_VERSION};
 use crate::onboarding::{self, E_ONBOARDING_REQUEST, GreetTarget};
+use crate::status;
 pub use crate::store::E_DISPATCH_HELD;
-use crate::store::{Admitted, InboxRow, State, Store, StoreError};
+use crate::store::{Admitted, InboxRow, LaneRow, LaneState, State, Store, StoreError};
 use crate::store::{LogLevel, LogRow};
 
 /// Empty message without attachments, or `/` message: not forwarded to omp.
@@ -141,6 +160,9 @@ pub const N_OMP_VERSION: &str = "N_OMP_VERSION";
 
 /// Stored row error: the conversation key has no reply target.
 pub const E_DISPATCH_KEY: &str = "E_DISPATCH_KEY";
+/// Stored row error: a lane news row reached its turn after its lane stopped running; it was
+/// dropped without a lead turn or a notice.
+pub const E_LANE_NEWS_STALE: &str = "E_LANE_NEWS_STALE";
 /// Log code: a notice skipped its channel fallback because there is no channel (a bridge
 /// whose hello names no `home`).
 pub const W_NO_HOME_CHANNEL: &str = "W_NO_HOME_CHANNEL";
@@ -232,7 +254,7 @@ pub fn reply_target(key: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-/// One lane's line in a news message.
+/// One lane's note as posted while the lead cannot start.
 pub fn news_line(lane_id: i64, text: &str) -> String {
     format!("[lane {lane_id}] {text}")
 }
@@ -338,6 +360,9 @@ pub enum Handled {
     /// An owner memory command, answered by moraebot itself as the row's reply; never sent to
     /// the lead.
     Memory(i64),
+    /// An owner status question, answered by moraebot itself as the row's reply; never sent to
+    /// the lead.
+    Status(i64),
 }
 
 /// What an owner row asks of the memory store.
@@ -866,6 +891,12 @@ impl Dispatcher {
                 {
                     return Ok(handled);
                 }
+                if let Some(handled) = self
+                    .status_command(id, key.as_str(), &event.text, true)
+                    .await?
+                {
+                    return Ok(handled);
+                }
             } else {
                 lock(&self.forget_asked).remove(key.as_str());
             }
@@ -969,6 +1000,9 @@ impl Dispatcher {
         };
         let key = row.conversation_key.as_str();
         let from_owner = row.origin == "owner";
+        if !from_owner && self.stale_news(&row)? {
+            return Ok(true);
+        }
 
         if from_owner && row.author_id != self.owner_id {
             tracing::warn!(
@@ -994,14 +1028,21 @@ impl Dispatcher {
             return Ok(true);
         }
 
-        if from_owner
-            && row.attachments.is_none()
-            && self
+        if from_owner && row.attachments.is_none() {
+            if self
                 .memory_command(row.id, key, &row.text, false)
                 .await?
                 .is_some()
-        {
-            return Ok(true);
+            {
+                return Ok(true);
+            }
+            if self
+                .status_command(row.id, key, &row.text, false)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
         }
 
         let prompt = if from_owner {
@@ -1115,9 +1156,97 @@ impl Dispatcher {
             }
         };
         tracing::info!(row = id, conversation = key, "memory command answered");
-        self.store().finish_memory(id, &reply)?;
+        self.store().finish_direct(id, &reply)?;
         self.send_reply(id).await?;
         Ok(Some(Handled::Memory(id)))
+    }
+
+    /// Answers owner row `id` of conversation `key` when its whole `text` is a status question
+    /// ([`status::request`]): the answer is stored and sent like a lead reply and the row ends
+    /// `done`, so the lead never sees it. On `arrival` the row is still `queued` and is claimed
+    /// first (a row the worker took meanwhile is left to it); the worker passes `arrival =
+    /// false` for its already claimed row. Returns `None` when the row is not a status question.
+    async fn status_command(
+        &self,
+        id: i64,
+        key: &str,
+        text: &str,
+        arrival: bool,
+    ) -> Result<Option<Handled>, StoreError> {
+        let Some(lang) = status::request(text) else {
+            return Ok(None);
+        };
+        if arrival {
+            let _gate = self.admission.lock().await;
+            if !self.store().claim(id)? {
+                return Ok(None);
+            }
+        }
+        let reply = self.status_reply(lang, key)?;
+        tracing::info!(row = id, conversation = key, "status question answered");
+        self.store().finish_direct(id, &reply)?;
+        self.send_reply(id).await?;
+        Ok(Some(Handled::Status(id)))
+    }
+
+    /// The status answer for conversation `key`: the lead's turn and the running lanes.
+    fn status_reply(&self, lang: status::Lang, key: &str) -> Result<String, StoreError> {
+        let now = Instant::now();
+        let lead = self.omp.lead_status(now);
+        let since = self.lanes().running_since();
+        let running: Vec<LaneRow> = self
+            .store()
+            .lanes()?
+            .into_iter()
+            .filter(|lane| lane.state == LaneState::Running)
+            .collect();
+        let (mine, others): (Vec<LaneRow>, Vec<LaneRow>) = running
+            .into_iter()
+            .partition(|lane| lane.conversation_key == key);
+        let lanes: Vec<status::LaneLine> = mine
+            .iter()
+            .map(|lane| status::LaneLine {
+                id: lane.id,
+                running: since
+                    .get(&lane.id)
+                    .map(|started| now.saturating_duration_since(*started)),
+                task: &lane.task,
+            })
+            .collect();
+        Ok(status::reply(
+            lang,
+            key,
+            lead.as_ref(),
+            &lanes,
+            others.len(),
+        ))
+    }
+
+    /// Drops lane news row `row` when its lane no longer runs: the note is out of date and the
+    /// lane's result follows it. Returns whether the row was dropped.
+    fn stale_news(&self, row: &InboxRow) -> Result<bool, StoreError> {
+        let Some(lane) = lead::parse_tag(&row.text)
+            .filter(|tag| tag.news)
+            .and_then(|tag| tag.lane)
+        else {
+            return Ok(false);
+        };
+        let running = self
+            .store()
+            .lane(lane)?
+            .is_some_and(|lane| lane.state == LaneState::Running);
+        if running {
+            return Ok(false);
+        }
+        tracing::info!(
+            row = row.id,
+            lane,
+            code = E_LANE_NEWS_STALE,
+            "stale lane news dropped"
+        );
+        self.store()
+            .mark(row.id, State::Failed, Some(E_LANE_NEWS_STALE))?;
+        Ok(true)
     }
 
     /// jev's reading of an owner message the rules did not match, when an observer is attached
@@ -1434,9 +1563,9 @@ impl Dispatcher {
     }
 
     /// One news step at tick time `now`: every conversation's quiet clock is updated, then
-    /// each lane of `news` whose conversation is quiet for [`NEWS_AFTER`] gets its note
-    /// delivered by [`Self::deliver_news`]; delivered texts are marked. Returns the number of
-    /// notes the messenger accepted.
+    /// each lane of `news` whose conversation is quiet for [`NEWS_AFTER`] gets its note handed
+    /// on by [`Self::hand_news`]; handed-on texts are marked. Returns the number of notes
+    /// handed on.
     pub async fn post_news(&self, news: Vec<LaneNews>, now: Instant) -> usize {
         let due: Vec<LaneNews> = {
             let mut talk = lock(&self.talk);
@@ -1467,10 +1596,7 @@ impl Dispatcher {
             let Some(target) = reply_target(&n.conversation_key) else {
                 continue;
             };
-            if self
-                .deliver_news(target, n.lane_id, &news_line(n.lane_id, &n.text))
-                .await
-            {
+            if self.hand_news(target, &n).await {
                 self.lanes().news_posted(n.lane_id, &n.text);
                 self.talked(&n.conversation_key);
                 sent += 1;
@@ -1479,32 +1605,69 @@ impl Dispatcher {
         sent
     }
 
-    /// Edits the news message of `lane_id` to `line`, or posts `line` as a new message when
-    /// the lane has none or the edit failed, and remembers the new id. Returns whether the
-    /// messenger accepted it.
-    async fn deliver_news(&self, target: &str, lane_id: i64, line: &str) -> bool {
-        if let Some(message_id) = self.lanes().news_message(lane_id) {
-            match self.adapter.edit(target, &message_id, line).await {
-                Ok(()) => {
-                    tracing::info!(lane = lane_id, "lane news edited");
-                    return true;
+    /// Hands lane note `n` to the lead: a [`NoteKind::News`] note when the running turn is of
+    /// the note's conversation, else a lane inbox row that waits for the lead (a turn of
+    /// another conversation finishes first). While the lead cannot start, the raw
+    /// [`news_line`] is posted in `target` instead. Returns whether the note was handed on (a
+    /// row that already exists, or a lane that stopped meanwhile, counts as handed on).
+    async fn hand_news(&self, target: &str, n: &LaneNews) -> bool {
+        if let Some((turn, key)) = self.omp.open_turn()
+            && key == n.conversation_key
+            && self.omp.notes().send(
+                turn,
+                NoteKind::News,
+                &lead::lane_news_note(n.lane_id, &n.text),
+                None,
+            )
+        {
+            tracing::info!(lane = n.lane_id, "lane news sent into the running turn");
+            return true;
+        }
+        if self.omp.lead_down() {
+            return match self
+                .adapter
+                .send(target, &news_line(n.lane_id, &n.text))
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(lane = n.lane_id, "lead is down; lane news posted");
+                    true
                 }
                 Err(err) => {
-                    tracing::warn!(lane = lane_id, code = err.code, "lane news edit failed")
+                    tracing::warn!(lane = n.lane_id, code = err.code, "lane news send failed");
+                    false
                 }
-            }
+            };
         }
-        match self.adapter.send(target, line).await {
-            Ok(sent) => {
-                self.lanes().set_news_message(lane_id, &sent.message_id);
-                tracing::info!(lane = lane_id, "lane news posted");
+        let input = lead::lane_news(&n.conversation_key, n.lane_id, &n.text);
+        let stored = self.store().news_notice(n.lane_id, &n.message_id(), &input);
+        match stored {
+            Ok(queued) => {
+                if queued {
+                    tracing::info!(lane = n.lane_id, "lane news queued for the lead");
+                    self.wake.notify_one();
+                }
                 true
             }
             Err(err) => {
-                tracing::warn!(lane = lane_id, code = err.code, "lane news send failed");
+                tracing::error!(lane = n.lane_id, code = err.code(), "lane news not stored");
                 false
             }
         }
+    }
+
+    /// One busy check at tick time `now` ([`OmpManager::lead_busy`]): an owner row of the
+    /// running turn's conversation that is still `queued` counts as waiting. Returns whether a
+    /// note was sent.
+    pub fn post_busy_note(&self, now: Instant) -> bool {
+        self.omp.lead_busy(now, |key| {
+            self.store()
+                .has_queued_owner_row(key)
+                .unwrap_or_else(|err| {
+                    tracing::error!(code = err.code(), "queued owner rows not read");
+                    false
+                })
+        })
     }
 
     /// Posts lane news after every lane watchdog tick until the task is aborted.
@@ -1515,6 +1678,7 @@ impl Dispatcher {
             if let Some(now) = now {
                 self.post_news(self.lanes().news(), now).await;
                 self.post_stall_notice(now).await;
+                self.post_busy_note(now);
             }
         }
     }

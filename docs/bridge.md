@@ -115,7 +115,7 @@ A second core gets `bye` with `E_BRIDGE_BUSY` in place of `hello`. The first one
 |---|---|---|
 | `threads` | `"none"`, `"implicit"`, `"create"` | `implicit`: the root message id is the thread, so `create_thread` returns `from_message_id` with no frame. `create`: the core sends a `thread` request. `none`: `create_thread` fails with `E_ADAPTER_THREAD`, no frame. |
 | `dm` | bool | false: `open_dm` fails with `E_ADAPTER_DM`, no frame. |
-| `edit` | bool | false: `edit` fails with `E_ADAPTER_EDIT`, no frame. Lane news then posts a new message. |
+| `edit` | bool | false: `edit` fails with `E_ADAPTER_EDIT`, no frame. The core does not edit messages today (lane news goes through the lead). |
 | `files` | bool | false: `fetch_attachment` and `send_file` fail with `E_ADAPTER_FILES`, no frame. |
 | `status` | bool | false: `start_typing` returns a handle that does nothing, no frame. |
 | `reactions` | bool | Reserved. The core sends no `react` in version 1. |

@@ -50,6 +50,7 @@ impl Harness {
             }),
             bridge: None,
             omp,
+            lead: Default::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");

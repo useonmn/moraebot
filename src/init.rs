@@ -210,6 +210,7 @@ fn assemble(
         home: env.default_home()?,
         access_mode: AccessMode::OwnerOnly,
         omp: OmpConfig::default(),
+        lead: Default::default(),
         memory: crate::config::MemoryConfig::default(),
     })
 }

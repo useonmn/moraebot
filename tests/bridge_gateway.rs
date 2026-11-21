@@ -107,6 +107,7 @@ fn bridge_config(root: &Path, socket: PathBuf, omp_path: PathBuf) -> Config {
         home,
         access_mode: AccessMode::OwnerOnly,
         omp: OmpConfig::default(),
+        lead: Default::default(),
         memory: MemoryConfig::default(),
     }
 }

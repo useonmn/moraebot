@@ -58,6 +58,7 @@ impl Harness {
             }),
             bridge: None,
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: moraebot::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
@@ -2023,6 +2024,7 @@ async fn lane_report_is_news_while_the_lane_runs() {
         news,
         [LaneNews {
             lane_id: 1,
+            seq: 1,
             conversation_key: KEY.into(),
             text: "qa step 1".into(),
         }]

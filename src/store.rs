@@ -1655,10 +1655,10 @@ impl Store {
         Ok(())
     }
 
-    /// Stores the memory store's answer to an owner memory command on `id`
-    /// (`reply_pending`, as [`Store::save_reply`]) and marks the row `memory_answered`, so
-    /// it is never counted as an onboarding turn.
-    pub fn finish_memory(&mut self, id: i64, reply: &str) -> Result<(), StoreError> {
+    /// Stores moraebot's own answer to an owner command on `id` (a memory or status command;
+    /// `reply_pending`, as [`Store::save_reply`]) and marks the row `memory_answered`, so it is
+    /// never counted as an onboarding turn.
+    pub fn finish_direct(&mut self, id: i64, reply: &str) -> Result<(), StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2069,6 +2069,25 @@ impl Store {
         episode: u32,
         text: &str,
     ) -> Result<bool, StoreError> {
+        self.lane_notice(id, &format!("{id}:{seq}:stalled:{episode}"), text)
+    }
+
+    /// Queues one lane progress note for the lead as a lane inbox row whose message id is
+    /// `message_id` (`<id>:<seq>:news:<text hash>`, [`crate::lane::LaneNews::message_id`])
+    /// without touching the lane's state. `Ok(false)` when that row already exists or the lane
+    /// is no longer running.
+    pub fn news_notice(
+        &mut self,
+        id: i64,
+        message_id: &str,
+        text: &str,
+    ) -> Result<bool, StoreError> {
+        self.lane_notice(id, message_id, text)
+    }
+
+    /// Inserts lane inbox row `message_id` of running lane `id` unless it exists; the lane's
+    /// state is not touched. `Ok(false)` when the row exists or the lane is not running.
+    fn lane_notice(&mut self, id: i64, message_id: &str, text: &str) -> Result<bool, StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2089,10 +2108,19 @@ impl Store {
                  VALUES (?1, ?2, ?3, 'lane', ?4, 'queued', {NOW}, {NOW}, 1, 'lane')
                  ON CONFLICT(platform, message_id) DO NOTHING"
             ),
-            params![LANE_PLATFORM, format!("{id}:{seq}:stalled:{episode}"), key, text],
+            params![LANE_PLATFORM, message_id, key, text],
         )?;
         tx.commit()?;
         Ok(inserted == 1)
+    }
+
+    /// Whether an owner row of conversation `key` is still `queued` (lane rows never count).
+    pub fn has_queued_owner_row(&self, key: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE state = 'queued' AND origin = 'owner' AND conversation_key = ?1)",
+            [key],
+            |r| r.get(0),
+        )?)
     }
 
     /// Lanes a restart interrupted whose notice has not been posted yet.
@@ -3523,6 +3551,45 @@ mod tests {
         assert!(!s.stall_notice(a, 1, 1, "n1").unwrap());
         assert_eq!(s.count().unwrap(), 1);
         assert!(s.stall_notice(a + 100, 1, 1, "n1").is_err());
+    }
+
+    #[test]
+    fn news_notice_stores_one_row_per_message_id_of_a_running_lane() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert!(s.news_notice(a, "1:1:news:01", "q1").unwrap());
+        assert!(!s.news_notice(a, "1:1:news:01", "q1").unwrap());
+        assert!(s.news_notice(a, "1:1:news:02", "q2").unwrap());
+        assert_eq!(
+            inbox_cols(&s),
+            vec![
+                inbox_row("1:1:news:01", "q1"),
+                inbox_row("1:1:news:02", "q2")
+            ]
+        );
+        assert_eq!(s.lane(a).unwrap().unwrap().state, LaneState::Running);
+        assert!(s.finish_lane(a, 1, "r", LaneState::Idle, None).unwrap());
+        assert!(!s.news_notice(a, "1:1:news:03", "q3").unwrap());
+        assert_eq!(s.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn queued_owner_rows_count_per_conversation_and_never_lane_rows() {
+        let (_d, _p, mut s) = open_tmp();
+        let a = new_lane(&mut s, "call-a", K1);
+        assert!(s.news_notice(a, "1:1:news:01", "q1").unwrap());
+        assert!(
+            !s.has_queued_owner_row(K1).unwrap(),
+            "a lane row is not the owner's"
+        );
+        let id = match s.admit("p", "m1", K1, "c", "u", "hi").unwrap() {
+            Admitted::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        };
+        assert!(s.has_queued_owner_row(K1).unwrap());
+        assert!(!s.has_queued_owner_row(K2).unwrap());
+        assert!(s.claim(id).unwrap());
+        assert!(!s.has_queued_owner_row(K1).unwrap());
     }
 
     #[test]

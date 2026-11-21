@@ -262,6 +262,29 @@ impl OmpConfig {
     }
 }
 
+/// How long a lead turn may run while an owner message of its conversation waits before the
+/// busy note, when `lead.handoff_after_minutes` is left out.
+pub const DEFAULT_HANDOFF_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// `[lead]`: how moraebot nudges a lead turn that keeps the owner waiting.
+#[derive(Debug, Clone, Default)]
+pub struct LeadConfig {
+    /// Absent means [`DEFAULT_HANDOFF_AFTER`]; `0` turns the busy note off.
+    pub handoff_after_minutes: Option<u64>,
+}
+
+impl LeadConfig {
+    /// How long a lead turn may run while an owner message of its conversation waits before
+    /// moraebot sends the busy note; `None` when it is turned off. It never stops the turn.
+    pub fn handoff_after(&self) -> Option<Duration> {
+        match self.handoff_after_minutes {
+            None => Some(DEFAULT_HANDOFF_AFTER),
+            Some(0) => None,
+            Some(minutes) => Some(Duration::from_secs(minutes.saturating_mul(60))),
+        }
+    }
+}
+
 /// A secret value held in memory. `Debug` never shows it, and it is never serialized.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -693,6 +716,7 @@ pub struct Config {
     pub home: PathBuf,
     pub access_mode: AccessMode,
     pub omp: OmpConfig,
+    pub lead: LeadConfig,
     pub memory: MemoryConfig,
 }
 
@@ -707,6 +731,7 @@ impl fmt::Debug for Config {
             .field("home", &self.home)
             .field("access_mode", &self.access_mode)
             .field("omp", &self.omp)
+            .field("lead", &self.lead)
             .field("memory", &self.memory)
             .finish()
     }
@@ -740,6 +765,8 @@ struct ConfigFile {
     bridge: Option<BridgeSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     omp: Option<OmpSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lead: Option<LeadSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemorySection>,
 }
@@ -830,6 +857,13 @@ struct OmpSection {
     max_cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stall_after_minutes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LeadSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_after_minutes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1489,6 +1523,9 @@ impl Config {
                 max_cost_usd: omp.max_cost_usd,
                 stall_after_minutes: omp.stall_after_minutes,
             },
+            lead: LeadConfig {
+                handoff_after_minutes: file.lead.and_then(|lead| lead.handoff_after_minutes),
+            },
             memory,
         })
     }
@@ -1608,6 +1645,9 @@ impl Config {
                 turn_timeout_minutes: self.omp.turn_timeout_minutes,
                 max_cost_usd: self.omp.max_cost_usd,
                 stall_after_minutes: self.omp.stall_after_minutes,
+            }),
+            lead: self.lead.handoff_after_minutes.map(|minutes| LeadSection {
+                handoff_after_minutes: Some(minutes),
             }),
             memory: self.memory.to_section(),
         };
@@ -3032,6 +3072,23 @@ mod tests {
         assert_eq!(cfg.omp.max_cost_usd, None);
         assert_eq!(cfg.omp.stall_after_minutes, None);
         assert_eq!(cfg.omp.stall_after(), Duration::from_secs(20 * 60));
+        assert_eq!(cfg.lead.handoff_after(), Some(Duration::from_secs(5 * 60)));
+    }
+
+    #[test]
+    fn handoff_after_is_parsed_and_zero_turns_it_off() {
+        let fx = Fixture::new();
+        let seven = format!("{}[lead]\nhandoff_after_minutes = 7\n", fx.valid_toml());
+        let cfg = fx.load(&seven).expect("loads");
+        assert_eq!(cfg.lead.handoff_after(), Some(Duration::from_secs(7 * 60)));
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.lead.handoff_after_minutes, Some(7));
+        let off = format!("{}[lead]\nhandoff_after_minutes = 0\n", fx.valid_toml());
+        assert_eq!(fx.load(&off).expect("loads").lead.handoff_after(), None);
+        let unknown = format!("{}[lead]\nhandoff_after = 3\n", fx.valid_toml());
+        assert!(fx.load(&unknown).is_err());
     }
 
     #[test]

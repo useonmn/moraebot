@@ -605,6 +605,7 @@ fn live_config(home: PathBuf) -> Config {
             }),
             bridge: None,
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: MemoryConfig::default(),
         },
     };

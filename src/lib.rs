@@ -29,6 +29,7 @@ pub mod persona;
 pub mod recall;
 pub mod secret;
 pub mod slack_bridge;
+pub mod status;
 pub mod store;
 pub mod summarizer;
 pub mod systemd;

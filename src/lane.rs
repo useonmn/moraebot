@@ -57,8 +57,9 @@
 //!
 //! Every lane job also gets `lane_report`: the lane leaves a one-line progress note, cleaned by
 //! `news_text` and kept as the job's newest report in its `Activity`. `news` lists the reports
-//! not yet posted for their lane; the dispatcher posts them while the lane's conversation is
-//! quiet and calls `news_posted`. The id of each lane's news message is kept too, so later news edits it. Reports live in memory only.
+//! not yet handed on for their lane; while the lane's conversation is quiet the dispatcher gives
+//! each one to the lead (a lane inbox row, or a note in the running turn of that conversation)
+//! and calls `news_posted`. Reports live in memory only.
 //!
 //! The lead stops a running job with the host tool `lane_stop` (`stop`): the job is marked stopped, its child's process
 //! group and the checks it started are killed the way `shutdown_all` kills them, and from then
@@ -146,7 +147,7 @@ pub const REPORT_CHARS: usize = 200;
 pub const STOP_REASON_CHARS: usize = 200;
 
 /// Appended to every lane prompt: ask for progress notes.
-pub const REPORT_FOOTER: &str = "\n[moraebot] At each big step (a milestone reached, a blocker hit), call lane_report with one short line for the owner. moraebot posts the newest line later, only while the conversation is quiet. Keep paths, keys and personal data out of it.";
+pub const REPORT_FOOTER: &str = "\n[moraebot] At each big step (a milestone reached, a blocker hit), call lane_report with one short line for the owner. moraebot hands the newest line to the lead later, only while the conversation is quiet, and the lead tells the owner. Keep paths, keys and personal data out of it.";
 
 /// At most this many posted-text hashes are kept per lane; a full set is cleared before the next one.
 pub const POSTED_PER_LANE: usize = 64;
@@ -155,10 +156,25 @@ pub const POSTED_PER_LANE: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneNews {
     pub lane_id: i64,
+    /// The job (prompt) whose report this is.
+    pub seq: i64,
     /// The conversation that started the lane.
     pub conversation_key: String,
     /// Already cleaned by `news_text`.
     pub text: String,
+}
+
+impl LaneNews {
+    /// The message id of this note's lane inbox row, `<lane>:<seq>:news:<text hash>`: the same
+    /// note of the same job is stored once.
+    pub fn message_id(&self) -> String {
+        format!(
+            "{}:{}:news:{:016x}",
+            self.lane_id,
+            self.seq,
+            text_hash(&self.text)
+        )
+    }
 }
 
 /// One registered lane worker: its child's process group once spawned, and its thread.
@@ -167,6 +183,8 @@ struct LaneChild {
     worker: JoinHandle<()>,
     /// The prompt (job) this worker runs.
     seq: i64,
+    /// When this job's worker started, for the status answer.
+    started: Instant,
     /// The lane's conversation, for notices.
     conversation_key: String,
     /// Counted by the child's event callback, read by `watch_tick`.
@@ -310,8 +328,6 @@ struct LaneSet {
     checks: HashMap<u32, (i64, i64)>,
     /// Hashes of the report texts posted per lane with a running job (at most `POSTED_PER_LANE` each).
     posted: HashMap<i64, HashSet<u64>>,
-    /// The news message id per lane with a running job (memory only).
-    news_ids: HashMap<i64, String>,
 }
 
 /// One lane prompt for a worker thread.
@@ -499,12 +515,11 @@ impl LaneManager {
     }
 
     /// The newest report of each running job that was not posted for its lane yet, in lane id
-    /// order; posted hashes of lanes without a running job are forgotten first, and so are their news message ids.
+    /// order; posted hashes of lanes without a running job are forgotten first.
     pub fn news(&self) -> Vec<LaneNews> {
         let mut guard = lock(&self.inner);
         let set = &mut *guard;
         set.posted.retain(|id, _| set.children.contains_key(id));
-        set.news_ids.retain(|id, _| set.children.contains_key(id));
         let mut news: Vec<LaneNews> = set
             .children
             .iter()
@@ -519,6 +534,7 @@ impl LaneManager {
                 }
                 Some(LaneNews {
                     lane_id: *id,
+                    seq: child.seq,
                     conversation_key: child.conversation_key.clone(),
                     text,
                 })
@@ -538,17 +554,13 @@ impl LaneManager {
         posted.insert(text_hash(text));
     }
 
-    /// The id of the news message posted for `lane_id`, if its job still runs.
-    pub fn news_message(&self, lane_id: i64) -> Option<String> {
-        lock(&self.inner).news_ids.get(&lane_id).cloned()
-    }
-
-    /// Remembers the news message posted for `lane_id`; later news edits it. `news` forgets it
-    /// when the lane has no running job.
-    pub fn set_news_message(&self, lane_id: i64, message_id: &str) {
+    /// When the current job of each running lane started, by lane id.
+    pub fn running_since(&self) -> HashMap<i64, Instant> {
         lock(&self.inner)
-            .news_ids
-            .insert(lane_id, message_id.to_owned());
+            .children
+            .iter()
+            .map(|(id, child)| (*id, child.started))
+            .collect()
     }
 
     /// Counts `event` of a lane child in its job's `activity`.
@@ -1085,6 +1097,7 @@ impl LaneManager {
                         kill: None,
                         worker,
                         seq,
+                        started: Instant::now(),
                         conversation_key: key.clone(),
                         activity,
                         stop: None,
@@ -2168,6 +2181,7 @@ mod tests {
             }),
             bridge: None,
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: crate::config::MemoryConfig::default(),
         };
         let mut store = Store::open(&home.join("inbox.sqlite")).expect("store");
@@ -2197,6 +2211,7 @@ mod tests {
                 kill: None,
                 worker: std::thread::spawn(|| {}),
                 seq: 1,
+                started: Instant::now(),
                 conversation_key: "discord:th:111".into(),
                 activity,
                 stop: None,
@@ -2304,6 +2319,7 @@ mod tests {
             }),
             bridge: None,
             omp: OmpConfig::default(),
+            lead: Default::default(),
             memory: crate::config::MemoryConfig::default(),
         };
         let store = Store::open(&home.join("inbox.sqlite")).expect("store");
@@ -2325,6 +2341,7 @@ mod tests {
                 kill: None,
                 worker: std::thread::spawn(|| {}),
                 seq: 1,
+                started: Instant::now(),
                 conversation_key: key.into(),
                 activity: Arc::clone(&activity),
                 stop: None,
@@ -2353,6 +2370,7 @@ mod tests {
             m.news(),
             [LaneNews {
                 lane_id: 1,
+                seq: 1,
                 conversation_key: "discord:th:111".into(),
                 text: "qa step 1".into(),
             }]
@@ -2373,6 +2391,7 @@ mod tests {
             m.news(),
             [LaneNews {
                 lane_id: 2,
+                seq: 1,
                 conversation_key: "discord:th:222".into(),
                 text: "qa b".into(),
             }]
@@ -2430,32 +2449,6 @@ mod tests {
         assert_eq!(before, [1, 9]);
         assert_eq!(running, [1]);
         assert!(after);
-    }
-
-    #[test]
-    fn news_messages_are_kept_for_running_lanes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let m = qa_manager(dir.path());
-        let _a1 = qa_child(&m, 1, "discord:th:111");
-        m.set_news_message(1, "333");
-        m.set_news_message(9, "999");
-        let a = m.news_message(1);
-        let b = m.news_message(9);
-        m.news();
-        let c = m.news_message(9);
-        let d = m.news_message(1);
-        m.set_news_message(1, "334");
-        let e = m.news_message(1);
-        qa_drop_child(&m, 1);
-        m.news();
-        let f = m.news_message(1);
-
-        assert_eq!(a, Some("333".to_owned()));
-        assert_eq!(b, Some("999".to_owned()));
-        assert_eq!(c, None);
-        assert_eq!(d, Some("333".to_owned()));
-        assert_eq!(e, Some("334".to_owned()));
-        assert_eq!(f, None);
     }
 
     #[tokio::test(start_paused = true)]
